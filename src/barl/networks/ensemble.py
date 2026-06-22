@@ -18,7 +18,11 @@ class Ensemble(nn.Module):
     super().__init__()
     self.models = nn.ModuleList([model])
     for _ in range(n_models - 1):
-      self.models.append(copy.deepcopy(model))
+      m = copy.deepcopy(model)
+      for layer in m.modules():
+        if hasattr(layer, "reset_parameters"):
+          layer.reset_parameters()
+      self.models.append(m)
 
     self.n_models = n_models
 
@@ -38,4 +42,4 @@ class Ensemble(nn.Module):
       return results.mean(0), results.std(0)
     
     raise NotImplementedError("Reduce method not implemented: ", reduce)
-    
+

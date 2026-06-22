@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from src.barl.policies.policy import Policy
+from barl.policy import Policy
 
 import gymnasium as gym
 

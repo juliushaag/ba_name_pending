@@ -4,28 +4,27 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from src.barl.models.resnet import SmallResNet
-from src.barl.models.mlp import MLP
+from barl.networks.resnet import SmallResNet
+from barl.networks.mlp import MLP
 
 import gymnasium as gym
 
 
-from src.barl.policies.policy import Policy
+from barl.policy import HParam, Policy, register_policy
 
+
+@register_policy
 class QPolicy(Policy):
+ 
+  gamma       = HParam(0.99,  "Discount factor",                          range=(0.9, 0.9999))
 
-  def __init__(self, observation_space : gym.Space, action_space : gym.Space, gamma : float, latent_dim : int = 128):
+  def __init__(self, env : gym.Env, latent_dim : int = 128, **kwargs):
 
-    super().__init__()
+    super().__init__(env, **kwargs)
 
-    self.action_dim = action_space.n
     self.eps = 0.0
-    self.gamma = gamma
-
-    if len(observation_space.shape) == 3: # This is an image
-      self.obs_encoder = SmallResNet(latent_dim)
-    elif len(observation_space.shape) == 1: 
-      self.obs_encoder = MLP(observation_space.shape[0], latent_dim, latent_dim, 0)
+   
+    self.obs_encoder = MLP(self.observation_dim, latent_dim, latent_dim, 0)
 
     self.layers = MLP(latent_dim + self.action_dim, 1, latent_dim, 3)
         

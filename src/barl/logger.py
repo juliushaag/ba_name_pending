@@ -5,9 +5,9 @@ import wandb
 
 class Logger():
 
-  def __init__(self, log_name : str, step_keys : set, run_name : str = None, config : dict = None):
+  def __init__(self, log_name : str, step_keys : set, run_name : str = None, tags : list[str] = None, config : dict = None):
     
-    wandb.init(project=log_name, name=run_name, config=config)
+    wandb.init(project=log_name, name=run_name, config=config, tags=tags)
 
     self._step_key_dict = dict()
 
@@ -33,7 +33,6 @@ class Logger():
     if self._step_key_dict.get(key) == step_key:
       return
 
-    print(key, step_key)
     wandb.define_metric(key, step_metric=step_key)
     self._step_key_dict[key] = step_key
 

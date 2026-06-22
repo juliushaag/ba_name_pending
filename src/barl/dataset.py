@@ -3,7 +3,7 @@ import numpy as np
 import ogbench
 import torch
 
-from src.barl.rollout import ReplayBuffer, Trajectory 
+from barl.rollout import ReplayBuffer, Trajectory 
 
 def convert_dtype(x : torch.Tensor):
     if x.dtype == np.float64: return torch.float32
