@@ -28,14 +28,8 @@ def collate_fn(batch):
             [torch.as_tensor(x.rewards).to(dtype=convert_dtype(x.rewards)) for x in batch],
             batch_first=True
         ),
-        "terminations": torch.nn.utils.rnn.pad_sequence(
-            [torch.as_tensor(x.terminations).to(dtype=convert_dtype(x.terminations)) for x in batch],
-            batch_first=True
-        ),
-        "truncations": torch.nn.utils.rnn.pad_sequence(
-            [torch.as_tensor(x.truncations).to(dtype=convert_dtype(x.truncations)) for x in batch],
-            batch_first=True
-        )
+        "terminations": torch.tensor([x.terminated for x in batch]),
+        "truncations":  torch.tensor([x.truncated  for x in batch])
     }
 
 
@@ -145,8 +139,8 @@ class SingleStepDataset(torch.utils.data.Dataset):
                 observations=np.asarray(obs, dtype=np.float32),       # (T+1, obs_dim)
                 actions=np.asarray(ep.actions),                       # (T, ...)
                 rewards=np.asarray(ep.rewards, dtype=np.float32),     # (T,)
-                truncated=not bool(ep.terminations[-1]),   # (T,)
                 terminated=bool(ep.terminations[-1]),
+                truncated=bool(ep.truncations[-1]),
             )
         )
     return cls(trajectories)
