@@ -14,7 +14,7 @@ from barl import Policy
 from barl.env import Environment
 
 torch.set_float32_matmul_precision("high")
-torch.autograd.set_detect_anomaly(True, check_nan=False)
+
 EVAL_EVERY  = 20_000   # grad steps
 EVAL_RUNS   = 50
 LOG_EVERY   = 10       # batches
@@ -57,11 +57,7 @@ def train_epoch(model: Policy, opts: dict[str, torch.optim.Optimizer], train_loa
 
     for k in losses:
       opts[k].zero_grad(set_to_none=True)
-
-    for k in losses:
       losses[k].backward()
-
-    for k in losses:
       torch.nn.utils.clip_grad_norm_(
         [p for group in opts[k].param_groups for p in group["params"]],
         max_norm=1.0,
@@ -121,7 +117,7 @@ if __name__ == "__main__":
     "BA-RL", 
     run_name=name, 
     step_keys={"env_steps", "grad_steps"},
-    tags=[MODEL, ENV],
+    tags=[MODEL, ENV, "offline"],
     config={"env": ENV, "model": MODEL, "hparams": model.hparams,
             "env_obs": str(env.observation_space), "env_act": str(env.action_space)}
   )
