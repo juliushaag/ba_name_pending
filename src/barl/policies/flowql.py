@@ -31,7 +31,7 @@ class FlowQLPolicy(FlowPolicy):
     
     self.time_dim = 8
 
-    self.q_function  = Ensemble(MLP(self.observation_dim + self.action_dim, 1, latent_dim, 4), 10)
+    self.q_function  = Ensemble(10, MLP, input_dim=self.observation_dim + self.action_dim, output_dim=1, latent_dim=latent_dim, hidden_layers=4)
     self.q_ema       = EMA(self.q_function, start_decay=1 - self.polyak_tau, end_decay=1 - self.polyak_tau, warmup_steps=1)
 
     self.act_flow    = MLP(self.observation_dim + self.action_dim + self.time_dim, self.action_dim, latent_dim, 4, layernorm=False)

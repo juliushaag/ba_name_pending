@@ -28,17 +28,11 @@ class IQLPolicy(Policy):
   def __init__(self, env: gym.Env, latent_dim=256, hidden_layers=6, **kwargs):
     super().__init__(env, **kwargs)
 
-    self.hparams    = self.resolve_hparams(kwargs)
-    self.tau        = self.hparams["tau"]
-    self.beta       = self.hparams["beta"]
-    self.gamma      = self.hparams["gamma"]
-    polyak_tau      = self.hparams["polyak_tau"]
-
     self.q_function = MLP(self.observation_dim + self.action_dim, 1, latent_dim, hidden_layers)
     self.v_function = MLP(self.observation_dim, 1, latent_dim, hidden_layers)
     self.actor      = MLP(self.observation_dim, self.action_dim, latent_dim, hidden_layers)
 
-    self.q_ema = EMA(self.q_function, start_decay=1 - polyak_tau, end_decay=1 - polyak_tau, warmup_steps=1)
+    self.q_ema = EMA(self.q_function, start_decay=1 - self.polyak_tau, end_decay=1 - self.polyak_tau, warmup_steps=1)
 
   def create_optimizer(self):
     return {

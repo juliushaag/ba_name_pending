@@ -14,17 +14,14 @@ class ReduceMethod(enum.Enum):
 
 class Ensemble(nn.Module):
 
-  def __init__(self, model : nn.Module, n_models : int):
+  def __init__(self, n: int, cls : type, *args, **kwargs):
     super().__init__()
-    self.models = nn.ModuleList([model])
-    for _ in range(n_models - 1):
-      m = copy.deepcopy(model)
-      for layer in m.modules():
-        if hasattr(layer, "reset_parameters"):
-          layer.reset_parameters()
-      self.models.append(m)
+    
+    self.models = nn.ModuleList([
+      cls(*args, **kwargs) for _ in range(n)
+    ])
 
-    self.n_models = n_models
+    self.n_models = n
 
   def forward(self, *args, reduce : ReduceMethod = None, **kwargs) -> list[torch.Tensor]:
     results = list(self.models[i](*args, **kwargs) for i in range(self.n_models))

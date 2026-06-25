@@ -37,11 +37,11 @@ class ReplayBuffer():
       self.buffer.append(traj)
 
   @torch.inference_mode()
-  def rollout(self, Q : Policy, env : gym.Env, n_steps = 10_000):
+  def rollout(self, policy : Policy, env : gym.Env, n_steps = 10_000):
 
     obs, _ = env.reset()
 
-    Q.eval()
+    policy.eval()
 
     observations = [obs]
     actions = list()
@@ -49,7 +49,7 @@ class ReplayBuffer():
 
     for _ in range(n_steps):
 
-      action = Q.inference_step(torch.from_numpy(obs).unsqueeze(0))[0].item()
+      action = policy.inference_step(torch.from_numpy(obs).unsqueeze(0).float()).cpu().squeeze(0).numpy()
 
       next_obs, reward, term, trunc, _ = env.step(action)
       obs = next_obs
@@ -60,14 +60,19 @@ class ReplayBuffer():
 
 
       if term or trunc:
+        observations=np.array(observations)
+        actions=np.array(actions)
+        rewards=np.array(rewards)
+        
         self.save_trajectory(Trajectory(
           id=0,
-          observations=np.array(observations),
-          actions=np.expand_dims(np.array(actions), 1),
-          rewards=np.array(rewards),
+          observations=observations,
+          actions=actions,
+          rewards=rewards,
           terminated=term,
           truncated=trunc
         ))
+
 
         obs, _ = env.reset()  
 

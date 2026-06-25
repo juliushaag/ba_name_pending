@@ -48,6 +48,7 @@ class Policy(nn.Module, ABC):
     out = {}
     for klass in reversed(cls.__mro__):
       for k, v in vars(klass).items():
+
         if isinstance(v, HParam):
           out[k] = v
     return out
@@ -169,18 +170,17 @@ class Policy(nn.Module, ABC):
       "hparams":      self.hparams,
     }, path)
 
-  @classmethod
-  def load(cls, path: str, env: gym.Env) -> "Policy":
+  @staticmethod
+  def load(type: str, path: str, env: gym.Env) -> "Policy":
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
-    policy = cls(env, **ckpt["hparams"])
+    policy = Policy._classes[type](env, **ckpt["hparams"])
     policy.load_state_dict(ckpt["state_dict"])
     return policy
 
   @staticmethod
   def load_any(path: str, env: gym.Env) -> "Policy":
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
-    cls  = Policy._classes[ckpt["policy_class"]]
-    return cls.load(path, env)
+    return Policy.load(ckpt["policy_class"], path, env)
 
   # ------------------------------------------------------------------
   # Observation normalisation
@@ -231,7 +231,7 @@ class Policy(nn.Module, ABC):
     ...
 
   @abstractmethod
-  @torch.inference_mode
+  @torch.inference_mode()
   def inference_step(self, observation: torch.Tensor, history: Optional[dict] = None) -> torch.Tensor:
     ...
 
@@ -296,8 +296,10 @@ class FlowPolicy(Policy):
       for i in range(self.flow_steps):
         t     = torch.full((B, 1), i * dt, device=self.device)
         v     = self.step_flow(obs, z, t, inference=True)
+        v     = torch.nan_to_num(v, 0.0, 0.0, 0.0)
         z_mid = z + v * (dt / 2)
         v_mid = self.step_flow(obs, z_mid, t + dt / 2, inference=True)
+        v_mid     = torch.nan_to_num(v_mid, 0.0, 0.0, 0.0)
         z     = z + v_mid * dt
 
     return z.clamp(self.act_low, self.act_high)

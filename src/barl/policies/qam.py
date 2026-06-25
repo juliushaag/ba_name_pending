@@ -24,7 +24,6 @@ class QAMPolicy(FlowPolicy):
   rho        = HParam(0.5,  "Pessimism weight on Q std (lower bound = mean - rho * std)", range=(0.0, 5.0))
   alpha      = HParam(1.0,  "Weight on distillation loss relative to Q loss",             range=(0.0, 10.0))
   polyak_tau = HParam(0.005,"EMA decay step size for Q target (1 - polyak_tau = decay)",  range=(0.001, 0.05))
-  max_steps  = HParam(10,   "Euler steps for flow ODE at inference",                      range=(2, 100))
 
   def __init__(self, env: gym.Env, latent_dim: int = 512, time_dim : int = 8, flow_steps : int = 8, **kwargs):
     super().__init__(env, flow_steps, **kwargs)
@@ -32,16 +31,17 @@ class QAMPolicy(FlowPolicy):
     assert isinstance(env.action_space, gym.spaces.Box)
 
     self.latent_dim   = latent_dim
+    self.max_steps = flow_steps
     self.time_dim = time_dim   
-    self.q_function  = Ensemble(MLP(self.observation_dim + self.action_dim, 1, latent_dim, 4), 10)
+    self.q_function  = Ensemble(10, MLP, self.observation_dim + self.action_dim, 1, latent_dim, 4)
     self.q_ema       = EMA(self.q_function, start_decay=1 - self.polyak_tau, end_decay=1 - self.polyak_tau, warmup_steps=1)
 
     self.act_flow    = MLP(self.observation_dim + self.action_dim + self.time_dim, self.action_dim, latent_dim, 4)
 
   def create_optimizer(self):
     return {
-      "critic":          torch.optim.AdamW(self.q_function.parameters(),  lr=3e-4, betas=(0.9, 0.95), weight_decay=1e-4),
-      "am":       torch.optim.AdamW(self.act_flow.parameters(),    lr=3e-4, betas=(0.9, 0.95), weight_decay=1e-4),
+      "critic":   torch.optim.AdamW(self.q_function.parameters(),  lr=3e-4),
+      "am":       torch.optim.AdamW(self.act_flow.parameters(),    lr=3e-4),
     }
 
   def train_step(self, batch: torch.DictType, frozen : FlowPolicy) -> torch.Tensor:
@@ -62,7 +62,7 @@ class QAMPolicy(FlowPolicy):
     log_dict = {}
 
     """ Critic """
-    with torch.no_grad():
+    with torch.no_grad(), torch.amp.autocast("cuda", torch.bfloat16):
       
       next_action  = self.inference_step(next_obs)
 
@@ -95,7 +95,10 @@ class QAMPolicy(FlowPolicy):
       ts.append(t)
 
     last_actions = xs[-1].requires_grad_(True)
-    q_field = self.q_ema(obs, last_actions, reduce=ReduceMethod.MEAN).sum()
+    
+    with torch.amp.autocast("cuda", torch.bfloat16):
+      q_field = self.q_function(obs, last_actions, reduce=ReduceMethod.MEAN).sum()
+    
     q_field.backward()
 
     adj = -self.tau * last_actions.grad
@@ -103,9 +106,9 @@ class QAMPolicy(FlowPolicy):
 
     adjs = list()
     for i in reversed(range(self.max_steps)):
-      t = i / self.max_steps * torch.ones_like(action[:, 0:1])
 
-      def fn(xi):  
+      def fn(xi):
+        t = i / self.max_steps * torch.ones_like(action[:, 0:1])
         return 2 * bc_policy.step_flow(obs, xi, t + h) - xi / (t + h)
 
       vjp = torch.func.vjp(fn, xs[i])[1](adj)[0]

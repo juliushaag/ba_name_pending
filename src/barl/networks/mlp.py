@@ -43,7 +43,7 @@ class MLP(nn.Module):
     
     if self.final_activation:
       if self.layernorm:
-        self.layers.append(nn.LayerNorm(self.latent_dim))
+        self.layers.append(nn.LayerNorm(self.output_dim))
   
       self.layers.append(ACT())
       
