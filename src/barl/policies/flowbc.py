@@ -1,7 +1,6 @@
 import math
 import torch
 from torch.nn import functional as F
-from barl.policies.flowql import FlowQLPolicy
 from barl.policy import HParam, register_policy, FlowPolicy
 
 from barl.networks.mlp import MLP

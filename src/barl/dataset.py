@@ -13,26 +13,6 @@ def convert_dtype(x : torch.Tensor):
 
     return x.dtype
 
-def collate_fn(batch):
-    return {
-        "id": torch.Tensor([x.id for x in batch]),
-        "observations": torch.nn.utils.rnn.pad_sequence(
-            [torch.as_tensor(x.observations).to(dtype=convert_dtype(x.observations)) for x in batch],
-            batch_first=True
-        ),
-        "actions": torch.nn.utils.rnn.pad_sequence(
-            [torch.as_tensor(x.actions).to(dtype=convert_dtype(x.actions)) for x in batch],
-            batch_first=True
-        ),
-        "rewards": torch.nn.utils.rnn.pad_sequence(
-            [torch.as_tensor(x.rewards).to(dtype=convert_dtype(x.rewards)) for x in batch],
-            batch_first=True
-        ),
-        "terminations": torch.tensor([x.terminated for x in batch]),
-        "truncations":  torch.tensor([x.truncated  for x in batch])
-    }
-
-
 
 class SingleStepDataset(torch.utils.data.Dataset):
 
@@ -65,13 +45,18 @@ class SingleStepDataset(torch.utils.data.Dataset):
     # discrete actions -> long (for embedding/cross-entropy), continuous -> float32
     act = act.long() if self.discrete_actions else act.float()
 
-    return dict(
+    sample = dict(
       obs=      torch.asarray(self.buffer[base_idx].observations[traj_idx]).float(),
       next_obs= torch.asarray(self.buffer[base_idx].observations[traj_idx + 1]).float(),
       act=      act,
       rew=      torch.asarray(self.buffer[base_idx].rewards[traj_idx]).float(),
       term=     traj_end and self.buffer[base_idx].terminated
     )
+
+    for key, values in self.buffer[base_idx].extras.items():
+      sample[key] = torch.asarray(values[traj_idx]).float()
+
+    return sample
   
 
   @classmethod

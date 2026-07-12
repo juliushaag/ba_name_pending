@@ -33,10 +33,10 @@ class QAMPolicy(FlowPolicy):
     self.latent_dim   = latent_dim
     self.max_steps = flow_steps
     self.time_dim = time_dim   
-    self.q_function  = Ensemble(10, MLP, self.observation_dim + self.action_dim, 1, latent_dim, 4)
+    self.q_function  = Ensemble(10, MLP, self.observation_dim + self.action_dim, 1, latent_dim, 3)
     self.q_ema       = EMA(self.q_function, start_decay=1 - self.polyak_tau, end_decay=1 - self.polyak_tau, warmup_steps=1)
 
-    self.act_flow    = MLP(self.observation_dim + self.action_dim + self.time_dim, self.action_dim, latent_dim, 4)
+    self.act_flow    = MLP(self.observation_dim + self.action_dim + self.time_dim, self.action_dim, latent_dim, 3)
 
   def create_optimizer(self):
     return {
@@ -64,7 +64,7 @@ class QAMPolicy(FlowPolicy):
     """ Critic """
     with torch.no_grad(), torch.amp.autocast("cuda", torch.bfloat16):
       
-      next_action  = self.inference_step(next_obs)
+      next_action, _  = self.inference_step(next_obs)
 
       q_mean, q_std = self.q_ema(next_obs, next_action, reduce=ReduceMethod.MEANSTD)
       target_q     = q_mean - self.rho * q_std
@@ -144,3 +144,4 @@ class QAMPolicy(FlowPolicy):
   def step_flow(self, obs, action, dt, inference = False):
     with torch.amp.autocast("cuda", torch.bfloat16):
       return self.act_flow(obs, action, self.sinusoidal_emb(dt, self.time_dim))
+    

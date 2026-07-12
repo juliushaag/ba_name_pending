@@ -117,6 +117,6 @@ class IQLPolicy(Policy):
       preds = self.actor(obs)
 
     if self.action_discrete:
-      return preds.argmax(dim=1, keepdim=True)
+      return preds.argmax(dim=1, keepdim=True), {}
 
-    return preds.float().clamp(self.act_low, self.act_high)
+    return preds.float().clamp(self.act_low, self.act_high), {}

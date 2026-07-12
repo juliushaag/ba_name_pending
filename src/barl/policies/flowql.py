@@ -19,7 +19,6 @@ Flow Q implementation guided by https://arxiv.org/pdf/2502.02538
 @register_policy
 class FlowQLPolicy(FlowPolicy):
 
-  rho        = HParam(0.5,  "Pessimism weight on Q std (lower bound = mean - rho * std)", range=(0.0, 5.0))
   gamma      = HParam(0.99, "Discount factor",                                        range=(0.9, 0.9999))
   alpha      = HParam(100.0,  "Weight on distillation loss relative to Q loss",         range=(0.1, 300.0))
   polyak_tau = HParam(0.005, "EMA decay step size for Q target (1 - polyak_tau = decay)", range=(0.001, 0.05))

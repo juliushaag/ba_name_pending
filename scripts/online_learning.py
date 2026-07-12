@@ -54,6 +54,7 @@ def evaluate_and_log(model: Policy, env: gym.Env, log: Logger, ckpt_dir: str, be
 
 def train_epoch(model: Policy, opts: dict[str, torch.optim.Optimizer], train_loader, log: Logger, env: gym.Env, ckpt_dir: str, best_reward: float, frozen : Policy = None) -> float:
 
+  model.on_epoch_start()
   model.train()
   for b, batch in enumerate(train_loader):
 
@@ -61,7 +62,7 @@ def train_epoch(model: Policy, opts: dict[str, torch.optim.Optimizer], train_loa
 
     for k in losses:
       opts[k].zero_grad(set_to_none=True)
-      losses[k].backward()
+      losses[k].backward(retain_graph=True)
       torch.nn.utils.clip_grad_norm_(
         [p for group in opts[k].param_groups for p in group["params"]],
         max_norm=1.0,
@@ -79,6 +80,8 @@ def train_epoch(model: Policy, opts: dict[str, torch.optim.Optimizer], train_loa
       best_reward = evaluate_and_log(model, env, log, ckpt_dir, best_reward)
       model.train()
 
+  model.on_epoch_end()
+
   return best_reward
 
 
@@ -90,7 +93,9 @@ if __name__ == "__main__":
   args.add_argument("--env", required=True)
   args.add_argument("--pretrained", default=None)
   args.add_argument("--checkpoint", default=None)
-  args.add_argument("--epochs_per_rollout", default=4)
+  args.add_argument("--epochs_per_rollout", default=32)
+  args.add_argument("--traj_len", type=int, default=500)
+  args.add_argument("--num_envs", type=int, default=32)
 
   kwargs = args.parse_args()
 
@@ -99,15 +104,21 @@ if __name__ == "__main__":
   pretrained = kwargs.pretrained
   checkpoint = kwargs.checkpoint
   epochs_per_rollout = kwargs.epochs_per_rollout
+  traj_len = kwargs.traj_len
+  num_envs = kwargs.num_envs
 
   now  = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
   name = f"{MODEL.lower()}/{ENV.lower()}/{now}"
 
   environment: Environment = Environment.make(ENV)
 
-  env = environment.get_env()
+  env         = environment.get_env()  # single env: used for eval (rendering) and action/obs spaces
+  rollout_env = gym.vector.SyncVectorEnv(
+    [environment.get_env for _ in range(num_envs)],
+    autoreset_mode=gym.vector.AutoresetMode.DISABLED,
+  )
 
-  buffer = ReplayBuffer(200)
+  buffer = ReplayBuffer(256, traj_len=traj_len)
 
   
 
@@ -145,7 +156,7 @@ if __name__ == "__main__":
   for _ in range(100):
 
 
-    buffer.rollout(model, env=env, n_steps=50_000)
+    buffer.rollout(model, env=rollout_env, n_steps=50_000 // num_envs)
 
     log.increment({"env_steps": 50_000})
 
@@ -153,7 +164,9 @@ if __name__ == "__main__":
     print(f"Finished Rollout buffer contains {len(buffer.buffer)} episodes")
 
     train_loader = torch.utils.data.DataLoader(
-      SingleStepDataset.from_replay(buffer), batch_size=256, shuffle=True, prefetch_factor=4, num_workers=4, persistent_workers=True
+      SingleStepDataset.from_replay(buffer), 
+      batch_size=1024, 
+      shuffle=True,
     )
 
     for i in range(epochs_per_rollout):
@@ -161,4 +174,5 @@ if __name__ == "__main__":
 
   model.save(os.path.join(ckpt_dir, "final.pt"))
   env.close()
+  rollout_env.close()
   log.finish()

@@ -44,13 +44,23 @@ class Policy(nn.Module, ABC):
 
   @classmethod
   def _hparam_descriptors(cls) -> dict[str, HParam]:
-    """Collect all HParam class attributes walking the MRO."""
+    """
+    Collect all HParam class attributes walking the MRO, cached per-class in
+    _hparams so later instances can still find the descriptors even after
+    resolve_hparams overwrites the class attributes with resolved values.
+    """
+    cached = cls.__dict__.get("_hparams")
+    if cached is not None:
+      return cached
+
     out = {}
     for klass in reversed(cls.__mro__):
       for k, v in vars(klass).items():
 
         if isinstance(v, HParam):
           out[k] = v
+
+    cls._hparams = out
     return out
 
   @classmethod
@@ -65,7 +75,6 @@ class Policy(nn.Module, ABC):
       value = kwargs.get(name, hp.default)
       hp.validate(name, value)
       resolved[name] = value
-      setattr(cls, name, value)
 
     unknown = set(kwargs) - set(descriptors)
     if unknown:
@@ -157,7 +166,15 @@ class Policy(nn.Module, ABC):
     self.register_buffer("obs_mean", torch.zeros(observation_space.shape[-1]))
 
     self.hparams: dict = self.resolve_hparams(kwargs)
-    
+    for name, value in self.hparams.items():
+      setattr(self, name, value)
+
+  def on_epoch_start(self):
+    ...
+
+  
+  def on_epoch_end(self):
+    ...
 
   # ------------------------------------------------------------------
   # Checkpointing
@@ -232,7 +249,8 @@ class Policy(nn.Module, ABC):
 
   @abstractmethod
   @torch.inference_mode()
-  def inference_step(self, observation: torch.Tensor, history: Optional[dict] = None) -> torch.Tensor:
+  def inference_step(self, observation: torch.Tensor, step_info: Optional[dict] = None) -> tuple[torch.Tensor, dict]:
+    """Returns (action, extras) where extras is a dict of per-step named tensors (e.g. entropy bounds) to log/persist."""
     ...
 
   # ------------------------------------------------------------------
@@ -240,7 +258,7 @@ class Policy(nn.Module, ABC):
   # ------------------------------------------------------------------
 
   @torch.inference_mode()
-  def evaluate(self, env: gym.Env, runs=3):
+  def evaluate(self, env: gym.Env, runs=3, **inference_kwargs):
     was_training = self.training
     self.eval()
     run_data = []
@@ -251,7 +269,7 @@ class Policy(nn.Module, ABC):
       data   = dict(frames=[], rewards=[])
 
       while not done:
-        action = self.inference_step(torch.from_numpy(obs).float().unsqueeze(0))
+        action, _ = self.inference_step(torch.from_numpy(obs).float().unsqueeze(0), **inference_kwargs)
         obs, reward, term, trunc, _ = env.step(action[0].cpu().numpy())
         done = term or trunc
         data["rewards"].append(reward)
@@ -306,7 +324,7 @@ class FlowPolicy(Policy):
 
   @torch.inference_mode()
   def inference_step(self, observation: torch.Tensor, z : torch.Tensor = None):
-    return self.generate_action(observation.to(self.device), z)
+    return self.generate_action(observation.to(self.device), z), {}
 
 def register_policy(cls: type):
   name = cls.__name__

@@ -38,6 +38,6 @@ class DirectPolicy(Policy):
     return {"direct": loss}, {"stats/pred_norm": pred.norm(dim=-1).mean().detach()}
 
   @torch.inference_mode()
-  def inference_step(self, observation, history=None):
+  def inference_step(self, observation, step_info=None):
     obs = self.normalize_obs(observation.to(self.device))
-    return self(obs).clamp(self.act_low, self.act_high)
+    return self(obs).clamp(self.act_low, self.act_high), {}

@@ -55,7 +55,7 @@ class QPolicy(Policy):
 
     with torch.amp.autocast("cuda", torch.bfloat16):
       with torch.no_grad():
-        best_actions = self.inference_step(next_obs, eps_greedy=False)
+        best_actions, _ = self.inference_step(next_obs, eps_greedy=False)
         future = target(next_obs, best_actions).squeeze(1)
       
       tgt = reward + self.gamma * (1 - term.long()) * future
@@ -76,7 +76,7 @@ class QPolicy(Policy):
     B = obs.shape[0] # We may have more than one observation
 
     if (torch.rand((1,)).item() < self.eps) and eps_greedy:
-      return torch.randint(0, self.action_dim, (B, 1), device=self.device)
+      return torch.randint(0, self.action_dim, (B, 1), device=self.device), {}
 
 
     with torch.amp.autocast("cuda", torch.bfloat16):
@@ -95,5 +95,5 @@ class QPolicy(Policy):
 
       actions = preds.argmax(dim=1, keepdim=True)
 
-    return actions
+    return actions, {}
 
