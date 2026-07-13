@@ -93,7 +93,7 @@ if __name__ == "__main__":
   args.add_argument("--env", required=True)
   args.add_argument("--pretrained", default=None)
   args.add_argument("--checkpoint", default=None)
-  args.add_argument("--epochs_per_rollout", default=32)
+  args.add_argument("--epochs_per_rollout", default=16)
   args.add_argument("--traj_len", type=int, default=500)
   args.add_argument("--num_envs", type=int, default=32)
 
