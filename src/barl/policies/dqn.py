@@ -1,99 +1,158 @@
 import einops
-import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from barl.networks.resnet import SmallResNet
+from barl.policy import Policy, Actor, Critic, HParam, register_policy
 from barl.networks.mlp import MLP
+from barl.networks.ema import EMA
 
 import gymnasium as gym
 
 
-from barl.policy import HParam, Policy, register_policy
+class _QNet(nn.Module):
+
+  def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int):
+    super().__init__()
+    self.action_dim  = action_dim
+    self.obs_encoder = MLP(obs_dim, hidden_dim, hidden_dim, 0)
+    self.layers      = MLP(hidden_dim + action_dim, 1, hidden_dim, 3)
+
+  def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    obs_enc   = self.obs_encoder(obs)
+    action_oh = F.one_hot(actions, num_classes=self.action_dim).float().squeeze(1)
+    return self.layers(torch.cat([obs_enc, action_oh], dim=-1))
+
+
+class DiscreteQCritic(nn.Module, Critic):
+  """
+  Q(s,a) over a discrete action set, action indices (not one-hot) in and
+  out. `score()` is undefined -- there's no action gradient for a discrete
+  action space. No update() -- QPolicy.train_step builds the Double-DQN
+  target and huber loss directly.
+  """
+
+  def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int = 128, polyak_tau: float = 0.005):
+    super().__init__()
+
+    self.action_dim = action_dim
+    self.q_net = _QNet(obs_dim, action_dim, hidden_dim)
+    self.q_ema = EMA(self.q_net, start_decay=1 - polyak_tau, end_decay=1 - polyak_tau, warmup_steps=1)
+
+  def step_ema(self):
+    self.q_ema.step()
+
+  def value(self, s: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+    with torch.amp.autocast("cuda", torch.bfloat16):
+      return self.q_net(s, a)
+
+  def score(self, s: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+    raise NotImplementedError("DiscreteQCritic has no action gradient -- actions are discrete indices.")
+
+  def target_value(self, s: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+    with torch.amp.autocast("cuda", torch.bfloat16):
+      return self.q_ema(s, a)
+
+  def create_optimizer(self) -> dict:
+    return {"q": torch.optim.AdamW(self.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=1e-2)}
+
+
+class GreedyDiscreteActor(nn.Module, Actor):
+  """
+  DQN-style actor: no generative net of its own, just eps-greedy argmax over
+  whatever discrete critic it's handed. `sample()` cannot act without a
+  `critic` -- there is nothing else to argmax over.
+  """
+
+  def __init__(self, action_dim: int, eps: float = 0.0):
+    super().__init__()
+    self.action_dim = action_dim
+    self.eps = eps
+
+  def set_eps(self, eps: float):
+    self.eps = eps
+
+  def sample(self, s: torch.Tensor, critic: Critic = None, eps_greedy: bool = True) -> torch.Tensor:
+    if critic is None:
+      raise ValueError("GreedyDiscreteActor.sample requires a critic to argmax over -- "
+                        "it has no generative net of its own.")
+
+    B = s.shape[0]
+
+    with torch.amp.autocast("cuda", torch.bfloat16):
+      reshaped_obs = einops.repeat(s, "b ... -> (b o) ...", o=self.action_dim)
+      actions      = einops.repeat(torch.arange(0, self.action_dim, device=s.device), "a -> (b a) 1", b=B)
+      values       = critic.value(reshaped_obs, actions)
+      values       = einops.rearrange(values, "(b o) 1 -> b o", o=self.action_dim)
+
+    greedy_action = values.argmax(dim=1, keepdim=True)
+    if not eps_greedy:
+      return greedy_action
+
+    # Per-example (not per-batch) coin flip -- also what makes this
+    # vmap-safe (torch.rand(...).item() can't be traced under vmap, see
+    # vmap_policy.py; a tensor-level torch.where naturally is), and is a
+    # more standard eps-greedy formulation than the old single-flip-for-
+    # the-whole-batch version besides.
+    random_action = torch.randint(0, self.action_dim, (B, 1), device=s.device)
+    explore = torch.rand((B, 1), device=s.device) < self.eps
+    return torch.where(explore, random_action, greedy_action)
+
+  def create_optimizer(self) -> dict:
+    return {}
 
 
 @register_policy
 class QPolicy(Policy):
- 
-  gamma       = HParam(0.99,  "Discount factor",                          range=(0.9, 0.9999))
+  """Double-DQN: greedy action picked by the online critic, evaluated by
+  the target/EMA net."""
 
-  def __init__(self, env : gym.Env, latent_dim : int = 128, **kwargs):
+  gamma      = HParam(0.99,  "Discount factor",                                              range=(0.9, 0.9999))
+  polyak_tau = HParam(0.005, "EMA decay step size for the Q target (1 - polyak_tau = decay)", range=(0.001, 0.05))
 
+  def __init__(self, env: gym.Env, hidden_dim: int = 128, **kwargs):
     super().__init__(env, **kwargs)
 
-    self.eps = 0.0
-   
-    self.obs_encoder = MLP(self.observation_dim, latent_dim, latent_dim, 0)
+    assert self.action_discrete
 
-    self.layers = MLP(latent_dim + self.action_dim, 1, latent_dim, 3)
-        
+    self.critic = DiscreteQCritic(self.observation_dim, self.action_dim,
+                                   hidden_dim=hidden_dim, polyak_tau=self.polyak_tau)
+    self.actor  = GreedyDiscreteActor(self.action_dim)
 
-  def set_eps(self, eps : float):
-    self.eps = eps
+  def set_eps(self, eps: float):
+    self.actor.set_eps(eps)
 
-
-  def forward(self, obs : torch.Tensor, actions : torch.Tensor):
-    
-    obs_enc = self.obs_encoder(obs)
-    
-    action_oh = F.one_hot(actions, num_classes=self.action_dim).float().squeeze(1)
-    
-    output = self.layers(torch.cat([obs_enc, action_oh], dim=-1))
-
-    return output
-  
   def create_optimizer(self):
-    return torch.optim.AdamW(self.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=1e-2)
-   
-  def train_step(self, batch : torch.DictType, target : "QPolicy") -> torch.Tensor:
-    obs =       batch["obs"].to(self.device)
-    next_obs=   batch["next_obs"].to(self.device)
-    action=     batch["act"].to(self.device)
-    reward=     batch["rew"].to(self.device)
-    term=       batch["term"].to(self.device)
+    return self.critic.create_optimizer()
 
-    with torch.amp.autocast("cuda", torch.bfloat16):
-      with torch.no_grad():
-        best_actions, _ = self.inference_step(next_obs, eps_greedy=False)
-        future = target(next_obs, best_actions).squeeze(1)
-      
-      tgt = reward + self.gamma * (1 - term.long()) * future
-      pred = self(obs, action).squeeze(1)
-    
-    loss = F.huber_loss(pred.float(), tgt.float())
+  def train_step(self, batch):
+    obs      = batch["obs"].to(self.device)
+    next_obs = batch["next_obs"].to(self.device)
+    action   = batch["act"].to(self.device)
+    reward   = batch["rew"].view(-1, 1).to(self.device)
+    term     = batch["term"].view(-1, 1).to(self.device).to(reward.dtype)
 
-    return loss
-    
+    self.critic.step_ema()
+
+    with torch.no_grad():
+      # Double-DQN-style decoupling: the greedy action is picked by the
+      # *online* critic (self.critic, passed explicitly -- the actor has no
+      # net of its own to pick with), and evaluated by the target/EMA net.
+      best_action = self.actor.sample(next_obs, critic=self.critic, eps_greedy=False)
+      target = reward + (1.0 - term) * self.gamma * self.critic.target_value(next_obs, best_action)
+
+    pred = self.critic.value(obs, action)
+    loss = F.huber_loss(pred.float(), target.float())
+
+    log = {
+      "train/loss/q": loss.detach(),
+      "stats/q_mean": pred.detach().float().mean(),
+    }
+    return {"q": loss}, log
+
   @torch.inference_mode()
-  def inference_step(self, obs : torch.Tensor, eps_greedy : bool = True):
-
+  def inference_step(self, obs: torch.Tensor, eps_greedy: bool = True):
     obs = obs.to(self.device)
-    
-    if len(obs.shape) < 2:
-      obs.unsqueeze_(0)
-
-    B = obs.shape[0] # We may have more than one observation
-
-    if (torch.rand((1,)).item() < self.eps) and eps_greedy:
-      return torch.randint(0, self.action_dim, (B, 1), device=self.device), {}
-
-
-    with torch.amp.autocast("cuda", torch.bfloat16):
-
-      reshaped_obs = einops.repeat(obs, "b ... -> (b o) ...", o=self.action_dim)
-
-      actions = einops.repeat(torch.arange(0, self.action_dim, device=self.device), "a -> (b a) 1", b=B)
-
-      preds = self(reshaped_obs, actions)
-
-      preds = einops.rearrange(
-        preds,
-        "(b o) 1 -> b o",
-        o=self.action_dim
-      )
-
-      actions = preds.argmax(dim=1, keepdim=True)
-
-    return actions, {}
-
+    if obs.dim() < 2:
+      obs = obs.unsqueeze(0)
+    return self.actor.sample(obs, self.critic, eps_greedy=eps_greedy), {}

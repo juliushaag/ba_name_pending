@@ -1,9 +1,46 @@
 import minari
 import numpy as np
-import ogbench
 import torch
 
-from barl.rollout import ReplayBuffer, Trajectory 
+from barl.rollout import ReplayBuffer, Trajectory
+
+
+@torch.no_grad()
+def compute_gae(trajectories: list[Trajectory], critic, gamma: float = 0.99,
+                 lam: float = 0.95, device: str = "cpu") -> None:
+  """
+  Fills each Trajectory's extras with GAE(lambda) advantages ("adv") and
+  bootstrapped returns ("ret"), in place.
+
+  Uses the per-step values PPOPolicy.inference_step already stashed in
+  extras["value"] at rollout time, plus one extra critic.value() call to
+  bootstrap the trailing observation each chunk stores but never ran
+  inference on. Must run once per rollout, over the still-in-order
+  trajectories, BEFORE SingleStepDataset flattens/shuffles them into
+  single-step batches -- GAE's backward recursion needs the sequential
+  rewards/values a shuffled dataset no longer has.
+  """
+  for traj in trajectories:
+    values  = np.asarray(traj.extras["value"], dtype=np.float32)
+    rewards = np.asarray(traj.rewards,         dtype=np.float32)
+    T = len(rewards)
+
+    last_obs  = torch.as_tensor(traj.observations[-1], dtype=torch.float32, device=device).unsqueeze(0)
+    bootstrap = 0.0 if traj.terminated else critic.value(last_obs).item()
+
+    next_values = np.append(values[1:], bootstrap)
+
+    adv = np.zeros(T, dtype=np.float32)
+    gae = 0.0
+    for t in reversed(range(T)):
+      nonterminal = 0.0 if (t == T - 1 and traj.terminated) else 1.0
+      delta = rewards[t] + gamma * next_values[t] * nonterminal - values[t]
+      gae   = delta + gamma * lam * nonterminal * gae
+      adv[t] = gae
+
+    traj.extras["adv"] = adv
+    traj.extras["ret"] = adv + values
+
 
 def convert_dtype(x : torch.Tensor):
     if x.dtype == np.float64: return torch.float32

@@ -3,6 +3,7 @@ import datetime
 import os
 
 from barl.dataset import SingleStepDataset
+from barl.config import load_config
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 
@@ -19,9 +20,7 @@ from barl.rollout import ReplayBuffer
 
 torch.set_float32_matmul_precision("high")
 
-EVAL_EVERY  = 10_000   # grad steps
-EVAL_RUNS   = 50
-LOG_EVERY   = 10       # batches
+DEFAULT_CONFIG = os.path.join(os.path.dirname(__file__), "..", "config", "offline_to_online.yaml")
 
 
 def offline_fraction(iteration: int, anneal_iters: int, start_frac: float, end_frac: float) -> float:
@@ -58,10 +57,10 @@ def make_combined_dataset(offline_ds: SingleStepDataset, online_buffer: ReplayBu
   return SingleStepDataset(offline_sample + list(online_traj))
 
 
-def evaluate_and_log(model: Policy, env: gym.Env, log: Logger, ckpt_dir: str, best_reward: float) -> float:
-  data_runs = model.evaluate(env, runs=EVAL_RUNS)
+def evaluate_and_log(model: Policy, env: gym.Env, log: Logger, ckpt_dir: str, best_reward: float, cfg: dict) -> float:
+  data_runs = model.evaluate(env, runs=cfg["eval_runs"])
 
-  log.increment({"env_steps": EVAL_RUNS})
+  log.increment({"env_steps": cfg["eval_runs"]})
 
   rewards     = [np.sum(run["rewards"]) for run in data_runs]
   avg_reward  = float(np.mean(rewards))
@@ -82,35 +81,42 @@ def evaluate_and_log(model: Policy, env: gym.Env, log: Logger, ckpt_dir: str, be
   if avg_reward > best_reward:
     model.save(os.path.join(ckpt_dir, "best.pt"))
     best_reward = avg_reward
+    log.summary("best_reward", best_reward)
 
   return best_reward
 
 
-def train_epoch(model: Policy, opts: dict[str, torch.optim.Optimizer], train_loader, log: Logger, env: gym.Env, ckpt_dir: str, best_reward: float, frozen: Policy = None) -> float:
+def train_epoch(model: Policy, opts: dict[str, torch.optim.Optimizer], train_loader, log: Logger, env: gym.Env, ckpt_dir: str, best_reward: float, cfg: dict) -> float:
 
   model.on_epoch_start()
   model.train()
   for b, batch in enumerate(train_loader):
 
-    losses, stats = model.train_step(batch, frozen=frozen)
+    losses, stats = model.train_step(batch)
 
+    # One update after another, with a gradient reset in between each --
+    # but every backward pass completes before any optimizer actually
+    # steps, so an actor loss reading the critic's forward pass never has
+    # its graph invalidated by the critic's own optimizer stepping mid-loop.
     for k in losses:
       opts[k].zero_grad(set_to_none=True)
       losses[k].backward(retain_graph=True)
+
+    for k in losses:
       torch.nn.utils.clip_grad_norm_(
         [p for group in opts[k].param_groups for p in group["params"]],
         max_norm=1.0,
       )
       opts[k].step()
 
-    if b % LOG_EVERY == 0:
+    if b % cfg["log_every"] == 0:
       log.log(stats)
 
     log.increment({"grad_steps": 1})
 
-    if log.get_step("grad_steps") % EVAL_EVERY == 0:
+    if log.get_step("grad_steps") % cfg["eval_every"] == 0:
       model.eval()
-      best_reward = evaluate_and_log(model, env, log, ckpt_dir, best_reward)
+      best_reward = evaluate_and_log(model, env, log, ckpt_dir, best_reward, cfg)
       model.train()
 
   model.on_epoch_end()
@@ -118,38 +124,14 @@ def train_epoch(model: Policy, opts: dict[str, torch.optim.Optimizer], train_loa
   return best_reward
 
 
-if __name__ == "__main__":
+def main(cfg: dict):
+  seed = cfg.get("seed")
+  if seed is not None:
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
-  args = argparse.ArgumentParser()
-
-  args.add_argument("--model", required=True)
-  args.add_argument("--env", required=True)
-  args.add_argument("--pretrained", default=None)
-  args.add_argument("--checkpoint", default=None)
-  args.add_argument("--epochs_per_rollout", type=int, default=16)
-  args.add_argument("--traj_len", type=int, default=500)
-  args.add_argument("--num_envs", type=int, default=32)
-  args.add_argument("--num_iterations", type=int, default=100)
-  args.add_argument("--offline_start_frac", type=float, default=1.0,
-                     help="Fraction of transitions drawn from the offline dataset at the start of training")
-  args.add_argument("--offline_end_frac", type=float, default=0.0,
-                     help="Fraction of transitions drawn from the offline dataset once annealing has finished")
-  args.add_argument("--anneal_iterations", type=int, default=50,
-                     help="Number of outer (rollout) iterations over which the offline fraction is annealed")
-
-  kwargs = args.parse_args()
-
-  MODEL = kwargs.model
-  ENV   = kwargs.env
-  pretrained = kwargs.pretrained
-  checkpoint = kwargs.checkpoint
-  epochs_per_rollout = kwargs.epochs_per_rollout
-  traj_len = kwargs.traj_len
-  num_envs = kwargs.num_envs
-  num_iterations = kwargs.num_iterations
-  offline_start_frac = kwargs.offline_start_frac
-  offline_end_frac = kwargs.offline_end_frac
-  anneal_iterations = kwargs.anneal_iterations
+  MODEL = cfg["model"]
+  ENV   = cfg["env"]
 
   now  = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
   name = f"{MODEL.lower()}/{ENV.lower()}/{now}"
@@ -157,24 +139,16 @@ if __name__ == "__main__":
   environment: Environment = Environment.make(ENV)
 
   env         = environment.get_env()  # single env: used for eval (rendering) and action/obs spaces
-  rollout_env = gym.vector.SyncVectorEnv(
-    [environment.get_env for _ in range(num_envs)],
-    autoreset_mode=gym.vector.AutoresetMode.DISABLED,
-  )
+  rollout_env = environment.get_vector_env(cfg["num_envs"])
 
   offline_ds = environment.get_dataset()
-  buffer     = ReplayBuffer(256, traj_len=traj_len)
+  buffer     = ReplayBuffer(cfg["buffer_size"], traj_len=cfg["traj_len"])
 
+  checkpoint = cfg.get("checkpoint")
   if checkpoint is not None and os.path.exists(checkpoint):
     model = Policy.load(MODEL, checkpoint, env).to("cuda")
   else:
     model: Policy = Policy.make(MODEL, env).to("cuda")
-
-  frozen = None
-  if pretrained is not None and os.path.exists(pretrained):
-    frozen = Policy.load_any(path=pretrained, env=env).to("cuda")
-    frozen.eval()
-    frozen.requires_grad_(False)
 
   opts  = model.create_optimizer()
 
@@ -183,10 +157,8 @@ if __name__ == "__main__":
     run_name=name,
     step_keys={"env_steps", "grad_steps"},
     tags=[MODEL, ENV, "offline_to_online"],
-    config={"env": ENV, "model": MODEL, "hparams": model.hparams,
-            "env_obs": str(env.observation_space), "env_act": str(env.action_space),
-            "offline_start_frac": offline_start_frac, "offline_end_frac": offline_end_frac,
-            "anneal_iterations": anneal_iterations}
+    config={**cfg, "hparams": model.hparams,
+            "env_obs": str(env.observation_space), "env_act": str(env.action_space)}
   )
 
   log.register("eval/*",  "env_steps")
@@ -198,30 +170,45 @@ if __name__ == "__main__":
   os.makedirs(ckpt_dir, exist_ok=True)
 
   best_reward = float("-inf")
-  for iteration in range(num_iterations):
+  for iteration in range(cfg["num_iterations"]):
 
-    buffer.rollout(model, env=rollout_env, n_steps=50_000 // num_envs)
+    buffer.rollout(model, env=rollout_env, n_steps=cfg["rollout_steps"] // cfg["num_envs"],
+                    seed=seed if iteration == 0 else None)
 
-    log.increment({"env_steps": 50_000})
+    log.increment({"env_steps": cfg["rollout_steps"]})
 
-    frac = offline_fraction(iteration, anneal_iterations, offline_start_frac, offline_end_frac)
+    frac = offline_fraction(iteration, cfg["anneal_iterations"], cfg["offline_start_frac"], cfg["offline_end_frac"])
     log.log({"train/offline_fraction": frac})
 
     combined_ds = make_combined_dataset(offline_ds, buffer, frac)
 
-    print(f"Iteration {iteration}: offline_fraction={frac:.3f}, "
-          f"online_trajectories={len(buffer.buffer)}, combined_trajectories={len(combined_ds.buffer)}")
+    log.message(f"Iteration {iteration}: offline_fraction={frac:.3f}, "
+                f"online_trajectories={len(buffer.buffer)}, combined_trajectories={len(combined_ds.buffer)}")
 
     train_loader = torch.utils.data.DataLoader(
       combined_ds,
-      batch_size=1024,
+      batch_size=cfg["batch_size"],
       shuffle=True,
     )
 
-    for i in range(epochs_per_rollout):
-      best_reward = train_epoch(model, opts, train_loader, log, env, ckpt_dir, best_reward, frozen=frozen)
+    for i in range(cfg["epochs_per_rollout"]):
+      best_reward = train_epoch(model, opts, train_loader, log, env, ckpt_dir, best_reward, cfg)
 
   model.save(os.path.join(ckpt_dir, "final.pt"))
   env.close()
   rollout_env.close()
   log.finish()
+
+
+if __name__ == "__main__":
+
+  args = argparse.ArgumentParser()
+  args.add_argument("--config", default=DEFAULT_CONFIG,
+                     help="Path to a YAML config (see config/offline_to_online.yaml). "
+                          "Lists one or more {model, env, ...} runs, executed in series.")
+  kwargs = args.parse_args()
+
+  runs = load_config(kwargs.config)
+  for i, cfg in enumerate(runs):
+    print(f"=== Run {i + 1}/{len(runs)}: {cfg['model']} on {cfg['env']} ===")
+    main(cfg)

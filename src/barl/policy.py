@@ -34,13 +34,13 @@ class HParam:
     return f"HParam({', '.join(parts)})"
 
 
-class Policy(nn.Module, ABC):
-
-  _classes = dict()
-
-  # ------------------------------------------------------------------
-  # HParam helpers
-  # ------------------------------------------------------------------
+class HParamMixin:
+  """
+  Shared HParam declaration/resolution machinery. Mixed into Policy, Actor and
+  Critic so hyperparameters can be declared on whichever of the three actually
+  owns them (e.g. discount/pessimism on a Critic, distillation weight on an
+  Actor) rather than forcing everything onto the outer Policy.
+  """
 
   @classmethod
   def _hparam_descriptors(cls) -> dict[str, HParam]:
@@ -82,6 +82,15 @@ class Policy(nn.Module, ABC):
 
     return resolved
 
+  def apply_hparams(self, kwargs: dict) -> dict:
+    """Resolve kwargs against this class's HParam descriptors and set each
+    as an instance attribute. Shared by Policy/Actor/Critic __init__s so the
+    resolve+setattr boilerplate lives in one place."""
+    self.hparams: dict = self.resolve_hparams(kwargs)
+    for name, value in self.hparams.items():
+      setattr(self, name, value)
+    return self.hparams
+
   @classmethod
   def describe_hparams(cls):
     """Print a human-readable table of all hyperparameters."""
@@ -122,6 +131,99 @@ class Policy(nn.Module, ABC):
       else:
         out[name] = hp.default
     return out
+
+
+class Actor(ABC):
+  """
+  A network that can produce actions. Pure architecture -- no algorithm
+  logic lives here: every Policy owns its full policy-improvement step
+  directly in train_step (Bellman targets, advantage weighting, clipped
+  surrogates, adjoint matching, ...), calling into whatever this actor
+  exposes (sample(), and for bespoke actors, whatever else their algorithm
+  needs, e.g. step_flow()). Concrete actors are configured by architecture
+  only (hidden_dim, layers, ...), never by algorithm hyperparameters --
+  those are HParams on the owning Policy.
+  """
+
+  @abstractmethod
+  def sample(self, s, critic: "Critic" = None) -> torch.Tensor:
+    """
+    `critic` is optional and unused by generative actors (Gaussian/diffusion/
+    flow). Implicit/Q-derived actors (greedy-discrete, Langevin) need it to
+    compute the action at all -- they have no generative net of their own.
+    """
+    ...
+
+  @abstractmethod
+  def create_optimizer(self) -> dict:
+    ...
+
+  def on_epoch_end(self):
+    """Hook for actors with a periodic (non-Polyak) reference snapshot, e.g.
+    a hard-copied trust-region policy. No-op by default."""
+    ...
+
+  @property
+  def device(self):
+    return next(self.parameters()).device
+
+
+class MaxEntActor(Actor):
+  """
+  Actor subtype that carries its own entropy dual and can price a soft-Q
+  Bellman target. `sample_with_entropy` is only meaningful for actors that
+  are actually entropy-regularized (e.g. FlowSDEActor), so it lives here
+  rather than as a zero-bonus default on every Actor -- policies with a
+  soft-Q Bellman target (e.g. DAMPolicy) call it directly when building
+  that target, instead of forcing every actor to carry an alpha dual.
+  """
+
+  @abstractmethod
+  def sample_with_entropy(self, s) -> tuple[torch.Tensor, torch.Tensor]:
+    """(action, alpha-scaled soft-entropy bonus) for the soft-Q Bellman
+    target (reward + gamma * (target_q + bonus))."""
+    ...
+
+
+class Critic(ABC):
+  """
+  A network that can price (s,a). Pure architecture -- no algorithm logic:
+  Bellman targets, discounting, and the regression loss itself all live in
+  each Policy's train_step. Concrete critics are configured by architecture
+  only (hidden_dim, layers, ensemble size, distributional-or-not, ...).
+  """
+
+  @abstractmethod
+  def value(self, s, a) -> torch.Tensor: ...
+
+  @abstractmethod
+  def score(self, s, a) -> torch.Tensor:
+    """∇_a Q(s,a) score of the EBM modeled by the critic"""
+    ...
+
+  @abstractmethod
+  def target_value(self, s, a) -> torch.Tensor:
+    """Polyak-averaged target net output."""
+    ...
+
+  @abstractmethod
+  def create_optimizer(self) -> dict:
+    ...
+
+  @property
+  def device(self):
+    return next(self.parameters()).device
+
+
+class Policy(nn.Module, HParamMixin, ABC):
+
+  _classes = dict()
+
+  # True for strictly on-policy algorithms (e.g. PPO): scripts/online_learning.py
+  # checks this to clear the replay buffer after each rollout's training pass
+  # instead of letting old-policy trajectories linger across rollouts the way
+  # every off-policy critic in this framework relies on.
+  on_policy = False
 
   # ------------------------------------------------------------------
   # Registry
@@ -165,9 +267,7 @@ class Policy(nn.Module, ABC):
     self.register_buffer("obs_std",  torch.ones(observation_space.shape[-1]))
     self.register_buffer("obs_mean", torch.zeros(observation_space.shape[-1]))
 
-    self.hparams: dict = self.resolve_hparams(kwargs)
-    for name, value in self.hparams.items():
-      setattr(self, name, value)
+    self.apply_hparams(kwargs)
 
   def on_epoch_start(self):
     ...
@@ -244,7 +344,13 @@ class Policy(nn.Module, ABC):
     ...
 
   @abstractmethod
-  def train_step(self, batch: torch.DictType, frozen : "Policy"= None) -> tuple[torch.Tensor, dict]:
+  def train_step(self, batch: torch.DictType) -> tuple[dict, dict]:
+    """
+    Computes every loss term for this batch. Returns (losses, stats):
+    `losses` keyed exactly matching create_optimizer()'s keys (the training
+    script zero_grads/backwards/steps each one), `stats` a separate dict of
+    whatever else is worth logging (already detached).
+    """
     ...
 
   @abstractmethod
@@ -283,48 +389,6 @@ class Policy(nn.Module, ABC):
 
     return run_data
 
-
-class FlowPolicy(Policy):
-
-  def __init__(self, env, flow_steps : int, **kwargs):
-    super().__init__(env, **kwargs)
-
-    self.flow_steps = flow_steps
-  
-  @abstractmethod
-  def step_flow(self, obs : torch.Tensor, action : torch.Tensor, dt : torch.Tensor, inference : bool = False):
-    ...
-
-  def sinusoidal_emb(self, t, time_dim):
-    shape = t.shape[:-1]  # all dims except the trailing 1
-    t = t.reshape(-1)
-    half = time_dim // 2
-    freqs = torch.exp(-math.log(10000) * torch.arange(half, device=t.device) / (half - 1))
-    args = t[:, None] * 1000.0 * freqs[None]
-    time_emb = torch.cat([args.sin(), args.cos()], dim=-1)
-    return time_emb.reshape(*shape, time_dim)
-
-  @torch.no_grad()
-  def generate_action(self, obs: torch.Tensor, z : torch.Tensor):
-    B   = obs.shape[0]
-    dt  = 1.0 / self.flow_steps
-
-    with torch.amp.autocast("cuda", torch.bfloat16):
-      z = z if z is not None else torch.randn((B, self.action_dim), device=self.device)
-      for i in range(self.flow_steps):
-        t     = torch.full((B, 1), i * dt, device=self.device)
-        v     = self.step_flow(obs, z, t, inference=True)
-        v     = torch.nan_to_num(v, 0.0, 0.0, 0.0)
-        z_mid = z + v * (dt / 2)
-        v_mid = self.step_flow(obs, z_mid, t + dt / 2, inference=True)
-        v_mid     = torch.nan_to_num(v_mid, 0.0, 0.0, 0.0)
-        z     = z + v_mid * dt
-
-    return z.clamp(self.act_low, self.act_high)
-
-  @torch.inference_mode()
-  def inference_step(self, observation: torch.Tensor, z : torch.Tensor = None):
-    return self.generate_action(observation.to(self.device), z), {}
 
 def register_policy(cls: type):
   name = cls.__name__

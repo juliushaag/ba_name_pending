@@ -6,4 +6,5 @@ from .dqn import QPolicy
 from .flowbc import FlowBCPolicy
 from .dam import DAMPolicy
 from .iql import IQLPolicy
-from .qam import QAMPolicy
+from .ppo import PPOPolicy
+from .sac import SACPolicy

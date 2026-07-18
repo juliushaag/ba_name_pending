@@ -41,13 +41,21 @@ class EMA(nn.Module):
   def step(self):
     self._step_count += 1
 
-    # linearly ramp decay from start to end over warmup_steps
-    t = min(self._step_count.item() / self._warmup_steps, 1.0)
-    self.decay.fill_(self._start_decay + t * (self._end_decay - self._start_decay))
+    # linearly ramp decay from start to end over warmup_steps -- stays in
+    # pure tensor ops throughout (no .item()/Python-scalar extraction) so
+    # this composes with vmap: stack_module_state+functional_call+vmap
+    # substitutes _step_count/decay with a per-replica batched tensor when
+    # training several seeds at once (see vmap_policy.py), and pulling a
+    # concrete Python float out of a batched tensor via .item() is exactly
+    # what vmap can't trace through.
+    t = torch.clamp(self._step_count.float() / self._warmup_steps, max=1.0)
+    self.decay.copy_(self._start_decay + t * (self._end_decay - self._start_decay))
 
-    tau = self.decay.item()
+    tau = self.decay
     for p_t, p_s in zip(self.target.parameters(), self.source.parameters()):
-      p_t.data.copy_(tau * p_t.data + (1.0 - tau) * p_s.data)
+      # .data (not just plain in-place ops) is disallowed under vmap --
+      # copy_ directly on the tensor itself works both plain and vmapped.
+      p_t.copy_(tau * p_t + (1.0 - tau) * p_s)
     for b_t, b_s in zip(self.target.buffers(), self.source.buffers()):
       b_t.copy_(b_s)
 

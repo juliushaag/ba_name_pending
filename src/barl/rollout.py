@@ -39,19 +39,22 @@ class ReplayBuffer():
       self.buffer.append(traj)
 
   @torch.inference_mode()
-  def rollout(self, policy : Policy, env : gym.Env | gym.vector.VectorEnv, n_steps = 10_000):
+  def rollout(self, policy : Policy, env : gym.Env | gym.vector.VectorEnv, n_steps = 10_000, seed : int = None):
     """
     Drives either a plain gym.Env or a gymnasium VectorEnv (num_envs = N). If env is a
     VectorEnv, it must use autoreset_mode=AutoresetMode.DISABLED -- finished sub-envs are
     reset explicitly here via `reset_mask` so a fresh Trajectory chunk always starts from a
     real initial observation. policy.inference_step is called once per step on the full
     batch of N observations, and one Trajectory chunk is accumulated independently per slot.
+
+    `seed` (if given) seeds only the very first reset -- gymnasium envs carry their own
+    internal RNG forward from there, so later resets deliberately stay unseeded.
     """
 
     is_vec = isinstance(env, gym.vector.VectorEnv)
     n_envs = env.num_envs if is_vec else 1
 
-    obs, _ = env.reset()
+    obs, _ = env.reset(seed=seed)
     if not is_vec:
       obs = obs[None, ...]
 
@@ -109,7 +112,8 @@ class ReplayBuffer():
 
         if done[i] or slot["t"] >= self.traj_len:
           self.save_trajectory(Trajectory(
-            id=0,
+            id=i,  # originating sub-env slot index -- e.g. multi-seed vmapped
+                   # training partitions trajectories by id // num_envs_per_seed
             observations=slot["observations"][:slot["t"] + 1],
             actions=slot["actions"][:slot["t"]],
             rewards=slot["rewards"][:slot["t"]],
