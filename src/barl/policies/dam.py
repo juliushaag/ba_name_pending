@@ -6,6 +6,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from barl.policy import Policy, Critic, MaxEntActor, HParam, register_policy
+from barl.networks import bfloat16
 from barl.networks.mlp import MLP
 from barl.networks.flow import sinusoidal_emb
 from barl.networks.critic import QCritic, q_bellman_loss
@@ -63,9 +64,6 @@ class FlowSDEActor(nn.Module, MaxEntActor):
     self.register_buffer("erf_k", (2 * sig_sq_one) ** -0.5)
 
   def on_epoch_end(self):
-    # .copy_() directly on the tensor, not via .data: .data access is
-    # disallowed under vmap (see networks/ema.py's identical fix), needed
-    # for training several seeds at once through VmapPolicyGroup.
     for p_t, p_s in zip(self.diffusion_act_old.parameters(), self.diffusion_act.parameters()):
       p_t.copy_(p_s)
     for b_t, b_s in zip(self.diffusion_act_old.buffers(), self.diffusion_act.buffers()):
@@ -79,10 +77,10 @@ class FlowSDEActor(nn.Module, MaxEntActor):
 
   @torch.no_grad()
   def generate_action_raw(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    X        = torch.zeros((obs.shape[0], self.action_dim), device=obs.device)
-    path_int = torch.zeros((obs.shape[0], 1), device=obs.device)
 
-    with torch.amp.autocast("cuda", torch.bfloat16):
+    with bfloat16():
+      X        = torch.zeros((obs.shape[0], self.action_dim), device=obs.device)
+      path_int = torch.zeros((obs.shape[0], 1), device=obs.device)
       for i in range(self.max_steps):
         tau  = self.taus[i]
         dtau = self.taus[i + 1] - self.taus[i]
@@ -153,8 +151,10 @@ class DAMPolicy(Policy):
     return {**self.critic.create_optimizer(), **self.actor.create_optimizer()}
 
   def train_step(self, batch) -> tuple[dict, dict]:
+    
     obs      = self.normalize_obs(batch["obs"].to(self.device))
     next_obs = self.normalize_obs(batch["next_obs"].to(self.device))
+
     action   = batch["act"].to(self.device)
     reward   = batch["rew"].to(self.device)
     term     = batch["term"].to(self.device)
@@ -172,44 +172,38 @@ class DAMPolicy(Policy):
     alpha     = self.actor.log_alpha.exp()
     tr_lambda = self.actor.log_tr_lambda.exp()
 
-    # Entropy-dual target: an independent SDE draw from the one used for the
-    # critic's own soft-Q target above -- both are unbiased path-integral
-    # estimates, trading a little variance for not threading a shared
-    # intermediate value across the critic/actor loss boundary.
     with torch.no_grad():
       _, next_path_int = self.actor.generate_action_raw(next_obs)
+
     ent_loss = self.actor.entropy_bonus(next_path_int)
 
-    # NB: original code did action.clamp(0.99, -0.99) (min > max), which
-    # collapses every action to the constant -0.99 before erfinv -- fixed here.
     X = torch.erfinv(action.clamp(-0.99, 0.99)) / self.actor.erf_k
 
     """ AMDP loss: regress the vector field against sigma * (1/alpha) * dQ/dX """
-    tau = torch.rand((obs.shape[0],), device=obs.device)
+    with bfloat16():
 
-    sig_sq_tau = self.actor.sigma_sq_int_fn(tau).unsqueeze(-1)
-    sig_sq_one = self.actor.sigma_sq_int_fn(torch.full((obs.shape[0],), self.tau_max, device=obs.device)).unsqueeze(-1)
+      tau = torch.rand((obs.shape[0],), device=obs.device)
 
-    X_t = X * (sig_sq_tau / sig_sq_one) + (sig_sq_tau - (sig_sq_tau ** 2 / sig_sq_one)).sqrt() * torch.randn_like(X)
+      sig_sq_tau = self.actor.sigma_sq_int_fn(tau).unsqueeze(-1)
+      sig_sq_one = self.actor.sigma_sq_int_fn(torch.full((obs.shape[0],), self.tau_max, device=obs.device)).unsqueeze(-1)
 
-    with torch.amp.autocast("cuda", torch.bfloat16):
+      X_t = X * (sig_sq_tau / sig_sq_one) + (sig_sq_tau - (sig_sq_tau ** 2 / sig_sq_one)).sqrt() * torch.randn_like(X)
+
       u = self.actor.diffusion_act(obs, X_t, sinusoidal_emb(tau.view(obs.shape[0], 1), self.actor.time_dim))
 
-    # d(erf(erf_k * X))/dX applied to the critic's action-space score: the
-    # critic only ever needs to expose dQ/da (via score()), the erf change-of-
-    # variables Jacobian is the actor's own business, not the critic's.
-    X_detached = X.detach()
-    a          = torch.erf(self.actor.erf_k * X_detached)
-    da_dX      = self.actor.erf_k * (2 / math.sqrt(math.pi)) * torch.exp(-(self.actor.erf_k * X_detached) ** 2)
-    x_score    = self.critic.score(obs, a).float() * da_dX
+      def q_values(x):
+        a          = torch.erf(self.actor.erf_k * x)
+        return self.critic.target_value(obs, a).sum()
+        
+      sigma_tau = self.actor.sigma_fn(tau).unsqueeze(-1)
+      x_score = torch.func.grad(q_values)(X)
 
-    sigma_tau = self.actor.sigma_fn(tau).unsqueeze(-1)
+      amdp_target = sigma_tau * (1 / alpha.detach()) * x_score
 
-    amdp_target = sigma_tau * (1 / alpha.detach()) * x_score
-    amdp_loss   = ((u.float() - amdp_target) ** 2 / sigma_tau).mean()
+    amdp_loss   = ((u.float() - amdp_target.float()) ** 2 / sigma_tau).mean()
 
     """ Trust region loss """
-    with torch.amp.autocast("cuda", torch.bfloat16):
+    with bfloat16():
       u_old = self.actor.diffusion_act_old(obs, X_t, sinusoidal_emb(tau.view(obs.shape[0], 1), self.actor.time_dim))
 
     tr_loss = F.mse_loss(u.float(), u_old.float())
