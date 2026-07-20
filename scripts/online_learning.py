@@ -35,7 +35,7 @@ def evaluate_and_log(model: Policy, env: gym.Env, log: Logger, ckpt_dir: str, be
   log.log({
     "eval/avg_cum_reward": avg_reward,
     "eval/avg_length":     np.mean([len(run["rewards"]) for run in data_runs]),
-    "eval/success_rate":   np.mean([run["terminated"]   for run in data_runs]),
+    "eval/success_rate":   np.mean([int(not bool(run["terminated"])) for run in data_runs]),
   })
 
   log.log_video("eval/video_best",  data_runs[best_idx]["frames"])
@@ -184,14 +184,18 @@ def main_multi_seed(cfg: dict):
   adapter     = _VmapRolloutAdapter(group, cfg["num_envs"])
   rollout_env = environment.get_vector_env(num_seeds * cfg["num_envs"])
 
-  buffer = ReplayBuffer(cfg["buffer_size"] * num_seeds, traj_len=cfg["traj_len"])
+  buffer = ReplayBuffer(cfg["buffer_size"] * num_seeds, traj_len=env.spec.max_episode_steps)
   opts   = group.create_optimizer()
+
+  tags = [MODEL, ENV, "online", f"seeds={num_seeds}"]
+  if cfg.get("sweep_tag"):
+    tags.append(cfg["sweep_tag"])
 
   log = Logger(
     "BA-RL",
     run_name=name,
     step_keys={"env_steps", "grad_steps"},
-    tags=[MODEL, ENV, "online", f"seeds={num_seeds}"],
+    tags=tags,
     config={**cfg, "env_obs": str(env.observation_space), "env_act": str(env.action_space)},
   )
   log.register("train/*", "grad_steps")
@@ -258,7 +262,7 @@ def main(cfg: dict):
   env         = environment.get_env()  # single env: used for eval (rendering) and action/obs spaces
   rollout_env = environment.get_vector_env(cfg["num_envs"])
 
-  buffer = ReplayBuffer(cfg["buffer_size"], traj_len=cfg["traj_len"])
+  buffer = ReplayBuffer(cfg["buffer_size"], traj_len=env.spec.max_episode_steps)
 
   checkpoint = cfg.get("checkpoint")
   if checkpoint is not None and os.path.exists(checkpoint):
@@ -268,11 +272,15 @@ def main(cfg: dict):
 
   opts  = model.create_optimizer()
 
+  tags = [MODEL, ENV, "online"]
+  if cfg.get("sweep_tag"):
+    tags.append(cfg["sweep_tag"])
+
   log = Logger(
     "BA-RL",
     run_name=name,
     step_keys={"env_steps", "grad_steps"},
-    tags=[MODEL, ENV, "online"],
+    tags=tags,
     config={**cfg, "hparams": model.hparams,
             "env_obs": str(env.observation_space), "env_act": str(env.action_space)}
   )

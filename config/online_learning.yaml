@@ -11,13 +11,12 @@ defaults:
   num_seeds: 1              # >1 trains that many independently-seeded replicas at
                              # once via vmap (see barl/vmap_policy.py) instead of one
                              # -- not supported for on-policy algorithms (e.g. PPO) yet
-  num_iterations: 100       # outer rollout/train loops
+  num_iterations: 500       # outer rollout/train loops
   rollout_steps: 50000      # env steps collected per outer iteration (across all num_envs)
   num_envs: 32              # parallel rollout envs
   buffer_size: 256          # max trajectory chunks kept in the replay buffer
-  traj_len: 500             # max steps per trajectory chunk
-  epochs_per_rollout: 16    # train_epoch passes over the buffer per outer iteration
-  batch_size: 1024
+  epochs_per_rollout: 32    # train_epoch passes over the buffer per outer iteration
+  batch_size: 256
   eval_every: 10000         # grad steps between evals
   eval_runs: 50
   log_every: 10             # batches between stat logs

@@ -62,7 +62,7 @@ if __name__ == "__main__":
                      help="Which training script to launch each run with")
   args.add_argument("--config", default=None,
                      help="Base config providing `defaults:` for every run (default: config/<script>.yaml)")
-  args.add_argument("--max_parallel", type=int, default=10, help="Max concurrent runs (0 = unlimited)")
+  args.add_argument("--max_parallel", type=int, default=8, help="Max concurrent runs (0 = unlimited)")
 
   kwargs = args.parse_args()
 
@@ -75,6 +75,11 @@ if __name__ == "__main__":
   now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
   sweep_dir = os.path.join(SCRIPT_DIR, "..", "sweeps", now)
   os.makedirs(sweep_dir, exist_ok=True)
+
+  # One tag per sweep invocation, threaded through `defaults` so every run
+  # in the grid picks it up and can be filtered together in wandb/the logger.
+  sweep_tag = "sweep-" + datetime.datetime.now().strftime("%m-%d-%H-%M")
+  defaults = {**defaults, "sweep_tag": sweep_tag}
 
   max_workers = kwargs.max_parallel if kwargs.max_parallel > 0 else len(combos)
   print(f"Launching {len(combos)} runs ({len(kwargs.algos)} algos x {len(kwargs.envs)} envs x {kwargs.seeds} seeds), "
