@@ -8,6 +8,41 @@ from barl.policy import Policy
 import gymnasium as gym
 
 
+class RandomPolicy:
+  """Duck-types just enough of Policy's rollout contract (eval()/
+  inference_step()/scale_action()) to drive ReplayBuffer.rollout() with
+  actions sampled uniformly from the env's actual action space, instead of a
+  trained policy -- used only by ReplayBuffer.random_fill() to seed the
+  buffer with broad, uncorrelated coverage before training starts (SAC/TD3-
+  style `random_steps`); never registered/selectable like a real Policy."""
+
+  def __init__(self, action_space: gym.Space):
+    self.action_space = action_space
+    self.discrete = isinstance(action_space, gym.spaces.Discrete)
+    if not self.discrete:
+      low  = torch.as_tensor(action_space.low,  dtype=torch.float32)
+      high = torch.as_tensor(action_space.high, dtype=torch.float32)
+      self.act_scale = (high - low) / 2
+      self.act_bias  = (high + low) / 2
+
+  def eval(self):
+    ...
+
+  def inference_step(self, observation: torch.Tensor, step_info=None):
+    batch = observation.shape[0]
+    if self.discrete:
+      action = torch.randint(0, self.action_space.n, (batch, 1))
+    else:
+      # canonical [-1, 1] per dimension -- same convention every real actor outputs.
+      action = torch.empty(batch, *self.action_space.shape).uniform_(-1.0, 1.0)
+    return action, {}
+
+  def scale_action(self, raw_action: torch.Tensor) -> torch.Tensor:
+    if self.discrete:
+      return raw_action
+    return raw_action * self.act_scale + self.act_bias
+
+
 @dataclass
 class Trajectory:
   id: int
@@ -42,6 +77,18 @@ class ReplayBuffer():
       del self.buffer[idx]
 
     self.buffer.append(traj)
+
+  def random_fill(self, env : gym.Env | gym.vector.VectorEnv, n_steps : int, seed : int = None):
+    """Seeds the buffer with `n_steps` of uniformly-random actions before
+    training starts -- broader, less-correlated coverage than an untrained
+    (but already-biased) policy's own actions would give. Just rollout()
+    under a RandomPolicy stand-in, so every chunking/truncation rule there
+    applies unchanged; the resulting Trajectory extras are empty, which is
+    fine for off-policy algorithms (they read obs/act/rew/next_obs only) but
+    not for on-policy ones (PPO's compute_gae needs extras["value"]) -- callers
+    should only use this for off-policy Policies (see Policy.on_policy)."""
+    action_space = env.single_action_space if isinstance(env, gym.vector.VectorEnv) else env.action_space
+    return self.rollout(RandomPolicy(action_space), env, n_steps=n_steps, seed=seed)
 
   @torch.inference_mode()
   def rollout(self, policy : Policy, env : gym.Env | gym.vector.VectorEnv, n_steps = 10_000, seed : int = None):
@@ -138,7 +185,10 @@ class ReplayBuffer():
             actions=slot["actions"][:slot["t"]],
             rewards=slot["rewards"][:slot["t"]],
             terminated=bool(term[i]),
-            truncated=bool(trunc[i]),
+            # A chunk-size cut mid-episode (done[i] False here) is truncated too,
+            # same as a real env-reported one -- either way this chunk doesn't
+            # represent an actual episode end.
+            truncated=bool(trunc[i]) if done[i] else True,
             extras={k: v[:slot["t"]] for k, v in slot["extras"].items()},
           ))
           if done[i]:
@@ -159,6 +209,22 @@ class ReplayBuffer():
 
         for i in finished_idx:
           slots[i] = fresh_slot(obs[i])
+
+    # n_steps ran out mid-chunk -- flush whatever each slot collected instead of
+    # silently discarding it when `slots` goes out of scope; the episode itself
+    # isn't over, so terminated=False, truncated=True, same as a chunk-size cut.
+    for i in range(n_envs):
+      slot = slots[i]
+      if slot["t"] > 0:
+        self.save_trajectory(Trajectory(
+          id=i,
+          observations=slot["observations"][:slot["t"] + 1],
+          actions=slot["actions"][:slot["t"]],
+          rewards=slot["rewards"][:slot["t"]],
+          terminated=False,
+          truncated=True,
+          extras={k: v[:slot["t"]] for k, v in slot["extras"].items()},
+        ))
 
     def _mean_std(s, sq, n):
       if n == 0:

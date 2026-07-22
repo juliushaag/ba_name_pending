@@ -31,28 +31,29 @@ class AMDP(Policy):
 
     assert isinstance(env.action_space, gym.spaces.Box)
 
-    self.critic = self.build_component("critic", QCriticBase, self.observation_dim, self.action_dim, pessimistic_score=True)
-    self.actor  = self.build_component("actor", ScoreContinuousActor, self.observation_dim, self.action_dim)
+    self.critic : QCriticBase = self.build_component("critic", QCriticBase, self.observation_dim, self.action_dim, pessimistic_score=True)
+    self.actor  : ScoreContinuousActor = self.build_component("actor", ScoreContinuousActor, self.observation_dim, self.action_dim)
 
     self.actor_old = Shadow(self.actor)
 
     self.entropy_target = -1.0 * self.action_dim
 
-    self.log_alpha     = nn.Parameter(torch.tensor(math.log(0.1)))
+    self.log_alpha     = nn.Parameter(torch.tensor(math.log(1.0)))
     self.log_tr_lambda = nn.Parameter(torch.tensor(math.log(self.tr_lambda_init)))
 
     sig_sq_one = self.actor.sigma_sq_int_fn(torch.tensor(self.actor.tau_max))
     self.squash = self.build_component("squash", Squash, erf_k=(2 * sig_sq_one) ** -0.5)
 
-  def clamp_tr_lambda(self, lo: float = 0.01, hi: float = 5.0):
+  def clamp_tr_lambda(self, lo: float = 1e-4, hi: float = 10.0):
     with torch.no_grad():
       self.log_tr_lambda.clamp_(math.log(lo), math.log(hi))
 
-  def clamp_log_alpha(self, lo: float = 0.01, hi: float = 5.0):
+  def clamp_log_alpha(self, lo: float = 1e-4, hi: float = 5.0):
     with torch.no_grad():
       self.log_alpha.clamp_(math.log(lo), math.log(hi))
 
   def on_epoch_start(self):
+    self.critic.on_epoch_start()
     self.actor_old.on_epoch_start()
     return super().on_epoch_start()
 
@@ -60,8 +61,8 @@ class AMDP(Policy):
     return {
       **self.critic.create_optimizer(),
       **self.actor.create_optimizer(),
-      "alpha":     torch.optim.Adam([self.log_alpha],     lr=3e-4),
-      "tr_lambda": torch.optim.Adam([self.log_tr_lambda], lr=3e-4, maximize=True),
+      "alpha":     torch.optim.Adam([self.log_alpha],     lr=1e-3),
+      "tr_lambda": torch.optim.Adam([self.log_tr_lambda], lr=1e-3, maximize=True),
     }
 
   def train_step(self, batch) -> tuple[dict, dict]:
@@ -73,6 +74,11 @@ class AMDP(Policy):
     reward   = batch["rew"].to(self.device)
     term     = batch["term"].to(self.device)
 
+    if "X" in batch:
+      X     = batch["X"].to(self.device)
+    else:
+      X = self.squash.inverse(action)
+      
     self.clamp_tr_lambda()
     self.clamp_log_alpha()
 
@@ -83,17 +89,17 @@ class AMDP(Policy):
 
     with bfloat16():
 
-      X = self.squash.inverse(action)
-
       with torch.no_grad():
+        
         next_action, entropy_penalty = self.actor.generate_action(next_obs)
+
         next_action = self.squash(next_action)
-        penalty = -(alpha * entropy_penalty).detach()
+        penalty = (alpha * entropy_penalty).detach()
 
       self.critic.loss(obs, action, reward, term, next_obs, next_action, penalty, log, losses)
 
       with float32():
-        entropy_target_loss = (self.log_alpha * (entropy_penalty.detach() - self.entropy_target)).mean()
+        entropy_target_loss = (self.log_alpha.float() * (entropy_penalty.detach().clamp(-100, 100).float() - self.entropy_target)).mean()
 
       tau = torch.rand((obs.shape[0],), device=obs.device)
 
@@ -113,9 +119,10 @@ class AMDP(Policy):
         return self.critic.target_value(obs, a).sum()
 
       x_score = torch.func.grad(q_values)(X)
-      amdp_target = sigma_tau * (1 / alpha.detach()) * x_score
 
       with float32():
+        amdp_target = sigma_tau * (1 / alpha) * x_score
+
         amdp_loss = 0.5 * ((u.float() - amdp_target.float()) ** 2 / sigma_tau).mean()
         tr_loss   = 0.5 * F.mse_loss(u.float(), u_old.float())
 
@@ -127,12 +134,13 @@ class AMDP(Policy):
     losses["tr_lambda"] = tr_lambda_loss
 
     log.update({
-      "train/loss/amdp":                amdp_loss.detach(),
-      "train/loss/tr_loss":             tr_loss.detach().mean(),
-      "train/loss/entropy":             entropy_penalty.detach().mean(),
-      "train/loss/actor_loss":          actor_loss.detach(),
-      "train/loss/entropy_target_loss": entropy_target_loss.detach(),
+      "train/loss/actor":          actor_loss.detach(),
+      "train/loss/alpha":          entropy_target_loss.detach(),
+      "train/loss/trust_region":   tr_loss.detach().mean(),
+
+      "stats/amdp":                     amdp_loss.detach(),
       "stats/alpha":                    alpha.detach(),
+      "stats/entropy":                  entropy_penalty.detach().mean(),
       "stats/tr_lambda":                tr_lambda.detach(),
       "stats/score_norm":               x_score.detach().norm(dim=-1).mean(),
     })
@@ -143,4 +151,4 @@ class AMDP(Policy):
     obs = self.normalize_obs(observation.to(self.device))
     X, _ = self.actor.generate_action(obs)
     action = self.squash(X)
-    return action, {}
+    return action, { "X" : X }

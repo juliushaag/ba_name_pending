@@ -25,17 +25,21 @@ class SACPolicy(Policy):
     self.critic = self.build_component("critic", QCriticBase, self.observation_dim, self.action_dim, pessimistic_score=False)
     self.actor  = self.build_component("actor", StochasticActor, self.observation_dim, self.action_dim)
 
-    self.entropy_target = -float(self.action_dim)
-    self.log_alpha = nn.Parameter(torch.tensor(0.0))
+    self.entropy_target = -1.0 * self.action_dim
+    self.log_alpha = nn.Parameter(torch.tensor(math.log(1.0)))
+
+  def on_epoch_start(self):
+    self.critic.on_epoch_start()
+    return super().on_epoch_start()
 
   def create_optimizer(self):
     return {
       **self.critic.create_optimizer(),
       **self.actor.create_optimizer(),
-      "alpha": torch.optim.Adam([self.log_alpha], lr=3e-4),
+      "alpha": torch.optim.Adam([self.log_alpha], lr=1e-3),
     }
 
-  def clamp_log_alpha(self, lo: float = 0.01, hi: float = 5.0):
+  def clamp_log_alpha(self, lo: float = 1e-6, hi: float = 15.0):
     with torch.no_grad():
       self.log_alpha.clamp_(math.log(lo), math.log(hi))
 
@@ -83,9 +87,9 @@ class SACPolicy(Policy):
     log.update({
       "train/loss/actor": actor_loss.detach(),
       "train/loss/alpha": alpha_loss.detach(),
+
       "stats/alpha":       alpha.detach(),
-      "stats/log_prob":    log_prob.detach().mean(),
-      "stats/q_new":       q_new.detach().mean(),
+      "stats/entropy" :    (-log_prob).detach().mean()
     })
     return losses, log
 

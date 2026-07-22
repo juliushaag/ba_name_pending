@@ -64,7 +64,7 @@ class ErfSquash(Squash):
   def forward(self, x: torch.Tensor) -> torch.Tensor:
     return torch.erf(self.erf_k * x).clamp(-1.0, 1.0)
 
-  def inverse(self, y: torch.Tensor, eps: float = 0.01) -> torch.Tensor:
+  def inverse(self, y: torch.Tensor, eps: float = 0.05) -> torch.Tensor:
     return torch.erfinv(y.clamp(-1 + eps, 1 - eps)) / self.erf_k
 
   def log_abs_det_jacobian(self, x: torch.Tensor, y: torch.Tensor = None) -> torch.Tensor:

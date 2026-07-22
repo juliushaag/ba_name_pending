@@ -2,7 +2,6 @@
 
 from .flowql import FlowQLPolicy
 from .direct import DirectPolicy
-from .dqn import QPolicy
 from .flowbc import FlowBCPolicy
 from .amdp import AMDP
 from .iql import IQLPolicy

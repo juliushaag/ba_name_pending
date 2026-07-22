@@ -64,11 +64,6 @@ IQLPolicy:
     actor:  {class: StochasticActor, hidden_dim: 256, layers: 6, squash_cls: TanhSquash}
     critic: {class: IQLCritic,       hidden_dim: 256, layers: 6}
 
-QPolicy:
-  components:
-    critic: {class: DiscreteQCritic, hidden_dim: 128}
-    actor:  {class: GreedyDiscreteActor}
-
 FlowQLPolicy:
   components:
     actor:  {class: DistilledFlowActor, latent_dim: 512, flow_steps: 16, time_dim: 8}

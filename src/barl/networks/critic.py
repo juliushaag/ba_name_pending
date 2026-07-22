@@ -3,7 +3,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from barl.networks.mlp import MLP
-from barl.networks.ema import EMA
+from barl.networks.ema import EMA, Shadow
 from barl.networks.ensemble import Ensemble
 from barl.networks.registry import register_component
 
@@ -24,10 +24,10 @@ class QCriticBase(Critic, nn.Module):
 
     self.pessimistic_score = pessimistic_score
     self.q_function = q_function
-    self.q_ema = EMA(self.q_function, start_decay=1 - self.polyak_tau, end_decay=1 - self.polyak_tau, warmup_steps=1)
+    self.q_ema = Shadow(self.q_function)
 
-  def step_ema(self):
-    self.q_ema.step()
+  def on_epoch_start(self):
+    self.q_ema.on_epoch_start()
 
   def raw(self, s: torch.Tensor, a: torch.Tensor, target: bool = False) -> torch.Tensor:
     """Un-reduced prediction: (n_models, B, 1) ensemble heads, or (B, num_atoms) atoms/logits."""
@@ -79,7 +79,7 @@ class EnsembleCriticBase(QCriticBase):
   def loss(self, obs: torch.Tensor, action: torch.Tensor, reward: torch.Tensor, term: torch.Tensor,
            next_obs: torch.Tensor, next_act: torch.Tensor, penalty: torch.Tensor,
            log: dict, losses: dict) -> None:
-    self.step_ema()
+    
     with torch.no_grad():
       bootstrap = self.target_value(next_obs, next_act) + penalty
       target    = self._bellman_target(reward, term, bootstrap)
@@ -90,6 +90,8 @@ class EnsembleCriticBase(QCriticBase):
     losses["q"] = q_loss
     log["train/loss/q"] = q_loss.detach()
 
+
+    log["stats/q_target"] = bootstrap.detach().mean()     
     log["stats/q_mean"] = pred.mean().detach()
     log["stats/q_std"]  = pred.std(0).mean().detach()
 
@@ -152,7 +154,6 @@ class QRDistributionalCritic(QCriticBase):
   def loss(self, obs: torch.Tensor, action: torch.Tensor, reward: torch.Tensor, term: torch.Tensor,
            next_obs: torch.Tensor, next_act: torch.Tensor, penalty: torch.Tensor,
            log: dict, losses: dict) -> None:
-    self.step_ema()
     with torch.no_grad():
       # Transported atom-wise -- the atoms approximate the return distribution's spread.
       bootstrap = self.raw(next_obs, next_act, target=True) + penalty
@@ -164,6 +165,7 @@ class QRDistributionalCritic(QCriticBase):
     losses["q"] = q_loss
     log["train/loss/q"] = q_loss.detach()
 
+    log["stats/q_target"] = bootstrap.detach().mean()     
     log["stats/q_mean"] = pred.mean().detach()
     log["stats/q_std"]  = pred.std(dim=-1).mean().detach()
 

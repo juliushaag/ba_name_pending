@@ -211,11 +211,13 @@ single-entry `runs`) per subprocess so it can reuse the exact same script/config
 
 ### Registered algorithms (`src/barl/policies/`)
 
-`DirectPolicy` (BC), `QPolicy` (DQN), `FlowBCPolicy`/`FlowQLPolicy` (flow-matching BC / flow-matching
+`DirectPolicy` (BC), `FlowBCPolicy`/`FlowQLPolicy` (flow-matching BC / flow-matching
 + Q), `AMDP` (direct-score regression against a critic's action-gradient, entropy +
 trust-region duals — see the extensive docstring in `amdp.py`), `IQLPolicy`, `PPOPolicy`,
-`SACPolicy`, `DIMEPolicy`. `on_policy = True` only on `PPOPolicy` — everything else is off-policy
-and relies on the replay buffer retaining older trajectories across iterations.
+`SACPolicy`, `DIMEPolicy`. All discrete-action support was removed with `QPolicy` (DQN) --
+every remaining Policy is continuous-action only. `on_policy = True` only on `PPOPolicy` --
+everything else is off-policy and relies on the replay buffer retaining older trajectories
+across iterations.
 
 ### Registered environments (`src/barl/environments/`)
 

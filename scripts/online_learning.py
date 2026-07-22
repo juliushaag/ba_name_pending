@@ -66,18 +66,18 @@ def train_epoch(model: Policy, opts: dict[str, torch.optim.Optimizer], train_loa
 
     losses, stats = model.train_step(batch)
 
-    # Every backward completes before any optimizer steps, so an actor loss
-    # reading the critic's forward pass never has its graph invalidated mid-loop.
+    
     for k in losses:
       opts[k].zero_grad(set_to_none=True)
       losses[k].backward(retain_graph=True)
-
-    for k in losses:
       norm = torch.nn.utils.clip_grad_norm_(
         [p for group in opts[k].param_groups for p in group["params"]],
         max_norm=1.0,
+        error_if_nonfinite=True,
       )
+
       opts[k].step()
+      
       stats[f"stats/{k}_norm"] = norm 
 
     if b % cfg["log_every"] == 0:
@@ -197,6 +197,13 @@ def main(cfg: dict):
 
   ckpt_dir = os.path.join("checkpoints", name)
   os.makedirs(ckpt_dir, exist_ok=True)
+
+  # Off-policy only: PPO's compute_gae needs extras["value"] on every trajectory,
+  # which a random-action rollout never stashes (see ReplayBuffer.random_fill).
+  if not model.on_policy and cfg.get("random_steps", 0) > 0:
+    buffer.random_fill(rollout_env, n_steps=cfg["random_steps"] // cfg["num_envs"], seed=seed)
+    log.increment({"env_steps": cfg["random_steps"]})
+    log.message(f"Random-filled buffer with {cfg['random_steps']} env steps before training")
 
   best_reward = float("-inf")
   it = 0

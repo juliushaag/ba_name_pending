@@ -54,8 +54,7 @@ class StochasticActor(Actor, nn.Module):
     self.net = MLP(obs_dim, action_dim, hidden_dim, layers)
 
   def dist(self, s: torch.Tensor) -> torch.distributions.Distribution:
-    with torch.amp.autocast("cuda", torch.bfloat16):
-      out = self.net(s)
+    out = self.net(s)
     log_std = self.log_std.clamp(LOG_STD_MIN, LOG_STD_MAX)
     return torch.distributions.Normal(out.float(), log_std.exp())
 
@@ -114,22 +113,24 @@ class ScoreContinuousActor(Actor, nn.Module):
 
   def generate_action(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Returns (raw unsquashed terminal state X, entropy bonus from the path integral)."""
-    with bfloat16():
-      X        = torch.zeros((obs.shape[0], self.action_dim), device=obs.device)
-      path_int = torch.zeros((obs.shape[0], 1), device=obs.device)
-      for i in range(self.max_steps):
-        tau  = self.taus[i]
-        dtau = self.taus[i + 1] - self.taus[i]
+  
+    X        = torch.zeros((obs.shape[0], self.action_dim), device=obs.device)
+    path_int = torch.zeros((obs.shape[0], 1), device=obs.device)
+    for i in range(self.max_steps):
+      tau  = self.taus[i]
+      dtau = self.taus[i + 1] - self.taus[i]
 
-        u = self.diffusion_act(obs, X, sinusoidal_emb(tau.expand(obs.shape[0], 1), self.time_dim)) * self.sigma[i]
+      net_out = self.diffusion_act(obs, X, sinusoidal_emb(tau.expand(obs.shape[0], 1), self.time_dim))
+      u = net_out * self.sigma[i]
 
-        drift     = u * dtau
-        diffusion = torch.sqrt(dtau) * torch.randn_like(u)
+      drift     = u * dtau
+      diffusion = self.sigma[i] * torch.sqrt(dtau) * torch.randn_like(u)
 
-        X        = X + self.sigma[i] * (drift + diffusion)
-        path_int = path_int + (u ** 2).sum(dim=-1, keepdim=True) * dtau
+      X        = X + drift + diffusion
+      # Girsanov control cost of drift `u` under base diffusion sigma*dW is 0.5*(u/sigma)^2 = 0.5*net_out^2.
+      path_int = path_int + (net_out ** 2).sum(dim=-1, keepdim=True) * dtau
 
-    return X,  -0.5 * path_int + math.log(2)
+    return X, math.log(2) - 0.5 * path_int
 
   def sample(self, s: torch.Tensor, critic: Critic = None) -> torch.Tensor:
     """Raw, unsquashed -- not a valid action on its own; exists to satisfy
@@ -187,8 +188,7 @@ class ScoreDiscreteActor(Actor, nn.Module):
  
   def predict_noise(self, obs: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     t_emb = self.time_emb(t.float().expand(x_t.shape[0], 1))
-    with bfloat16():
-      return self.diffusion_act(obs, x_t, t_emb)
+    return self.diffusion_act(obs, x_t, t_emb)
  
   def generate_action(self, obs: torch.Tensor, x : torch.Tensor = None):
     """Differentiable Euler-Maruyama reverse sampling x_T ~ N(0, I) -> x_0

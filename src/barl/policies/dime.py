@@ -21,7 +21,7 @@ class DIMEPolicy(Policy):
   against `target_entropy`). Unlike AMDP, needs no squash-Jacobian correction:
   `entropy` feeds in as a plain additive bonus/dual target, not a log-density."""
 
-  target_entropy_scale = HParam(4.0, "target_entropy = scale * action_dim", range=(0.0, 20.0))
+  target_entropy_scale = HParam(-4.0, "target_entropy = scale * action_dim", range=(-10.0, 10.0))
 
   def __init__(self, env: gym.Env, **kwargs):
 
@@ -34,13 +34,17 @@ class DIMEPolicy(Policy):
 
     self.squash = self.build_component("squash", Squash)
 
-    self.log_alpha = nn.Parameter(torch.tensor(math.log(0.1)))
+    self.log_alpha = nn.Parameter(torch.tensor(math.log(1.0)))
     self.target_entropy = self.target_entropy_scale * self.action_dim
 
-  def create_optimizer(self):
-    return {**self.critic.create_optimizer(), **self.actor.create_optimizer(), "alpha" : torch.optim.Adam([self.log_alpha], lr=3e-4)}
+  def on_epoch_start(self):
+    self.critic.on_epoch_start()
+    return super().on_epoch_start()
 
-  def clamp_log_alpha(self, lo: float = 0.01, hi: float = 5.0):
+  def create_optimizer(self):
+    return {**self.critic.create_optimizer(), **self.actor.create_optimizer(), "alpha" : torch.optim.Adam([self.log_alpha], lr=1e-3)}
+
+  def clamp_log_alpha(self, lo: float = 1e-6, hi: float = 10.0):
     with torch.no_grad():
       self.log_alpha.clamp_(math.log(lo), math.log(hi))
 
@@ -64,7 +68,7 @@ class DIMEPolicy(Policy):
         next_action, entropy_penalty = self.actor.generate_action(next_obs)
         next_action = self.squash(next_action)
 
-        entropy_bonus_val = -(alpha * entropy_penalty).detach()
+        entropy_bonus_val = (alpha * entropy_penalty).detach()
 
       self.critic.loss(obs, action, reward, term, next_obs, next_action, entropy_bonus_val, log, losses)
 
@@ -72,7 +76,8 @@ class DIMEPolicy(Policy):
       action = self.squash(raw_action)
 
       with float32():
-        dime_loss = (-self.critic.target_value(obs, action) - alpha * entropy).mean()
+        q_new = self.critic.target_value(obs, action)
+        dime_loss = (-q_new -alpha * entropy).mean()
 
         alpha_loss = (self.log_alpha * (entropy.detach() - self.target_entropy)).mean()
     
@@ -80,9 +85,11 @@ class DIMEPolicy(Policy):
     losses["actor"]  = dime_loss
 
     log.update({
-      "train/loss/dime":                dime_loss.detach(),
-      "train/loss/entropy":             entropy_penalty.detach().mean(),
-      "stats/alpha":                    alpha.detach(),
+      "train/loss/actor":           dime_loss.detach(),
+      "train/loss/alpha":           alpha_loss.detach(),
+
+      "stats/entropy":                  entropy_penalty.detach().mean(),
+      "stats/alpha":                    alpha.detach()
     })
     return losses, log
 
