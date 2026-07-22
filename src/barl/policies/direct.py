@@ -12,11 +12,10 @@ class DirectPolicy(Policy):
   """Pure behavior cloning: a deterministic point-estimate actor regressed
   directly against buffer actions, no critic."""
 
-  def __init__(self, env: gym.Env, hidden_dim: int = 128, layers: int = 4):
-    super().__init__(env)
+  def __init__(self, env: gym.Env, **kwargs):
+    super().__init__(env, **kwargs)
 
-    self.actor = DeterministicActor(self.observation_dim, self.action_dim,
-                                     self.act_low, self.act_high, hidden_dim=hidden_dim, layers=layers)
+    self.actor = self.build_component("actor", DeterministicActor, self.observation_dim, self.action_dim)
 
   def create_optimizer(self):
     return self.actor.create_optimizer()

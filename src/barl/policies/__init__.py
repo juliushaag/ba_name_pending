@@ -4,7 +4,8 @@ from .flowql import FlowQLPolicy
 from .direct import DirectPolicy
 from .dqn import QPolicy
 from .flowbc import FlowBCPolicy
-from .dam import DAMPolicy
+from .amdp import AMDP
 from .iql import IQLPolicy
 from .ppo import PPOPolicy
 from .sac import SACPolicy
+from .dime import DIMEPolicy

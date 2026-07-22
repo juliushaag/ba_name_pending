@@ -2,34 +2,22 @@ import argparse
 import datetime
 import itertools
 import os
+import shlex
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
 import yaml
 
-"""
-Launches a grid of {algo x env x seed} training runs as separate, truly
-concurrent OS processes (each run gets its own Python interpreter and CUDA
-context, unlike the in-process `runs:` series in scripts/online_learning.py
-et al. -- that one runs a list sequentially in a single process; this one
-fans a grid out in parallel).
-
-  uv run python scripts/run_sweep.py \\
-      --algos SACPolicy PPOPolicy \\
-      --envs HalfCheetah CheetahRun \\
-      --seeds 3
-
-launches 2*2*3 = 12 runs (seeds 0, 1, 2 per algo/env pair), up to
---max_parallel at a time. Each run's stdout/stderr goes to its own log file
-under sweeps/<timestamp>/ so concurrent output doesn't interleave.
-"""
+# Launches a grid of {algo x env x seed} training runs as separate, truly
+# concurrent OS processes (own interpreter + CUDA context each), unlike
+# scripts/online_learning.py's in-process sequential `runs:` list.
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(SCRIPT_DIR, "..", "config")
 
 
-def run_one(script: str, model: str, env: str, seed: int, defaults: dict, sweep_dir: str) -> int:
+def run_one(script: str, model: str, env: str, seed: int, defaults: dict, sweep_dir: str, stream: bool = False) -> int:
   tag = f"{model}_{env}_seed{seed}"
 
   run_config_path = os.path.join(sweep_dir, f"{tag}.yaml")
@@ -38,13 +26,23 @@ def run_one(script: str, model: str, env: str, seed: int, defaults: dict, sweep_
 
   script_path = os.path.join(SCRIPT_DIR, f"{script}.py")
   log_path = os.path.join(sweep_dir, f"{tag}.log")
+  cmd = [sys.executable, script_path, "--config", run_config_path]
 
-  print(f"[{tag}] starting -- log: {log_path}")
+  print(f"[{tag}] starting -- log: {log_path}\n[{tag}] $ {shlex.join(cmd)}")
   with open(log_path, "w") as logf:
-    proc = subprocess.run(
-      [sys.executable, script_path, "--config", run_config_path],
-      stdout=logf, stderr=subprocess.STDOUT,
-    )
+    if stream:
+      # --validate runs: tee each line (tag-prefixed) to the terminal as well as the log file.
+      proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+      )
+      for line in proc.stdout:
+        print(f"[{tag}] {line}", end="")
+        logf.write(line)
+      proc.wait()
+    else:
+      proc = subprocess.run(
+        cmd, stdout=logf, stderr=subprocess.STDOUT,
+      )
 
   status = "OK" if proc.returncode == 0 else f"FAILED (exit {proc.returncode})"
   print(f"[{tag}] {status}")
@@ -62,7 +60,12 @@ if __name__ == "__main__":
                      help="Which training script to launch each run with")
   args.add_argument("--config", default=None,
                      help="Base config providing `defaults:` for every run (default: config/<script>.yaml)")
-  args.add_argument("--max_parallel", type=int, default=8, help="Max concurrent runs (0 = unlimited)")
+  args.add_argument("--max_parallel", type=int, default=4, help="Max concurrent runs (0 = unlimited)")
+  args.add_argument("--validate", action="store_true",
+                     help="Smoke-test every {algo x env} combination instead of running a full "
+                          "sweep: one rollout chunk + one train_step + optimizer step each, no "
+                          "eval/checkpointing/wandb logging (see online_learning.validate_run). "
+                          "Ignores --seeds -- exactly one run per combination.")
 
   kwargs = args.parse_args()
 
@@ -70,24 +73,28 @@ if __name__ == "__main__":
   with open(base_config_path) as f:
     defaults = (yaml.safe_load(f) or {}).get("defaults", {})
 
-  combos = list(itertools.product(kwargs.algos, kwargs.envs, range(kwargs.seeds)))
+  if kwargs.validate:
+    defaults = {**defaults, "validate": True}
+    combos = list(itertools.product([0], kwargs.envs, kwargs.algos))
+  else:
+    combos = list(itertools.product(range(kwargs.seeds), kwargs.envs, kwargs.algos))
 
   now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
   sweep_dir = os.path.join(SCRIPT_DIR, "..", "sweeps", now)
   os.makedirs(sweep_dir, exist_ok=True)
 
-  # One tag per sweep invocation, threaded through `defaults` so every run
-  # in the grid picks it up and can be filtered together in wandb/the logger.
+  # Threaded through `defaults` so every run in the grid can be filtered together in wandb.
   sweep_tag = "sweep-" + datetime.datetime.now().strftime("%m-%d-%H-%M")
   defaults = {**defaults, "sweep_tag": sweep_tag}
 
   max_workers = kwargs.max_parallel if kwargs.max_parallel > 0 else len(combos)
-  print(f"Launching {len(combos)} runs ({len(kwargs.algos)} algos x {len(kwargs.envs)} envs x {kwargs.seeds} seeds), "
-        f"max_parallel={max_workers}, logs under {sweep_dir}")
+  desc = (f"{len(combos)} validate run(s) ({len(kwargs.algos)} algos x {len(kwargs.envs)} envs)" if kwargs.validate
+          else f"{len(combos)} runs ({len(kwargs.algos)} algos x {len(kwargs.envs)} envs x {kwargs.seeds} seeds)")
+  print(f"Launching {desc}, max_parallel={max_workers}, logs under {sweep_dir}")
 
   with ThreadPoolExecutor(max_workers=max_workers) as pool:
-    futures = [pool.submit(run_one, kwargs.script, algo, env, seed, defaults, sweep_dir)
-               for algo, env, seed in combos]
+    futures = [pool.submit(run_one, kwargs.script, algo, env, seed, defaults, sweep_dir, kwargs.validate)
+               for seed, env, algo  in combos]
     results = [f.result() for f in futures]
 
   failed = sum(1 for r in results if r != 0)

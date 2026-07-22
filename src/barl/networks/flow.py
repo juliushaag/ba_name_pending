@@ -4,7 +4,7 @@ import torch
 
 
 def sinusoidal_emb(t: torch.Tensor, time_dim: int) -> torch.Tensor:
-  shape = t.shape[:-1]  # all dims except the trailing 1
+  shape = t.shape[:-1]
   t = t.reshape(-1)
   half = time_dim // 2
   freqs = torch.exp(-math.log(10000) * torch.arange(half, device=t.device) / (half - 1))
@@ -14,10 +14,9 @@ def sinusoidal_emb(t: torch.Tensor, time_dim: int) -> torch.Tensor:
 
 
 @torch.no_grad()
-def midpoint_flow_sample(step_fn, obs: torch.Tensor, action_dim: int, low: torch.Tensor,
-                          high: torch.Tensor, steps: int, z: torch.Tensor = None) -> torch.Tensor:
-  """Deterministic-ish midpoint ODE integration of a learned vector field `step_fn(obs, x, t) -> v`,
-  from x0 ~ N(0, I) to x1, clamped to [low, high]. Shared by every plain flow-matching actor."""
+def midpoint_flow_sample(step_fn, obs: torch.Tensor, action_dim: int, steps: int, z: torch.Tensor = None) -> torch.Tensor:
+  """Midpoint ODE integration of a learned vector field `step_fn(obs, x, t) -> v`,
+  from x0 ~ N(0, I) to x1, clamped to canonical [-1, 1]."""
   B  = obs.shape[0]
   dt = 1.0 / steps
 
@@ -30,4 +29,4 @@ def midpoint_flow_sample(step_fn, obs: torch.Tensor, action_dim: int, low: torch
       v_mid = torch.nan_to_num(step_fn(obs, z_mid, t + dt / 2), 0.0, 0.0, 0.0)
       z     = z + v_mid * dt
 
-  return z.clamp(low, high)
+  return z.clamp(-1.0, 1.0)

@@ -1,4 +1,5 @@
 import math
+import time
 from typing import Optional, Any
 
 import numpy as np
@@ -16,8 +17,8 @@ class HParam:
   def __init__(self, default: Any, description: str, range: tuple = None, choices: list = None):
     self.default     = default
     self.description = description
-    self.range       = range    # (min, max) for numeric params
-    self.choices     = choices  # exhaustive set of valid values
+    self.range       = range
+    self.choices     = choices
 
   def validate(self, name: str, value: Any):
     if self.choices is not None and value not in self.choices:
@@ -35,20 +36,23 @@ class HParam:
 
 
 class HParamMixin:
-  """
-  Shared HParam declaration/resolution machinery. Mixed into Policy, Actor and
-  Critic so hyperparameters can be declared on whichever of the three actually
-  owns them (e.g. discount/pessimism on a Critic, distillation weight on an
-  Actor) rather than forcing everything onto the outer Policy.
-  """
+  """Shared HParam declaration/resolution, mixed into Policy/Actor/Critic.
+  `call_super_init=True` only takes effect when this mixin precedes
+  nn.Module in the concrete class's MRO (see actor.py/critic.py base order)."""
+
+  call_super_init = True
+
+  # Shared empty-dict fallback for a class whose MRO never reaches __init__
+  # below; always read via a fresh dict() copy (see `hparams`), so sharing
+  # this instance is safe.
+  _own_hparams: dict = {}
+
+  def __init__(self, **kwargs):
+    super().__init__()
+    self.apply_hparams(kwargs)
 
   @classmethod
   def _hparam_descriptors(cls) -> dict[str, HParam]:
-    """
-    Collect all HParam class attributes walking the MRO, cached per-class in
-    _hparams so later instances can still find the descriptors even after
-    resolve_hparams overwrites the class attributes with resolved values.
-    """
     cached = cls.__dict__.get("_hparams")
     if cached is not None:
       return cached
@@ -65,31 +69,27 @@ class HParamMixin:
 
   @classmethod
   def resolve_hparams(cls, kwargs: dict) -> dict:
-    """
-    Merge caller-supplied kwargs with class-level HParam defaults,
-    validate every value, and return a plain {name: value} dict.
-    """
+    """Names in `kwargs` this class doesn't declare are silently ignored,
+    not an error -- Policy/Actor/Critic forward the same full kwargs dict to
+    each other, so each just picks out its own slice."""
     descriptors = cls._hparam_descriptors()
     resolved = {}
     for name, hp in descriptors.items():
       value = kwargs.get(name, hp.default)
       hp.validate(name, value)
       resolved[name] = value
-
-    unknown = set(kwargs) - set(descriptors)
-    if unknown:
-      raise TypeError(f"{cls.__name__} got unexpected hparams: {unknown}")
-
     return resolved
 
   def apply_hparams(self, kwargs: dict) -> dict:
-    """Resolve kwargs against this class's HParam descriptors and set each
-    as an instance attribute. Shared by Policy/Actor/Critic __init__s so the
-    resolve+setattr boilerplate lives in one place."""
-    self.hparams: dict = self.resolve_hparams(kwargs)
-    for name, value in self.hparams.items():
+    resolved = self.resolve_hparams(kwargs)
+    for name, value in resolved.items():
       setattr(self, name, value)
-    return self.hparams
+    self._own_hparams = resolved
+    return resolved
+
+  @property
+  def hparams(self) -> dict:
+    return dict(self._own_hparams)
 
   @classmethod
   def describe_hparams(cls):
@@ -111,10 +111,6 @@ class HParamMixin:
 
   @classmethod
   def sample_hparams(cls, rng: np.random.Generator = None) -> dict:
-    """
-    Sample one value per HParam from its range/choices uniformly.
-    Falls back to the default for params with no range or choices.
-    """
     if rng is None:
       rng = np.random.default_rng()
     descriptors = cls._hparam_descriptors()
@@ -133,34 +129,19 @@ class HParamMixin:
     return out
 
 
-class Actor(ABC):
-  """
-  A network that can produce actions. Pure architecture -- no algorithm
-  logic lives here: every Policy owns its full policy-improvement step
-  directly in train_step (Bellman targets, advantage weighting, clipped
-  surrogates, adjoint matching, ...), calling into whatever this actor
-  exposes (sample(), and for bespoke actors, whatever else their algorithm
-  needs, e.g. step_flow()). Concrete actors are configured by architecture
-  only (hidden_dim, layers, ...), never by algorithm hyperparameters --
-  those are HParams on the owning Policy.
-  """
+class Actor(HParamMixin, ABC):
+  """A network that can produce actions -- pure architecture; every
+  algorithm-level decision (loss, squash choice, etc.) stays on the owning
+  Policy's train_step."""
 
   @abstractmethod
   def sample(self, s, critic: "Critic" = None) -> torch.Tensor:
-    """
-    `critic` is optional and unused by generative actors (Gaussian/diffusion/
-    flow). Implicit/Q-derived actors (greedy-discrete, Langevin) need it to
-    compute the action at all -- they have no generative net of their own.
-    """
+    """`critic` is unused by generative actors; implicit/Q-derived actors
+    (e.g. greedy-discrete) need it to compute an action at all."""
     ...
 
   @abstractmethod
   def create_optimizer(self) -> dict:
-    ...
-
-  def on_epoch_end(self):
-    """Hook for actors with a periodic (non-Polyak) reference snapshot, e.g.
-    a hard-copied trust-region policy. No-op by default."""
     ...
 
   @property
@@ -168,38 +149,12 @@ class Actor(ABC):
     return next(self.parameters()).device
 
 
-class MaxEntActor(Actor):
-  """
-  Actor subtype that carries its own entropy dual and can price a soft-Q
-  Bellman target. `sample_with_entropy` is only meaningful for actors that
-  are actually entropy-regularized (e.g. FlowSDEActor), so it lives here
-  rather than as a zero-bonus default on every Actor -- policies with a
-  soft-Q Bellman target (e.g. DAMPolicy) call it directly when building
-  that target, instead of forcing every actor to carry an alpha dual.
-  """
-
-  @abstractmethod
-  def sample_with_entropy(self, s) -> tuple[torch.Tensor, torch.Tensor]:
-    """(action, alpha-scaled soft-entropy bonus) for the soft-Q Bellman
-    target (reward + gamma * (target_q + bonus))."""
-    ...
-
-
-class Critic(ABC):
-  """
-  A network that can price (s,a). Pure architecture -- no algorithm logic:
-  Bellman targets, discounting, and the regression loss itself all live in
-  each Policy's train_step. Concrete critics are configured by architecture
-  only (hidden_dim, layers, ensemble size, distributional-or-not, ...).
-  """
+class Critic(HParamMixin, ABC):
+  """A network that can price (s,a) -- pure architecture; Bellman targets
+  and the regression loss itself live in each Policy's train_step."""
 
   @abstractmethod
   def value(self, s, a) -> torch.Tensor: ...
-
-  @abstractmethod
-  def score(self, s, a) -> torch.Tensor:
-    """∇_a Q(s,a) score of the EBM modeled by the critic"""
-    ...
 
   @abstractmethod
   def target_value(self, s, a) -> torch.Tensor:
@@ -215,14 +170,12 @@ class Critic(ABC):
     return next(self.parameters()).device
 
 
-class Policy(nn.Module, HParamMixin, ABC):
+class Policy(HParamMixin, nn.Module, ABC):
 
   _classes = dict()
 
-  # True for strictly on-policy algorithms (e.g. PPO): scripts/online_learning.py
-  # checks this to clear the replay buffer after each rollout's training pass
-  # instead of letting old-policy trajectories linger across rollouts the way
-  # every off-policy critic in this framework relies on.
+  # True for strictly on-policy algorithms (e.g. PPO) -- scripts/online_learning.py
+  # clears the replay buffer after each rollout's training pass when set.
   on_policy = False
 
   # ------------------------------------------------------------------
@@ -231,6 +184,11 @@ class Policy(nn.Module, HParamMixin, ABC):
 
   @staticmethod
   def make(name: str, env: gym.Env, *args, **kwargs) -> "Policy":
+    from barl.model_config import resolve_model_name
+    name, profile = resolve_model_name(name)
+    if profile is not None:
+      kwargs.setdefault("profile", profile)
+
     if name not in Policy._classes:
       raise KeyError(f"{name} not in registered policies: {list(Policy._classes.keys())}")
     return Policy._classes[name](env, *args, **kwargs)
@@ -243,8 +201,12 @@ class Policy(nn.Module, HParamMixin, ABC):
   # Construction
   # ------------------------------------------------------------------
 
-  def __init__(self, env: gym.Env, **kwargs):
-    super().__init__()
+  def __init__(self, env: gym.Env, profile: str = None, **kwargs):
+    super().__init__(**kwargs)
+
+    # nn.Module's attribute dicts don't exist until super().__init__() returns.
+    self._profile     = profile
+    self._raw_kwargs  = kwargs
 
     action_space      = env.action_space
     observation_space = env.observation_space
@@ -258,6 +220,8 @@ class Policy(nn.Module, HParamMixin, ABC):
 
       self.register_buffer("act_low",  torch.as_tensor(action_space.low,  dtype=torch.float32))
       self.register_buffer("act_high", torch.as_tensor(action_space.high, dtype=torch.float32))
+      self.register_buffer("act_scale", (self.act_high - self.act_low) / 2)
+      self.register_buffer("act_bias",  (self.act_high + self.act_low) / 2)
     else:
       raise NotImplementedError(f"{action_space} type not supported ... yet")
 
@@ -267,14 +231,46 @@ class Policy(nn.Module, HParamMixin, ABC):
     self.register_buffer("obs_std",  torch.ones(observation_space.shape[-1]))
     self.register_buffer("obs_mean", torch.zeros(observation_space.shape[-1]))
 
-    self.apply_hparams(kwargs)
+  @property
+  def hparams(self) -> dict:
+    """This Policy's own resolved HParams merged with its actor's/critic's."""
+    merged = dict(self._own_hparams)
+    for component in (getattr(self, "actor", None), getattr(self, "critic", None)):
+      if isinstance(component, HParamMixin):
+        merged.update(component.hparams)
+    return merged
+
+  def resolve_component(self, slot: str, **explicit_kwargs) -> tuple[type, dict]:
+    """Resolves a named slot's class + kwargs from config/models.yaml (see
+    model_config.py), then layers `self._raw_kwargs` and `explicit_kwargs`
+    on top (highest precedence -- for algorithm-fixed choices like
+    EnsembleCritic's `pessimistic_score` that must never be tunable)."""
+    from barl.model_config import resolve_slot
+    cls, kwargs = resolve_slot(type(self).__name__, slot, self._profile)
+    return cls, {**kwargs, **self._raw_kwargs, **explicit_kwargs}
+
+  def build_component(self, slot: str, gate_cls: type, *args, **explicit_kwargs):
+    """Resolves + constructs a named slot (actor/critic/squash/...), gated to
+    `gate_cls`: the resolved class must be `gate_cls` or a subclass (e.g.
+    QCriticBase admits MeanStdEnsembleCritic, MeanEnsembleCritic,
+    MinEnsembleCritic, QRDistributionalCritic and C51Critic alike)."""
+    cls, kwargs = self.resolve_component(slot, **explicit_kwargs)
+    assert issubclass(cls, gate_cls), (
+      f"config/models.yaml: {type(self).__name__}'s {slot!r} slot names {cls.__name__}, "
+      f"which is not a subclass of {gate_cls.__name__} -- {type(self).__name__} can only "
+      f"work with {gate_cls.__name__} (or a subclass of it) there."
+    )
+    return cls(*args, **kwargs)
 
   def on_epoch_start(self):
-    ...
+    self._epoch_start_time = time.perf_counter()
 
-  
   def on_epoch_end(self):
     ...
+
+  def epoch_time(self) -> float:
+    """Wall-clock seconds since the last on_epoch_start() call."""
+    return time.perf_counter() - self._epoch_start_time
 
   # ------------------------------------------------------------------
   # Checkpointing
@@ -311,6 +307,26 @@ class Policy(nn.Module, HParamMixin, ABC):
     return (obs - self.obs_mean) / self.obs_std
 
   # ------------------------------------------------------------------
+  # Action scaling
+  # ------------------------------------------------------------------
+
+  # Every continuous actor trains against a canonical per-dimension [-1, 1]
+  # output, independent of the env's real bounds; scale/unscale_action are
+  # the one-place affine remap, used only at env.step() call sites.
+
+  def scale_action(self, raw_action: torch.Tensor) -> torch.Tensor:
+    """Canonical [-1, 1]-per-dimension actor output -> this env's actual action bounds."""
+    if self.action_discrete:
+      return raw_action
+    return raw_action * self.act_scale + self.act_bias
+
+  def unscale_action(self, action: torch.Tensor) -> torch.Tensor:
+    """Inverse of scale_action: real env-scale action -> canonical [-1, 1]."""
+    if self.action_discrete:
+      return action
+    return (action - self.act_bias) / self.act_scale
+
+  # ------------------------------------------------------------------
   # Misc
   # ------------------------------------------------------------------
 
@@ -320,6 +336,25 @@ class Policy(nn.Module, HParamMixin, ABC):
 
   def num_params(self):
     return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+  @torch.inference_mode()
+  def measure_latency(self, n: int = 10) -> float:
+    """Rough per-epoch regression signal, not a rigorous benchmark."""
+    was_training = self.training
+    self.eval()
+
+    dummy = torch.zeros(1, *self.observation_shape, device=self.device)
+    self.inference_step(dummy)  # warm-up: lazy CUDA init/kernel autotune
+
+    start = time.perf_counter()
+    for _ in range(n):
+      self.inference_step(dummy)
+    elapsed = time.perf_counter() - start
+
+    if was_training:
+      self.train()
+
+    return 1000 * elapsed / n
 
   def create_scheduler(self, optim: torch.optim.Optimizer, epochs: int, min_lr=3e-5, base_lr=3e-4, warmup_epochs=8) -> torch.optim.lr_scheduler.LRScheduler:
     min_lr_ratio = min_lr / base_lr if base_lr > 0 else 0.0
@@ -345,12 +380,7 @@ class Policy(nn.Module, HParamMixin, ABC):
 
   @abstractmethod
   def train_step(self, batch: torch.DictType) -> tuple[dict, dict]:
-    """
-    Computes every loss term for this batch. Returns (losses, stats):
-    `losses` keyed exactly matching create_optimizer()'s keys (the training
-    script zero_grads/backwards/steps each one), `stats` a separate dict of
-    whatever else is worth logging (already detached).
-    """
+    """Returns (losses, stats) -- `losses` keys must exactly match create_optimizer()'s keys."""
     ...
 
   @abstractmethod
@@ -376,7 +406,7 @@ class Policy(nn.Module, HParamMixin, ABC):
 
       while not done:
         action, _ = self.inference_step(torch.from_numpy(obs).float().unsqueeze(0), **inference_kwargs)
-        obs, reward, term, trunc, _ = env.step(action[0].cpu().numpy())
+        obs, reward, term, trunc, _ = env.step(self.scale_action(action)[0].cpu().numpy())
         done = term or trunc
         data["rewards"].append(reward)
         data["frames"].append(env.render())

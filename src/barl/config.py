@@ -2,24 +2,8 @@ import yaml
 
 
 def load_config(path: str) -> list[dict]:
-  """
-  Loads a YAML config shaped like:
-
-      defaults:
-        num_iterations: 100
-        ...
-      runs:
-        - model: FlowQLPolicy
-          env: HalfCheetah
-        - model: SACPolicy
-          env: HalfCheetah
-          num_iterations: 50   # overrides defaults for this run only
-
-  Each entry in `runs` is merged onto `defaults` (run-specific keys win),
-  so a single config can list several algorithm/env combinations to run in
-  series while only writing down what differs between them. Returns the
-  resolved list of run dicts -- callers just iterate and run each in turn.
-  """
+  """Merges each `runs:` entry onto `defaults:` (run-specific keys win) and
+  returns the resolved list of run dicts."""
   with open(path) as f:
     raw = yaml.safe_load(f) or {}
 

@@ -6,6 +6,7 @@ from torch.nn import functional as F
 from barl.policy import Policy, Actor, Critic, HParam, register_policy
 from barl.networks.mlp import MLP
 from barl.networks.ema import EMA
+from barl.networks.registry import register_component
 
 import gymnasium as gym
 
@@ -24,20 +25,20 @@ class _QNet(nn.Module):
     return self.layers(torch.cat([obs_enc, action_oh], dim=-1))
 
 
-class DiscreteQCritic(nn.Module, Critic):
-  """
-  Q(s,a) over a discrete action set, action indices (not one-hot) in and
-  out. `score()` is undefined -- there's no action gradient for a discrete
-  action space. No update() -- QPolicy.train_step builds the Double-DQN
-  target and huber loss directly.
-  """
+@register_component
+class DiscreteQCritic(Critic, nn.Module):
+  """Q(s,a) over a discrete action set, action indices (not one-hot) in and
+  out. `score()` is undefined -- no action gradient for a discrete space."""
 
-  def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int = 128, polyak_tau: float = 0.005):
-    super().__init__()
+  polyak_tau = HParam(0.005, "EMA decay step size for the Q target (1 - polyak_tau = decay)", range=(0.001, 0.05))
+  gamma      = HParam(0.99,  "Discount factor",                                               range=(0.9, 0.9999))
+
+  def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int, **kwargs):
+    super().__init__(**kwargs)
 
     self.action_dim = action_dim
     self.q_net = _QNet(obs_dim, action_dim, hidden_dim)
-    self.q_ema = EMA(self.q_net, start_decay=1 - polyak_tau, end_decay=1 - polyak_tau, warmup_steps=1)
+    self.q_ema = EMA(self.q_net, start_decay=1 - self.polyak_tau, end_decay=1 - self.polyak_tau, warmup_steps=1)
 
   def step_ema(self):
     self.q_ema.step()
@@ -57,15 +58,13 @@ class DiscreteQCritic(nn.Module, Critic):
     return {"q": torch.optim.AdamW(self.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=1e-2)}
 
 
-class GreedyDiscreteActor(nn.Module, Actor):
-  """
-  DQN-style actor: no generative net of its own, just eps-greedy argmax over
-  whatever discrete critic it's handed. `sample()` cannot act without a
-  `critic` -- there is nothing else to argmax over.
-  """
+@register_component
+class GreedyDiscreteActor(Actor, nn.Module):
+  """No generative net of its own -- eps-greedy argmax over whatever
+  discrete critic it's handed; sample() requires one."""
 
-  def __init__(self, action_dim: int, eps: float = 0.0):
-    super().__init__()
+  def __init__(self, action_dim: int, eps: float = 0.0, **kwargs):
+    super().__init__(**kwargs)
     self.action_dim = action_dim
     self.eps = eps
 
@@ -89,11 +88,7 @@ class GreedyDiscreteActor(nn.Module, Actor):
     if not eps_greedy:
       return greedy_action
 
-    # Per-example (not per-batch) coin flip -- also what makes this
-    # vmap-safe (torch.rand(...).item() can't be traced under vmap, see
-    # vmap_policy.py; a tensor-level torch.where naturally is), and is a
-    # more standard eps-greedy formulation than the old single-flip-for-
-    # the-whole-batch version besides.
+    # Per-example coin flip, not per-batch -- also keeps this vmap-safe (torch.rand().item() isn't).
     random_action = torch.randint(0, self.action_dim, (B, 1), device=s.device)
     explore = torch.rand((B, 1), device=s.device) < self.eps
     return torch.where(explore, random_action, greedy_action)
@@ -107,17 +102,13 @@ class QPolicy(Policy):
   """Double-DQN: greedy action picked by the online critic, evaluated by
   the target/EMA net."""
 
-  gamma      = HParam(0.99,  "Discount factor",                                              range=(0.9, 0.9999))
-  polyak_tau = HParam(0.005, "EMA decay step size for the Q target (1 - polyak_tau = decay)", range=(0.001, 0.05))
-
-  def __init__(self, env: gym.Env, hidden_dim: int = 128, **kwargs):
+  def __init__(self, env: gym.Env, **kwargs):
     super().__init__(env, **kwargs)
 
     assert self.action_discrete
 
-    self.critic = DiscreteQCritic(self.observation_dim, self.action_dim,
-                                   hidden_dim=hidden_dim, polyak_tau=self.polyak_tau)
-    self.actor  = GreedyDiscreteActor(self.action_dim)
+    self.critic = self.build_component("critic", DiscreteQCritic, self.observation_dim, self.action_dim)
+    self.actor  = self.build_component("actor", GreedyDiscreteActor, self.action_dim)  # action_dim only, no obs_dim
 
   def set_eps(self, eps: float):
     self.actor.set_eps(eps)
@@ -139,7 +130,7 @@ class QPolicy(Policy):
       # *online* critic (self.critic, passed explicitly -- the actor has no
       # net of its own to pick with), and evaluated by the target/EMA net.
       best_action = self.actor.sample(next_obs, critic=self.critic, eps_greedy=False)
-      target = reward + (1.0 - term) * self.gamma * self.critic.target_value(next_obs, best_action)
+      target = reward + (1.0 - term) * self.critic.gamma * self.critic.target_value(next_obs, best_action)
 
     pred = self.critic.value(obs, action)
     loss = F.huber_loss(pred.float(), target.float())

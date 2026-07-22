@@ -1,0 +1,85 @@
+# Per-policy component specs + named profiles/aliases. Separate from
+# config/online_learning.yaml (the run/training-loop config) -- this only
+# controls architecture (which component class each Policy's slots use, and
+# their kwargs), never touched by the run scripts directly. See
+# src/barl/model_config.py for the resolution order (this file's per-policy
+# `components:` < the active profile's overrides < any explicit kwarg the
+# Policy itself passes to resolve_component()).
+#
+# Every slot's kwargs are written out in full here -- there is no
+# per-component default file to fall back on. Switching a slot's `class:`
+# (e.g. critic: MeanStdEnsembleCritic -> QRDistributionalCritic, or squash: TanhSquash
+# -> ErfSquash) means writing out *all* of that class's required kwargs right
+# here; nothing else fills in the gaps, so a missing one surfaces immediately
+# as a plain missing-argument TypeError from the component's own __init__.
+#
+# `model:` in a run config (config/online_learning.yaml's `runs:`) can name
+# either a plain Policy class below, or one of the `aliases:` shortcuts,
+# which resolve to a (policy, profile) pair.
+#
+# Critic slots accept any QCriticBase subclass from src/barl/networks/critic.py:
+# MeanStdEnsembleCritic / MeanEnsembleCritic / MinEnsembleCritic (n_models MLP
+# heads, differing only in mean/min/mean-minus-rho*std reduction), or
+# QRDistributionalCritic / C51Critic (single-head return-distribution critics,
+# QR-DQN vs. standard fixed-support categorical C51).
+
+aliases:
+  SACSmall: {policy: SACPolicy, profile: Small}
+  SACLarge: {policy: SACPolicy, profile: Large}
+
+SACPolicy:
+  components:
+    actor:  {class: StochasticActor, hidden_dim: 256, layers: 3, squash_cls: TanhSquash}
+    critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
+    squash: {class: TanhSquash}
+
+  profiles:
+    Small:
+      actor:  {hidden_dim: 128, layers: 2}
+      critic: {hidden_dim: 128, layers: 2, n_models: 2}
+    Large:
+      actor:  {hidden_dim: 512, layers: 3}
+      critic: {hidden_dim: 512, layers: 3, n_models: 5}
+
+DIMEPolicy:
+  components:
+    actor:  {class: ScoreDiscreteActor, latent_dim: 256, layers: 3, num_steps: 16}
+    critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
+    squash: {class: TanhSquash}
+
+AMDP:
+  components:
+    actor:  {class: ScoreContinuousActor, latent_dim: 512, layers: 3, max_steps: 32}
+    critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
+    squash: {class: ErfSquash}   # `k` is always derived at construction time -- see AMDP.__init__
+
+
+PPOPolicy:
+  components:
+    actor:  {class: StochasticActor, hidden_dim: 256, layers: 4, squash_cls: TanhSquash}
+    critic: {class: PPOCritic,       hidden_dim: 256, layers: 4}
+
+IQLPolicy:
+  components:
+    actor:  {class: StochasticActor, hidden_dim: 256, layers: 6, squash_cls: TanhSquash}
+    critic: {class: IQLCritic,       hidden_dim: 256, layers: 6}
+
+QPolicy:
+  components:
+    critic: {class: DiscreteQCritic, hidden_dim: 128}
+    actor:  {class: GreedyDiscreteActor}
+
+FlowQLPolicy:
+  components:
+    actor:  {class: DistilledFlowActor, latent_dim: 512, flow_steps: 16, time_dim: 8}
+    critic: {class: MeanStdEnsembleCritic, hidden_dim: 512, layers: 4, n_models: 10}
+
+FlowBCPolicy:
+  components:
+    actor: {class: FlowBCActor, latent_dim: 512, flow_steps: 16, time_dim: 8, hidden_layers: 4}
+
+DirectPolicy:
+  components:
+    actor: {class: DeterministicActor, hidden_dim: 128, layers: 4}
+
+

@@ -8,14 +8,13 @@
 
 defaults:
   checkpoint: null          # path to resume from, or null to train from scratch
-  num_seeds: 1              # >1 trains that many independently-seeded replicas at
-                             # once via vmap (see barl/vmap_policy.py) instead of one
-                             # -- not supported for on-policy algorithms (e.g. PPO) yet
-  num_iterations: 500       # outer rollout/train loops
+  total_env_steps: 5000000  # stop once this many env steps have been collected
   rollout_steps: 50000      # env steps collected per outer iteration (across all num_envs)
   num_envs: 32              # parallel rollout envs
-  buffer_size: 256          # max trajectory chunks kept in the replay buffer
-  epochs_per_rollout: 32    # train_epoch passes over the buffer per outer iteration
+  buffer_size: 1000000       # max transitions kept in the replay buffer (whole
+                             # trajectory chunks are evicted/kept, never split,
+                             # so this is a budget, not an exact count)
+  epochs_per_rollout: 20    # train_epoch passes over the buffer per outer iteration
   batch_size: 256
   eval_every: 10000         # grad steps between evals
   eval_runs: 50
@@ -28,3 +27,9 @@ runs:
     env: HalfCheetah
   - model: FlowQLPolicy
     env: HalfCheetah
+  - model: AMDP
+    env: Humanoid
+    epochs_per_rollout: 100  # AMDP is off-policy at UTD~2 (Thilges et al. 2026, Table 3):
+                             # once the (transition-budgeted) buffer is full, this gives
+                             # ~100 * ceil(buffer_size / batch_size) = ~100,000 grad steps
+                             # per 50,000-step rollout, i.e. grad_steps/env_steps ~= 2

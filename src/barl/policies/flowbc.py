@@ -6,29 +6,23 @@ from barl.policy import Policy, Actor, Critic, register_policy
 from barl.networks.mlp import MLP
 from barl.networks.ema import EMA
 from barl.networks.flow import sinusoidal_emb, midpoint_flow_sample
+from barl.networks.registry import register_component
 
 import gymnasium as gym
 
 
-class FlowBCActor(nn.Module, Actor):
-  """
-  Pure flow-matching behavior-cloning actor. No critic dependency, no
-  update() -- FlowBCPolicy.train_step runs the flow-matching regression
-  directly against buffer actions. Inference samples through an EMA
-  snapshot of the flow net (`flow_ema`); the loss trains the live net
-  (`flow`).
-  """
+@register_component
+class FlowBCActor(Actor, nn.Module):
+  """Pure flow-matching BC actor. Inference samples through an EMA snapshot
+  (`flow_ema`); the loss trains the live net (`flow`)."""
 
-  def __init__(self, obs_dim: int, action_dim: int, act_low: torch.Tensor, act_high: torch.Tensor,
-               latent_dim: int = 512, flow_steps: int = 16, time_dim: int = 8, hidden_layers: int = 4):
-    super().__init__()
+  def __init__(self, obs_dim: int, action_dim: int,
+               latent_dim: int, flow_steps: int, time_dim: int, hidden_layers: int, **kwargs):
+    super().__init__(**kwargs)
 
     self.action_dim = action_dim
     self.flow_steps  = flow_steps
     self.time_dim    = time_dim
-
-    self.register_buffer("act_low",  act_low.clone())
-    self.register_buffer("act_high", act_high.clone())
 
     self.flow     = MLP(obs_dim + time_dim + action_dim, action_dim, latent_dim, hidden_layers, layernorm=False)
     self.flow_ema = EMA(self.flow, start_decay=0.995, end_decay=0.995)
@@ -43,7 +37,7 @@ class FlowBCActor(nn.Module, Actor):
 
   def sample(self, s: torch.Tensor, critic: Critic = None, z: torch.Tensor = None) -> torch.Tensor:
     step_fn = lambda o, a, t: self.step_flow(o, a, t, inference=True)
-    return midpoint_flow_sample(step_fn, s, self.action_dim, self.act_low, self.act_high, self.flow_steps, z=z)
+    return midpoint_flow_sample(step_fn, s, self.action_dim, self.flow_steps, z=z)
 
   def create_optimizer(self) -> dict:
     return {"flow": torch.optim.AdamW(self.flow.parameters(), lr=1e-4, betas=(0.9, 0.95), weight_decay=1e-4, fused=True)}
@@ -52,11 +46,10 @@ class FlowBCActor(nn.Module, Actor):
 @register_policy
 class FlowBCPolicy(Policy):
 
-  def __init__(self, env: gym.Env, latent_dim=512, max_steps=16, hidden_layers=4, **kwargs):
+  def __init__(self, env: gym.Env, **kwargs):
     super().__init__(env, **kwargs)
 
-    self.actor = FlowBCActor(self.observation_dim, self.action_dim, self.act_low, self.act_high,
-                              latent_dim=latent_dim, flow_steps=max_steps, hidden_layers=hidden_layers)
+    self.actor = self.build_component("actor", FlowBCActor, self.observation_dim, self.action_dim)
 
   def create_optimizer(self):
     return self.actor.create_optimizer()
@@ -69,7 +62,7 @@ class FlowBCPolicy(Policy):
 
     B = actions.shape[0]
 
-    z1 = actions
+    z1 = actions  # already canonical [-1, 1] -- see ReplayBuffer.rollout()
     t  = torch.sigmoid(torch.randn((B, 1), device=obs.device))  # logit normal sampling
     z0 = torch.randn_like(z1)
     zt = t * z1 + (1 - t) * z0

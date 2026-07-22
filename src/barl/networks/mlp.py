@@ -9,8 +9,9 @@ import gymnasium as gym
 import numpy as np
 
 _ACTIVATIONS = dict(
-  silu = nn.SiLU,
+  silu =nn.SiLU,
   relu=nn.ReLU,
+  gelu=nn.GELU,
 )
 
 class MLP(nn.Module):

@@ -31,9 +31,8 @@ class Ensemble(nn.Module):
     for k, v in buffers.items():
       self.register_buffer(k.replace(".", "__"), v)
 
-    # meta-device template used by functional_call to describe the module's shape.
-    # Set via object.__setattr__ so nn.Module doesn't register it as a submodule --
-    # it must stay on the meta device even after .to()/.cuda() move the real params.
+    # object.__setattr__ so nn.Module doesn't register this as a submodule --
+    # it must stay on the meta device even after .to()/.cuda() moves the real params.
     object.__setattr__(self, "_template", copy.deepcopy(models[0]).to("meta"))
 
     self.n_models = n
@@ -47,8 +46,7 @@ class Ensemble(nn.Module):
   def forward(self, *args, reduce : ReduceMethod = None, **kwargs) -> list[torch.Tensor]:
     params, buffers = self._stacked_params_and_buffers()
 
-    # autocast dtype casting doesn't propagate through vmap, so replicate it manually
-    # to match the dtype behavior of a plain per-model forward loop under autocast.
+    # autocast doesn't propagate through vmap, so replicate its dtype casting manually.
     device_type = args[0].device.type if args else "cpu"
     if torch.is_autocast_enabled(device_type):
       amp_dtype = torch.get_autocast_dtype(device_type)

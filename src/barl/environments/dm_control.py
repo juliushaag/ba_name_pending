@@ -8,21 +8,9 @@ import gymnasium as gym
 
 
 class DMControlEnvironment(Environment):
-  """
-  Wraps a DeepMind Control Suite (dm_control.suite) domain/task pair into a
-  gymnasium.Env via shimmy, then flattens its observation: dm_control tasks
-  expose a Dict of named arrays (e.g. {"position":..., "velocity":...}), but
-  Policy/MLP throughout this framework assume a single flat Box observation
-  (Policy.__init__ reads env.observation_space.shape directly), same as
-  every other suite here. Online-only, like MuJoCoGymEnvironment -- no
-  offline dataset.
-
-  render_mode="rgb_array" is set unconditionally: shimmy's compatibility
-  wrapper only builds a renderer eagerly for render_mode="human" (see
-  DmControlCompatibilityV0.__init__); "rgb_array" just calls
-  physics.render() lazily on demand, so this is free for envs that never
-  render, same reasoning as MuJoCoGymEnvironment.
-  """
+  """Wraps a DeepMind Control Suite domain/task pair via shimmy, flattening
+  its Dict observation into a single flat Box (every Policy/MLP here assumes
+  that shape). Online-only, like MuJoCoGymEnvironment."""
 
   use_async_vector_env = True
 

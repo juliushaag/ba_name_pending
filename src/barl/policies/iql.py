@@ -6,6 +6,7 @@ from barl.policy import Policy, Critic, HParam, register_policy
 from barl.networks.mlp import MLP
 from barl.networks.ema import EMA
 from barl.networks.actor import StochasticActor
+from barl.networks.registry import register_component
 
 import gymnasium as gym
 
@@ -16,23 +17,22 @@ def asymmetric_l2_loss(u: torch.Tensor, tau: float) -> torch.Tensor:
   return torch.mean(torch.abs(tau - (u < 0).to(u.dtype)) * u.pow(2))
 
 
-class IQLCritic(nn.Module, Critic):
-  """
-  Expectile-regression critic (Kostrikov et al., IQL): a state-value net
-  V(s) is regressed toward an asymmetric expectile of Q(s,a) from the SAME
-  buffer transition, so the critic never needs to sample an action from an
-  actor at all. Exposes `advantage(s,a)` beyond the base Critic ABC for the
-  AWR weighting IQLPolicy.train_step needs -- a plain Critic has nowhere to
-  put V(s), so this is a genuine, documented IQL-specific extension.
-  """
+@register_component
+class IQLCritic(Critic, nn.Module):
+  """Expectile-regression critic (Kostrikov et al., IQL): V(s) regressed
+  toward an asymmetric expectile of Q(s,a) from the same buffer transition
+  -- never samples an action from an actor. `advantage()` is an IQL-specific
+  extension beyond the base Critic ABC, for IQLPolicy's AWR weighting."""
 
-  def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int = 256,
-               layers: int = 6, polyak_tau: float = 0.005):
-    super().__init__()
+  polyak_tau = HParam(0.005, "EMA decay step size for the Q target (1 - polyak_tau = decay)", range=(0.001, 0.05))
+  gamma      = HParam(0.99,  "Discount factor",                                               range=(0.9, 0.9999))
+
+  def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int, layers: int, **kwargs):
+    super().__init__(**kwargs)
 
     self.q_function = MLP(obs_dim + action_dim, 1, hidden_dim, layers)
     self.v_function = MLP(obs_dim, 1, hidden_dim, layers)
-    self.q_ema = EMA(self.q_function, start_decay=1 - polyak_tau, end_decay=1 - polyak_tau, warmup_steps=1)
+    self.q_ema = EMA(self.q_function, start_decay=1 - self.polyak_tau, end_decay=1 - self.polyak_tau, warmup_steps=1)
 
   def step_ema(self):
     self.q_ema.step()
@@ -42,8 +42,7 @@ class IQLCritic(nn.Module, Critic):
       return self.q_function(s, a)
 
   def score(self, s: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
-    # torch.func.grad, not a.requires_grad_(True) + eager .backward() (see
-    # QCritic.score()'s docstring) -- composes with vmap for multi-seed training.
+    # torch.func.grad, not a.requires_grad_(True) + eager .backward(), composes with vmap.
     a = a.detach()
     return torch.func.grad(lambda a: self.value(s, a).float().sum())(a)
 
@@ -52,7 +51,6 @@ class IQLCritic(nn.Module, Critic):
       return self.q_ema(s, a)
 
   def advantage(self, s: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
-    """Q_target(s,a) - V(s), the AWR weighting signal IQLPolicy needs."""
     with torch.amp.autocast("cuda", torch.bfloat16):
       v = self.v_function(s)
     return self.target_value(s, a).float() - v.float()
@@ -66,25 +64,19 @@ class IQLCritic(nn.Module, Critic):
 
 @register_policy
 class IQLPolicy(Policy):
-  """
-  Implicit Q-Learning (Kostrikov et al.): critic learns entirely off the
-  buffer (expectile regression, no actor-sampled next action); actor is a
-  plain advantage-weighted regression (AWR) against buffer actions.
-  """
+  """Implicit Q-Learning (Kostrikov et al.): critic learns entirely off the
+  buffer; actor is a plain advantage-weighted regression (AWR)."""
 
-  gamma      = HParam(0.99,  "Discount factor",                                              range=(0.9, 0.9999))
-  tau        = HParam(0.7,   "Expectile for asymmetric value regression",                     range=(0.5, 0.99))
-  polyak_tau = HParam(0.005, "EMA decay step size for the Q target (1 - polyak_tau = decay)", range=(0.001, 0.05))
-  beta       = HParam(3.0,   "Inverse temperature for advantage weighting",                   range=(0.1, 20.0))
+  tau   = HParam(0.7,  "Expectile for asymmetric value regression",    range=(0.5, 0.99))
+  beta  = HParam(3.0,  "Inverse temperature for advantage weighting",  range=(0.1, 20.0))
 
-  def __init__(self, env: gym.Env, hidden_dim=256, layers=6, **kwargs):
+  def __init__(self, env: gym.Env, **kwargs):
     super().__init__(env, **kwargs)
 
-    self.critic = IQLCritic(self.observation_dim, self.action_dim, hidden_dim=hidden_dim,
-                             layers=layers, polyak_tau=self.polyak_tau)
-    self.actor  = StochasticActor(self.observation_dim, self.action_dim, self.action_discrete,
-                                   act_low=getattr(self, "act_low", None), act_high=getattr(self, "act_high", None),
-                                   hidden_dim=hidden_dim, layers=layers)
+    assert isinstance(env.action_space, gym.spaces.Box)
+
+    self.critic = self.build_component("critic", IQLCritic, self.observation_dim, self.action_dim)
+    self.actor  = self.build_component("actor", StochasticActor, self.observation_dim, self.action_dim)
 
   def create_optimizer(self):
     return {**self.critic.create_optimizer(), **self.actor.create_optimizer()}
@@ -96,16 +88,11 @@ class IQLPolicy(Policy):
     reward   = batch["rew"].view(-1, 1).to(self.device)
     term     = batch["term"].view(-1, 1).to(self.device).to(reward.dtype)
 
-    if self.action_discrete:
-      act_idx = action.long().view(-1)
-      act_enc = F.one_hot(act_idx, self.action_dim).float()
-    else:
-      act_idx = action.float().view(action.shape[0], -1)
-      act_enc = act_idx
+    act_idx = action.float().view(action.shape[0], -1)
+    act_enc = act_idx
 
     self.critic.step_ema()
 
-    """ Critic: expectile V regression + plain Q regression, both off the buffer transition """
     with torch.amp.autocast("cuda", torch.bfloat16):
       with torch.no_grad():
         next_v   = self.critic.v_function(next_obs)
@@ -118,10 +105,9 @@ class IQLPolicy(Policy):
     with torch.amp.autocast("cuda", torch.bfloat16):
       qs = self.critic.q_function(obs, act_enc)
 
-    targets = reward + (1.0 - term) * self.gamma * next_v
+    targets = reward + (1.0 - term) * self.critic.gamma * next_v
     q_loss  = F.mse_loss(qs.float(), targets.float())
 
-    """ Actor: advantage-weighted regression (AWR) against buffer actions """
     awr_adv = self.critic.advantage(obs, act_enc).detach()
     exp_adv = torch.exp(self.beta * awr_adv).clamp(max=EXP_ADV_MAX).squeeze(1)
 

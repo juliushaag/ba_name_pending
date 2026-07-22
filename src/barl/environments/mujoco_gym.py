@@ -5,18 +5,10 @@ import gymnasium as gym
 
 
 class MuJoCoGymEnvironment(Environment):
-  """
-  Wraps gymnasium's built-in MuJoCo `-v5` continuous-control envs
-  (https://gymnasium.farama.org/environments/mujoco/). Online-only -- these
-  benchmarks ship no offline dataset (unlike OGBench/Minari), so
-  get_dataset() always raises.
-
-  Always constructs with render_mode="rgb_array": gymnasium's MujocoRenderer
-  only sets up its (offscreen) rendering context lazily on the first actual
-  render() call, so this costs nothing for the N parallel rollout envs that
-  never render, while letting the single eval env feed eval/video_* without
-  a second, differently-configured env class.
-  """
+  """Wraps gymnasium's built-in MuJoCo `-v5` envs. Online-only --
+  get_dataset() always raises. render_mode="rgb_array" is free for the N
+  parallel rollout envs that never render (MujocoRenderer sets up its
+  context lazily on the first real render() call)."""
 
   use_async_vector_env = True
 

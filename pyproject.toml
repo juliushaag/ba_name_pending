@@ -23,6 +23,8 @@ dependencies = [
     "dm-control>=1.0.43",
     "pyyaml>=6.0.3",
     "rich>=15.0.0",
+    "playground>=0.2.0",
+    "warp-lang==1.13.0",
 ]
 
 

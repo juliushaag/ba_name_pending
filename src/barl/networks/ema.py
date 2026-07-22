@@ -5,22 +5,8 @@ from torch import nn
 
 
 class EMA(nn.Module):
-  """
-  Exponential moving average wrapper.
-
-  Owns a frozen copy (target) of the source module as a proper submodule,
-  so state_dict / load_state_dict cover it automatically. The decay scalar
-  and step counter are registered buffers for the same reason.
-
-  Usage:
-      self.q_ema = EMA(self.q_function, end_decay=1 - tau)
-
-      # each train step:
-      self.q_ema.step()
-
-      # inference (runs the frozen target):
-      q_val = self.q_ema(obs, action)
-  """
+  """Exponential moving average wrapper. Owns a frozen `target` copy of
+  `source` as a proper submodule so state_dict/load_state_dict cover it."""
 
   def __init__(self, source: nn.Module, start_decay: float = 0.9, end_decay: float = 0.99, warmup_steps: int = 5000):
     super().__init__()
@@ -41,21 +27,35 @@ class EMA(nn.Module):
   def step(self):
     self._step_count += 1
 
-    # linearly ramp decay from start to end over warmup_steps -- stays in
-    # pure tensor ops throughout (no .item()/Python-scalar extraction) so
-    # this composes with vmap: stack_module_state+functional_call+vmap
-    # substitutes _step_count/decay with a per-replica batched tensor when
-    # training several seeds at once (see vmap_policy.py), and pulling a
-    # concrete Python float out of a batched tensor via .item() is exactly
-    # what vmap can't trace through.
+    # Stays in pure tensor ops (no .item()) so this composes with vmap.
     t = torch.clamp(self._step_count.float() / self._warmup_steps, max=1.0)
     self.decay.copy_(self._start_decay + t * (self._end_decay - self._start_decay))
 
     tau = self.decay
     for p_t, p_s in zip(self.target.parameters(), self.source.parameters()):
-      # .data (not just plain in-place ops) is disallowed under vmap --
-      # copy_ directly on the tensor itself works both plain and vmapped.
-      p_t.copy_(tau * p_t + (1.0 - tau) * p_s)
+      p_t.copy_(tau * p_t + (1.0 - tau) * p_s)  # .data in-place ops are disallowed under vmap
+    for b_t, b_s in zip(self.target.buffers(), self.source.buffers()):
+      b_t.copy_(b_s)
+
+  def forward(self, *args, **kwargs):
+    return self.target(*args, **kwargs)
+
+
+class Shadow(nn.Module):
+  """Hard-copy snapshot wrapper -- EMA's trust-region counterpart.
+  on_epoch_start() fully overwrites `target` with `source`'s current weights
+  instead of blending; named after the Policy lifecycle hook meant to drive it."""
+
+  def __init__(self, source: nn.Module):
+    super().__init__()
+
+    self.source = source
+    self.target = copy.deepcopy(source).eval().requires_grad_(False)
+    
+  @torch.no_grad()
+  def on_epoch_start(self):
+    for p_t, p_s in zip(self.target.parameters(), self.source.parameters()):
+      p_t.copy_(p_s)
     for b_t, b_s in zip(self.target.buffers(), self.source.buffers()):
       b_t.copy_(b_s)
 

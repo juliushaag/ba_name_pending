@@ -38,18 +38,14 @@ def _fmt_duration(seconds: float) -> str:
 
 
 class Logger():
-  """
-  Wraps wandb (the source of truth for plots/history) with a live rich
-  terminal display (throughput + latest stats, updated in place instead of
-  scrolling one print per log() call) -- both driven off the same log()/
-  increment() calls, so nothing needs to be logged twice.
-  """
+  """Wraps wandb with a live rich terminal display, both driven off the
+  same log()/increment() calls."""
 
   REFRESH_INTERVAL = 0.5   # seconds between terminal redraws, regardless of log() call frequency
 
-  def __init__(self, log_name : str, step_keys : set, run_name : str = None, tags : list[str] = None, config : dict = None):
+  def __init__(self, log_name : str, step_keys : set, run_name : str = None, tags : list[str] = None, config : dict = None, group=None):
 
-    wandb.init(project=log_name, name=run_name, config=config, tags=tags)
+    wandb.init(project=log_name, group=group, name=run_name, config=config, tags=tags)
 
     self._step_key_dict = dict()
     self._steps = { k : 0 for k in step_keys}
@@ -99,12 +95,9 @@ class Logger():
     self._maybe_render()
 
   def log(self, stats : dict):
-    # Fold the current step counters into the SAME wandb.log() call as the
-    # data, instead of relying on a separate (earlier or later) increment()
-    # call to have already set them: define_metric(step_metric=...) aligns
-    # a key's x-axis to whatever value of that step metric was logged
-    # alongside it, so logging them apart risks an off-by-one/misaligned
-    # plot depending on call order (increment() then log(), or vice versa).
+    # Step counters ride in the SAME wandb.log() call as the data -- logging them
+    # via a separate increment() risks an off-by-one/misaligned plot (define_metric
+    # aligns a key's x-axis to whatever step value was logged alongside it).
     wandb.log({**stats, **self._steps})
 
     self._latest.update(stats)
