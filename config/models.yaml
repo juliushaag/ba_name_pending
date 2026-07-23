@@ -29,9 +29,11 @@ aliases:
 
 SACPolicy:
   components:
-    actor:  {class: StochasticActor, hidden_dim: 256, layers: 3, squash_cls: TanhSquash}
-    critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
-    squash: {class: TanhSquash}
+    actor:    {class: StochasticActor, hidden_dim: 256, layers: 3, squash_cls: TanhSquash}
+    # critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
+    critic:   {class: MinEnsembleCritic, hidden_dim: 2048, layers: 2, n_models: 10}
+    squash:   {class: TanhSquash}
+    entropy:  {class: EntropyRegulator, alpha_init: 0.01, min_alpha: 1.0e-6, max_alpha: 15.0, entropy_factor: -1.0}
 
   profiles:
     Small:
@@ -44,14 +46,18 @@ SACPolicy:
 DIMEPolicy:
   components:
     actor:  {class: ScoreDiscreteActor, latent_dim: 256, layers: 3, num_steps: 16}
-    critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
+    # critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
+    critic: {class: MinEnsembleCritic, hidden_dim: 2048, layers: 2, n_models: 10}
     squash: {class: TanhSquash}
+    entropy: {class: EntropyRegulator, alpha_init: 0.01, min_alpha: 1.0e-6, max_alpha: 10.0, entropy_factor: -4.0}
 
 AMDP:
   components:
     actor:  {class: ScoreContinuousActor, latent_dim: 512, layers: 3, max_steps: 32}
-    critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
+    # critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
+    critic: {class: MinEnsembleCritic, hidden_dim: 2048, layers: 2, n_models: 10}
     squash: {class: ErfSquash}   # `k` is always derived at construction time -- see AMDP.__init__
+    entropy: {class: EntropyRegulator, alpha_init: 0.01, min_alpha: 1.0e-4, max_alpha: 5.0, entropy_factor: -1.0}
 
 
 PPOPolicy:

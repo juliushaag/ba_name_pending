@@ -1,8 +1,10 @@
 import math
 
+from barl.networks import bfloat16, float32
 import torch
 from torch import nn
 
+from barl.networks.entro import EntropyRegulator
 from barl.policy import Policy, register_policy
 from barl.networks.actor import StochasticActor
 from barl.networks.critic import QCriticBase
@@ -22,11 +24,10 @@ class SACPolicy(Policy):
 
     assert isinstance(env.action_space, gym.spaces.Box)
 
-    self.critic = self.build_component("critic", QCriticBase, self.observation_dim, self.action_dim, pessimistic_score=False)
-    self.actor  = self.build_component("actor", StochasticActor, self.observation_dim, self.action_dim)
+    self.critic : QCriticBase = self.build_component("critic", QCriticBase, self.observation_dim, self.action_dim, pessimistic_score=False)
+    self.actor : StochasticActor = self.build_component("actor", StochasticActor, self.observation_dim, self.action_dim)
 
-    self.entropy_target = -1.0 * self.action_dim
-    self.log_alpha = nn.Parameter(torch.tensor(math.log(1.0)))
+    self.entropy : EntropyRegulator = self.build_component("entropy", EntropyRegulator, self.action_dim)
 
   def on_epoch_start(self):
     self.critic.on_epoch_start()
@@ -36,12 +37,8 @@ class SACPolicy(Policy):
     return {
       **self.critic.create_optimizer(),
       **self.actor.create_optimizer(),
-      "alpha": torch.optim.Adam([self.log_alpha], lr=1e-3),
+      **self.entropy.create_optimizer()
     }
-
-  def clamp_log_alpha(self, lo: float = 1e-6, hi: float = 15.0):
-    with torch.no_grad():
-      self.log_alpha.clamp_(math.log(lo), math.log(hi))
 
   def rsample(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Reparameterized (action, log_prob), differentiable through obs. The
@@ -53,7 +50,7 @@ class SACPolicy(Policy):
     y = self.actor.squash(x)
 
     log_prob = dist.log_prob(x) - self.actor.squash.log_abs_det_jacobian(x, y) - torch.log(self.act_scale)
-    return y, log_prob.sum(dim=-1, keepdim=True)
+    return y, -log_prob.sum(dim=-1, keepdim=True)
 
   def train_step(self, batch):
     obs      = self.normalize_obs(batch["obs"].to(self.device))
@@ -62,35 +59,29 @@ class SACPolicy(Policy):
     reward   = batch["rew"].to(self.device)
     term     = batch["term"].to(self.device)
 
-    self.clamp_log_alpha()
 
     losses, log = {}, {}
-    alpha = self.log_alpha.exp()
+    alpha = self.entropy.value()
 
-    with torch.no_grad():
-      next_action, next_log_prob = self.rsample(next_obs)
-      entropy_bonus = -alpha * next_log_prob
+    with bfloat16():
 
-    self.critic.loss(obs, action, reward, term, next_obs, next_action,
-                      entropy_bonus, log, losses)
+      with torch.no_grad():
+        next_action, next_nlog_prob = self.rsample(next_obs)
+        entropy_bonus = alpha * next_nlog_prob
 
-    new_action, log_prob = self.rsample(obs)
+      new_action, nlog_prob = self.rsample(obs)
+      q_new      = self.critic.value(obs, new_action)
 
-    q_new      = self.critic.target_value(obs, new_action)
-    actor_loss = (alpha.detach() * log_prob - q_new).mean()
+    with float32():
 
-    alpha_loss = (alpha * (-log_prob.detach() - self.entropy_target)).mean()
+      self.critic.loss(obs, action, reward, term, next_obs, next_action, entropy_bonus, log, losses)
+      self.entropy.loss(nlog_prob.detach(), log, losses)
+
+      actor_loss = -(q_new + (alpha * nlog_prob)).mean() # Gradient descent therfore the minus
+
 
     losses["actor"] = actor_loss
-    losses["alpha"] = alpha_loss
 
-    log.update({
-      "train/loss/actor": actor_loss.detach(),
-      "train/loss/alpha": alpha_loss.detach(),
-
-      "stats/alpha":       alpha.detach(),
-      "stats/entropy" :    (-log_prob).detach().mean()
-    })
     return losses, log
 
   @torch.inference_mode()

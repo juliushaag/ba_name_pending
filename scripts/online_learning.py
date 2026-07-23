@@ -77,8 +77,9 @@ def train_epoch(model: Policy, opts: dict[str, torch.optim.Optimizer], train_loa
       )
 
       opts[k].step()
-      
-      stats[f"stats/{k}_norm"] = norm 
+
+      stats[f"train/loss/{k}"] = losses[k].detach() 
+      stats[f"train/norm/{k}"] = norm 
 
     if b % cfg["log_every"] == 0:
       log.log(stats)

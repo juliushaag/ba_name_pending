@@ -60,7 +60,7 @@ if __name__ == "__main__":
                      help="Which training script to launch each run with")
   args.add_argument("--config", default=None,
                      help="Base config providing `defaults:` for every run (default: config/<script>.yaml)")
-  args.add_argument("--max_parallel", type=int, default=4, help="Max concurrent runs (0 = unlimited)")
+  args.add_argument("--max_parallel", type=int, default=3, help="Max concurrent runs (0 = unlimited)")
   args.add_argument("--validate", action="store_true",
                      help="Smoke-test every {algo x env} combination instead of running a full "
                           "sweep: one rollout chunk + one train_step + optimizer step each, no "

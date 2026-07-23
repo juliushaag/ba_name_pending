@@ -9,7 +9,7 @@
 defaults:
   checkpoint: null          # path to resume from, or null to train from scratch
   total_env_steps: 1000000  # stop once this many env steps have been collected
-  random_steps: 5000       # random-action buffer fill before training starts (off-policy only, see main())
+  random_steps: 0       # random-action buffer fill before training starts (off-policy only, see main())
   rollout_steps: 50000      # env steps collected per outer iteration (across all num_envs)
   num_envs: 32              # parallel rollout envs
   buffer_size: 1000000       # max transitions kept in the replay buffer (whole
@@ -20,17 +20,3 @@ defaults:
   eval_every: 10000         # grad steps between evals
   eval_runs: 10
   log_every: 10             # batches between stat logs
-
-runs:
-  - model: SACPolicy
-    env: HalfCheetah
-  - model: PPOPolicy
-    env: HalfCheetah
-  - model: FlowQLPolicy
-    env: HalfCheetah
-  - model: AMDP
-    env: Humanoid
-    epochs_per_rollout: 100  # AMDP is off-policy at UTD~2 (Thilges et al. 2026, Table 3):
-                             # once the (transition-budgeted) buffer is full, this gives
-                             # ~100 * ceil(buffer_size / batch_size) = ~100,000 grad steps
-                             # per 50,000-step rollout, i.e. grad_steps/env_steps ~= 2

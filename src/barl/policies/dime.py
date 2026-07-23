@@ -5,6 +5,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from barl.networks.entro import EntropyRegulator
 from barl.policy import Policy, HParam, register_policy
 from barl.networks.actor import ScoreDiscreteActor
 from barl.networks.critic import QCriticBase
@@ -21,32 +22,25 @@ class DIMEPolicy(Policy):
   against `target_entropy`). Unlike AMDP, needs no squash-Jacobian correction:
   `entropy` feeds in as a plain additive bonus/dual target, not a log-density."""
 
-  target_entropy_scale = HParam(-4.0, "target_entropy = scale * action_dim", range=(-10.0, 10.0))
-
   def __init__(self, env: gym.Env, **kwargs):
 
     super().__init__(env, **kwargs)
 
     assert isinstance(env.action_space, gym.spaces.Box)
 
-    self.critic = self.build_component("critic", QCriticBase, self.observation_dim, self.action_dim, pessimistic_score=True)
-    self.actor  = self.build_component("actor", ScoreDiscreteActor, self.observation_dim, self.action_dim)
+    self.critic : QCriticBase = self.build_component("critic", QCriticBase, self.observation_dim, self.action_dim, pessimistic_score=True)
+    self.actor : ScoreDiscreteActor = self.build_component("actor", ScoreDiscreteActor, self.observation_dim, self.action_dim)
 
-    self.squash = self.build_component("squash", Squash)
+    self.squash : Squash = self.build_component("squash", Squash)
 
-    self.log_alpha = nn.Parameter(torch.tensor(math.log(1.0)))
-    self.target_entropy = self.target_entropy_scale * self.action_dim
+    self.entropy : EntropyRegulator = self.build_component("entropy", EntropyRegulator, self.action_dim)
 
   def on_epoch_start(self):
     self.critic.on_epoch_start()
     return super().on_epoch_start()
 
   def create_optimizer(self):
-    return {**self.critic.create_optimizer(), **self.actor.create_optimizer(), "alpha" : torch.optim.Adam([self.log_alpha], lr=1e-3)}
-
-  def clamp_log_alpha(self, lo: float = 1e-6, hi: float = 10.0):
-    with torch.no_grad():
-      self.log_alpha.clamp_(math.log(lo), math.log(hi))
+    return {**self.critic.create_optimizer(), **self.actor.create_optimizer(), **self.entropy.create_optimizer()}
 
   def train_step(self, batch) -> tuple[dict, dict]:
 
@@ -57,9 +51,7 @@ class DIMEPolicy(Policy):
     reward   = batch["rew"].to(self.device)
     term     = batch["term"].to(self.device)
 
-    self.clamp_log_alpha()
-
-    alpha = self.log_alpha.exp().detach()
+    alpha = self.entropy.value()
 
     losses, log = {}, {}
 
@@ -76,21 +68,13 @@ class DIMEPolicy(Policy):
       action = self.squash(raw_action)
 
       with float32():
-        q_new = self.critic.target_value(obs, action)
-        dime_loss = (-q_new -alpha * entropy).mean()
+        q_new = self.critic.value(obs, action)
+        dime_loss = -(q_new + alpha * entropy).mean()
 
-        alpha_loss = (self.log_alpha * (entropy.detach() - self.target_entropy)).mean()
+        self.entropy.loss(entropy.detach(), log, losses)
     
-    losses["alpha"] = alpha_loss
     losses["actor"]  = dime_loss
 
-    log.update({
-      "train/loss/actor":           dime_loss.detach(),
-      "train/loss/alpha":           alpha_loss.detach(),
-
-      "stats/entropy":                  entropy_penalty.detach().mean(),
-      "stats/alpha":                    alpha.detach()
-    })
     return losses, log
 
   @torch.inference_mode()

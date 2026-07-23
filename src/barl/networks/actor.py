@@ -141,13 +141,13 @@ class ScoreContinuousActor(Actor, nn.Module):
   def create_optimizer(self) -> dict:
     return {"actor": torch.optim.Adam(self.diffusion_act.parameters(), lr=3e-4)}
 
-
 @register_component
 class ScoreDiscreteActor(Actor, nn.Module):
   """Discrete-time diffusion actor (Ho et al. 2020 DDPM): a fixed `num_steps`
-  variance-preserving forward noising schedule with an epsilon-prediction
-  network, ancestral reverse sampling x_T ~ N(0, I) -> x_0. Counterpart to
-  ScoreContinuousActor; same "raw, unsquashed output" contract."""
+  variance-preserving forward noising schedule with a score-prediction
+  network (learns s_theta(x_t, t) ~= grad_x log p_t(x_t) directly, no
+  eps -> score conversion), ancestral reverse sampling x_T ~ N(0, I) -> x_0.
+  Counterpart to ScoreContinuousActor; same "raw, unsquashed output" contract."""
 
   beta_min = HParam(0.01, "Sampling-time diffusion coefficient (min)", range=(1e-4, 1e-2))
   beta_max = HParam(0.02,  "Sampling-time diffusion coefficient (max)", range=(0.01, 0.1))
@@ -186,11 +186,23 @@ class ScoreDiscreteActor(Actor, nn.Module):
   def time_emb(self, t: torch.Tensor) -> torch.Tensor:
     return sinusoidal_emb(t, self.time_dim)
  
-  def predict_noise(self, obs: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+  def predict_score(self, obs: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """s_theta(x_t; s, t) ~= grad_{x_t} log p_t(x_t | s), predicted directly
+    (no eps-prediction intermediary)."""
     t_emb = self.time_emb(t.float().expand(x_t.shape[0], 1))
     return self.diffusion_act(obs, x_t, t_emb)
- 
-  def generate_action(self, obs: torch.Tensor, x : torch.Tensor = None):
+
+  def diffuse(self, x : torch.Tensor, t : torch.Tensor):
+    return self.actor.alpha_bars[t].sqrt() * x + (1 - self.actor.alpha_bars[t]) * torch.randn_like(x)
+
+  def score_target(self, x0: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """Denoising score-matching regression target: grad_{x_t} log q_{t|0}(x_t | x0)
+    = -(x_t - sqrt(alpha_bar_t) * x0) / (1 - alpha_bar_t). Use this (instead of
+    the raw noise) as the target for predict_score's training loss."""
+    alpha_bar_t = self.alpha_bars[t]
+    return -(x_t - alpha_bar_t.sqrt() * x0) / (1.0 - alpha_bar_t)
+
+  def generate_action(self, obs: torch.Tensor, x : torch.Tensor = None, t : int = 0):
     """Differentiable Euler-Maruyama reverse sampling x_T ~ N(0, I) -> x_0
     (DIME Eq. 12, not ancestral DDPM) -- NOT wrapped in torch.no_grad(), the
     actor loss needs gradients through the whole chain. Returns (raw
@@ -203,13 +215,12 @@ class ScoreDiscreteActor(Actor, nn.Module):
  
     eta = self.eta  # (action_dim,), broadcasts against (B, action_dim)
  
-    for t in reversed(range(self.num_steps)):
+    for t in reversed(range(self.num_steps - t)):
       t_tensor = torch.tensor(t, device=obs.device)
-      eps_hat  = self.predict_noise(obs, x, t_tensor).float()
+      score    = self.predict_score(obs, x, t_tensor).float()       # score predicted directly, no eps -> score conversion
  
       beta_t      = self.betas[t]                                   # plays the role of (beta_n * delta)
       alpha_bar_t = self.alpha_bars[t]
-      score       = -eps_hat / torch.sqrt(1.0 - alpha_bar_t)         # eps -> score conversion
  
       var = 2.0 * eta ** 2 * beta_t                                 # (action_dim,) -> broadcasts to (B, action_dim)
       var = var.expand_as(x)
@@ -227,7 +238,7 @@ class ScoreDiscreteActor(Actor, nn.Module):
       ell = ell + (logp_fwd - logp_rev)
       x = x_new
  
-    return x, ell  # x_0, ell_pi(x_0, s)
+    return x, -ell  # x_0, ell_pi(x_0, s)
  
   def sample(self, s: torch.Tensor, critic: Critic = None):
     """Raw, unsquashed x_0 -- the owning Policy squashes it."""

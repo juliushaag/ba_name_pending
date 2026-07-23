@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from barl.networks.entro import EntropyRegulator
 from barl.policy import Policy, HParam, register_policy
 from barl.networks import bfloat16, float32
 from barl.networks.actor import ScoreContinuousActor
@@ -36,9 +37,9 @@ class AMDP(Policy):
 
     self.actor_old = Shadow(self.actor)
 
-    self.entropy_target = -1.0 * self.action_dim
 
-    self.log_alpha     = nn.Parameter(torch.tensor(math.log(1.0)))
+    self.entropy : EntropyRegulator = self.build_component("entropy", EntropyRegulator, self.action_dim)
+
     self.log_tr_lambda = nn.Parameter(torch.tensor(math.log(self.tr_lambda_init)))
 
     sig_sq_one = self.actor.sigma_sq_int_fn(torch.tensor(self.actor.tau_max))
@@ -47,10 +48,6 @@ class AMDP(Policy):
   def clamp_tr_lambda(self, lo: float = 1e-4, hi: float = 10.0):
     with torch.no_grad():
       self.log_tr_lambda.clamp_(math.log(lo), math.log(hi))
-
-  def clamp_log_alpha(self, lo: float = 1e-4, hi: float = 5.0):
-    with torch.no_grad():
-      self.log_alpha.clamp_(math.log(lo), math.log(hi))
 
   def on_epoch_start(self):
     self.critic.on_epoch_start()
@@ -61,7 +58,7 @@ class AMDP(Policy):
     return {
       **self.critic.create_optimizer(),
       **self.actor.create_optimizer(),
-      "alpha":     torch.optim.Adam([self.log_alpha],     lr=1e-3),
+      **self.entropy.create_optimizer(),
       "tr_lambda": torch.optim.Adam([self.log_tr_lambda], lr=1e-3, maximize=True),
     }
 
@@ -74,15 +71,11 @@ class AMDP(Policy):
     reward   = batch["rew"].to(self.device)
     term     = batch["term"].to(self.device)
 
-    if "X" in batch:
-      X     = batch["X"].to(self.device)
-    else:
-      X = self.squash.inverse(action)
-      
-    self.clamp_tr_lambda()
-    self.clamp_log_alpha()
+    X     = batch["X"].to(self.device)
 
-    alpha     = self.log_alpha.exp().detach()
+    self.clamp_tr_lambda()
+
+    alpha     = self.entropy.value()
     tr_lambda = self.log_tr_lambda.exp()
 
     losses, log = {}, {}
@@ -91,15 +84,15 @@ class AMDP(Policy):
 
       with torch.no_grad():
         
-        next_action, entropy_penalty = self.actor.generate_action(next_obs)
+        next_X, entropy_penalty = self.actor.generate_action(next_obs)
+        next_action = self.squash(next_X)
 
-        next_action = self.squash(next_action)
         penalty = (alpha * entropy_penalty).detach()
 
-      self.critic.loss(obs, action, reward, term, next_obs, next_action, penalty, log, losses)
 
       with float32():
-        entropy_target_loss = (self.log_alpha.float() * (entropy_penalty.detach().clamp(-100, 100).float() - self.entropy_target)).mean()
+        self.critic.loss(obs, action, reward, term, next_obs, next_action, penalty, log, losses)
+        self.entropy.loss(entropy_penalty.detach(), log, losses)
 
       tau = torch.rand((obs.shape[0],), device=obs.device)
 
@@ -112,16 +105,16 @@ class AMDP(Policy):
       time_embed = sinusoidal_emb(tau.view(obs.shape[0], 1), self.actor.time_dim)
 
       u     = self.actor.diffusion_act(obs, X_t, time_embed) * sigma_tau
-      u_old = self.actor_old.target.diffusion_act(obs, X_t, time_embed)   * sigma_tau
+      u_old = self.actor_old.target.diffusion_act(obs, X_t, time_embed) * sigma_tau
 
       def q_values(x):
         a = self.squash(x)
-        return self.critic.target_value(obs, a).sum()
+        return self.critic.value(obs, a).sum()
 
-      x_score = torch.func.grad(q_values)(X)
+      x_score : torch.Tensor = torch.func.grad(q_values)(X)
 
       with float32():
-        amdp_target = sigma_tau * (1 / alpha) * x_score
+        amdp_target = sigma_tau * x_score
 
         amdp_loss = 0.5 * ((u.float() - amdp_target.float()) ** 2 / sigma_tau).mean()
         tr_loss   = 0.5 * F.mse_loss(u.float(), u_old.float())
@@ -130,17 +123,10 @@ class AMDP(Policy):
         actor_loss     = amdp_loss + tr_lambda.detach() * (tr_loss - self.tr_epsilon)
 
     losses["actor"]     = actor_loss
-    losses["alpha"]     = entropy_target_loss
     losses["tr_lambda"] = tr_lambda_loss
 
     log.update({
-      "train/loss/actor":          actor_loss.detach(),
-      "train/loss/alpha":          entropy_target_loss.detach(),
-      "train/loss/trust_region":   tr_loss.detach().mean(),
-
       "stats/amdp":                     amdp_loss.detach(),
-      "stats/alpha":                    alpha.detach(),
-      "stats/entropy":                  entropy_penalty.detach().mean(),
       "stats/tr_lambda":                tr_lambda.detach(),
       "stats/score_norm":               x_score.detach().norm(dim=-1).mean(),
     })
