@@ -7,27 +7,34 @@ from barl.networks.ema import EMA, Shadow
 from barl.networks.ensemble import Ensemble
 from barl.networks.registry import register_component
 
-from barl.policy import Critic, HParam
+from barl.policy import Critic
 
 
 class QCriticBase(Critic, nn.Module):
-  """Shared scaffolding for every concrete critic below: HParams, Polyak
-  target-net bookkeeping, mean-minus-rho*std value reduction. Not
-  instantiated directly."""
+  """Shared scaffolding for every concrete critic below: Polyak target-net
+  bookkeeping, mean-minus-rho*std value reduction. Not instantiated
+  directly. `rho`/`polyak_tau`/`gamma` are config/models.yaml-supplied, not
+  Python-level defaults -- see each policy's `critic:` slot kwargs."""
 
-  rho        = HParam(2.0,   "Pessimism weight on Q std (lower bound = mean - rho * std)",    range=(0.0, 5.0))
-  polyak_tau = HParam(0.005, "EMA decay step size for the Q target (1 - polyak_tau = decay)", range=(0.001, 0.05))
-  gamma      = HParam(0.99,  "Discount factor",                                               range=(0.9, 0.9999))
-
-  def __init__(self, q_function: nn.Module, pessimistic_score: bool = False, **kwargs):
+  def __init__(self, q_function: nn.Module, pessimistic_score: bool = False, *,
+               rho: float, polyak_tau: float, gamma: float, **kwargs):
     super().__init__(**kwargs)
+
+    self.rho        = rho
+    self.polyak_tau = polyak_tau
+    self.gamma      = gamma
 
     self.pessimistic_score = pessimistic_score
     self.q_function = q_function
-    self.q_ema = Shadow(self.q_function)
+
+    self.q_ema = EMA(self.q_function)
 
   def on_epoch_start(self):
-    self.q_ema.on_epoch_start()
+    # self.q_ema.on_epoch_start()
+    ...
+
+  def step(self):
+    self.q_ema.step()
 
   def raw(self, s: torch.Tensor, a: torch.Tensor, target: bool = False) -> torch.Tensor:
     """Un-reduced prediction: (n_models, B, 1) ensemble heads, or (B, num_atoms) atoms/logits."""
@@ -83,6 +90,7 @@ class EnsembleCriticBase(QCriticBase):
     with torch.no_grad():
       bootstrap = self.target_value(next_obs, next_act) + penalty
       target    = self._bellman_target(reward, term, bootstrap)
+
 
     pred   = self.raw(obs, action)
     q_loss = F.mse_loss(pred.float(), target.detach().float().expand(pred.shape))

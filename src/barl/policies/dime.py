@@ -5,8 +5,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from barl.networks.entro import EntropyRegulator
-from barl.policy import Policy, HParam, register_policy
+from barl.networks.regulator import AutotuneRegulator
+from barl.policy import Policy, register_policy
 from barl.networks.actor import ScoreDiscreteActor
 from barl.networks.critic import QCriticBase
 from barl.networks import bfloat16, float32
@@ -26,6 +26,9 @@ class DIMEPolicy(Policy):
 
     super().__init__(env, **kwargs)
 
+    params = self.resolve_params()
+    self.entropy_scale        = params["entropy_scale"]
+
     assert isinstance(env.action_space, gym.spaces.Box)
 
     self.critic : QCriticBase = self.build_component("critic", QCriticBase, self.observation_dim, self.action_dim, pessimistic_score=True)
@@ -33,7 +36,7 @@ class DIMEPolicy(Policy):
 
     self.squash : Squash = self.build_component("squash", Squash)
 
-    self.entropy : EntropyRegulator = self.build_component("entropy", EntropyRegulator, self.action_dim)
+    self.entropy : AutotuneRegulator = self.build_component("entropy", AutotuneRegulator, target=self.action_dim * self.entropy_scale, name="entropy")
 
   def on_epoch_start(self):
     self.critic.on_epoch_start()
@@ -51,26 +54,26 @@ class DIMEPolicy(Policy):
     reward   = batch["rew"].to(self.device)
     term     = batch["term"].to(self.device)
 
+    self.critic.step()
     alpha = self.entropy.value()
 
     losses, log = {}, {}
 
     with bfloat16():
       with torch.no_grad():
-        next_action, entropy_penalty = self.actor.generate_action(next_obs)
-        next_action = self.squash(next_action)
-
+        next_X, entropy_penalty = self.actor.generate_action(next_obs)
+        next_action = self.squash(next_X)
         entropy_bonus_val = (alpha * entropy_penalty).detach()
 
       self.critic.loss(obs, action, reward, term, next_obs, next_action, entropy_bonus_val, log, losses)
 
-      raw_action, entropy = self.actor.generate_action(obs)
-      action = self.squash(raw_action)
+      X, entropy = self.actor.generate_action(obs)
+      new_action = self.squash(X)
+      q_new = self.critic.value(obs, new_action)
 
       with float32():
-        q_new = self.critic.value(obs, action)
-        dime_loss = -(q_new + alpha * entropy).mean()
 
+        dime_loss = -(q_new + (alpha * entropy)).mean()
         self.entropy.loss(entropy.detach(), log, losses)
     
     losses["actor"]  = dime_loss

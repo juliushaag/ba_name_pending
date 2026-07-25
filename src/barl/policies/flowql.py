@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from barl.policy import Policy, Actor, Critic, HParam, register_policy
+from barl.policy import Policy, Actor, Critic, register_policy
 from barl.networks.mlp import MLP
 from barl.networks.flow import sinusoidal_emb, midpoint_flow_sample
 from barl.networks.critic import QCriticBase
@@ -54,12 +54,12 @@ class DistilledFlowActor(Actor, nn.Module):
 @register_policy
 class FlowQLPolicy(Policy):
 
-  alpha = HParam(100.0, "Weight on distillation loss relative to the critic-gradient (DPG) loss", range=(0.1, 300.0))
-
   def __init__(self, env: gym.Env, **kwargs):
     super().__init__(env, **kwargs)
 
     assert isinstance(env.action_space, gym.spaces.Box)
+
+    self.alpha = self.resolve_params()["alpha"]
 
     self.critic = self.build_component("critic", QCriticBase, self.observation_dim, self.action_dim, pessimistic_score=False)
     self.actor  = self.build_component("actor", DistilledFlowActor, self.observation_dim, self.action_dim)

@@ -25,7 +25,7 @@ class EMA(nn.Module):
 
   @torch.no_grad()
   def step(self):
-    self._step_count += 1
+    self._step_count = self._step_count +  1
 
     # Stays in pure tensor ops (no .item()) so this composes with vmap.
     t = torch.clamp(self._step_count.float() / self._warmup_steps, max=1.0)

@@ -1,7 +1,9 @@
-"""YAML-driven architecture configuration (component classes + kwargs, all
-in config/models.yaml with no Python-level default class) -- a separate axis
-from HParamMixin's algorithm-tuning knobs; see resolve_slot/resolve_component
-for the override precedence."""
+"""YAML-driven configuration: component classes + kwargs (resolve_slot) and
+each Policy's own top-level tunables (resolve_params), all in
+config/models.yaml with no Python-level defaults -- see resolve_slot/
+resolve_component/resolve_params for the override precedence, and
+set_models_override()/snapshot_for() for how a sweep run's embedded `models:`
+snapshot reproduces its exact resolved config later."""
 
 import os
 
@@ -13,6 +15,7 @@ _CONFIG_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "config")
 _MODELS_PATH = os.path.join(_CONFIG_DIR, "models.yaml")
 
 _models_cache: dict = None
+_models_override: dict | None = None
 
 
 def _load_yaml(path: str) -> dict:
@@ -26,7 +29,17 @@ def _models() -> dict:
   global _models_cache
   if _models_cache is None:
     _models_cache = _load_yaml(_MODELS_PATH)
-  return _models_cache
+  return {**_models_cache, **_models_override} if _models_override else _models_cache
+
+
+def set_models_override(override: dict | None):
+  """Layers `override` on top of config/models.yaml for the rest of the
+  process -- lets a saved per-run YAML's embedded `models:` snapshot (see
+  scripts/run_sweep.py / snapshot_for()) reproduce its exact resolved
+  architecture/params even if config/models.yaml has since changed. Called
+  once per run by scripts/online_learning.py's main()."""
+  global _models_override
+  _models_override = override
 
 
 def resolve_model_name(name: str) -> tuple[str, str | None]:
@@ -65,3 +78,37 @@ def resolve_slot(policy_name: str, slot: str, profile: str | None) -> tuple[type
     resolved.update(profile_slot_cfg)
 
   return cls, resolved
+
+
+def resolve_params(policy_name: str, profile: str | None) -> dict:
+  """Like resolve_slot but for a Policy's own top-level tunables
+  (models.yaml's `params:` block) rather than a named actor/critic/squash/...
+  slot -- no `class:` involved, just a flat kwargs dict, profile-overridable
+  the same way."""
+  policy_cfg = _models().get(policy_name) or {}
+  params = dict(policy_cfg.get("params", {}))
+
+  if profile is not None:
+    profile_cfg = policy_cfg.get("profiles", {}).get(profile)
+    if profile_cfg is None:
+      raise KeyError(f"{policy_name!r} has no profile {profile!r} in {_MODELS_PATH}")
+    params.update(profile_cfg.get("params", {}))
+
+  return params
+
+
+def snapshot_for(name: str) -> dict:
+  """Minimal models.yaml sub-dict needed to reproduce resolving `name`
+  later, regardless of subsequent edits to config/models.yaml: the aliases:
+  entry (if `name` names one) plus the resolved policy's full block. Embedded
+  verbatim by scripts/run_sweep.py into each run's per-run YAML, and logged
+  to wandb by scripts/online_learning.py."""
+  models = _models()
+  out: dict = {}
+  alias = models.get("aliases", {}).get(name)
+  if alias:
+    out["aliases"] = {name: alias}
+  policy_name, _ = resolve_model_name(name)
+  if policy_name in models:
+    out[policy_name] = models[policy_name]
+  return out

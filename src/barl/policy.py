@@ -1,6 +1,6 @@
 import math
 import time
-from typing import Optional, Any
+from typing import Optional
 
 import numpy as np
 import torch
@@ -12,124 +12,7 @@ import gymnasium as gym
 import torch.optim.lr_scheduler as sched
 
 
-class HParam:
-
-  def __init__(self, default: Any, description: str, range: tuple = None, choices: list = None):
-    self.default     = default
-    self.description = description
-    self.range       = range
-    self.choices     = choices
-
-  def validate(self, name: str, value: Any):
-    if self.choices is not None and value not in self.choices:
-      raise ValueError(f"HParam '{name}': {value!r} not in valid choices {self.choices}")
-    if self.range is not None:
-      lo, hi = self.range
-      if not (lo <= value <= hi):
-        raise ValueError(f"HParam '{name}': {value!r} out of range [{lo}, {hi}]")
-
-  def __repr__(self):
-    parts = [f"default={self.default!r}", f"desc={self.description!r}"]
-    if self.range   is not None: parts.append(f"range={self.range}")
-    if self.choices is not None: parts.append(f"choices={self.choices}")
-    return f"HParam({', '.join(parts)})"
-
-
-class HParamMixin:
-  """Shared HParam declaration/resolution, mixed into Policy/Actor/Critic.
-  `call_super_init=True` only takes effect when this mixin precedes
-  nn.Module in the concrete class's MRO (see actor.py/critic.py base order)."""
-
-  call_super_init = True
-
-  # Shared empty-dict fallback for a class whose MRO never reaches __init__
-  # below; always read via a fresh dict() copy (see `hparams`), so sharing
-  # this instance is safe.
-  _own_hparams: dict = {}
-
-  def __init__(self, **kwargs):
-    super().__init__()
-    self.apply_hparams(kwargs)
-
-  @classmethod
-  def _hparam_descriptors(cls) -> dict[str, HParam]:
-    cached = cls.__dict__.get("_hparams")
-    if cached is not None:
-      return cached
-
-    out = {}
-    for klass in reversed(cls.__mro__):
-      for k, v in vars(klass).items():
-
-        if isinstance(v, HParam):
-          out[k] = v
-
-    cls._hparams = out
-    return out
-
-  @classmethod
-  def resolve_hparams(cls, kwargs: dict) -> dict:
-    """Names in `kwargs` this class doesn't declare are silently ignored,
-    not an error -- Policy/Actor/Critic forward the same full kwargs dict to
-    each other, so each just picks out its own slice."""
-    descriptors = cls._hparam_descriptors()
-    resolved = {}
-    for name, hp in descriptors.items():
-      value = kwargs.get(name, hp.default)
-      hp.validate(name, value)
-      resolved[name] = value
-    return resolved
-
-  def apply_hparams(self, kwargs: dict) -> dict:
-    resolved = self.resolve_hparams(kwargs)
-    for name, value in resolved.items():
-      setattr(self, name, value)
-    self._own_hparams = resolved
-    return resolved
-
-  @property
-  def hparams(self) -> dict:
-    return dict(self._own_hparams)
-
-  @classmethod
-  def describe_hparams(cls):
-    """Print a human-readable table of all hyperparameters."""
-    descriptors = cls._hparam_descriptors()
-    if not descriptors:
-      print(f"{cls.__name__}: no registered HParams")
-      return
-    col = max(len(k) for k in descriptors) + 2
-    print(f"\n{cls.__name__} hyperparameters:")
-    print(f"  {'name':<{col}} {'default':<12} {'range/choices':<20} description")
-    print(f"  {'-'*col} {'-'*12} {'-'*20} -----------")
-    for name, hp in descriptors.items():
-      constraint = ""
-      if hp.range   is not None: constraint = f"{hp.range[0]}..{hp.range[1]}"
-      if hp.choices is not None: constraint = str(hp.choices)
-      print(f"  {name:<{col}} {str(hp.default):<12} {constraint:<20} {hp.description}")
-    print()
-
-  @classmethod
-  def sample_hparams(cls, rng: np.random.Generator = None) -> dict:
-    if rng is None:
-      rng = np.random.default_rng()
-    descriptors = cls._hparam_descriptors()
-    out = {}
-    for name, hp in descriptors.items():
-      if hp.choices is not None:
-        out[name] = rng.choice(hp.choices)
-      elif hp.range is not None:
-        lo, hi = hp.range
-        if isinstance(hp.default, int):
-          out[name] = int(rng.integers(lo, hi + 1))
-        else:
-          out[name] = float(rng.uniform(lo, hi))
-      else:
-        out[name] = hp.default
-    return out
-
-
-class Actor(HParamMixin, ABC):
+class Actor(ABC):
   """A network that can produce actions -- pure architecture; every
   algorithm-level decision (loss, squash choice, etc.) stays on the owning
   Policy's train_step."""
@@ -149,7 +32,7 @@ class Actor(HParamMixin, ABC):
     return next(self.parameters()).device
 
 
-class Critic(HParamMixin, ABC):
+class Critic(ABC):
   """A network that can price (s,a) -- pure architecture; Bellman targets
   and the regression loss itself live in each Policy's train_step."""
 
@@ -170,7 +53,7 @@ class Critic(HParamMixin, ABC):
     return next(self.parameters()).device
 
 
-class Policy(HParamMixin, nn.Module, ABC):
+class Policy(nn.Module, ABC):
 
   _classes = dict()
 
@@ -231,15 +114,6 @@ class Policy(HParamMixin, nn.Module, ABC):
     self.register_buffer("obs_std",  torch.ones(observation_space.shape[-1]))
     self.register_buffer("obs_mean", torch.zeros(observation_space.shape[-1]))
 
-  @property
-  def hparams(self) -> dict:
-    """This Policy's own resolved HParams merged with its actor's/critic's."""
-    merged = dict(self._own_hparams)
-    for component in (getattr(self, "actor", None), getattr(self, "critic", None)):
-      if isinstance(component, HParamMixin):
-        merged.update(component.hparams)
-    return merged
-
   def resolve_component(self, slot: str, **explicit_kwargs) -> tuple[type, dict]:
     """Resolves a named slot's class + kwargs from config/models.yaml (see
     model_config.py), then layers `self._raw_kwargs` and `explicit_kwargs`
@@ -248,6 +122,16 @@ class Policy(HParamMixin, nn.Module, ABC):
     from barl.model_config import resolve_slot
     cls, kwargs = resolve_slot(type(self).__name__, slot, self._profile)
     return cls, {**kwargs, **self._raw_kwargs, **explicit_kwargs}
+
+  def resolve_params(self, **explicit_kwargs) -> dict:
+    """Resolves this Policy's own top-level tunable kwargs (read directly
+    off `self` in train_step, not part of any actor/critic slot) from
+    config/models.yaml's `params:` block (see model_config.py), then layers
+    `self._raw_kwargs` and `explicit_kwargs` on top -- same precedence as
+    resolve_component()."""
+    from barl.model_config import resolve_params
+    params = resolve_params(type(self).__name__, self._profile)
+    return {**params, **self._raw_kwargs, **explicit_kwargs}
 
   def build_component(self, slot: str, gate_cls: type, *args, **explicit_kwargs):
     """Resolves + constructs a named slot (actor/critic/squash/...), gated to
@@ -280,13 +164,13 @@ class Policy(HParamMixin, nn.Module, ABC):
     torch.save({
       "policy_class": self.__class__.__name__,
       "state_dict":   self.state_dict(),
-      "hparams":      self.hparams,
+      "profile":      self._profile,
     }, path)
 
   @staticmethod
   def load(type: str, path: str, env: gym.Env) -> "Policy":
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
-    policy = Policy._classes[type](env, **ckpt["hparams"])
+    policy = Policy._classes[type](env, profile=ckpt.get("profile"))
     policy.load_state_dict(ckpt["state_dict"])
     return policy
 

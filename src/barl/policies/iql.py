@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from barl.policy import Policy, Critic, HParam, register_policy
+from barl.policy import Policy, Critic, register_policy
 from barl.networks.mlp import MLP
 from barl.networks.ema import EMA
 from barl.networks.actor import StochasticActor
@@ -24,11 +24,12 @@ class IQLCritic(Critic, nn.Module):
   -- never samples an action from an actor. `advantage()` is an IQL-specific
   extension beyond the base Critic ABC, for IQLPolicy's AWR weighting."""
 
-  polyak_tau = HParam(0.005, "EMA decay step size for the Q target (1 - polyak_tau = decay)", range=(0.001, 0.05))
-  gamma      = HParam(0.99,  "Discount factor",                                               range=(0.9, 0.9999))
-
-  def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int, layers: int, **kwargs):
+  def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int, layers: int,
+               polyak_tau: float, gamma: float, **kwargs):
     super().__init__(**kwargs)
+
+    self.polyak_tau = polyak_tau
+    self.gamma      = gamma
 
     self.q_function = MLP(obs_dim + action_dim, 1, hidden_dim, layers)
     self.v_function = MLP(obs_dim, 1, hidden_dim, layers)
@@ -67,13 +68,14 @@ class IQLPolicy(Policy):
   """Implicit Q-Learning (Kostrikov et al.): critic learns entirely off the
   buffer; actor is a plain advantage-weighted regression (AWR)."""
 
-  tau   = HParam(0.7,  "Expectile for asymmetric value regression",    range=(0.5, 0.99))
-  beta  = HParam(3.0,  "Inverse temperature for advantage weighting",  range=(0.1, 20.0))
-
   def __init__(self, env: gym.Env, **kwargs):
     super().__init__(env, **kwargs)
 
     assert isinstance(env.action_space, gym.spaces.Box)
+
+    params = self.resolve_params()
+    self.tau  = params["tau"]
+    self.beta = params["beta"]
 
     self.critic = self.build_component("critic", IQLCritic, self.observation_dim, self.action_dim)
     self.actor  = self.build_component("actor", StochasticActor, self.observation_dim, self.action_dim)

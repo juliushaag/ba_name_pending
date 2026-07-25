@@ -17,12 +17,36 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(SCRIPT_DIR, "..", "config")
 
 
+def _resolve_model_snapshot(model_name: str) -> dict:
+  """Self-contained mirror of barl.model_config.snapshot_for() -- duplicated
+  (not imported) so this lightweight subprocess-launcher script never has to
+  import the `barl` package (and therefore torch/mujoco) just to read a YAML
+  file. Embedded into each run's per-run YAML under `models:` so the run
+  stays exactly recreatable even if config/models.yaml changes later."""
+  models_path = os.path.join(CONFIG_DIR, "models.yaml")
+  with open(models_path) as f:
+    models = yaml.safe_load(f) or {}
+
+  out: dict = {}
+  alias = models.get("aliases", {}).get(model_name)
+  policy_name = alias["policy"] if alias else model_name
+  if alias:
+    out["aliases"] = {model_name: alias}
+  if policy_name in models:
+    out[policy_name] = models[policy_name]
+  return out
+
+
 def run_one(script: str, model: str, env: str, seed: int, defaults: dict, sweep_dir: str, stream: bool = False) -> int:
   tag = f"{model}_{env}_seed{seed}"
 
   run_config_path = os.path.join(sweep_dir, f"{tag}.yaml")
   with open(run_config_path, "w") as f:
-    yaml.safe_dump({"defaults": defaults, "runs": [{"model": model, "env": env, "seed": seed}]}, f)
+    yaml.safe_dump({
+      "defaults": defaults,
+      "runs": [{"model": model, "env": env, "seed": seed}],
+      "models": _resolve_model_snapshot(model),
+    }, f)
 
   script_path = os.path.join(SCRIPT_DIR, f"{script}.py")
   log_path = os.path.join(sweep_dir, f"{tag}.log")

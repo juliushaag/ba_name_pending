@@ -6,6 +6,7 @@ import torch
 from barl.policy import Policy
 
 import gymnasium as gym
+from torch.utils.data import default_collate
 
 
 class RandomPolicy:
@@ -64,6 +65,7 @@ class ReplayBuffer():
     self.max_transitions = max_transitions
     self.traj_len = traj_len
     self.buffer = list()
+    self._length_cumsum_cache = None
 
   def save_trajectory(self, traj : Trajectory):
     """Evicts random whole chunks (never splits one) until `traj` fits under
@@ -77,6 +79,53 @@ class ReplayBuffer():
       del self.buffer[idx]
 
     self.buffer.append(traj)
+    self._length_cumsum_cache = None
+
+  def _length_cumsum(self):
+    """Cached across sample() calls within the same outer iteration --
+    invalidated (above) whenever save_trajectory() adds/evicts a chunk.
+    Callers that reassign `buffer.buffer = []` directly (on-policy reset)
+    must not call sample() before the next save_trajectory()/rollout()."""
+    if self._length_cumsum_cache is None:
+      self._length_cumsum_cache = np.cumsum([len(t) for t in self.buffer])
+    return self._length_cumsum_cache
+
+  def sample(self, batch_size : int) -> dict:
+    """Draws `batch_size` i.i.d. random transition indices across the whole
+    buffer, with replacement (standard SAC-style minibatch) -- unlike
+    SingleStepDataset, which is an ordered, non-repeating epoch pass. Returns
+    the same keys/dtypes as SingleStepDataset.__getitem__, stacked into a
+    batch."""
+    cumsum = self._length_cumsum()
+    total = int(cumsum[-1])
+    flat_idx = np.random.randint(0, total, size=batch_size)
+
+    base_idx = np.searchsorted(cumsum, flat_idx, side="right")
+    prev = np.where(base_idx == 0, 0, cumsum[np.maximum(base_idx - 1, 0)])
+    traj_idx = flat_idx - prev
+
+    discrete_actions = np.issubdtype(np.asarray(self.buffer[0].actions).dtype, np.integer)
+
+    samples = []
+    for b, t in zip(base_idx.tolist(), traj_idx.tolist()):
+      traj = self.buffer[b]
+
+      act = torch.asarray(traj.actions[t])
+      act = act.long() if discrete_actions else act.float()
+
+      sample = dict(
+        obs=      torch.asarray(traj.observations[t]).float(),
+        next_obs= torch.asarray(traj.observations[t + 1]).float(),
+        act=      act,
+        rew=      torch.asarray(traj.rewards[t]).float(),
+        term=     (t == len(traj) - 1) and traj.terminated,
+      )
+      for key, values in traj.extras.items():
+        sample[key] = torch.asarray(values[t]).float()
+
+      samples.append(sample)
+
+    return default_collate(samples)
 
   def random_fill(self, env : gym.Env | gym.vector.VectorEnv, n_steps : int, seed : int = None):
     """Seeds the buffer with `n_steps` of uniformly-random actions before

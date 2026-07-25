@@ -20,6 +20,7 @@ import torch
 
 from barl.logger import Logger
 from barl import Policy
+import barl.model_config as model_config
 from barl.env import Environment
 
 from barl.rollout import ReplayBuffer
@@ -56,43 +57,42 @@ def evaluate_and_log(model: Policy, env: gym.Env, log: Logger, ckpt_dir: str, be
   return best_reward
 
 
-def train_epoch(model: Policy, opts: dict[str, torch.optim.Optimizer], train_loader, log: Logger, env: gym.Env, ckpt_dir: str, best_reward: float, cfg: dict) -> float:
+def train_batch(model: Policy, opts: dict[str, torch.optim.Optimizer], batch, batch_idx: int,
+                 log: Logger, env: gym.Env, ckpt_dir: str, best_reward: float, cfg: dict) -> float:
+  """One gradient step: loss compute, backward+clip+step per loss key, stat
+  logging, grad_steps increment, periodic eval trigger. Shared by the
+  on-policy epoch loop (train_epoch) and the off-policy fixed-UTD loop in
+  main() -- both just differ in how `batch` is produced."""
+  losses, stats = model.train_step(batch)
 
-  model.on_epoch_start()
-  model.train()
-  num_steps = 0
-  for b, batch in enumerate(train_loader):
-    num_steps += 1
+  for k in losses:
+    opts[k].zero_grad(set_to_none=True)
+    losses[k].backward(retain_graph=True)
+    norm = torch.nn.utils.clip_grad_norm_(
+      [p for group in opts[k].param_groups for p in group["params"]],
+      max_norm=1.0,
+      error_if_nonfinite=True,
+    )
 
-    losses, stats = model.train_step(batch)
+    opts[k].step()
 
-    
-    for k in losses:
-      opts[k].zero_grad(set_to_none=True)
-      losses[k].backward(retain_graph=True)
-      norm = torch.nn.utils.clip_grad_norm_(
-        [p for group in opts[k].param_groups for p in group["params"]],
-        max_norm=1.0,
-        error_if_nonfinite=True,
-      )
+    stats[f"train/loss/{k}"] = losses[k].detach()
+    stats[f"train/norm/{k}"] = norm
 
-      opts[k].step()
+  if batch_idx % cfg["log_every"] == 0:
+    log.log(stats)
 
-      stats[f"train/loss/{k}"] = losses[k].detach() 
-      stats[f"train/norm/{k}"] = norm 
+  log.increment({"grad_steps": 1})
 
-    if b % cfg["log_every"] == 0:
-      log.log(stats)
+  if log.get_step("grad_steps") % cfg["eval_every"] == 0:
+    model.eval()
+    best_reward = evaluate_and_log(model, env, log, ckpt_dir, best_reward, cfg)
+    model.train()
 
-    log.increment({"grad_steps": 1})
+  return best_reward
 
-    if log.get_step("grad_steps") % cfg["eval_every"] == 0:
-      model.eval()
-      best_reward = evaluate_and_log(model, env, log, ckpt_dir, best_reward, cfg)
-      model.train()
 
-  model.on_epoch_end()
-
+def log_model_stats(model: Policy, log: Logger, num_steps: int, cfg: dict) -> None:
   epoch_time = model.epoch_time()
   n_samples  = max(1, num_steps * cfg["batch_size"])
   log.log({
@@ -101,6 +101,20 @@ def train_epoch(model: Policy, opts: dict[str, torch.optim.Optimizer], train_loa
     "model/epoch_time_s":             epoch_time,
     "model/epoch_time_per_sample_ms": 1000 * epoch_time / n_samples,
   })
+
+
+def train_epoch(model: Policy, opts: dict[str, torch.optim.Optimizer], train_loader, log: Logger, env: gym.Env, ckpt_dir: str, best_reward: float, cfg: dict) -> float:
+
+  model.on_epoch_start()
+  model.train()
+  num_steps = 0
+  for b, batch in enumerate(train_loader):
+    num_steps += 1
+    best_reward = train_batch(model, opts, batch, b, log, env, ckpt_dir, best_reward, cfg)
+
+  model.on_epoch_end()
+
+  log_model_stats(model, log, num_steps, cfg)
 
   return best_reward
 
@@ -150,6 +164,10 @@ def main(cfg: dict):
   MODEL = cfg["model"]
   ENV   = cfg["env"]
 
+  # Unconditional: also resets any override left over from a previous run in
+  # this process's `runs:` series when the current run doesn't carry one.
+  model_config.set_models_override(cfg.get("models"))
+
   now  = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
   name = f"{MODEL.lower()}/{ENV.lower()}/{now}"
 
@@ -179,12 +197,14 @@ def main(cfg: dict):
   if cfg.get("sweep_tag"):
     tags.append(cfg["sweep_tag"])
 
+  resolved_model_cfg = cfg.get("models") or model_config.snapshot_for(MODEL)
+
   log = Logger(
     "BA-RL",
     run_name=name,
     step_keys={"env_steps", "grad_steps"},
     tags=tags,
-    config={**cfg, "hparams": model.hparams,
+    config={**cfg, "resolved_model": resolved_model_cfg,
             "env_obs": str(env.observation_space), "env_act": str(env.action_space)},
     group=cfg["sweep_tag"]
   )
@@ -216,8 +236,14 @@ def main(cfg: dict):
     log.log({f"rollout/{k}": v for k, v in rollout_stats.items()})
 
     n_transitions = sum(len(traj) for traj in buffer.buffer)
-    batches_per_epoch = -(-n_transitions // cfg["batch_size"])  # ceil div
-    grad_steps_this_iter = batches_per_epoch * cfg["epochs_per_rollout"]
+
+    if model.on_policy:
+      batches_per_epoch = -(-n_transitions // cfg["batch_size"])  # ceil div
+      grad_steps_this_iter = batches_per_epoch * cfg["epochs_per_rollout"]
+    else:
+      # Fixed UTD ratio, independent of however large the (never-cleared) buffer
+      # has grown -- NOT a shuffled epoch pass over the whole thing.
+      grad_steps_this_iter = round(cfg["rollout_steps"] * cfg["utd_ratio"])
 
     log.message(f"Finished Rollout buffer contains {len(buffer.buffer)} episodes "
                 f"({n_transitions} transitions, ~{grad_steps_this_iter} grad steps this iter)")
@@ -228,17 +254,26 @@ def main(cfg: dict):
       # GAE needs the trajectories in-order -- must run before SingleStepDataset shuffles them.
       compute_gae(buffer.buffer, model.critic, gamma=model.gamma, lam=model.lam, device=model.device)
 
-    train_loader = torch.utils.data.DataLoader(
-      SingleStepDataset.from_replay(buffer),
-      batch_size=cfg["batch_size"],
-      shuffle=True,
-    )
+      train_loader = torch.utils.data.DataLoader(
+        SingleStepDataset.from_replay(buffer),
+        batch_size=cfg["batch_size"],
+        shuffle=True,
+      )
 
-    for _ in range(cfg["epochs_per_rollout"]):
-      best_reward = train_epoch(model, opts, train_loader, log, env, ckpt_dir, best_reward, cfg)
+      for _ in range(cfg["epochs_per_rollout"]):
+        best_reward = train_epoch(model, opts, train_loader, log, env, ckpt_dir, best_reward, cfg)
 
-    if model.on_policy:
       buffer.buffer = []  # never replay trajectories from a stale policy version
+
+    else:
+      model.on_epoch_start()
+      model.train()
+      for b in range(grad_steps_this_iter):
+        batch = buffer.sample(cfg["batch_size"])
+        best_reward = train_batch(model, opts, batch, b, log, env, ckpt_dir, best_reward, cfg)
+      model.on_epoch_end()
+
+      log_model_stats(model, log, grad_steps_this_iter, cfg)
 
     it += 1
 

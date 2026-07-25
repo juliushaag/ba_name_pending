@@ -4,7 +4,7 @@ from barl.networks import bfloat16, float32
 import torch
 from torch import nn
 
-from barl.networks.entro import EntropyRegulator
+from barl.networks.regulator import AutotuneRegulator
 from barl.policy import Policy, register_policy
 from barl.networks.actor import StochasticActor
 from barl.networks.critic import QCriticBase
@@ -24,10 +24,14 @@ class SACPolicy(Policy):
 
     assert isinstance(env.action_space, gym.spaces.Box)
 
+
+    params = self.resolve_params()
+    self.entropy_scale        = params["entropy_scale"]
+
     self.critic : QCriticBase = self.build_component("critic", QCriticBase, self.observation_dim, self.action_dim, pessimistic_score=False)
     self.actor : StochasticActor = self.build_component("actor", StochasticActor, self.observation_dim, self.action_dim)
 
-    self.entropy : EntropyRegulator = self.build_component("entropy", EntropyRegulator, self.action_dim)
+    self.entropy : AutotuneRegulator = self.build_component("entropy", AutotuneRegulator, target=self.action_dim * self.entropy_scale, name="entropy")
 
   def on_epoch_start(self):
     self.critic.on_epoch_start()
@@ -60,24 +64,25 @@ class SACPolicy(Policy):
     term     = batch["term"].to(self.device)
 
 
+    self.critic.step()
     losses, log = {}, {}
     alpha = self.entropy.value()
 
     with bfloat16():
 
       with torch.no_grad():
-        next_action, next_nlog_prob = self.rsample(next_obs)
-        entropy_bonus = alpha * next_nlog_prob
+        next_action, next_entropy = self.rsample(next_obs)
+        entropy_bonus = alpha * next_entropy
 
-      new_action, nlog_prob = self.rsample(obs)
+      new_action, entropy = self.rsample(obs)
       q_new      = self.critic.value(obs, new_action)
 
     with float32():
 
       self.critic.loss(obs, action, reward, term, next_obs, next_action, entropy_bonus, log, losses)
-      self.entropy.loss(nlog_prob.detach(), log, losses)
+      self.entropy.loss(entropy.detach(), log, losses)
 
-      actor_loss = -(q_new + (alpha * nlog_prob)).mean() # Gradient descent therfore the minus
+      actor_loss = -(q_new + (alpha * entropy)).mean() # Gradient descent therfore the minus
 
 
     losses["actor"] = actor_loss

@@ -95,9 +95,10 @@ Every algorithm is one `Policy` subclass (`src/barl/policy.py`) composing an `Ac
 (`src/barl/networks/actor.py`) and, where applicable, a `Critic` (`src/barl/networks/critic.py`).
 The load-bearing convention throughout the codebase:
 
-- **Actor/Critic = pure architecture** (plus whatever HParams are intrinsic to that architecture's
-  own process — e.g. a diffusion actor's noise schedule, a critic's ensemble pessimism). No
-  algorithm logic lives here.
+- **Actor/Critic = pure architecture** (plus whatever tunables are intrinsic to that architecture's
+  own process — e.g. a diffusion actor's noise schedule, a critic's ensemble pessimism — supplied
+  as required kwargs from `config/models.yaml`, no Python-level defaults). No algorithm logic
+  lives here.
 - **Policy = the whole algorithm**: Bellman targets, advantage weighting, clipped surrogates,
   entropy/trust-region duals, adjoint matching — everything algorithm-specific lives in that
   Policy's `train_step`, calling into whatever its actor/critic expose.
@@ -119,7 +120,8 @@ Score-based actors deliberately return a **raw, unsquashed** terminal state from
 Policy makes on top (e.g. AMDP's `ErfSquash`), not something the actor architecture bakes in.
 
 Concrete critics in `networks/critic.py`, all subclassing `QCriticBase` (shared Polyak-averaged
-target net, `rho`/`polyak_tau`/`gamma` HParams, mean-minus-`rho`*std pessimistic lower bound):
+target net, `rho`/`polyak_tau`/`gamma` -- config/models.yaml-supplied, see below --
+mean-minus-`rho`*std pessimistic lower bound):
 - `MeanStdEnsembleCritic` — `n_models` independent MLP heads reduced by mean - rho*std; spread =
   epistemic uncertainty. Default for every continuous-action off-policy algorithm here.
 - `MeanEnsembleCritic` / `MinEnsembleCritic` — same `n_models` MLP-head ensemble, reduced by plain
@@ -144,23 +146,43 @@ Only two call sites ever need it: `ReplayBuffer.rollout()` (immediately before `
 canonical — a Policy re-invoking its own actor mid-`train_step` (e.g. for a Bellman bootstrap
 action) can feed the result straight to its critic with no further conversion.
 
-### HParam machinery
+### Tunables all live in config/models.yaml -- there is no Python-level HParam system
 
-`HParam`/`HParamMixin` (`src/barl/policy.py`) is the shared hyperparameter declaration system
-mixed into `Policy`, `Actor` and `Critic`. Declare an HParam as a class attribute:
+Every tunable value -- both architecture kwargs (`hidden_dim`, `layers`, ...) and algorithm
+tunables that used to be a separate `HParam`-declared axis (`rho`, `gamma`, `tr_lambda_init`, PPO's
+`clip_eps`, ...) -- is a required, no-default keyword argument supplied from `config/models.yaml`.
+There is no Python-level fallback anywhere in this chain; a missing value is a `KeyError`/`TypeError`
+at construction time, not a silently-applied default.
 
-```python
-rho = HParam(2.0, "Pessimism weight on Q std", range=(0.0, 5.0))
-```
+- **Component-level tunables** (things an `Actor`/`Critic` itself needs, e.g. `QCriticBase`'s
+  `rho`/`polyak_tau`/`gamma`, `ScoreContinuousActor`'s `sigma_min`/`sigma_max`/`tau_min`/`tau_max`)
+  are just more keys in that component's slot dict in `config/models.yaml`, resolved the same way
+  as `hidden_dim`/`layers` via `Policy.build_component()`/`resolve_component()` →
+  `model_config.resolve_slot()`.
+- **Policy-level tunables** (things a Policy reads directly off `self` in `train_step`, not part of
+  any actor/critic slot -- AMDP's `tr_lambda_init`/`tr_epsilon`, PPO's `gamma`/`lam`/`clip_eps`/
+  `entropy_coef`, IQL's `tau`/`beta`, FlowQL's `alpha`) live in a `params:` block alongside that
+  policy's `components:` block in `config/models.yaml`, resolved via `Policy.resolve_params()` →
+  `model_config.resolve_params()` (same `models.yaml` < profile-override < `_raw_kwargs` <
+  explicit-kwargs precedence as `resolve_component()`), called once early in the Policy's
+  `__init__` and assigned by required dict key.
 
-`apply_hparams(kwargs)` resolves+validates+`setattr`s every HParam this class declares and is
-called in every `__init__`; each class's full unfiltered `kwargs` is forwarded to every component
-it constructs (Policy → Actor, Policy → Critic), and each recipient's `resolve_hparams` silently
-ignores names it doesn't declare — so a Policy never needs to know which of its sub-components
-owns a given hyperparameter name. `Policy.hparams` merges the Policy's own HParams with its
-actor's/critic's into one flat dict for checkpointing and run-config logging.
-`describe_hparams()`/`sample_hparams()` are introspection/random-search helpers off the same
-descriptors.
+Because `config/models.yaml` is now the *only* place tunables live, a checkpoint's reconstruction
+(`Policy.save`/`Policy.load`) only needs to persist which `profile` was used, not a `hparams` dict
+-- both architecture and former-HParams come back from `config/models.yaml` at load time, so
+keeping that file (or a run's own frozen snapshot of it, see below) stable is what makes a
+checkpoint reproducible.
+
+`model_config.snapshot_for(name)` returns the minimal `config/models.yaml` sub-dict needed to
+reproduce resolving `name` later (the `aliases:` entry if `name` is one, plus the resolved policy's
+full block). `scripts/run_sweep.py` embeds this into every per-run YAML it writes under a `models:`
+key (via a small dependency-free local mirror of `snapshot_for()`, so the lightweight
+subprocess-launcher script never has to import `barl` itself); `config.py`'s `load_config()` threads
+that key through to `cfg["models"]`, and `scripts/online_learning.py`'s `main()` applies it via
+`model_config.set_models_override()` before constructing the Policy -- so a saved sweep run stays
+exactly recreatable even if `config/models.yaml` changes afterward. The same resolved-config dict
+(embedded snapshot, or freshly computed via `snapshot_for()` for a non-sweep run) is logged to
+wandb under `"resolved_model"` in every run's `config=` dict.
 
 ### Rollout / replay / dataset pipeline
 

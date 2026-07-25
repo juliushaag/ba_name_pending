@@ -4,12 +4,12 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from barl.networks.entro import EntropyRegulator
-from barl.policy import Policy, HParam, register_policy
+from barl.networks.regulator import AutotuneRegulator
+from barl.policy import Policy, register_policy
 from barl.networks import bfloat16, float32
 from barl.networks.actor import ScoreContinuousActor
 from barl.networks.critic import QCriticBase
-from barl.networks.ema import Shadow
+from barl.networks.ema import EMA, Shadow
 from barl.networks.flow import sinusoidal_emb
 from barl.networks.squash import Squash
 
@@ -23,35 +23,30 @@ class AMDP(Policy):
   vector field, with an entropy dual and a trust-region dual regularizing
   against `actor_old` (a Shadow snapshot resynced once per epoch)."""
 
-  tr_lambda_init = HParam(0.5,   "Trust region lambda (dual variable init)",  range=(0.01, 5.0))
-  tr_epsilon     = HParam(0.1,   "Trust region KL/L2 bound",                  range=(0.01, 1.0))
-
   def __init__(self, env: gym.Env, **kwargs):
 
     super().__init__(env, **kwargs)
+
+    params = self.resolve_params()
+    self.entropy_scale        = params["entropy_scale"]
 
     assert isinstance(env.action_space, gym.spaces.Box)
 
     self.critic : QCriticBase = self.build_component("critic", QCriticBase, self.observation_dim, self.action_dim, pessimistic_score=True)
     self.actor  : ScoreContinuousActor = self.build_component("actor", ScoreContinuousActor, self.observation_dim, self.action_dim)
 
-    self.actor_old = Shadow(self.actor)
+    self.actor_old = EMA(self.actor)
 
 
-    self.entropy : EntropyRegulator = self.build_component("entropy", EntropyRegulator, self.action_dim)
-
-    self.log_tr_lambda = nn.Parameter(torch.tensor(math.log(self.tr_lambda_init)))
+    self.entropy : AutotuneRegulator = self.build_component("entropy", AutotuneRegulator, target=self.action_dim * self.entropy_scale, name="entropy")
+    self.tr_lambda : AutotuneRegulator = self.build_component("trust_region", AutotuneRegulator, name="trust_region")
 
     sig_sq_one = self.actor.sigma_sq_int_fn(torch.tensor(self.actor.tau_max))
     self.squash = self.build_component("squash", Squash, erf_k=(2 * sig_sq_one) ** -0.5)
 
-  def clamp_tr_lambda(self, lo: float = 1e-4, hi: float = 10.0):
-    with torch.no_grad():
-      self.log_tr_lambda.clamp_(math.log(lo), math.log(hi))
-
   def on_epoch_start(self):
     self.critic.on_epoch_start()
-    self.actor_old.on_epoch_start()
+    # self.actor_old.on_epoch_start()
     return super().on_epoch_start()
 
   def create_optimizer(self):
@@ -59,7 +54,6 @@ class AMDP(Policy):
       **self.critic.create_optimizer(),
       **self.actor.create_optimizer(),
       **self.entropy.create_optimizer(),
-      "tr_lambda": torch.optim.Adam([self.log_tr_lambda], lr=1e-3, maximize=True),
     }
 
   def train_step(self, batch) -> tuple[dict, dict]:
@@ -73,27 +67,24 @@ class AMDP(Policy):
 
     X     = batch["X"].to(self.device)
 
-    self.clamp_tr_lambda()
+    self.critic.step()
+    self.actor_old.step()
 
     alpha     = self.entropy.value()
-    tr_lambda = self.log_tr_lambda.exp()
+    tr_lambda = self.tr_lambda.value()
 
     losses, log = {}, {}
 
     with bfloat16():
-
       with torch.no_grad():
-        
         next_X, entropy_penalty = self.actor.generate_action(next_obs)
         next_action = self.squash(next_X)
-
-        penalty = (alpha * entropy_penalty).detach()
+        entropy_bonus = (alpha * entropy_penalty).detach()
 
 
       with float32():
-        self.critic.loss(obs, action, reward, term, next_obs, next_action, penalty, log, losses)
-        self.entropy.loss(entropy_penalty.detach(), log, losses)
-
+        self.critic.loss(obs, action, reward, term, next_obs, next_action, entropy_bonus, log, losses)
+        
       tau = torch.rand((obs.shape[0],), device=obs.device)
 
       sigma_tau = self.actor.sigma_fn(tau).unsqueeze(-1)
@@ -104,8 +95,8 @@ class AMDP(Policy):
 
       time_embed = sinusoidal_emb(tau.view(obs.shape[0], 1), self.actor.time_dim)
 
-      u     = self.actor.diffusion_act(obs, X_t, time_embed) * sigma_tau
-      u_old = self.actor_old.target.diffusion_act(obs, X_t, time_embed) * sigma_tau
+      u = self.actor.diffusion_act(obs, X_t, time_embed)
+      # u_old = self.actor_old.target.diffusion_act(obs, X_t, time_embed)
 
       def q_values(x):
         a = self.squash(x)
@@ -114,20 +105,22 @@ class AMDP(Policy):
       x_score : torch.Tensor = torch.func.grad(q_values)(X)
 
       with float32():
-        amdp_target = sigma_tau * x_score
+        amdp_target = sigma_tau * x_score.div(alpha)
+        
+        amdp_loss = 0.5 * F.mse_loss(u, amdp_target)
+        # tr_loss   = 0.5 * F.mse_loss(u.float(), u_old.float())
 
-        amdp_loss = 0.5 * ((u.float() - amdp_target.float()) ** 2 / sigma_tau).mean()
-        tr_loss   = 0.5 * F.mse_loss(u.float(), u_old.float())
+        # self.tr_lambda.loss(tr_loss, log, losses)
+        self.entropy.loss(entropy_penalty.detach(), log, losses)
 
-        tr_lambda_loss = tr_lambda * (tr_loss.detach() - self.tr_epsilon)
-        actor_loss     = amdp_loss + tr_lambda.detach() * (tr_loss - self.tr_epsilon)
+        actor_loss     = amdp_loss # + tr_lambda * (tr_loss - self.tr_lambda.target())
 
     losses["actor"]     = actor_loss
-    losses["tr_lambda"] = tr_lambda_loss
 
     log.update({
       "stats/amdp":                     amdp_loss.detach(),
-      "stats/tr_lambda":                tr_lambda.detach(),
+      "stats/amdp_target" :             amdp_target.detach().mean(),
+      "stats/u_norm":                   u.detach().norm(dim=-1).mean(),  
       "stats/score_norm":               x_score.detach().norm(dim=-1).mean(),
     })
     return losses, log

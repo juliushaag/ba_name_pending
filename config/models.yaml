@@ -28,12 +28,15 @@ aliases:
   SACLarge: {policy: SACPolicy, profile: Large}
 
 SACPolicy:
+  params:
+    entropy_scale: -1.0
+
   components:
     actor:    {class: StochasticActor, hidden_dim: 256, layers: 3, squash_cls: TanhSquash}
     # critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
-    critic:   {class: MinEnsembleCritic, hidden_dim: 2048, layers: 2, n_models: 10}
-    squash:   {class: TanhSquash}
-    entropy:  {class: EntropyRegulator, alpha_init: 0.01, min_alpha: 1.0e-6, max_alpha: 15.0, entropy_factor: -1.0}
+    critic:   {class: MinEnsembleCritic, hidden_dim: 512, layers: 2, n_models: 10, rho: 2.0, polyak_tau: 0.005, gamma: 0.99}
+    
+    entropy:  {class: AutotuneRegulator, alpha_init: 0.01, min_alpha: 1.0e-6, max_alpha: 50.0 }
 
   profiles:
     Small:
@@ -44,36 +47,66 @@ SACPolicy:
       critic: {hidden_dim: 512, layers: 3, n_models: 5}
 
 DIMEPolicy:
+  params:
+    entropy_scale: -4.0
+  
   components:
-    actor:  {class: ScoreDiscreteActor, latent_dim: 256, layers: 3, num_steps: 16}
+    actor:  {class: ScoreDiscreteActor, latent_dim: 256, layers: 3, num_steps: 20, noise_start: 0.999, noise_end: 0.001 }
     # critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
-    critic: {class: MinEnsembleCritic, hidden_dim: 2048, layers: 2, n_models: 10}
+    critic: {class: MinEnsembleCritic, hidden_dim: 512, layers: 2, n_models: 10, rho: 2.0, polyak_tau: 0.005, gamma: 0.99}
     squash: {class: TanhSquash}
-    entropy: {class: EntropyRegulator, alpha_init: 0.01, min_alpha: 1.0e-6, max_alpha: 10.0, entropy_factor: -4.0}
+    entropy: {class: AutotuneRegulator, alpha_init: 0.01, min_alpha: 1.0e-6, max_alpha: 50.0 }
 
 AMDP:
-  components:
-    actor:  {class: ScoreContinuousActor, latent_dim: 512, layers: 3, max_steps: 32}
-    # critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
-    critic: {class: MinEnsembleCritic, hidden_dim: 2048, layers: 2, n_models: 10}
-    squash: {class: ErfSquash}   # `k` is always derived at construction time -- see AMDP.__init__
-    entropy: {class: EntropyRegulator, alpha_init: 0.01, min_alpha: 1.0e-4, max_alpha: 5.0, entropy_factor: -1.0}
+  params:
+    entropy_scale: -1.0
 
+  components:
+    actor:  {class: ScoreContinuousActor, latent_dim: 256, layers: 3, max_steps: 16, sigma_min: 0.01, sigma_max: 2.5, tau_min: 0.01, tau_max: 1.0, layernorm: true}
+    # critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
+    critic: {class: MinEnsembleCritic, hidden_dim: 512, layers: 2, n_models: 10, rho: 2.0, polyak_tau: 0.005, gamma: 0.99}
+    squash: {class: ErfSquash}   # `k` is always derived at construction time -- see AMDP.__init__
+    entropy: {class: AutotuneRegulator, alpha_init: 0.01, min_alpha: 1.0e-6, max_alpha: 50.0}
+    trust_region: {class: AutotuneRegulator, alpha_init: 0.5, min_alpha: 1.0e-6, max_alpha: 10.0, target: 0.2}
+
+
+SDAC:
+  params:
+    entropy_scale: -1.0
+    num_candidates: 20
+    explore_init: 0.1
+
+  components:
+    actor:  {class: ScoreDiscreteActor, latent_dim: 256, layers: 3, num_steps: 20, noise_start: 0.999, noise_end: 0.001 }
+    # critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
+    critic: {class: MinEnsembleCritic, hidden_dim: 2048, layers: 2, n_models: 10, rho: 2.0, polyak_tau: 0.005, gamma: 0.99}
+    squash: {class: TanhSquash}   # `k` is always derived at construction time -- see AMDP.__init__
+    entropy: {class: AutotuneRegulator, alpha_init: 0.01, min_alpha: 1.0e-6, max_alpha: 50.0}
 
 PPOPolicy:
+  params:
+    gamma: 0.99
+    lam: 0.95
+    clip_eps: 0.2
+    entropy_coef: 0.05
   components:
     actor:  {class: StochasticActor, hidden_dim: 256, layers: 4, squash_cls: TanhSquash}
     critic: {class: PPOCritic,       hidden_dim: 256, layers: 4}
 
 IQLPolicy:
+  params:
+    tau: 0.7
+    beta: 3.0
   components:
     actor:  {class: StochasticActor, hidden_dim: 256, layers: 6, squash_cls: TanhSquash}
-    critic: {class: IQLCritic,       hidden_dim: 256, layers: 6}
+    critic: {class: IQLCritic,       hidden_dim: 256, layers: 6, polyak_tau: 0.005, gamma: 0.99}
 
 FlowQLPolicy:
+  params:
+    alpha: 100.0
   components:
     actor:  {class: DistilledFlowActor, latent_dim: 512, flow_steps: 16, time_dim: 8}
-    critic: {class: MeanStdEnsembleCritic, hidden_dim: 512, layers: 4, n_models: 10}
+    critic: {class: MeanStdEnsembleCritic, hidden_dim: 512, layers: 4, n_models: 10, rho: 2.0, polyak_tau: 0.005, gamma: 0.99}
 
 FlowBCPolicy:
   components:

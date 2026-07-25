@@ -26,6 +26,43 @@ class DMControlEnvironment(Environment):
   def get_dataset(self) -> SingleStepDataset:
     raise NotImplementedError(f"{type(self).__name__} has no offline dataset -- DeepMind Control Suite is online-only.")
 
+# Doggo
+
+@register_environment
+class DogRun(DMControlEnvironment):
+  def domain_task(self): return ("dog", "run")
+
+
+@register_environment
+class DogStand(DMControlEnvironment):
+  def domain_task(self): return ("dog", "stand")
+
+@register_environment
+class DogWalk(DMControlEnvironment):
+  def domain_task(self): return ("dog", "walk")
+
+
+@register_environment
+class DogTrot(DMControlEnvironment):
+  def domain_task(self): return ("dog", "Trot")
+
+
+# Humanoid 
+
+
+@register_environment
+class HumanoidWalk(DMControlEnvironment):
+  def domain_task(self): return ("humanoid", "walk")
+
+@register_environment
+class HumanoidRun(DMControlEnvironment):
+  def domain_task(self): return ("humanoid", "run")
+
+@register_environment
+class HumanoidStand(DMControlEnvironment):
+  def domain_task(self): return ("humanoid", "stand")
+
+
 
 @register_environment
 class CartpoleSwingup(DMControlEnvironment):
@@ -54,14 +91,6 @@ class HopperHop(DMControlEnvironment):
 @register_environment
 class HopperStand(DMControlEnvironment):
   def domain_task(self): return ("hopper", "stand")
-
-@register_environment
-class HumanoidWalk(DMControlEnvironment):
-  def domain_task(self): return ("humanoid", "walk")
-
-@register_environment
-class HumanoidRun(DMControlEnvironment):
-  def domain_task(self): return ("humanoid", "run")
 
 @register_environment
 class QuadrupedWalk(DMControlEnvironment):

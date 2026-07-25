@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from barl.policy import Policy, HParam, register_policy
+from barl.policy import Policy, register_policy
 from barl.networks.mlp import MLP
 from barl.networks.actor import StochasticActor
 from barl.networks.registry import register_component
@@ -36,15 +36,16 @@ class PPOPolicy(Policy):
 
   on_policy = True
 
-  gamma        = HParam(0.99, "Discount factor for GAE",              range=(0.9, 0.9999))
-  lam          = HParam(0.95, "GAE lambda (bias/variance trade-off)", range=(0.0, 1.0))
-  clip_eps     = HParam(0.2,  "PPO clipped-surrogate ratio bound",    range=(0.05, 0.5))
-  entropy_coef = HParam(0.05,  "Weight on the entropy bonus",          range=(0.0, 0.1))
-
   def __init__(self, env: gym.Env, **kwargs):
     super().__init__(env, **kwargs)
 
     assert isinstance(env.action_space, gym.spaces.Box)
+
+    params = self.resolve_params()
+    self.gamma        = params["gamma"]
+    self.lam          = params["lam"]
+    self.clip_eps     = params["clip_eps"]
+    self.entropy_coef = params["entropy_coef"]
 
     # PPOCritic takes obs_dim only (no action_dim; it's a state-value V(s), not a Q(s,a)).
     self.critic = self.build_component("critic", PPOCritic, self.observation_dim)
