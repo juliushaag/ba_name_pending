@@ -5,6 +5,7 @@ import os
 import shlex
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import yaml
@@ -37,7 +38,21 @@ def _resolve_model_snapshot(model_name: str) -> dict:
   return out
 
 
-def run_one(script: str, model: str, env: str, seed: int, defaults: dict, sweep_dir: str, stream: bool = False) -> int:
+def detect_gpus() -> list[str]:
+  """Best-effort GPU index detection via nvidia-smi, without depending on torch. Returns [] if
+  nvidia-smi isn't available/fails, meaning: don't restrict CUDA_VISIBLE_DEVICES at all."""
+  try:
+    out = subprocess.run(
+      ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+      capture_output=True, text=True, check=True,
+    )
+    return [line.strip() for line in out.stdout.splitlines() if line.strip()]
+  except (OSError, subprocess.CalledProcessError):
+    return []
+
+
+def run_one(script: str, model: str, env: str, seed: int, defaults: dict, sweep_dir: str,
+            gpu_id: str | None = None, stream: bool = False) -> int:
   tag = f"{model}_{env}_seed{seed}"
 
   run_config_path = os.path.join(sweep_dir, f"{tag}.yaml")
@@ -52,12 +67,17 @@ def run_one(script: str, model: str, env: str, seed: int, defaults: dict, sweep_
   log_path = os.path.join(sweep_dir, f"{tag}.log")
   cmd = [sys.executable, script_path, "--config", run_config_path]
 
+  env_vars = os.environ.copy()
+  if gpu_id is not None:
+    env_vars["CUDA_VISIBLE_DEVICES"] = gpu_id
+    tag = f"{tag}_gpu{gpu_id}"
+
   print(f"[{tag}] starting -- log: {log_path}\n[{tag}] $ {shlex.join(cmd)}")
   with open(log_path, "w") as logf:
     if stream:
       # --validate runs: tee each line (tag-prefixed) to the terminal as well as the log file.
       proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars,
       )
       for line in proc.stdout:
         print(f"[{tag}] {line}", end="")
@@ -65,7 +85,7 @@ def run_one(script: str, model: str, env: str, seed: int, defaults: dict, sweep_
       proc.wait()
     else:
       proc = subprocess.run(
-        cmd, stdout=logf, stderr=subprocess.STDOUT,
+        cmd, stdout=logf, stderr=subprocess.STDOUT, env=env_vars,
       )
 
   status = "OK" if proc.returncode == 0 else f"FAILED (exit {proc.returncode})"
@@ -84,7 +104,13 @@ if __name__ == "__main__":
                      help="Which training script to launch each run with")
   args.add_argument("--config", default=None,
                      help="Base config providing `defaults:` for every run (default: config/<script>.yaml)")
-  args.add_argument("--max_parallel", type=int, default=3, help="Max concurrent runs (0 = unlimited)")
+  args.add_argument("--max_parallel", type=int, default=3,
+                     help="Max concurrent runs per GPU (0 = unlimited per GPU). Total concurrency "
+                          "is this times the number of GPUs in --gpus / detected via nvidia-smi.")
+  args.add_argument("--gpus", nargs="+", default=None,
+                     help="GPU indices to spread runs across, e.g. --gpus 0 1 2 3 -- each run gets "
+                          "CUDA_VISIBLE_DEVICES set to exactly one of these. Default: autodetect "
+                          "via nvidia-smi; if that finds none, CUDA_VISIBLE_DEVICES is left untouched.")
   args.add_argument("--validate", action="store_true",
                      help="Smoke-test every {algo x env} combination instead of running a full "
                           "sweep: one rollout chunk + one train_step + optimizer step each, no "
@@ -111,14 +137,38 @@ if __name__ == "__main__":
   sweep_tag = "sweep-" + datetime.datetime.now().strftime("%m-%d-%H-%M")
   defaults = {**defaults, "sweep_tag": sweep_tag}
 
-  max_workers = kwargs.max_parallel if kwargs.max_parallel > 0 else len(combos)
+  gpus = kwargs.gpus if kwargs.gpus is not None else detect_gpus()
+  per_gpu_limit = kwargs.max_parallel if kwargs.max_parallel > 0 else None
+
+  if gpus:
+    semaphores = {g: threading.Semaphore(per_gpu_limit) for g in gpus} if per_gpu_limit else None
+    max_workers = (per_gpu_limit * len(gpus)) if per_gpu_limit else len(combos)
+    gpu_desc = f", gpus={gpus}, max_parallel_per_gpu={per_gpu_limit or 'unlimited'}"
+  else:
+    semaphores = None
+    max_workers = per_gpu_limit or len(combos)
+    gpu_desc = ""
+
   desc = (f"{len(combos)} validate run(s) ({len(kwargs.algos)} algos x {len(kwargs.envs)} envs)" if kwargs.validate
           else f"{len(combos)} runs ({len(kwargs.algos)} algos x {len(kwargs.envs)} envs x {kwargs.seeds} seeds)")
-  print(f"Launching {desc}, max_parallel={max_workers}, logs under {sweep_dir}")
+  print(f"Launching {desc}, max_parallel={max_workers}{gpu_desc}, logs under {sweep_dir}")
+
+  def run_one_gated(script, model, env, seed, defaults, sweep_dir, gpu_id, stream):
+    sem = semaphores[gpu_id] if semaphores else None
+    if sem is not None:
+      sem.acquire()
+    try:
+      return run_one(script, model, env, seed, defaults, sweep_dir, gpu_id=gpu_id, stream=stream)
+    finally:
+      if sem is not None:
+        sem.release()
 
   with ThreadPoolExecutor(max_workers=max_workers) as pool:
-    futures = [pool.submit(run_one, kwargs.script, algo, env, seed, defaults, sweep_dir, kwargs.validate)
-               for seed, env, algo  in combos]
+    futures = [
+      pool.submit(run_one_gated, kwargs.script, algo, env, seed, defaults, sweep_dir,
+                  gpus[i % len(gpus)] if gpus else None, kwargs.validate)
+      for i, (seed, env, algo) in enumerate(combos)
+    ]
     results = [f.result() for f in futures]
 
   failed = sum(1 for r in results if r != 0)
