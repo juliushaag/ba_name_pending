@@ -75,6 +75,11 @@ class DIMEPolicy(Policy):
     
     losses["actor"]  = dime_loss
 
+    log.update({
+      "stats/reward_mean" :             reward.mean(),
+      "stats/act_abs" :                 next_action.abs().mean(),
+    })
+
     return losses, log
 
   @torch.inference_mode()

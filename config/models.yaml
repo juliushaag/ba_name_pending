@@ -51,15 +51,30 @@ DIMEPolicy:
     entropy_scale: -4.0
   
   components:
-    actor:  {class: ScoreDiscreteActor, latent_dim: 256, layers: 3, num_steps: 20, noise_start: 0.999, noise_end: 0.001 }
+    actor: 
+      class: ScoreDiscreteActor
+      latent_dim: 256
+      layers: 3
+      num_steps: 20
+      beta_min: 0.12
+      beta_max: 0.18
+      beta_scale_min: 0.7
+      beta_scale_max: 1.8
+      learn_beta_scale: true
+      eta_init: 1.5811 # sqrt(2.5)
+      learn_eta: false
+      anchor_score: true,
+      noise_start: 0.999
+      noise_end: 0.001
+
     # critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
     critic: {class: MinEnsembleCritic, hidden_dim: 512, layers: 2, n_models: 10, rho: 2.0, polyak_tau: 0.005, gamma: 0.99}
     squash: {class: TanhSquash}
-    entropy: {class: AutotuneRegulator, lr: 3e-4, alpha_init: 0.005, min_alpha: 0.0001, max_alpha: 10.0 }
+    entropy: {class: AutotuneRegulator, lr: 3e-4, alpha_init: 0.001, min_alpha: 0.0001, max_alpha: 10.0 }
 
 AMDP:
   params:
-    entropy_scale: -1.0
+    entropy_scale: -1.5
 
   components:
     actor:  {class: ScoreContinuousActor, latent_dim: 256, layers: 3, max_steps: 16, sigma_min: 2.0, sigma_max: 2.5, tau_min: 0.0, tau_max: 1.0 }
@@ -76,10 +91,24 @@ SDAC:
     num_candidates: 20
     explore_init: 0.1
 
-  components:
-    actor:  {class: ScoreDiscreteActor, latent_dim: 256, layers: 3, num_steps: 20, noise_start: 0.999, noise_end: 0.001 }
+    components:
+      class: ScoreDiscreteActor
+      latent_dim: 256
+      layers: 3
+      num_steps: 20
+      beta_min: 0.12
+      beta_max: 0.18
+      beta_scale_min: 0.7
+      beta_scale_max: 1.8
+      learn_beta_scale: true
+      eta_init: 1.5811 # sqrt(2.5)
+      learn_eta: false
+      anchor_score: true,
+      noise_start: 0.999
+      noise_end: 0.001
+
     # critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
-    critic: {class: MinEnsembleCritic, hidden_dim: 2048, layers: 2, n_models: 10, rho: 2.0, polyak_tau: 0.005, gamma: 0.99}
+    critic: {class: MinEnsembleCritic, hidden_dim: 512, layers: 2, n_models: 10, rho: 2.0, polyak_tau: 0.005, gamma: 0.99}
     squash: {class: TanhSquash}   # `k` is always derived at construction time -- see AMDP.__init__
     entropy: {class: AutotuneRegulator, lr: 3e-4, alpha_init: 0.05, min_alpha: 0.01, max_alpha: 10.0}
 

@@ -149,127 +149,183 @@ class ScoreContinuousActor(Actor, nn.Module):
 
   def create_optimizer(self) -> dict:
     return {"actor": torch.optim.Adam(self.diffusion_act.parameters(), lr=3e-4)}
+import math
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+
+from barl.networks.mlp import MLP
+from barl.networks.flow import sinusoidal_emb
+from barl.networks.registry import register_component
+
+from barl.policy import Actor, Critic
+
+
+def _inv_softplus(y: float) -> float:
+  return math.log(math.expm1(y))
+
+
+def _inv_sigmoid(y: float) -> float:
+  return math.log(y / (1.0 - y))
+
 
 @register_component
 class ScoreDiscreteActor(Actor, nn.Module):
-  """Discrete-time diffusion actor (Ho et al. 2020 DDPM): a fixed `num_steps`
-  variance-preserving forward noising schedule with a score-prediction
-  network (learns s_theta(x_t, t) ~= grad_x log p_t(x_t) directly, no
-  eps -> score conversion), ancestral reverse sampling x_T ~ N(0, I) -> x_0.
-  Counterpart to ScoreContinuousActor; same "raw, unsquashed output" contract."""
+  """Discrete-time diffusion actor for DIME (Celik et al. 2025) """
+
+  EULER_MAX_STEP = 0.35
+  MIN_TOTAL_NOISE = 2.0
 
   def __init__(self, obs_dim: int, action_dim: int, latent_dim: int, layers: int, num_steps: int,
-               noise_start: float, noise_end: float, **kwargs):
+               beta_min: float, beta_max: float, noise_start: float, noise_end: float,
+               beta_scale_min: float = 0.7,
+               beta_scale_max: float = 1.8,
+               learn_beta_scale: bool = True,
+               eta_init: float = 1.5811,          # sqrt(2.5), the paper's prior
+               learn_eta: bool = False,
+               anchor_score: bool = True, **kwargs):
     super().__init__(**kwargs)
 
-    self.noise_start, self.noise_end = noise_start, noise_end
-
-    self.num_steps   = num_steps
-    self.action_dim = action_dim
+    self.num_steps    = num_steps
+    self.action_dim   = action_dim
     self.time_dim     = 8
+    self.anchor_score = anchor_score
 
     self.diffusion_act = MLP(obs_dim + action_dim + self.time_dim, action_dim, latent_dim, layers, layernorm=False)
+    t    = torch.linspace(0.0, 1.0, num_steps + 1)
+    beta = beta_min + 0.5 * (beta_max - beta_min) * (1.0 - torch.cos(math.pi * t))
+    self.register_buffer("beta", beta)
 
+    self.register_buffer("logvar_offset", 0.5 * action_dim * (beta[1:].log() - beta[:-1].log()))
+
+    self.beta_scale_min = beta_scale_min
+    self.beta_scale_max = min(beta_scale_max, self.EULER_MAX_STEP / float(beta[1:].max()))
+
+    self.total_noise    = float(beta[1:].sum())
+    self.max_step       = float(beta[1:].max()) * self.beta_scale_max
+    self.logratio_const = float(self.logvar_offset.sum())
+
+    # ---- variance-preserving schedule (SDAC path only) -------------------
     s  = 0.008
     tt = torch.linspace(0, 1, num_steps + 1)
     f  = torch.cos((tt + s) / (1 + s) * math.pi / 2) ** 2
-    g  = f / f[0]                                             # cosine-shaped, 1 -> 0
+    self.register_buffer("alpha_bars", noise_end + (noise_start - noise_end) * (f / f[0]))
 
-    alpha_bars = noise_end + (noise_start - noise_end) * g     # noise_start -> noise_end
+    lo, hi = self.beta_scale_min, self.beta_scale_max
+    self._beta_scale_raw = nn.Parameter(
+        torch.full((action_dim,), _inv_sigmoid((1.0 - lo) / (hi - lo))),
+        requires_grad=learn_beta_scale)
+    self._eta_raw = nn.Parameter(
+        torch.full((action_dim,), _inv_softplus(eta_init)), requires_grad=learn_eta)
 
-    ratios = alpha_bars[1:] / alpha_bars[:-1]
-    trans_betas = (1.0 - ratios).clamp(1e-5, 0.999)
-    betas  = torch.cat([trans_betas[:1], trans_betas])         # length num_steps + 1
-    alphas = torch.cat([torch.ones(1), ratios])                # kept index-aligned
-
-    print("betas", betas.tolist())
-
-    print("alphas", alphas.tolist())
-
-    self.register_buffer("betas", betas)
-    self.register_buffer("alphas", alphas)
-    self.register_buffer("alpha_bars", alpha_bars)
-    # eta (Eq. 11/12), softplus-parameterized to stay positive; init so softplus(raw) ~= 1.0.
-    self._eta_raw = nn.Parameter(torch.full((action_dim,), math.log(math.e - 1.0)))
+  @property
+  def beta_scale(self) -> torch.Tensor:
+    lo, hi = self.beta_scale_min, self.beta_scale_max
+    return lo + (hi - lo) * torch.sigmoid(self._beta_scale_raw)
 
   @property
   def eta(self) -> torch.Tensor:
-    return F.softplus(self._eta_raw)
+    return F.softplus(self._eta_raw).clamp(0.25, 4.0)
+
+  def describe_schedule(self) -> dict:
+    """Diagnostics worth asserting on in a unit test, and worth logging."""
+    with torch.no_grad():
+      s    = self.beta_scale
+      used = self.beta[1:].unsqueeze(-1) * s                  # (N, D)
+      tot  = used.sum(0)
+      return {
+        "max_step":        float(used.max()),
+        "total_noise_min": float(tot.min()),
+        "total_noise_max": float(tot.max()),
+        "signal_at_N_max": math.exp(-float(tot.min())),
+        "logratio_const":  self.logratio_const,
+        "scale_min":       float(s.min()),
+        "scale_max":       float(s.max()),
+        "eta_mean":        float(self.eta.mean()),
+      }
 
   def gaussian_logprob(self, x, mean, var):
-    # keepdim: entropy bonuses feed critic.loss's `penalty` as (B, 1) -- dropping it
-    # would let `target_value() + penalty` silently outer-broadcast to (B, B).
     return (-0.5 * (x - mean) ** 2 / var - 0.5 * torch.log(2 * math.pi * var)).sum(-1, keepdim=True)
 
   def time_emb(self, t: torch.Tensor) -> torch.Tensor:
     return sinusoidal_emb(t, self.time_dim)
- 
+
   def time_emb_for(self, t: torch.Tensor, batch_size: int) -> torch.Tensor:
-    """Normalizes t to shape (batch_size,) whether it arrives as a scalar
-    (single diffusion step shared across the batch, as in generate_action)
-    or already per-sample (B,), then embeds it."""
     if t.dim() == 0:
       t = t.expand(batch_size)
     return self.time_emb(t.float().unsqueeze(-1))
 
   def predict_score(self, obs: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-    """s_theta(x_t; s, t) ~= grad_{x_t} log p_t(x_t | s), predicted directly
-    (no eps-prediction intermediary)."""
-    t_emb = self.time_emb_for(t, x_t.shape[0])
-    return self.diffusion_act(obs, x_t, t_emb)
+    """`t` is expected in [0, 1] (n / num_steps), not the raw step index."""
+    return self.diffusion_act(obs, x_t, self.time_emb_for(t, x_t.shape[0]))
+
+  # --- SDAC-only helpers, on the variance-preserving schedule ---------------
 
   def diffuse(self, x: torch.Tensor, t: torch.Tensor):
-    alpha_bar_t = self.alpha_bars[t].unsqueeze(-1)  # (B,) -> (B,1), broadcasts against (B, action_dim)
+    alpha_bar_t = self.alpha_bars[t].unsqueeze(-1)
     return alpha_bar_t.sqrt() * x + (1.0 - alpha_bar_t).sqrt() * torch.randn_like(x)
 
   def score_target(self, x0: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-    alpha_bar_t = self.alpha_bars[t].unsqueeze(-1)  # (B,1), broadcasts against (..., B, action_dim)
+    alpha_bar_t = self.alpha_bars[t].unsqueeze(-1)
     return -(x_t - alpha_bar_t.sqrt() * x0) / (1.0 - alpha_bar_t)
 
   def sample_phi0(self, x_t: torch.Tensor, t: torch.Tensor, K: int) -> torch.Tensor:
-    """K candidates ~ phi_{0|t}(.|x_t) = N(x_t/sqrt(alpha_bar_t), (1-alpha_bar_t)/alpha_bar_t * I) (Ma et al. 2025, Eq. 15/24) """
-    alpha_bar_t = self.alpha_bars[t].unsqueeze(-1)          # (B, 1)
-    mean = x_t / alpha_bar_t.sqrt()                          # (B, action_dim)
-    var  = (1.0 - alpha_bar_t) / alpha_bar_t                 # (B, 1)
-    eps  = torch.randn((K,) + x_t.shape, device=x_t.device)  # (K, B, action_dim)
-    return mean.unsqueeze(0) + var.sqrt().unsqueeze(0) * eps # (K, B, action_dim)
-  
-  def generate_action(self, obs: torch.Tensor, x: torch.Tensor = None, n_stop: int = 0):
-    B = obs.shape[0]
-    x = torch.randn((B, self.action_dim), device=obs.device) if x is None else x
+    alpha_bar_t = self.alpha_bars[t].unsqueeze(-1)
+    mean = x_t / alpha_bar_t.sqrt()
+    var  = (1.0 - alpha_bar_t) / alpha_bar_t
+    eps  = torch.randn((K,) + x_t.shape, device=x_t.device)
+    return mean.unsqueeze(0) + var.sqrt().unsqueeze(0) * eps
 
-    ell = -self.gaussian_logprob(x, torch.zeros_like(x), torch.ones_like(x))
-    eta = self.eta
+  # --- DIME path -----------------------------------------------------------
+
+  def generate_action(self, obs: torch.Tensor, x: torch.Tensor = None, n_stop: int = 0):
+    """Reverse chain a^N -> a^0 with the latent entropy lower bound (Eq. 15).
+
+    Returns (x, ell_latent). CALLER MUST ADD the squash log-Jacobian."""
+    B     = obs.shape[0]
+    eta2  = self.eta ** 2                                   # (D,)
+    scale = self.beta_scale                                 # (D,)
+
+    if x is None:
+      x = eta2.sqrt() * torch.randn((B, self.action_dim), device=obs.device)
+
+    ell = -self.gaussian_logprob(x, torch.zeros_like(x), eta2.expand_as(x))
 
     # x holds a^n; each iteration maps a^n -> a^{n-1}
     for n in range(self.num_steps, n_stop, -1):
-      n_t   = torch.tensor(n, device=obs.device)
-      score = self.predict_score(obs, x, n_t).float()   # grad log pi_n, evaluated at the SOURCE state a^n
+      tau = torch.tensor(n / self.num_steps, device=obs.device)
 
-      beta_rev = self.betas[n]       # Eq. 12: reverse step sourced at n
-      beta_fwd = self.betas[n - 1]   # Eq. 11: forward step sourced at n-1
+      score = self.predict_score(obs, x, tau).float()   # evaluated at the SOURCE state a^n
+      if self.anchor_score:
+        score = score - x / eta2
 
-      var_rev = (2.0 * eta ** 2 * beta_rev).expand_as(x)
-      var_fwd = (2.0 * eta ** 2 * beta_fwd).expand_as(x)
+      b_rev = self.beta[n] * scale        # Eq. 12: reverse step sourced at n     (D,)
+      b_fwd = self.beta[n - 1] * scale    # Eq. 11: forward step sourced at n-1   (D,)
 
-      rev_mean = x + beta_rev * x + 2.0 * (eta ** 2) * beta_rev * score
-      x_new    = rev_mean + var_rev.sqrt() * torch.randn_like(x)
-      logp_rev = self.gaussian_logprob(x_new, rev_mean, var_rev)
+      var_rev = (2.0 * eta2 * b_rev).expand_as(x)
+      var_fwd = (2.0 * eta2 * b_fwd).expand_as(x)
 
-      fwd_mean = x_new - beta_fwd * x_new
-      logp_fwd = self.gaussian_logprob(x, fwd_mean, var_fwd)
+      rev_mean = x + b_rev * x + 2.0 * eta2 * b_rev * score
+      eps      = torch.randn_like(x)
+      x_new    = rev_mean + var_rev.sqrt() * eps
 
-      ell = ell + (logp_fwd - logp_rev)
+      fwd_mean = x_new - b_fwd * x_new
+      resid    = x - fwd_mean
+
+      step = (0.5 * eps ** 2 - 0.5 * resid ** 2 / var_fwd).sum(-1, keepdim=True)
+      ell  = ell + step + self.logvar_offset[n - 1]
+
       x = x_new
 
     return x, ell
- 
+
   def sample(self, s: torch.Tensor, critic: Critic = None):
     """Raw, unsquashed x_0 -- the owning Policy squashes it."""
     act, _ = self.generate_action(s)
     return act
- 
+
   def create_optimizer(self) -> dict:
+    process = [p for p in (self._beta_scale_raw, self._eta_raw) if p.requires_grad]
     return {"actor": torch.optim.Adam(
-        list(self.diffusion_act.parameters()) + [self._eta_raw], lr=3e-4
-    )}
+        list(self.diffusion_act.parameters()) + process, lr=3e-4)}
