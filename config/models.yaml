@@ -34,9 +34,9 @@ SACPolicy:
   components:
     actor:    {class: StochasticActor, hidden_dim: 256, layers: 3, squash_cls: TanhSquash}
     # critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
-    critic:   {class: MinEnsembleCritic, hidden_dim: 512, layers: 2, n_models: 10, rho: 2.0, polyak_tau: 0.005, gamma: 0.99}
+    critic:   {class: MeanStdEnsembleCritic, hidden_dim: 512, layers: 2, n_models: 10, rho: 2.0, polyak_tau: 0.005, gamma: 0.99}
     
-    entropy:  {class: AutotuneRegulator, alpha_init: 0.01, min_alpha: 1.0e-6, max_alpha: 50.0 }
+    entropy:  {class: AutotuneRegulator, lr: 3e-4, alpha_init: 0.05, min_alpha: 0.01, max_alpha: 10.0 }
 
   profiles:
     Small:
@@ -55,19 +55,19 @@ DIMEPolicy:
     # critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
     critic: {class: MinEnsembleCritic, hidden_dim: 512, layers: 2, n_models: 10, rho: 2.0, polyak_tau: 0.005, gamma: 0.99}
     squash: {class: TanhSquash}
-    entropy: {class: AutotuneRegulator, alpha_init: 0.01, min_alpha: 1.0e-6, max_alpha: 50.0 }
+    entropy: {class: AutotuneRegulator, lr: 3e-4, alpha_init: 0.005, min_alpha: 0.0001, max_alpha: 10.0 }
 
 AMDP:
   params:
     entropy_scale: -1.0
 
   components:
-    actor:  {class: ScoreContinuousActor, latent_dim: 256, layers: 3, max_steps: 16, sigma_min: 0.01, sigma_max: 2.5, tau_min: 0.01, tau_max: 1.0, layernorm: true}
+    actor:  {class: ScoreContinuousActor, latent_dim: 256, layers: 3, max_steps: 16, sigma_min: 2.0, sigma_max: 2.5, tau_min: 0.0, tau_max: 1.0 }
     # critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
-    critic: {class: MinEnsembleCritic, hidden_dim: 512, layers: 2, n_models: 10, rho: 2.0, polyak_tau: 0.005, gamma: 0.99}
+    critic: {class: MeanStdEnsembleCritic, hidden_dim: 512, layers: 2, n_models: 10, rho: 2.0, polyak_tau: 0.005, gamma: 0.99}
     squash: {class: ErfSquash}   # `k` is always derived at construction time -- see AMDP.__init__
-    entropy: {class: AutotuneRegulator, alpha_init: 0.01, min_alpha: 1.0e-6, max_alpha: 50.0}
-    trust_region: {class: AutotuneRegulator, alpha_init: 0.5, min_alpha: 1.0e-6, max_alpha: 10.0, target: 0.2}
+    entropy: {class: AutotuneRegulator, lr: 3e-4, alpha_init: 0.05, min_alpha: 0.01, max_alpha: 10.0}
+    trust_region: {class: AutotuneRegulator,  lr: 3e-4, alpha_init: 0.05, min_alpha: 1.0e-6, max_alpha: 10.0, target: 0.2}
 
 
 SDAC:
@@ -81,7 +81,7 @@ SDAC:
     # critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
     critic: {class: MinEnsembleCritic, hidden_dim: 2048, layers: 2, n_models: 10, rho: 2.0, polyak_tau: 0.005, gamma: 0.99}
     squash: {class: TanhSquash}   # `k` is always derived at construction time -- see AMDP.__init__
-    entropy: {class: AutotuneRegulator, alpha_init: 0.01, min_alpha: 1.0e-6, max_alpha: 50.0}
+    entropy: {class: AutotuneRegulator, lr: 3e-4, alpha_init: 0.05, min_alpha: 0.01, max_alpha: 10.0}
 
 PPOPolicy:
   params:

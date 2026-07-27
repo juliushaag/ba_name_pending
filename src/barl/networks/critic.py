@@ -54,7 +54,7 @@ class QCriticBase(Critic, nn.Module):
     return mean - self.rho * std
 
   def create_optimizer(self) -> dict:
-    return {"q": torch.optim.AdamW(self.q_function.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=1e-4)}
+    return {"q": torch.optim.Adam(self.q_function.parameters(), lr=1e-4, betas=(0.95, 0.99) )}
 
   def _bellman_target(self, reward: torch.Tensor, term: torch.Tensor, bootstrap: torch.Tensor) -> torch.Tensor:
     reward = reward.view(-1, 1)

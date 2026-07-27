@@ -41,8 +41,7 @@ class AMDP(Policy):
     self.entropy : AutotuneRegulator = self.build_component("entropy", AutotuneRegulator, target=self.action_dim * self.entropy_scale, name="entropy")
     self.tr_lambda : AutotuneRegulator = self.build_component("trust_region", AutotuneRegulator, name="trust_region")
 
-    sig_sq_one = self.actor.sigma_sq_int_fn(torch.tensor(self.actor.tau_max))
-    self.squash = self.build_component("squash", Squash, erf_k=(2 * sig_sq_one) ** -0.5)
+    self.squash = self.build_component("squash", Squash, erf_k=(2 * self.actor.terminal_var) ** -0.5)
 
   def on_epoch_start(self):
     self.critic.on_epoch_start()
@@ -58,14 +57,13 @@ class AMDP(Policy):
 
   def train_step(self, batch) -> tuple[dict, dict]:
 
-    obs      = self.normalize_obs(batch["obs"].to(self.device))
-    next_obs = self.normalize_obs(batch["next_obs"].to(self.device))
+    obs      = batch["obs"].to(self.device)
+    next_obs = batch["next_obs"].to(self.device)
 
     action   = batch["act"].to(self.device)
     reward   = batch["rew"].to(self.device)
     term     = batch["term"].to(self.device)
 
-    X     = batch["X"].to(self.device)
 
     self.critic.step()
     self.actor_old.step()
@@ -78,36 +76,39 @@ class AMDP(Policy):
     with bfloat16():
       with torch.no_grad():
         next_X, entropy_penalty = self.actor.generate_action(next_obs)
-        next_action = self.squash(next_X)
         entropy_bonus = (alpha * entropy_penalty).detach()
+        next_action = self.squash(next_X)
 
 
       with float32():
         self.critic.loss(obs, action, reward, term, next_obs, next_action, entropy_bonus, log, losses)
         
-      tau = torch.rand((obs.shape[0],), device=obs.device)
+      tau = torch.rand(obs.shape[0], device=obs.device)
 
       sigma_tau = self.actor.sigma_fn(tau).unsqueeze(-1)
       sig_sq_tau = self.actor.sigma_sq_int_fn(tau).unsqueeze(-1)
       sig_sq_one = self.actor.sigma_sq_int_fn(torch.full((obs.shape[0],), self.actor.tau_max, device=obs.device)).unsqueeze(-1)
 
-      X_t = X * (sig_sq_tau / sig_sq_one) + (sig_sq_tau - (sig_sq_tau ** 2 / sig_sq_one)).sqrt() * torch.randn_like(X)
+      var = (sig_sq_tau - (sig_sq_tau ** 2 / sig_sq_one)).clamp_min(0.0)
+      X_t = next_X * (sig_sq_tau / sig_sq_one) + var.sqrt() * torch.randn_like(next_X)
 
       time_embed = sinusoidal_emb(tau.view(obs.shape[0], 1), self.actor.time_dim)
 
-      u = self.actor.diffusion_act(obs, X_t, time_embed)
+      u_tilde = self.actor.diffusion_act(next_obs, X_t, time_embed)
       # u_old = self.actor_old.target.diffusion_act(obs, X_t, time_embed)
 
       def q_values(x):
-        a = self.squash(x)
-        return self.critic.value(obs, a).sum()
-
-      x_score : torch.Tensor = torch.func.grad(q_values)(X)
+        return self.critic.value(next_obs, self.squash(x)).sum()
+      
 
       with float32():
-        amdp_target = sigma_tau * x_score.div(alpha)
-        
-        amdp_loss = 0.5 * F.mse_loss(u, amdp_target)
+
+        x_score : torch.Tensor = torch.func.grad(q_values)(next_X).detach()
+
+        u      = sigma_tau * u_tilde                       # scale NN output by sigma(tau)
+        target = sigma_tau * x_score.div(alpha)            # Eq. (15) target, as written
+        amdp_loss = (0.5 * (u - target).pow(2).sum(-1) / sigma_tau.squeeze(-1)).mean()
+
         # tr_loss   = 0.5 * F.mse_loss(u.float(), u_old.float())
 
         # self.tr_lambda.loss(tr_loss, log, losses)
@@ -119,15 +120,17 @@ class AMDP(Policy):
 
     log.update({
       "stats/amdp":                     amdp_loss.detach(),
-      "stats/amdp_target" :             amdp_target.detach().mean(),
+      "stats/amdp_target" :             target.detach().mean(),
       "stats/u_norm":                   u.detach().norm(dim=-1).mean(),  
       "stats/score_norm":               x_score.detach().norm(dim=-1).mean(),
+      "stats/reward_mean" :             reward.mean(),
+      "stats/act_abs" :                 next_action.abs().mean(),
     })
     return losses, log
 
   @torch.inference_mode()
   def inference_step(self, observation: torch.Tensor, step_info=None):
-    obs = self.normalize_obs(observation.to(self.device))
-    X, _ = self.actor.generate_action(obs)
+    obs = observation.to(self.device)
+    X, ell = self.actor.generate_action(obs)
     action = self.squash(X)
-    return action, { "X" : X }
+    return action, { }

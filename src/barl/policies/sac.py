@@ -68,6 +68,8 @@ class SACPolicy(Policy):
     losses, log = {}, {}
     alpha = self.entropy.value()
 
+    
+
     with bfloat16():
 
       with torch.no_grad():
@@ -86,6 +88,9 @@ class SACPolicy(Policy):
 
 
     losses["actor"] = actor_loss
+
+    log["stats/reward_mean"]  = reward.mean()
+    log["stats/act_abs"]      = action.abs().mean()  
 
     return losses, log
 

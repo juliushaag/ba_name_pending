@@ -60,19 +60,16 @@ class DIMEPolicy(Policy):
     losses, log = {}, {}
 
     with bfloat16():
-      with torch.no_grad():
-        next_X, entropy_penalty = self.actor.generate_action(next_obs)
-        next_action = self.squash(next_X)
-        entropy_bonus_val = (alpha * entropy_penalty).detach()
 
-      self.critic.loss(obs, action, reward, term, next_obs, next_action, entropy_bonus_val, log, losses)
+      next_X, entropy = self.actor.generate_action(next_obs)
+      next_action = self.squash(next_X)
+ 
+      entropy_bonus = (alpha * entropy).detach()
+      self.critic.loss(obs, action, reward, term, next_obs, next_action, entropy_bonus, log, losses)
 
-      X, entropy = self.actor.generate_action(obs)
-      new_action = self.squash(X)
-      q_new = self.critic.value(obs, new_action)
+      q_new = self.critic.value(next_obs, next_action)
 
       with float32():
-
         dime_loss = -(q_new + (alpha * entropy)).mean()
         self.entropy.loss(entropy.detach(), log, losses)
     

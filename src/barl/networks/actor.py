@@ -77,67 +77,69 @@ class StochasticActor(Actor, nn.Module):
   def create_optimizer(self) -> dict:
     return {"actor": torch.optim.Adam(self.parameters(), lr=3e-4)}
 
-
 @register_component
 class ScoreContinuousActor(Actor, nn.Module):
-  """AMDP-style continuous-time score-matching actor (Thilges et al. 2026),
-  trained via direct-score regression by the owning Policy (AMDP). No
-  squash -- generate_action()'s raw terminal state isn't a canonical action."""
+  """AMDP continuous-time control (Thilges et al. 2026). The network predicts
+  u_tilde with u = sigma(tau) * u_tilde, so each Euler step reduces to
+  X += v_i * u_tilde + sqrt(v_i) * eps  with  v_i = \int_{tau_i}^{tau_{i+1}} sigma^2.
+  Raw, unsquashed output -- the owning Policy applies the erf squash."""
 
-  def __init__(self, obs_dim: int, action_dim: int, latent_dim: int, layers: int, max_steps: int, 
-               sigma_min: float, sigma_max: float, tau_min: float, tau_max: float, layernorm=False, **kwargs):
+  def __init__(self, obs_dim: int, action_dim: int, latent_dim: int, layers: int, max_steps: int,
+               sigma_min: float, sigma_max: float, tau_min: float, tau_max: float,
+               bound_c: float = 50.0, layernorm=False, **kwargs):
+    
     super().__init__(**kwargs)
 
     self.sigma_min, self.sigma_max = sigma_min, sigma_max
     self.tau_min,   self.tau_max   = tau_min,   tau_max
-
-    self.action_dim = action_dim
-    self.max_steps   = max_steps
-    self.time_dim     = 8
+    self.action_dim, self.max_steps, self.time_dim = action_dim, max_steps, 8
+    self.bound_c   = bound_c
+    self._log_r    = math.log(sigma_max / sigma_min)
+    self._int_base = float(self._raw_int(torch.tensor(float(tau_min))))
 
     self.diffusion_act = MLP(obs_dim + action_dim + self.time_dim, action_dim, latent_dim, layers, layernorm=layernorm)
 
-    taus = torch.linspace(self.tau_min, self.tau_max, self.max_steps + 1)
-    self.register_buffer("taus", taus)
+    taus   = torch.linspace(tau_min, tau_max, max_steps + 1)
+    sig_sq = self.sigma_sq_int_fn(taus)                        # exact, rebased to tau_min
+    self.register_buffer("taus",     taus)
+    self.register_buffer("step_var", (sig_sq[1:] - sig_sq[:-1]).clamp_min(0.0))
+    self.register_buffer("sigma",    self.sigma_fn(taus[:-1]))
 
-    sigmas = torch.tensor([self.sigma_fn(taus[i]) for i in range(self.max_steps)])
-    self.register_buffer("sigma", sigmas)
-
-  def sigma_fn(self, tau: torch.Tensor) -> torch.Tensor:
+  def sigma_fn(self, tau):
     return self.sigma_min * (self.sigma_max / self.sigma_min) ** tau
 
-  def sigma_sq_int_fn(self, tau: torch.Tensor) -> torch.Tensor:
-    return self.sigma_min ** 2 * ((self.sigma_max / self.sigma_min) ** (2 * tau) - 1) / (2 * math.log(self.sigma_max / self.sigma_min))
+  def _raw_int(self, tau):
+    return self.sigma_min ** 2 * ((self.sigma_max / self.sigma_min) ** (2 * tau) - 1) / (2 * self._log_r)
 
-  def bound_control(self, u: torch.Tensor, X: torch.Tensor, C: float = 10.0) -> torch.Tensor:
-    """Enforce the admissible-control growth condition ||u|| <= C(1+||X||) (paper Eq. 20)."""
-    max_norm = C * (1.0 + X.norm(dim=-1, keepdim=True))
-    u_norm   = u.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-    scale    = (max_norm / u_norm).clamp(max=1.0)
-    return u * scale
+  def sigma_sq_int_fn(self, tau):
+    """\int_{tau_min}^{tau} sigma^2(t) dt -- matches what the sampler injects."""
+    return self._raw_int(tau) - self._int_base
   
-  def generate_action(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Returns (raw unsquashed terminal state X, entropy bonus from the path integral)."""
+  @property
+  def terminal_var(self) -> float:
+    """Var(X_1) at zero control. erf_k MUST be derived from this."""
+    return float(self.step_var.sum())
+
+  def bound_control(self, u_tilde, X, sigma_i):
+    """||u|| <= C(1 + ||X||) with u = sigma * u_tilde."""
+    max_norm = self.bound_c * (1.0 + X.norm(dim=-1, keepdim=True)) / sigma_i
+    n = u_tilde.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    return u_tilde * (max_norm / n).clamp(max=1.0)
   
-    X        = torch.zeros((obs.shape[0], self.action_dim), device=obs.device)
-    path_int = torch.zeros((obs.shape[0], 1), device=obs.device)
+  def generate_action(self, obs):
+      B = obs.shape[0]
+      X        = torch.zeros((B, self.action_dim), device=obs.device)
+      path_int = torch.zeros((B, 1),               device=obs.device)
 
-    for i in range(self.max_steps):
-      tau  = self.taus[i]
-      dtau = self.taus[i + 1] - self.taus[i]
+      for i in range(self.max_steps):
+        emb     = sinusoidal_emb(self.taus[i].expand(B, 1), self.time_dim)
+        u_tilde = self.bound_control(self.diffusion_act(obs, X, emb), X, self.sigma[i])
+        v       = self.step_var[i]
 
-      # u = self.bound_control(self.diffusion_act(obs, X, sinusoidal_emb(tau.expand(obs.shape[0], 1), self.time_dim)), X)
-      
-      u = self.diffusion_act(obs, X, sinusoidal_emb(tau.expand(obs.shape[0], 1), self.time_dim))
-      
-      drift     = self.sigma[i] * u * dtau
-      diffusion = self.sigma[i] * torch.sqrt(dtau) * torch.randn_like(u)
+        X        = X + v * u_tilde + v.sqrt() * torch.randn_like(u_tilde)
+        path_int = path_int + (v * (u_tilde ** 2).sum(-1)).unsqueeze(1)   # = \int ||u||^2 dtau
 
-      X        = X + drift + diffusion
-
-      path_int = path_int + ((u ** 2).sum(dim=-1) * dtau).unsqueeze(1)
-
-    return X, math.log(2) * self.action_dim - 0.5 * path_int
+      return X, math.log(2) * self.action_dim - 0.5 * path_int
 
   def sample(self, s: torch.Tensor, critic: Critic = None) -> torch.Tensor:
     """Raw, unsquashed -- not a valid action on its own; exists to satisfy

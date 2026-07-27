@@ -10,7 +10,7 @@ defaults:
   checkpoint: null          # path to resume from, or null to train from scratch
   total_env_steps: 1000000  # stop once this many env steps have been collected
   random_steps: 0       # random-action buffer fill before training starts (off-policy only, see main())
-  rollout_steps: 10000      # env steps collected per outer iteration (across all num_envs)
+  rollout_steps: 5000      # env steps collected per outer iteration (across all num_envs)
   num_envs: 40              # parallel rollout envs
   buffer_size: 1000000       # max transitions kept in the replay buffer (whole
                              # trajectory chunks are evicted/kept, never split,
@@ -18,6 +18,8 @@ defaults:
   epochs_per_rollout: 32    # on-policy only: train_epoch passes over the buffer per outer iteration
 
   utd_ratio: 1.0            # off-policy only: grad steps per outer iteration = round(rollout_steps * utd_ratio)
+
+  lr_warmup_steps: 1000     # grad steps of linear 0 -> base_lr ramp before the sine decay to 0 kicks in
 
   batch_size: 256
   eval_every: 10000         # grad steps between evals

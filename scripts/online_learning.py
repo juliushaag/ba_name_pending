@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import math
 import os
 import warnings
 
@@ -30,6 +31,28 @@ torch.set_float32_matmul_precision("high")
 DEFAULT_CONFIG = os.path.join(os.path.dirname(__file__), "..", "config", "online_learning.yaml")
 
 
+def lr_schedule(step: int, warmup_steps: int, total_steps: int) -> float:
+  """Multiplicative LR factor: linear 0 -> 1 ramp over `warmup_steps`, then a
+  quarter-sine decay 1 -> 0 from `warmup_steps` to `total_steps` (flat at 0
+  past that, in case `total_steps` -- an estimate, see `total_grad_steps` in
+  main() -- undershoots the run's actual grad-step count)."""
+  if warmup_steps <= 0 or step >= warmup_steps:
+    progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
+    return math.sin((1.0 - progress) * math.pi / 2)
+  return step / warmup_steps
+
+
+def create_schedulers(opts: dict[str, torch.optim.Optimizer], warmup_steps: int, total_steps: int) -> dict[str, torch.optim.lr_scheduler.LambdaLR]:
+  """One LambdaLR per optimizer in `opts`, all sharing the same warmup/decay
+  shape -- each scales its own optimizer's per-param-group base lr, so
+  differently-tuned optimizers (actor/critic/explore/...) keep their own
+  absolute lr while following the same schedule."""
+  return {
+    k: torch.optim.lr_scheduler.LambdaLR(opt, lambda step: lr_schedule(step, warmup_steps, total_steps))
+    for k, opt in opts.items()
+  }
+
+
 def evaluate_and_log(model: Policy, env: gym.Env, log: Logger, ckpt_dir: str, best_reward: float, cfg: dict) -> float:
   data_runs = model.evaluate(env, runs=cfg["eval_runs"])
 
@@ -57,8 +80,8 @@ def evaluate_and_log(model: Policy, env: gym.Env, log: Logger, ckpt_dir: str, be
   return best_reward
 
 
-def train_batch(model: Policy, opts: dict[str, torch.optim.Optimizer], batch, batch_idx: int,
-                 log: Logger, env: gym.Env, ckpt_dir: str, best_reward: float, cfg: dict) -> float:
+def train_batch(model: Policy, opts: dict[str, torch.optim.Optimizer], scheds: dict[str, torch.optim.lr_scheduler.LambdaLR],
+                 batch, batch_idx: int, log: Logger, env: gym.Env, ckpt_dir: str, best_reward: float, cfg: dict) -> float:
   """One gradient step: loss compute, backward+clip+step per loss key, stat
   logging, grad_steps increment, periodic eval trigger. Shared by the
   on-policy epoch loop (train_epoch) and the off-policy fixed-UTD loop in
@@ -75,9 +98,11 @@ def train_batch(model: Policy, opts: dict[str, torch.optim.Optimizer], batch, ba
     )
 
     opts[k].step()
+    scheds[k].step()
 
     stats[f"train/loss/{k}"] = losses[k].detach()
     stats[f"train/norm/{k}"] = norm
+    stats[f"train/lr/{k}"]   = scheds[k].get_last_lr()[0]
 
   if batch_idx % cfg["log_every"] == 0:
     log.log(stats)
@@ -103,14 +128,15 @@ def log_model_stats(model: Policy, log: Logger, num_steps: int, cfg: dict) -> No
   })
 
 
-def train_epoch(model: Policy, opts: dict[str, torch.optim.Optimizer], train_loader, log: Logger, env: gym.Env, ckpt_dir: str, best_reward: float, cfg: dict) -> float:
+def train_epoch(model: Policy, opts: dict[str, torch.optim.Optimizer], scheds: dict[str, torch.optim.lr_scheduler.LambdaLR],
+                 train_loader, log: Logger, env: gym.Env, ckpt_dir: str, best_reward: float, cfg: dict) -> float:
 
   model.on_epoch_start()
   model.train()
   num_steps = 0
   for b, batch in enumerate(train_loader):
     num_steps += 1
-    best_reward = train_batch(model, opts, batch, b, log, env, ckpt_dir, best_reward, cfg)
+    best_reward = train_batch(model, opts, scheds, batch, b, log, env, ckpt_dir, best_reward, cfg)
 
   model.on_epoch_end()
 
@@ -142,7 +168,6 @@ def validate_run(model: Policy, opts: dict[str, torch.optim.Optimizer], buffer: 
   for k in losses:
     opts[k].zero_grad(set_to_none=True)
     losses[k].backward(retain_graph=True)
-  for k in losses:
     torch.nn.utils.clip_grad_norm_(
       [p for group in opts[k].param_groups for p in group["params"]],
       max_norm=1.0,
@@ -186,6 +211,17 @@ def main(cfg: dict):
     model: Policy = Policy.make(MODEL, env).to("cuda")
 
   opts  = model.create_optimizer()
+
+  # Estimated total grad-step budget for the whole run, matching the same
+  # accounting the training loop below uses per-iteration -- just an estimate
+  # (on-policy's actual batches/epoch varies with episode boundaries), fine
+  # for an LR schedule since lr_schedule() flattens at 0 past it regardless.
+  if model.on_policy:
+    total_grad_steps = max(1, cfg["total_env_steps"] // cfg["batch_size"]) * cfg["epochs_per_rollout"]
+  else:
+    total_grad_steps = max(1, round(cfg["total_env_steps"] * cfg["utd_ratio"]))
+
+  scheds = create_schedulers(opts, warmup_steps=cfg["lr_warmup_steps"], total_steps=total_grad_steps)
 
   if cfg.get("validate"):
     validate_run(model, opts, buffer, rollout_env, cfg)
@@ -241,8 +277,6 @@ def main(cfg: dict):
       batches_per_epoch = -(-n_transitions // cfg["batch_size"])  # ceil div
       grad_steps_this_iter = batches_per_epoch * cfg["epochs_per_rollout"]
     else:
-      # Fixed UTD ratio, independent of however large the (never-cleared) buffer
-      # has grown -- NOT a shuffled epoch pass over the whole thing.
       grad_steps_this_iter = round(cfg["rollout_steps"] * cfg["utd_ratio"])
 
     log.message(f"Finished Rollout buffer contains {len(buffer.buffer)} episodes "
@@ -261,7 +295,7 @@ def main(cfg: dict):
       )
 
       for _ in range(cfg["epochs_per_rollout"]):
-        best_reward = train_epoch(model, opts, train_loader, log, env, ckpt_dir, best_reward, cfg)
+        best_reward = train_epoch(model, opts, scheds, train_loader, log, env, ckpt_dir, best_reward, cfg)
 
       buffer.buffer = []  # never replay trajectories from a stale policy version
 
@@ -270,7 +304,7 @@ def main(cfg: dict):
       model.train()
       for b in range(grad_steps_this_iter):
         batch = buffer.sample(cfg["batch_size"])
-        best_reward = train_batch(model, opts, batch, b, log, env, ckpt_dir, best_reward, cfg)
+        best_reward = train_batch(model, opts, scheds, batch, b, log, env, ckpt_dir, best_reward, cfg)
       model.on_epoch_end()
 
       log_model_stats(model, log, grad_steps_this_iter, cfg)
