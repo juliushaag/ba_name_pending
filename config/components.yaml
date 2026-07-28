@@ -1,0 +1,145 @@
+# Per-component-class baseline kwargs -- the one and only defaults layer in
+# the whole config chain. Top-level keys are component class names exactly as
+# registered in src/barl/networks/registry.py (`class:` values in
+# config/models.yaml); each block is that class's full kwarg set.
+#
+# Full resolution order for a slot (lowest -> highest precedence):
+#
+#   this file's entry for the slot's `class:`
+#     < config/models.yaml's per-policy `components: {<slot>: {...}}`
+#     < the active profile's override for that slot
+#     < kwargs the Policy passes itself (algorithm-fixed, e.g. pessimistic_score)
+#
+# There is no other defaults layer -- no per-policy fallback, no Python-level
+# HParam table. A policy slot only needs `class:` plus whatever it wants to
+# differ from the baseline here, and
+#
+#   uv run python scripts/print_config.py <model> [--profile P]
+#
+# prints every resolved kwarg annotated with which of the layers above it came
+# from, so no value is ever unattributable.
+#
+# A class missing from this file isn't an error -- its slot just has to spell
+# every kwarg out in models.yaml. Adding an entry here is what makes swapping a
+# slot's `class:` a one-word edit (and therefore a sweepable axis).
+
+# --- Actors ---------------------------------------------------------------
+
+DeterministicActor:
+  hidden_dim: 128
+  layers: 4
+
+StochasticActor:
+  hidden_dim: 256
+  layers: 4
+  squash_cls: TanhSquash
+
+ScoreContinuousActor:
+  latent_dim: 512
+  layers: 3
+  max_steps: 32
+  sigma_min: 2.0
+  sigma_max: 2.5
+  tau_min: 0.0
+  tau_max: 1.0
+
+ScoreDiscreteActor:
+  latent_dim: 512
+  layers: 3
+  num_steps: 20
+  beta_min: 0.12
+  beta_max: 0.18
+  beta_scale_min: 0.7
+  beta_scale_max: 1.8
+  learn_beta_scale: true
+  eta_init: 1.5811   # sqrt(2.5)
+  learn_eta: false
+  anchor_score: true
+  noise_start: 0.999
+  noise_end: 0.001
+
+DistilledFlowActor:
+  latent_dim: 512
+  flow_steps: 16
+  time_dim: 8
+
+FlowBCActor:
+  latent_dim: 512
+  flow_steps: 16
+  time_dim: 8
+  hidden_layers: 4
+
+# --- Critics --------------------------------------------------------------
+#
+# rho/polyak_tau/gamma are required by QCriticBase itself, so every
+# QCriticBase subclass below has to carry them; the three ensemble critics
+# differ only in how they reduce their heads (mean-rho*std / mean / min), and
+# MeanEnsembleCritic + MinEnsembleCritic ignore `rho` entirely.
+
+MeanStdEnsembleCritic:
+  hidden_dim: 2048
+  layers: 2
+  n_models: 10
+  rho: 2.0
+  polyak_tau: 0.005
+  gamma: 0.99
+
+MeanEnsembleCritic:
+  hidden_dim: 2048
+  layers: 2
+  n_models: 10
+  rho: 2.0
+  polyak_tau: 0.005
+  gamma: 0.99
+
+MinEnsembleCritic:
+  hidden_dim: 2048
+  layers: 2
+  n_models: 10
+  rho: 2.0
+  polyak_tau: 0.005
+  gamma: 0.99
+
+QRDistributionalCritic:
+  hidden_dim: 2048
+  layers: 2
+  num_quantiles: 100
+  rho: 2.0
+  polyak_tau: 0.005
+  gamma: 0.99
+
+C51Critic:
+  hidden_dim: 2048
+  layers: 2
+  num_atoms: 51
+  v_min: -100.0   # fixed support, unlike the other critics -- set per env's actual return range
+  v_max: 500.0
+  rho: 2.0
+  polyak_tau: 0.005
+  gamma: 0.99
+
+PPOCritic:
+  hidden_dim: 256
+  layers: 4
+
+IQLCritic:
+  hidden_dim: 256
+  layers: 6
+  polyak_tau: 0.005
+  gamma: 0.99
+
+# --- Duals / squashes -----------------------------------------------------
+#
+# `target` is deliberately absent here: entropy regulators get theirs from the
+# owning Policy (action_dim * entropy_scale), so a baseline would be dead
+# weight for those and only the trust-region slot sets one in models.yaml.
+
+AutotuneRegulator:
+  lr: 3.0e-4
+  alpha_init: 0.05
+  min_alpha: 0.01
+  max_alpha: 10.0
+
+TanhSquash: {}
+
+ErfSquash: {}   # `erf_k` is always derived at construction time -- see AMDP.__init__

@@ -45,6 +45,23 @@ uv run python scripts/run_sweep.py --algos SACPolicy PPOPolicy --envs HalfCheeta
 uv run python scripts/run_sweep.py --algos SACPolicy --envs HalfCheetah --max_parallel 4
 ```
 
+Anything in `config/models.yaml` is sweepable as a `model.<dotted path>` axis and anything in the
+run config as a `run.<key>` axis, either inline or via a `--grid` spec file (see
+`config/sweep_grid.yaml`); `--dry_run` prints the expansion instead of launching it:
+
+```bash
+uv run python scripts/run_sweep.py --algos AMDP --envs HalfCheetah --seeds 3 \
+    --set model.components.critic.rho=0.0 --set run.utd_ratio=0.5
+uv run python scripts/run_sweep.py --grid config/sweep_grid.yaml --dry_run
+```
+
+To see what a `model:` string actually resolves to, with every value attributed to the layer that
+set it:
+
+```bash
+uv run python scripts/print_config.py AMDP    # no args: every model in config/models.yaml
+```
+
 There is no unit test suite. The closest thing to "run the tests" is `--validate`: a cheap smoke
 test that runs one rollout chunk + one `train_step` + one optimizer step per `{algo, env}`
 combination (no eval/checkpointing/wandb logging), to catch shape/dtype/algo-env mismatches
@@ -146,43 +163,73 @@ Only two call sites ever need it: `ReplayBuffer.rollout()` (immediately before `
 canonical — a Policy re-invoking its own actor mid-`train_step` (e.g. for a Bellman bootstrap
 action) can feed the result straight to its critic with no further conversion.
 
-### Tunables all live in config/models.yaml -- there is no Python-level HParam system
+### Tunables all live in YAML -- there is no Python-level HParam system
 
 Every tunable value -- both architecture kwargs (`hidden_dim`, `layers`, ...) and algorithm
 tunables that used to be a separate `HParam`-declared axis (`rho`, `gamma`, `tr_lambda_init`, PPO's
-`clip_eps`, ...) -- is a required, no-default keyword argument supplied from `config/models.yaml`.
-There is no Python-level fallback anywhere in this chain; a missing value is a `KeyError`/`TypeError`
-at construction time, not a silently-applied default.
+`clip_eps`, ...) -- is a required, no-default keyword argument supplied from YAML, across exactly
+two files: `config/components.yaml` (baseline kwargs per component *class*) under
+`config/models.yaml` (per *policy* slots/params/profiles). There is no Python-level fallback
+anywhere in this chain; a value listed in neither file is a `KeyError`/`TypeError` at construction
+time.
 
 - **Component-level tunables** (things an `Actor`/`Critic` itself needs, e.g. `QCriticBase`'s
   `rho`/`polyak_tau`/`gamma`, `ScoreContinuousActor`'s `sigma_min`/`sigma_max`/`tau_min`/`tau_max`)
-  are just more keys in that component's slot dict in `config/models.yaml`, resolved the same way
-  as `hidden_dim`/`layers` via `Policy.build_component()`/`resolve_component()` →
-  `model_config.resolve_slot()`.
+  resolve through `Policy.build_component()`/`resolve_component()` → `model_config.resolve_slot()`,
+  which layers, lowest precedence first: `config/components.yaml`'s entry for the slot's `class:` <
+  the slot dict in `config/models.yaml` < the active profile's override for that slot < the
+  Policy's own explicit kwargs. `config/components.yaml` is the *only* defaults layer in the
+  codebase; a policy slot names its `class:` and then lists only its deltas, so swapping a slot's
+  class (`MeanStdEnsembleCritic` → `QRDistributionalCritic`) is a one-word edit as long as the new
+  class has an entry there. Classes without one must have every kwarg spelled out in the slot.
+  `uv run python scripts/print_config.py <model>` prints a model's fully resolved config with every
+  value annotated by the layer it came from (and what it shadows), so no default is unattributable.
+- **Per-run overrides** (`model_config.set_overrides()`) sit above both YAML files and any profile,
+  below only the Policy's own explicit kwargs: a flat dotted-path map,
+  `{"components.critic.rho": 1.0, "params.entropy_scale": -2.0}`, coming from a run config's
+  `model_overrides:` key (which `scripts/run_sweep.py`'s `model.*` grid axes write). This is the
+  layer a sweep varies, so **sweeping a tunable never means editing a config file in place**.
+  `components.<slot>.class` is overridable too and re-bases the slot on the new class's
+  `config/components.yaml` entry, which is what makes an architecture axis
+  (`MeanStdEnsembleCritic` vs `QRDistributionalCritic`) sweepable. The active overrides are
+  captured into every checkpoint (`Policy.save`) and reapplied by `Policy.load`, since they are
+  part of the architecture.
+
+`model_config.validate(name)` is run by `scripts/online_learning.py`'s `main()` before anything is
+constructed, and raises rather than starting a doomed run: overrides that land on no slot/param,
+kwargs no `__init__` in the resolved class's MRO accepts (every component has a `**kwargs`
+catch-all, so a typo'd kwarg is otherwise silently swallowed and a mistyped sweep axis silently
+becomes a no-op), and values whose YAML type contradicts the annotation (a bare `3e-4` or a stray
+`true,` parses as a `str`). `scripts/print_config.py` reports the same problems non-fatally.
 - **Policy-level tunables** (things a Policy reads directly off `self` in `train_step`, not part of
   any actor/critic slot -- AMDP's `tr_lambda_init`/`tr_epsilon`, PPO's `gamma`/`lam`/`clip_eps`/
   `entropy_coef`, IQL's `tau`/`beta`, FlowQL's `alpha`) live in a `params:` block alongside that
   policy's `components:` block in `config/models.yaml`, resolved via `Policy.resolve_params()` →
   `model_config.resolve_params()` (same `models.yaml` < profile-override < `_raw_kwargs` <
-  explicit-kwargs precedence as `resolve_component()`), called once early in the Policy's
-  `__init__` and assigned by required dict key.
+  explicit-kwargs precedence as `resolve_component()`, minus the `components.yaml` layer -- a
+  `params:` block has no `class:`), called once early in the Policy's `__init__` and assigned by
+  required dict key.
 
-Because `config/models.yaml` is now the *only* place tunables live, a checkpoint's reconstruction
+Because those two YAML files are the *only* place tunables live, a checkpoint's reconstruction
 (`Policy.save`/`Policy.load`) only needs to persist which `profile` was used, not a `hparams` dict
--- both architecture and former-HParams come back from `config/models.yaml` at load time, so
-keeping that file (or a run's own frozen snapshot of it, see below) stable is what makes a
-checkpoint reproducible.
+-- both architecture and former-HParams come back from YAML at load time, so keeping those files
+(or a run's own frozen snapshot of them, see below) stable is what makes a checkpoint reproducible.
 
-`model_config.snapshot_for(name)` returns the minimal `config/models.yaml` sub-dict needed to
-reproduce resolving `name` later (the `aliases:` entry if `name` is one, plus the resolved policy's
-full block). `scripts/run_sweep.py` embeds this into every per-run YAML it writes under a `models:`
+`model_config.snapshot_for(name)` returns the minimal config sub-dict needed to reproduce resolving
+`name` later: the `aliases:` entry if `name` is one, the resolved policy's full `models.yaml` block,
+and -- under the reserved `component_defaults:` key -- the `components.yaml` entry for every class
+that policy's slots name, so replay never depends on either file's current contents.
+`scripts/run_sweep.py` embeds this into every per-run YAML it writes under a `models:`
 key (via a small dependency-free local mirror of `snapshot_for()`, so the lightweight
 subprocess-launcher script never has to import `barl` itself); `config.py`'s `load_config()` threads
 that key through to `cfg["models"]`, and `scripts/online_learning.py`'s `main()` applies it via
 `model_config.set_models_override()` before constructing the Policy -- so a saved sweep run stays
 exactly recreatable even if `config/models.yaml` changes afterward. The same resolved-config dict
 (embedded snapshot, or freshly computed via `snapshot_for()` for a non-sweep run) is logged to
-wandb under `"resolved_model"` in every run's `config=` dict.
+wandb under `"resolved_model"` in every run's `config=` dict, alongside `resolved/*` — every
+*effective* value flattened to `resolved/components.critic.rho`-style keys via
+`model_config.resolved_flat()`, which is what makes runs in a sweep groupable/comparable by
+hyperparameter rather than by which layer happened to define it.
 
 ### Rollout / replay / dataset pipeline
 
@@ -224,12 +271,22 @@ separate `increment()` call before/after.
 
 ### Config resolution (`src/barl/config.py`)
 
-A YAML config has a `defaults:` dict and a `runs:` list; each run entry is merged onto `defaults`
-(run-specific keys win) and `load_config()` returns the resolved list — `scripts/online_learning.py`
-iterates it and runs each `{model, env, ...}` combination in series in one process.
-`scripts/run_sweep.py` instead fans a `{algo x env x seed}` grid out across **separate processes**
-(own interpreter, own CUDA context each), writing one throwaway per-run YAML (same `defaults` +
-single-entry `runs`) per subprocess so it can reuse the exact same script/config-loading path.
+A YAML config has a `defaults:` dict, an optional `env_defaults:` map (keyed by env name) and a
+`runs:` list; each run entry is merged onto `env_defaults[<its env>]` onto `defaults` (later wins)
+and `load_config()` returns the resolved list — `scripts/online_learning.py` iterates it and runs
+each `{model, env, ...}` combination in series in one process. `model_overrides:` is the one key
+merged key-wise across those three levels rather than replaced wholesale, since a per-env and a
+per-run override normally mean to stack.
+
+`scripts/run_sweep.py` instead fans a grid out across **separate processes** (own interpreter, own
+CUDA context each), writing one throwaway per-run YAML (same `defaults`/`env_defaults` +
+single-entry `runs`) per subprocess so it can reuse the exact same script/config-loading path. The
+grid is a cross product over named axes — `algo`/`env`/`seed`, plus any number of
+`model.<dotted path>` axes (written into that run's `model_overrides:`) and `run.<key>` axes
+(written into its run entry) — declared either on the CLI or in a `--grid` spec file
+(`config/sweep_grid.yaml` is a documented example), with an `exclude:` list for pruning
+combinations out of the full product. `--dry_run` prints the expansion without launching anything.
+Because the axes are just overrides, **no config file is ever edited to run a sweep**.
 
 ### Registered algorithms (`src/barl/policies/`)
 

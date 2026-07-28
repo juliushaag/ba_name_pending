@@ -87,9 +87,12 @@ class Policy(nn.Module, ABC):
   def __init__(self, env: gym.Env, profile: str = None, **kwargs):
     super().__init__(**kwargs)
 
+    from barl.model_config import get_overrides
+
     # nn.Module's attribute dicts don't exist until super().__init__() returns.
     self._profile     = profile
     self._raw_kwargs  = kwargs
+    self._overrides   = get_overrides()  # captured so a checkpoint reconstructs under them too
 
     action_space      = env.action_space
     observation_space = env.observation_space
@@ -165,11 +168,19 @@ class Policy(nn.Module, ABC):
       "policy_class": self.__class__.__name__,
       "state_dict":   self.state_dict(),
       "profile":      self._profile,
+      "overrides":    self._overrides,
     }, path)
 
   @staticmethod
   def load(type: str, path: str, env: gym.Env) -> "Policy":
+    from barl.model_config import set_overrides
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
+    # The run's dotted overrides are part of the architecture, so they have to
+    # be back in place before the components are constructed -- and they beat
+    # the resuming run's own, which the weights would not match. A checkpoint
+    # predating this key keeps whatever the resuming run set.
+    if "overrides" in ckpt:
+      set_overrides(ckpt["overrides"])
     policy = Policy._classes[type](env, profile=ckpt.get("profile"))
     policy.load_state_dict(ckpt["state_dict"])
     return policy

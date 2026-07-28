@@ -228,23 +228,6 @@ class ScoreDiscreteActor(Actor, nn.Module):
   def eta(self) -> torch.Tensor:
     return F.softplus(self._eta_raw).clamp(0.25, 4.0)
 
-  def describe_schedule(self) -> dict:
-    """Diagnostics worth asserting on in a unit test, and worth logging."""
-    with torch.no_grad():
-      s    = self.beta_scale
-      used = self.beta[1:].unsqueeze(-1) * s                  # (N, D)
-      tot  = used.sum(0)
-      return {
-        "max_step":        float(used.max()),
-        "total_noise_min": float(tot.min()),
-        "total_noise_max": float(tot.max()),
-        "signal_at_N_max": math.exp(-float(tot.min())),
-        "logratio_const":  self.logratio_const,
-        "scale_min":       float(s.min()),
-        "scale_max":       float(s.max()),
-        "eta_mean":        float(self.eta.mean()),
-      }
-
   def gaussian_logprob(self, x, mean, var):
     return (-0.5 * (x - mean) ** 2 / var - 0.5 * torch.log(2 * math.pi * var)).sum(-1, keepdim=True)
 

@@ -1,17 +1,40 @@
-# Per-policy component specs + named profiles/aliases. Separate from
-# config/online_learning.yaml (the run/training-loop config) -- this only
-# controls architecture (which component class each Policy's slots use, and
-# their kwargs), never touched by the run scripts directly. See
-# src/barl/model_config.py for the resolution order (this file's per-policy
-# `components:` < the active profile's overrides < any explicit kwarg the
-# Policy itself passes to resolve_component()).
+# Per-policy component slots, policy-level params, and named profiles/aliases.
+# Separate from config/online_learning.yaml (the run/training-loop config) --
+# this only controls the model (which component class each Policy's slots use,
+# their kwargs, and the Policy's own tunables), never touched by the run
+# scripts directly.
 #
-# Every slot's kwargs are written out in full here -- there is no
-# per-component default file to fall back on. Switching a slot's `class:`
-# (e.g. critic: MeanStdEnsembleCritic -> QRDistributionalCritic, or squash: TanhSquash
-# -> ErfSquash) means writing out *all* of that class's required kwargs right
-# here; nothing else fills in the gaps, so a missing one surfaces immediately
-# as a plain missing-argument TypeError from the component's own __init__.
+# Each slot names its `class:` explicitly and then lists only what it wants to
+# differ from that class's baseline in config/components.yaml -- the single
+# defaults layer, keyed by component class name. Resolution order, lowest
+# precedence first (see src/barl/model_config.py):
+#
+#   components.yaml's entry for the slot's `class:`
+#     < this file's `components: {<slot>: {...}}`
+#     < the active profile's override for that slot
+#     < any explicit kwarg the Policy itself passes to resolve_component()
+#
+# `params:` (the Policy's own tunables, read off `self` in train_step) skips
+# the components.yaml layer -- it has no `class:` -- but is profile-overridable
+# the same way. Neither layer has a Python-level fallback: a kwarg listed in
+# neither file is a missing-argument TypeError from the component's own
+# __init__.
+#
+#   uv run python scripts/print_config.py <model> [--profile P]
+#
+# prints the fully resolved model with every value annotated by which layer
+# above it came from.
+#
+# Switching a slot's `class:` (e.g. critic: MeanStdEnsembleCritic ->
+# QRDistributionalCritic, or squash: TanhSquash -> ErfSquash) is a one-word
+# edit as long as the new class has a components.yaml entry; if it doesn't,
+# spell its kwargs out here instead. Nothing below needs to be edited to *try*
+# an alternative, though -- a run config's `model_overrides:` (and therefore
+# any scripts/run_sweep.py `model.` axis) can set both kwargs and the `class:`
+# itself for one run only:
+#
+#   uv run python scripts/run_sweep.py --algos AMDP --envs HalfCheetah \
+#       --set model.components.critic.class=QRDistributionalCritic
 #
 # `model:` in a run config (config/online_learning.yaml's `runs:`) can name
 # either a plain Policy class below, or one of the `aliases:` shortcuts,
@@ -32,11 +55,9 @@ SACPolicy:
     entropy_scale: -1.0
 
   components:
-    actor:    {class: StochasticActor, hidden_dim: 256, layers: 3, squash_cls: TanhSquash}
-    # critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
-    critic:   {class: MeanStdEnsembleCritic, hidden_dim: 512, layers: 2, n_models: 10, rho: 2.0, polyak_tau: 0.005, gamma: 0.99}
-    
-    entropy:  {class: AutotuneRegulator, lr: 3e-4, alpha_init: 0.05, min_alpha: 0.01, max_alpha: 10.0 }
+    actor:    {class: StochasticActor, hidden_dim: 512, layers: 3}
+    critic:   {class: MeanStdEnsembleCritic}
+    entropy:  {class: AutotuneRegulator}
 
   profiles:
     Small:
@@ -49,41 +70,23 @@ SACPolicy:
 DIMEPolicy:
   params:
     entropy_scale: -4.0
-  
-  components:
-    actor: 
-      class: ScoreDiscreteActor
-      latent_dim: 256
-      layers: 3
-      num_steps: 20
-      beta_min: 0.12
-      beta_max: 0.18
-      beta_scale_min: 0.7
-      beta_scale_max: 1.8
-      learn_beta_scale: true
-      eta_init: 1.5811 # sqrt(2.5)
-      learn_eta: false
-      anchor_score: true,
-      noise_start: 0.999
-      noise_end: 0.001
 
-    # critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
-    critic: {class: MinEnsembleCritic, hidden_dim: 512, layers: 2, n_models: 10, rho: 2.0, polyak_tau: 0.005, gamma: 0.99}
-    squash: {class: TanhSquash}
-    entropy: {class: AutotuneRegulator, lr: 3e-4, alpha_init: 0.001, min_alpha: 0.0001, max_alpha: 10.0 }
+  components:
+    actor:   {class: ScoreDiscreteActor}
+    critic:  {class: MinEnsembleCritic}
+    squash:  {class: TanhSquash}
+    entropy: {class: AutotuneRegulator, alpha_init: 0.001, min_alpha: 0.0001}
 
 AMDP:
   params:
     entropy_scale: -1.5
 
   components:
-    actor:  {class: ScoreContinuousActor, latent_dim: 256, layers: 3, max_steps: 16, sigma_min: 2.0, sigma_max: 2.5, tau_min: 0.0, tau_max: 1.0 }
-    # critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
-    critic: {class: MeanStdEnsembleCritic, hidden_dim: 512, layers: 2, n_models: 10, rho: 2.0, polyak_tau: 0.005, gamma: 0.99}
-    squash: {class: ErfSquash}   # `k` is always derived at construction time -- see AMDP.__init__
-    entropy: {class: AutotuneRegulator, lr: 3e-4, alpha_init: 0.05, min_alpha: 0.01, max_alpha: 10.0}
-    trust_region: {class: AutotuneRegulator,  lr: 3e-4, alpha_init: 0.05, min_alpha: 1.0e-6, max_alpha: 10.0, target: 0.2}
-
+    actor:   {class: ScoreContinuousActor}
+    critic:  {class: MeanStdEnsembleCritic}
+    squash:  {class: ErfSquash}
+    entropy: {class: AutotuneRegulator}
+    trust_region: {class: AutotuneRegulator, min_alpha: 1.0e-6, target: 0.2}
 
 SDAC:
   params:
@@ -91,26 +94,11 @@ SDAC:
     num_candidates: 20
     explore_init: 0.1
 
-    components:
-      class: ScoreDiscreteActor
-      latent_dim: 256
-      layers: 3
-      num_steps: 20
-      beta_min: 0.12
-      beta_max: 0.18
-      beta_scale_min: 0.7
-      beta_scale_max: 1.8
-      learn_beta_scale: true
-      eta_init: 1.5811 # sqrt(2.5)
-      learn_eta: false
-      anchor_score: true,
-      noise_start: 0.999
-      noise_end: 0.001
-
-    # critic: {class: QRDistributionalCritic, hidden_dim: 2048, layers: 2, num_quantiles: 100}
-    critic: {class: MinEnsembleCritic, hidden_dim: 512, layers: 2, n_models: 10, rho: 2.0, polyak_tau: 0.005, gamma: 0.99}
-    squash: {class: TanhSquash}   # `k` is always derived at construction time -- see AMDP.__init__
-    entropy: {class: AutotuneRegulator, lr: 3e-4, alpha_init: 0.05, min_alpha: 0.01, max_alpha: 10.0}
+  components:
+    actor:   {class: ScoreDiscreteActor, latent_dim: 256}
+    critic:  {class: MinEnsembleCritic}
+    squash:  {class: TanhSquash}
+    entropy: {class: AutotuneRegulator}
 
 PPOPolicy:
   params:
@@ -119,30 +107,28 @@ PPOPolicy:
     clip_eps: 0.2
     entropy_coef: 0.05
   components:
-    actor:  {class: StochasticActor, hidden_dim: 256, layers: 4, squash_cls: TanhSquash}
-    critic: {class: PPOCritic,       hidden_dim: 256, layers: 4}
+    actor:  {class: StochasticActor}
+    critic: {class: PPOCritic}
 
 IQLPolicy:
   params:
     tau: 0.7
     beta: 3.0
   components:
-    actor:  {class: StochasticActor, hidden_dim: 256, layers: 6, squash_cls: TanhSquash}
-    critic: {class: IQLCritic,       hidden_dim: 256, layers: 6, polyak_tau: 0.005, gamma: 0.99}
+    actor:  {class: StochasticActor, layers: 6}
+    critic: {class: IQLCritic}
 
 FlowQLPolicy:
   params:
     alpha: 100.0
   components:
-    actor:  {class: DistilledFlowActor, latent_dim: 512, flow_steps: 16, time_dim: 8}
-    critic: {class: MeanStdEnsembleCritic, hidden_dim: 512, layers: 4, n_models: 10, rho: 2.0, polyak_tau: 0.005, gamma: 0.99}
+    actor:  {class: DistilledFlowActor}
+    critic: {class: MeanStdEnsembleCritic, hidden_dim: 512, layers: 4}
 
 FlowBCPolicy:
   components:
-    actor: {class: FlowBCActor, latent_dim: 512, flow_steps: 16, time_dim: 8, hidden_layers: 4}
+    actor: {class: FlowBCActor}
 
 DirectPolicy:
   components:
-    actor: {class: DeterministicActor, hidden_dim: 128, layers: 4}
-
-
+    actor: {class: DeterministicActor}

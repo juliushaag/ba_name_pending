@@ -89,11 +89,13 @@ class AMDP(Policy):
       sig_sq_tau = self.actor.sigma_sq_int_fn(tau).unsqueeze(-1)
       sig_sq_one = self.actor.sigma_sq_int_fn(torch.full((obs.shape[0],), self.actor.tau_max, device=obs.device)).unsqueeze(-1)
 
+      # !!! Very important to sample X from the policy NOT from the batch !!!
       var = (sig_sq_tau - (sig_sq_tau ** 2 / sig_sq_one)).clamp_min(0.0)
       X_t = next_X * (sig_sq_tau / sig_sq_one) + var.sqrt() * torch.randn_like(next_X)
 
       time_embed = sinusoidal_emb(tau.view(obs.shape[0], 1), self.actor.time_dim)
 
+      # Taking next_X because freeee 
       u_tilde = self.actor.diffusion_act(next_obs, X_t, time_embed)
       # u_old = self.actor_old.target.diffusion_act(obs, X_t, time_embed)
 
@@ -105,8 +107,8 @@ class AMDP(Policy):
 
         x_score : torch.Tensor = torch.func.grad(q_values)(next_X).detach()
 
-        u      = sigma_tau * u_tilde                       # scale NN output by sigma(tau)
-        target = sigma_tau * x_score.div(alpha)            # Eq. (15) target, as written
+        u      = sigma_tau * u_tilde
+        target = sigma_tau * x_score.div(alpha)
         amdp_loss = (0.5 * (u - target).pow(2).sum(-1) / sigma_tau.squeeze(-1)).mean()
 
         # tr_loss   = 0.5 * F.mse_loss(u.float(), u_old.float())

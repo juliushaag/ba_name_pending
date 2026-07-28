@@ -79,7 +79,6 @@ def evaluate_and_log(model: Policy, env: gym.Env, log: Logger, ckpt_dir: str, be
 
   return best_reward
 
-
 def train_batch(model: Policy, opts: dict[str, torch.optim.Optimizer], scheds: dict[str, torch.optim.lr_scheduler.LambdaLR],
                  batch, batch_idx: int, log: Logger, env: gym.Env, ckpt_dir: str, best_reward: float, cfg: dict) -> float:
   """One gradient step: loss compute, backward+clip+step per loss key, stat
@@ -189,9 +188,15 @@ def main(cfg: dict):
   MODEL = cfg["model"]
   ENV   = cfg["env"]
 
-  # Unconditional: also resets any override left over from a previous run in
-  # this process's `runs:` series when the current run doesn't carry one.
+  # Unconditional: also resets anything left over from a previous run in this
+  # process's `runs:` series when the current run doesn't carry one.
   model_config.set_models_override(cfg.get("models"))
+  model_config.set_overrides(cfg.get("model_overrides"))
+
+  problems = model_config.validate(MODEL)
+  if problems:
+    raise ValueError(f"{MODEL}: unusable model config, refusing to start:\n  "
+                     + "\n  ".join(problems))
 
   now  = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
   name = f"{MODEL.lower()}/{ENV.lower()}/{now}"
@@ -240,7 +245,11 @@ def main(cfg: dict):
     run_name=name,
     step_keys={"env_steps", "grad_steps"},
     tags=tags,
+    # resolved/* is every *effective* value, flat, whichever layer set it --
+    # what makes runs in a sweep comparable by hyperparameter rather than by
+    # which layer happened to define it.
     config={**cfg, "resolved_model": resolved_model_cfg,
+            **{f"resolved/{k}": v for k, v in model_config.resolved_flat(MODEL).items()},
             "env_obs": str(env.observation_space), "env_act": str(env.action_space)},
     group=cfg["sweep_tag"]
   )

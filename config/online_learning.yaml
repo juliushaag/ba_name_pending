@@ -5,6 +5,15 @@
 # module constant). `runs` is a list of {model, env, ...} -- each entry is
 # merged onto `defaults` and run in series, so listing several algorithms
 # here trains them one after another in a single invocation.
+#
+# Merge order per run: `defaults` < `env_defaults[<that run's env>]` < the run
+# entry itself. A run entry (or either defaults level) may also carry
+# `model_overrides:`, a dotted-path map layered over config/models.yaml on top
+# of any profile -- `{components.critic.rho: 1.0, params.entropy_scale: -2.0}`
+# -- which is how a tunable gets varied without editing the model config.
+# Unlike every other key those merge key-wise across the three levels instead
+# of replacing wholesale. scripts/run_sweep.py's `model.*`/`run.*` grid axes
+# write exactly these.
 
 defaults:
   checkpoint: null          # path to resume from, or null to train from scratch
@@ -25,3 +34,14 @@ defaults:
   eval_every: 10000         # grad steps between evals
   eval_runs: 10
   log_every: 10             # batches between stat logs
+
+# Per-env overrides of anything above, applied to every run on that env (in
+# this file's `runs:` and in every scripts/run_sweep.py grid alike) -- so a
+# sweep spanning envs of very different cost/horizon doesn't need one run
+# entry per env just to restate the same handful of keys.
+env_defaults: {}
+  # Humanoid:
+  #   total_env_steps: 5000000
+  #   num_envs: 64
+  # InvertedPendulum:
+  #   total_env_steps: 200000
