@@ -21,12 +21,18 @@ import torch
 
 from barl.logger import Logger
 from barl import Policy
+from barl.metrics import DEBUG, PRIMARY
 import barl.model_config as model_config
 from barl.env import Environment
 
 from barl.rollout import ReplayBuffer
 
 torch.set_float32_matmul_precision("high")
+
+# Every Normal/Distribution built in a train_step validates its constraints with
+# a .all() reduction, i.e. a GPU sync per construction -- ~6 ms each, and SAC
+# builds two per step. Nothing here relies on the resulting exceptions.
+torch.distributions.Distribution.set_default_validate_args(False)
 
 DEFAULT_CONFIG = os.path.join(os.path.dirname(__file__), "..", "config", "online_learning.yaml")
 
@@ -53,13 +59,26 @@ def create_schedulers(opts: dict[str, torch.optim.Optimizer], warmup_steps: int,
   }
 
 
+def assign_grads(params: list[torch.Tensor], grads: tuple[torch.Tensor, ...]) -> None:
+  """Attaches `grads` as `.grad`, normalized to each parameter's dtype and
+  layout. backward() used to do both on the way into AccumulateGrad; taking
+  gradients via autograd.grad hands them back raw, and a fused optimizer
+  rejects a grad whose dtype or strides don't match its parameter (an
+  Ensemble's vmapped matmul yields non-contiguous grads for its stacked
+  weights, and a loss under autocast yields bf16 ones for fp32 parameters)."""
+  for p, g in zip(params, grads):
+    if g.dtype != p.dtype:
+      g = g.to(p.dtype)
+    if g.stride() != p.stride():
+      g = g.contiguous()
+    p.grad = g
+
+
 def evaluate_and_log(model: Policy, env: gym.Env, log: Logger, ckpt_dir: str, best_reward: float, cfg: dict) -> float:
-  data_runs = model.evaluate(env, runs=cfg["eval_runs"])
+  data_runs = model.evaluate(env, runs=cfg["eval_runs"], videos=cfg.get("eval_videos", 2))
 
   rewards     = [np.sum(run["rewards"]) for run in data_runs]
   avg_reward  = float(np.mean(rewards))
-  best_idx    = int(np.argmax(rewards))
-  worst_idx   = int(np.argmin(rewards))
 
   log.log({
     "eval/avg_cum_reward": avg_reward,
@@ -67,8 +86,10 @@ def evaluate_and_log(model: Policy, env: gym.Env, log: Logger, ckpt_dir: str, be
     "eval/success_rate":   np.mean([int(not bool(run["terminated"])) for run in data_runs]),
   })
 
-  log.log_video("eval/video_best",  data_runs[best_idx]["frames"])
-  log.log_video("eval/video_worst", data_runs[worst_idx]["frames"])
+  # Only the randomly-recorded runs carry frames; keys are positional so a given
+  # slot stays the same wandb panel across evals.
+  for i, run in enumerate(r for r in data_runs if r["frames"]):
+    log.log_video(f"eval/video_{i}", run["frames"])
 
   model.save(os.path.join(ckpt_dir, "latest.pt"))
 
@@ -85,26 +106,36 @@ def train_batch(model: Policy, opts: dict[str, torch.optim.Optimizer], scheds: d
   logging, grad_steps increment, periodic eval trigger. Shared by the
   on-policy epoch loop (train_epoch) and the off-policy fixed-UTD loop in
   main() -- both just differ in how `batch` is produced."""
-  losses, stats = model.train_step(batch)
+  # Tiers are keyed off the global grad-step counter, not batch_idx -- the latter
+  # restarts every epoch/iteration, so the cadence would differ on- vs off-policy.
+  step  = log.get_step("grad_steps")
+  tiers = ([PRIMARY] if step % cfg["log_every"] == 0 else []) \
+        + ([DEBUG]   if step % cfg["debug_every"] == 0 else [])
+
+  model.before_step(tiers)
+  model.record_batch(batch)
+  losses = model.train_step(batch)
 
   for k in losses:
-    opts[k].zero_grad(set_to_none=True)
-    losses[k].backward(retain_graph=True)
-    norm = torch.nn.utils.clip_grad_norm_(
-      [p for group in opts[k].param_groups for p in group["params"]],
-      max_norm=1.0,
-      error_if_nonfinite=True,
+    params = [p for group in opts[k].param_groups for p in group["params"]]
+
+    grads = torch.autograd.grad(
+      losses[k], params, retain_graph=True,
+      allow_unused=True, materialize_grads=True
     )
+    assign_grads(params, grads)
+    norm = torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
 
     opts[k].step()
     scheds[k].step()
 
-    stats[f"train/loss/{k}"] = losses[k].detach()
-    stats[f"train/norm/{k}"] = norm
-    stats[f"train/lr/{k}"]   = scheds[k].get_last_lr()[0]
+    model.record_optimizer(k, losses[k], scheds[k].get_last_lr()[0], norm, params)
 
-  if batch_idx % cfg["log_every"] == 0:
-    log.log(stats)
+  model.after_step()
+
+  primary, debug = model.drain_metrics()
+  log.log(primary)
+  log.log_quiet(debug)
 
   log.increment({"grad_steps": 1})
 
@@ -148,7 +179,9 @@ def validate_run(model: Policy, opts: dict[str, torch.optim.Optimizer], buffer: 
                   rollout_env: gym.vector.VectorEnv, cfg: dict):
   """Cheap smoke test for `--validate` sweeps: one rollout chunk + one
   train_step + optimizer step, no eval/checkpointing/wandb logging."""
-  buffer.rollout(model, env=rollout_env, n_steps=cfg["batch_size"] * 10,
+  # One full batch is all the single train_step below consumes; collecting 10x
+  # that was most of a validate's wall clock at the single env --validate uses.
+  buffer.rollout(model, env=rollout_env, n_steps=cfg["batch_size"],
                  seed=cfg.get("seed"))
 
   if model.on_policy:
@@ -157,22 +190,25 @@ def validate_run(model: Policy, opts: dict[str, torch.optim.Optimizer], buffer: 
   train_loader = torch.utils.data.DataLoader(
     SingleStepDataset.from_replay(buffer),
     batch_size=cfg["batch_size"],
+    collate_fn=SingleStepDataset.collate,
   )
   batch = next(iter(train_loader))
 
   model.train()
   model.on_epoch_start()
-  losses, _ = model.train_step(batch)
+  model.before_step((PRIMARY, DEBUG))
+  model.record_batch(batch)
+  losses = model.train_step(batch)
 
   for k in losses:
-    opts[k].zero_grad(set_to_none=True)
-    losses[k].backward(retain_graph=True)
-    torch.nn.utils.clip_grad_norm_(
-      [p for group in opts[k].param_groups for p in group["params"]],
-      max_norm=1.0,
-    )
+    params = [p for group in opts[k].param_groups for p in group["params"]]
+    grads = torch.autograd.grad(losses[k], params, retain_graph=True,
+                                allow_unused=True, materialize_grads=True)
+    assign_grads(params, grads)
+    torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
     opts[k].step()
 
+  model.after_step()
   model.on_epoch_end()
 
   print(f"[validate] {cfg['model']} on {cfg['env']}: OK ({len(losses)} loss term(s), "
@@ -209,18 +245,24 @@ def main(cfg: dict):
 
   buffer = ReplayBuffer(cfg["buffer_size"], traj_len=environment.get_max_traj_length(env))
 
+  # Handed to every actor/critic/squash/... via Policy.build_component; its
+  # "live" section is refreshed from each rollout's stats below.
+  env_stats = environment.get_env_stats(env)
+
   checkpoint = cfg.get("checkpoint")
   if checkpoint is not None and os.path.exists(checkpoint):
-    model = Policy.load(MODEL, checkpoint, env).to("cuda")
+    model = Policy.load(MODEL, checkpoint, env, env_stats).to("cuda")
   else:
-    model: Policy = Policy.make(MODEL, env).to("cuda")
+    model: Policy = Policy.make(MODEL, env, env_stats=env_stats).to("cuda")
 
   opts  = model.create_optimizer()
 
-  # Estimated total grad-step budget for the whole run, matching the same
-  # accounting the training loop below uses per-iteration -- just an estimate
-  # (on-policy's actual batches/epoch varies with episode boundaries), fine
-  # for an LR schedule since lr_schedule() flattens at 0 past it regardless.
+  if cfg.get("compile"):
+    model.train_step = torch.compile(model.train_step)
+
+  if cfg.get("compile_inference"):
+    model.inference_step = torch.compile(model.inference_step, mode="reduce-overhead")
+
   if model.on_policy:
     total_grad_steps = max(1, cfg["total_env_steps"] // cfg["batch_size"]) * cfg["epochs_per_rollout"]
   else:
@@ -245,21 +287,21 @@ def main(cfg: dict):
     run_name=name,
     step_keys={"env_steps", "grad_steps"},
     tags=tags,
-    # resolved/* is every *effective* value, flat, whichever layer set it --
-    # what makes runs in a sweep comparable by hyperparameter rather than by
-    # which layer happened to define it.
     config={**cfg, "resolved_model": resolved_model_cfg,
             **{f"resolved/{k}": v for k, v in model_config.resolved_flat(MODEL).items()},
+            # Arrays are skipped -- env_obs/env_act below already carry the bounds.
+            **{f"env_stats/{k}": v for k, v in env_stats.static().items()
+               if not isinstance(v, np.ndarray)},
             "env_obs": str(env.observation_space), "env_act": str(env.action_space)},
     group=cfg["sweep_tag"]
   )
 
-  log.register("eval/*",  "env_steps")
-  log.register("train/*", "grad_steps")
-  log.register("train/loss/*", "grad_steps")
-  log.register("stats/*", "grad_steps")
-  log.register("model/*", "grad_steps")
+  log.register("eval/*",    "env_steps")
   log.register("rollout/*", "env_steps")
+  log.register("model/*",   "grad_steps")
+  # One namespace per component slot plus the algorithm's own -- see Policy.algo_name().
+  for ns in [*model.components, model.algo_name(), "batch", "buffer"]:
+    log.register(f"{ns}/*", "grad_steps")
 
   ckpt_dir = os.path.join("checkpoints", name)
   os.makedirs(ckpt_dir, exist_ok=True)
@@ -267,7 +309,8 @@ def main(cfg: dict):
   # Off-policy only: PPO's compute_gae needs extras["value"] on every trajectory,
   # which a random-action rollout never stashes (see ReplayBuffer.random_fill).
   if not model.on_policy and cfg.get("random_steps", 0) > 0:
-    buffer.random_fill(rollout_env, n_steps=cfg["random_steps"] // cfg["num_envs"], seed=seed)
+    env_stats["live"].update(
+      buffer.random_fill(rollout_env, n_steps=cfg["random_steps"] // cfg["num_envs"], seed=seed))
     log.increment({"env_steps": cfg["random_steps"]})
     log.message(f"Random-filled buffer with {cfg['random_steps']} env steps before training")
 
@@ -279,8 +322,11 @@ def main(cfg: dict):
                     seed=seed if it == 0 else None)
     log.increment({"env_steps": cfg["rollout_steps"]})
     log.log({f"rollout/{k}": v for k, v in rollout_stats.items()})
+    # Every component holds a reference to this same EnvStats, so one update
+    # is all it takes for them to see the current rollout's numbers.
+    env_stats["live"].update(rollout_stats)
 
-    n_transitions = sum(len(traj) for traj in buffer.buffer)
+    n_transitions = buffer.n_transitions
 
     if model.on_policy:
       batches_per_epoch = -(-n_transitions // cfg["batch_size"])  # ceil div
@@ -290,8 +336,8 @@ def main(cfg: dict):
 
     log.message(f"Finished Rollout buffer contains {len(buffer.buffer)} episodes "
                 f"({n_transitions} transitions, ~{grad_steps_this_iter} grad steps this iter)")
-    log.log({"stats/buffer_transitions": n_transitions,
-              "stats/utd_ratio": grad_steps_this_iter / cfg["rollout_steps"]})
+    log.log({"buffer/transitions": n_transitions,
+              "buffer/utd_ratio": grad_steps_this_iter / cfg["rollout_steps"]})
 
     if model.on_policy:
       # GAE needs the trajectories in-order -- must run before SingleStepDataset shuffles them.
@@ -301,6 +347,7 @@ def main(cfg: dict):
         SingleStepDataset.from_replay(buffer),
         batch_size=cfg["batch_size"],
         shuffle=True,
+        collate_fn=SingleStepDataset.collate,
       )
 
       for _ in range(cfg["epochs_per_rollout"]):

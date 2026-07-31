@@ -48,45 +48,85 @@ class SingleStepDataset(torch.utils.data.Dataset):
   def __init__(self, trajectories : list[Trajectory]):
     self.buffer = trajectories
 
-    lengths = [len(i) for i in self.buffer]
+    lengths = np.array([len(i) for i in self.buffer])
 
     self.length_cumsum = np.cumsum(lengths)
-  
+
     self.discrete_actions = np.issubdtype(
         np.asarray(self.buffer[0].actions).dtype, np.integer
     )
 
+    # Flattened once here rather than re-derived per item: __getitem__ is on the
+    # DataLoader's hot path, and a searchsorted + per-field torch.asarray per
+    # sample dominated it. Observations are stored once -- `obs_row` indexes a
+    # transition's observation and that row + 1 is its next_obs.
+    self.observations = np.concatenate(
+        [t.observations for t in self.buffer]).astype(np.float32, copy=False)
+    starts = np.concatenate([[0], np.cumsum(lengths + 1)[:-1]])
+    self.obs_row = np.concatenate([s + np.arange(n) for s, n in zip(starts, lengths)])
+
+    self.term = np.zeros(int(lengths.sum()), dtype=bool)
+    self.term[self.length_cumsum - 1] = [t.terminated for t in self.buffer]
+
+    actions = np.concatenate([t.actions for t in self.buffer])
+    # discrete actions -> long (for embedding/cross-entropy), continuous -> float32
+    self.act = actions if self.discrete_actions else actions.astype(np.float32, copy=False)
+    self.rew = np.concatenate([t.rewards for t in self.buffer]).astype(np.float32, copy=False)
+    self.extras = {
+      k: np.concatenate([t.extras[k] for t in self.buffer]).astype(np.float32, copy=False)
+      for k in set.intersection(*(set(t.extras) for t in self.buffer))
+    }
+
   def __len__(self):
     return self.length_cumsum[-1]
-  
-  def __getitem__(self, idx) -> dict: 
+
+  def __getitem__(self, idx) -> dict:
 
     assert idx < len(self)
 
-    base_idx = np.searchsorted(self.length_cumsum, idx, side="right")
-
-    prev = 0 if base_idx == 0 else self.length_cumsum[base_idx - 1]
-    traj_idx = idx - prev
-    
-    traj_end = traj_idx == len(self.buffer[base_idx]) - 1
-
-    act = torch.asarray(self.buffer[base_idx].actions[traj_idx])
-    # discrete actions -> long (for embedding/cross-entropy), continuous -> float32
-    act = act.long() if self.discrete_actions else act.float()
+    row = self.obs_row[idx]
 
     sample = dict(
-      obs=      torch.asarray(self.buffer[base_idx].observations[traj_idx]).float(),
-      next_obs= torch.asarray(self.buffer[base_idx].observations[traj_idx + 1]).float(),
-      act=      act,
-      rew=      torch.asarray(self.buffer[base_idx].rewards[traj_idx]).float(),
-      term=     traj_end and self.buffer[base_idx].terminated
+      obs=      torch.from_numpy(self.observations[row]),
+      next_obs= torch.from_numpy(self.observations[row + 1]),
+      act=      torch.from_numpy(self.act[idx]),
+      rew=      torch.from_numpy(self.rew[idx: idx + 1])[0],
+      term=     bool(self.term[idx]),
     )
 
-    for key, values in self.buffer[base_idx].extras.items():
-      sample[key] = torch.asarray(values[traj_idx]).float()
+    for key, values in self.extras.items():
+      sample[key] = torch.from_numpy(values[idx: idx + 1])[0]
 
     return sample
-  
+
+  @staticmethod
+  def collate(batch: dict) -> dict:
+    """Pass-through: __getitems__ already returns a stacked batch, so a
+    DataLoader over this dataset must be given this as its `collate_fn`
+    (torch still routes __getitems__' output through collate_fn, and the
+    default one expects a list of samples)."""
+    return batch
+
+  def __getitems__(self, indices: list[int]) -> dict:
+    """Batched fetch. torch's DataLoader prefers this over per-index
+    __getitem__ when present, which -- together with collate() above -- makes
+    the whole minibatch one fancy-index per field."""
+    idx  = np.asarray(indices)
+    rows = self.obs_row[idx]
+
+    batch = dict(
+      obs=      torch.from_numpy(self.observations[rows]),
+      next_obs= torch.from_numpy(self.observations[rows + 1]),
+      act=      torch.from_numpy(self.act[idx]),
+      rew=      torch.from_numpy(self.rew[idx]),
+      term=     torch.from_numpy(self.term[idx]),
+    )
+    for key, values in self.extras.items():
+      batch[key] = torch.from_numpy(values[idx])
+
+    return batch
+
+
 
   @classmethod
   def from_replay(cls, replay : "ReplayBuffer") -> "SingleStepDataset":

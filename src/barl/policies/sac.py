@@ -28,14 +28,10 @@ class SACPolicy(Policy):
     params = self.resolve_params()
     self.entropy_scale        = params["entropy_scale"]
 
-    self.critic : QCriticBase = self.build_component("critic", QCriticBase, self.observation_dim, self.action_dim, pessimistic_score=False)
-    self.actor : StochasticActor = self.build_component("actor", StochasticActor, self.observation_dim, self.action_dim)
+    self.critic : QCriticBase = self.build_component("critic", QCriticBase)
+    self.actor : StochasticActor = self.build_component("actor", StochasticActor)
 
-    self.entropy : AutotuneRegulator = self.build_component("entropy", AutotuneRegulator, target=self.action_dim * self.entropy_scale, name="entropy")
-
-  def on_epoch_start(self):
-    self.critic.on_epoch_start()
-    return super().on_epoch_start()
+    self.entropy : AutotuneRegulator = self.build_component("entropy", AutotuneRegulator, target=self.action_dim * self.entropy_scale)
 
   def create_optimizer(self):
     return {
@@ -49,7 +45,7 @@ class SACPolicy(Policy):
     tanh Jacobian correction needs the extra `act_scale` term since log_prob
     is the density of an affine-transformed variable, not of `action` itself."""
     dist = self.actor.dist(obs)
-    # Hand-rolled, not dist.rsample(): its in-place .normal_() fill can't trace under vmap.
+    
     x = dist.mean + dist.stddev * torch.randn_like(dist.mean)
     y = self.actor.squash(x)
 
@@ -63,9 +59,7 @@ class SACPolicy(Policy):
     reward   = batch["rew"].to(self.device)
     term     = batch["term"].to(self.device)
 
-
-    self.critic.step()
-    losses, log = {}, {}
+    losses = {}
     alpha = self.entropy.value()
 
     
@@ -81,20 +75,25 @@ class SACPolicy(Policy):
 
     with float32():
 
-      self.critic.loss(obs, action, reward, term, next_obs, next_action, entropy_bonus, log, losses)
-      self.entropy.loss(entropy.detach(), log, losses)
+      with torch.no_grad():
+        bootstrap = self.critic.bootstrap(next_obs, next_action) + entropy_bonus
+        q_target  = self.critic.bellman_target(reward, term, bootstrap)
+
+      self.critic.loss(obs, action, q_target, losses)
+      self.entropy.loss(entropy.detach(), losses)
 
       actor_loss = -(q_new + (alpha * entropy)).mean() # Gradient descent therfore the minus
 
 
     losses["actor"] = actor_loss
 
-    log["stats/reward_mean"]  = reward.mean()
-    log["stats/act_abs"]      = action.abs().mean()  
+    self.actor.metrics.dist("entropy", entropy)
+    self.actor.metrics.vec("action", new_action, limit=1.0)
+    self.critic.metrics.dist("q_new", q_new)
 
-    return losses, log
+    return losses
 
-  @torch.inference_mode()
+  @torch.no_grad()
   def inference_step(self, observation: torch.Tensor, step_info=None):
     obs = self.normalize_obs(observation.to(self.device))
     return self.actor.sample(obs), {}

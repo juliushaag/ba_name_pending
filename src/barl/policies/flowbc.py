@@ -16,18 +16,18 @@ class FlowBCActor(Actor, nn.Module):
   """Pure flow-matching BC actor. Inference samples through an EMA snapshot
   (`flow_ema`); the loss trains the live net (`flow`)."""
 
-  def __init__(self, obs_dim: int, action_dim: int,
-               latent_dim: int, flow_steps: int, time_dim: int, hidden_layers: int, **kwargs):
-    super().__init__(**kwargs)
+  def __init__(self, env_stats, latent_dim: int, flow_steps: int, time_dim: int,
+               hidden_layers: int, **kwargs):
+    super().__init__(env_stats, **kwargs)
 
-    self.action_dim = action_dim
     self.flow_steps  = flow_steps
     self.time_dim    = time_dim
 
-    self.flow     = MLP(obs_dim + time_dim + action_dim, action_dim, latent_dim, hidden_layers, layernorm=False)
+    self.flow     = MLP(self.obs_dim + time_dim + self.action_dim, self.action_dim,
+                        latent_dim, hidden_layers, layernorm=False)
     self.flow_ema = EMA(self.flow, start_decay=0.995, end_decay=0.995)
 
-  def step_ema(self):
+  def before_step(self):
     self.flow_ema.step()
 
   def step_flow(self, obs: torch.Tensor, action: torch.Tensor, t: torch.Tensor, inference: bool = False) -> torch.Tensor:
@@ -49,7 +49,7 @@ class FlowBCPolicy(Policy):
   def __init__(self, env: gym.Env, **kwargs):
     super().__init__(env, **kwargs)
 
-    self.actor = self.build_component("actor", FlowBCActor, self.observation_dim, self.action_dim)
+    self.actor = self.build_component("actor", FlowBCActor)
 
   def create_optimizer(self):
     return self.actor.create_optimizer()
@@ -58,7 +58,6 @@ class FlowBCPolicy(Policy):
     obs     = self.normalize_obs(batch["obs"].to(self.device))
     actions = batch["act"].to(self.device)
 
-    self.actor.step_ema()
 
     B = actions.shape[0]
 
@@ -70,9 +69,11 @@ class FlowBCPolicy(Policy):
     v_pred = self.actor.step_flow(obs, zt, t)
     loss = F.mse_loss(v_pred.float(), (z1 - z0).float())
 
-    return {"flow": loss}, {"stats/v_norm": v_pred.norm(dim=-1).mean().detach()}
+    self.actor.metrics.vec("velocity", v_pred)
 
-  @torch.inference_mode()
+    return {"flow": loss}
+
+  @torch.no_grad()
   def inference_step(self, observation: torch.Tensor, z: torch.Tensor = None):
     obs = self.normalize_obs(observation.to(self.device))
     return self.actor.sample(obs, z=z), {}

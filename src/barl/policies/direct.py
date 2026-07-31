@@ -15,7 +15,7 @@ class DirectPolicy(Policy):
   def __init__(self, env: gym.Env, **kwargs):
     super().__init__(env, **kwargs)
 
-    self.actor = self.build_component("actor", DeterministicActor, self.observation_dim, self.action_dim)
+    self.actor = self.build_component("actor", DeterministicActor)
 
   def create_optimizer(self):
     return self.actor.create_optimizer()
@@ -27,9 +27,11 @@ class DirectPolicy(Policy):
     pred = self.actor(obs)
     loss = F.mse_loss(pred, actions.float())
 
-    return {"actor": loss}, {"stats/pred_norm": pred.norm(dim=-1).mean().detach()}
+    self.actor.metrics.vec("pred", pred, limit=1.0)
 
-  @torch.inference_mode()
+    return {"actor": loss}
+
+  @torch.no_grad()
   def inference_step(self, observation: torch.Tensor, step_info=None):
     obs = self.normalize_obs(observation.to(self.device))
     return self.actor.sample(obs), {}

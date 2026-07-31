@@ -6,15 +6,17 @@ from torch import nn
 
 from barl.networks.registry import register_component
 
+from barl.policy import Component
 
-class Squash(nn.Module, ABC):
+
+class Squash(Component, nn.Module, ABC):
   """Maps an actor's unconstrained output to a canonical [-1, 1]-per-dimension
   action and back (SAC's tanh, AMDP's erf, ...)."""
 
-  def __init__(self, **kwargs):
+  def __init__(self, env_stats=None, **kwargs):
     """Absorbs kwargs a concrete Squash doesn't need -- e.g. AMDP always
     passes `erf_k=...` regardless of which class the squash slot resolves to."""
-    super().__init__()
+    super().__init__(env_stats)
 
   @abstractmethod
   def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -55,8 +57,8 @@ class ErfSquash(Squash):
   this squash's log-Jacobian cancels out of AMDP's direct-score regression
   (see AMDP)."""
 
-  def __init__(self, erf_k: torch.Tensor | float = 1.0, **kwargs):
-    super().__init__(**kwargs)
+  def __init__(self, env_stats=None, erf_k: torch.Tensor | float = 1.0, **kwargs):
+    super().__init__(env_stats, **kwargs)
     if not torch.is_tensor(erf_k):
       erf_k = torch.tensor(float(erf_k))
     self.register_buffer("erf_k", erf_k)

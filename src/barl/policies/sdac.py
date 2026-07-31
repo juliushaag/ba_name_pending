@@ -4,38 +4,50 @@ import gymnasium as gym
 import torch
 from torch import nn
 
+from barl.networks.registry import register_component
 from barl.networks.regulator import AutotuneRegulator
 from barl.policy import Policy, register_policy
-from barl.networks.actor import ScoreDiscreteActor
+from barl.networks.actor import DiscreteDiffusionActorBase
 from barl.networks.critic import QCriticBase
 from barl.networks import bfloat16, float32
 from barl.networks.squash import Squash
 
 
+@register_component
+class VPDiffusionActor(DiscreteDiffusionActorBase):
+  """Variance-preserving cosine ladder + DDPM ancestral sampler.
+  Network predicts eps; to_score converts. Fixed schedule (Ma et al. Table 4)."""
+
+  def __init__(self, env_stats, latent_dim, layers, num_steps,
+               cosine_s=0.008, ab_start=0.999, ab_end=0.001, **kw):
+    super().__init__(env_stats, latent_dim, layers, num_steps, **kw)
+    tt = torch.linspace(0, 1, num_steps + 1)
+    f  = torch.cos((tt + cosine_s) / (1 + cosine_s) * math.pi / 2) ** 2
+    self.register_buffer("alpha_bar", ab_end + (ab_start - ab_end) * (f / f[0]))
+
+  def marginal_coef(self, n):
+    ab = self.alpha_bar[n].unsqueeze(-1)
+    return ab.sqrt(), (1.0 - ab)
+
+  def to_score(self, raw, x, n):
+    return -raw / self.marginal_coef(n)[1].sqrt()      # raw == eps_theta
+
+  def prior_sample(self, B, dev):
+    return torch.randn(B, self.action_dim, device=dev)
+
+  def reverse_step(self, obs, x, n):
+    ab_t, ab_prev = self.alpha_bar[n], self.alpha_bar[n - 1]
+    a_t    = ab_t / ab_prev
+    beta_t = 1.0 - a_t
+    mean   = (x + beta_t * self.predict_score(obs, x, n)) / a_t.sqrt()
+    if n > 1:
+      var = (1.0 - ab_prev) / (1.0 - ab_t) * beta_t     # sigma_t^2 -- Eq. 8 omits the sqrt
+      mean = mean + var.sqrt() * torch.randn_like(x)
+    return mean, 0.0
+
 @register_policy
 class SDAC(Policy):
-  """Soft Diffusion Actor-Critic (Ma et al. 2025, "Efficient Online RL for
-  Diffusion Policy").
-
-  Policy improvement is reweighted score matching (Eq. 14): candidates are drawn
-  from the closed-form phi_{0|t}, weighted by softmax(Q/alpha), and regressed
-  onto the denoising score target. No backprop through the reverse chain -- that
-  is the entire point of RSM, and it is what makes SDAC cheap relative to DIME.
-
-  Action selection is Best-of-N over diffusion samples plus additive Gaussian
-  exploration noise. Entropy is the log-likelihood of that additive noise with
-  the BoN result treated as deterministic; the reverse-chain ELBO (ScoreDiscrete
-  Actor.generate_action's `ell`) is a DIME construct and is NOT used here.
-
-  Divergences from the paper, called out because they are deliberate:
-
-    * Ma et al. list no temperature learning rate (Table 4) -- alpha is a fixed
-      hyperparameter there. Autotuning alpha against a constant entropy is
-      ill-posed (the dual gradient never changes sign), so `explore_std` is made
-      learnable and trained against Q + alpha*H. That closes the loop: alpha up
-      -> sigma up -> H up -> alpha back down. To run the paper version instead,
-      freeze `_log_std` and hold alpha constant.
-  """
+  """Soft Diffusion Actor-Critic (Ma et al. 2025)  """
 
   def __init__(self, env: gym.Env, **kwargs):
 
@@ -44,18 +56,18 @@ class SDAC(Policy):
     params = self.resolve_params()
     self.entropy_scale  = params["entropy_scale"]
     self.num_candidates = params["num_candidates"]   # K: phi_{0|t} candidates for the softmax weight
-    self.num_bon        = params["num_candidates"]          # N: Best-of-N action selection
+    self.num_bon        = params["num_bon"]          # N: Best-of-N action selection
     self.explore_init   = params["explore_init"]
 
     assert isinstance(env.action_space, gym.spaces.Box)
 
-    self.actor  : ScoreDiscreteActor = self.build_component("actor", ScoreDiscreteActor, self.observation_dim, self.action_dim)
-    self.critic : QCriticBase        = self.build_component("critic", QCriticBase, self.observation_dim, self.action_dim, pessimistic_score=True)
+    self.actor  : VPDiffusionActor = self.build_component("actor", VPDiffusionActor)
+    self.critic : QCriticBase        = self.build_component("critic", QCriticBase)
     self.squash : Squash             = self.build_component("squash", Squash)
 
     
     self.entropy : AutotuneRegulator = self.build_component(
-        "entropy", AutotuneRegulator, target=self.entropy_scale * self.action_dim, name="entropy")
+        "entropy", AutotuneRegulator, target=self.entropy_scale * self.action_dim)
 
     # Per-dimension exploration noise, applied in SQUASHED space (post-tanh), so
     # no Jacobian correction is needed in the entropy -- unlike DIME's ELBO,
@@ -85,19 +97,15 @@ class SDAC(Policy):
   def explore(self, act: torch.Tensor) -> torch.Tensor:
     return (act + self.explore_std * torch.randn_like(act)).clamp(-1.0, 1.0)
 
-  def on_epoch_start(self):
-    self.critic.on_epoch_start()
-    return super().on_epoch_start()
-
   def create_optimizer(self):
     return {
         **self.critic.create_optimizer(),
         **self.actor.create_optimizer(),
         **self.entropy.create_optimizer(),
-        "explore": torch.optim.Adam([self._log_std], lr=1e-2),
+        "explore": torch.optim.Adam([self._log_std], lr=1e-2, fused=True),
     }
 
-  def train_step(self, batch) -> tuple[dict, dict]:
+  def train_step(self, batch) -> dict:
 
     obs      = self.normalize_obs(batch["obs"].to(self.device))
     next_obs = self.normalize_obs(batch["next_obs"].to(self.device))
@@ -109,7 +117,7 @@ class SDAC(Policy):
     alpha = self.entropy.value()
 
     B, K = obs.shape[0], self.num_candidates
-    losses, log = {}, {}
+    losses = {}
 
     with bfloat16():
 
@@ -118,7 +126,11 @@ class SDAC(Policy):
         next_action = self.explore(self.best_of_n(next_obs, self.num_bon))
         entropy_bonus_val = (alpha * self.noise_entropy()).detach().reshape(1, 1).expand(B, 1)
 
-      self.critic.loss(obs, action, reward, term, next_obs, next_action, entropy_bonus_val, log, losses)
+      with torch.no_grad():
+        bootstrap = self.critic.bootstrap(next_obs, next_action) + entropy_bonus_val
+        q_target  = self.critic.bellman_target(reward, term, bootstrap)
+
+      self.critic.loss(obs, action, q_target, losses)
 
       with torch.no_grad():
         t   = torch.randint(1, self.actor.num_steps + 1, (B,), device=self.device)
@@ -134,7 +146,7 @@ class SDAC(Policy):
         weight = torch.softmax(qv / alpha, dim=0).unsqueeze(-1)      # (K, B, 1), sums to 1 over K
         target = self.actor.score_target(a0_samples, x_t.unsqueeze(0), t) # (K, B, D)
 
-        dsm_w = (1.0 - self.actor.alpha_bars[t]).unsqueeze(-1)            # (B, 1)
+        dsm_w = self.actor.dsm_weight(t)                                  # (B, 1)
 
       score_pred = self.actor.predict_score(obs, x_t, t)                  # (B, D)
 
@@ -143,22 +155,24 @@ class SDAC(Policy):
 
       a_bon    = self.best_of_n(obs, self.num_bon)                        # already detached (no_grad)
       a_noisy  = a_bon + self.explore_std * torch.randn_like(a_bon)
-      std_loss = -(self.critic.value(obs, a_noisy).mean() + alpha * self.noise_entropy())
+      std_loss = -(self.critic.value(obs, a_noisy).mean() + alpha.detach() * self.noise_entropy())
 
-      self.entropy.loss(self.noise_entropy(), log, losses)
+      self.entropy.loss(self.noise_entropy(), losses)
 
     losses["actor"]   = sdac_loss
     losses["explore"] = std_loss
 
-    log["stats/score_pred_norm"] = score_pred.detach().norm(dim=-1).mean()
-    log["stats/score_tgt_norm"]  = target.detach().norm(dim=-1).mean()
-    log["stats/explore_std"]     = self.explore_std.detach().mean()
-    log["stats/noise_entropy"]   = self.noise_entropy().detach()
-    log["stats/weight_ess"]      = (1.0 / weight.squeeze(-1).pow(2).sum(0)).mean()  # effective sample size, in [1, K]
+    self.metrics.scalar("explore_std", self.explore_std.detach().mean())
+    self.metrics.scalar("noise_entropy", self.noise_entropy().detach())
+    # effective sample size of the softmax(Q/alpha) candidate weights, in [1, K]
+    self.metrics.dist("weight_ess", 1.0 / weight.squeeze(-1).pow(2).sum(0))
+    self.actor.metrics.vec("score_pred", score_pred)
+    self.actor.metrics.vec("score_target", target.reshape(-1, target.shape[-1]))
+    self.actor.metrics.vec("action", next_action, limit=1.0)
 
-    return losses, log
+    return losses
 
-  @torch.inference_mode()
+  @torch.no_grad()
   def inference_step(self, observation: torch.Tensor, step_info=None):
     obs = self.normalize_obs(observation.to(self.device))
     act = self.best_of_n(obs, self.num_bon)

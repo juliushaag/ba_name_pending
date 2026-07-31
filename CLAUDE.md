@@ -106,6 +106,17 @@ video rendering), `get_vector_env(n)` builds an `N`-way vectorized env for rollo
 itself). `get_dataset()` is only implemented by offline-dataset-backed environments; MuJoCo Gym
 and DM Control are online-only and raise `NotImplementedError` there.
 
+`get_env_stats(env)` builds the run's `EnvStats` (`src/barl/env_stats.py`) — a plain dict of
+env-derived facts handed to every component, so adding a key costs nothing. Static entries come
+from the spaces and spec (`obs_dim`, `act_low`/`act_high`, `max_episode_steps`, ...) merged with
+the class attribute `Environment.stats`, itself merged down the MRO so a family base can declare a
+default and one subclass override a single key. That is where `return_min`/`return_max` live —
+`C51Critic`'s fixed categorical support defaults from them, since no gym space reports a return
+range. A `live` sub-dict is refreshed from each rollout's stats and, because every component holds
+a reference to the same object, one update reaches all of them. `EnvStats` is *not* part of the
+models.yaml layering: it is a function of the environment, not a tunable, so a component that wants
+one of its values tunable takes a normal kwarg that falls back to the `EnvStats` entry.
+
 ### `Policy` / `Actor` / `Critic` split
 
 Every algorithm is one `Policy` subclass (`src/barl/policy.py`) composing an `Actor`
@@ -121,37 +132,69 @@ The load-bearing convention throughout the codebase:
   Policy's `train_step`, calling into whatever its actor/critic expose.
 
 This is why the same `StochasticActor` backs SAC, PPO and IQL (three very different updates over
-the same Gaussian-or-Categorical architecture), and the same `QCriticBase` subclasses back SAC,
+the same squashed-Gaussian architecture), and the same `QCriticBase` subclasses back SAC,
 FlowQL and AMDP. When extending an existing actor/critic, ask whether the new behavior is
 architectural (belongs there) or algorithmic (belongs on the owning Policy) before adding it.
 
+Everything `build_component()` constructs inherits the `Component` mixin (`policy.py`), which
+supplies four things: the run's `EnvStats` (**first positional argument** of every component —
+`self.obs_dim`/`self.action_dim` come from it, so dims are never passed separately), the slot name,
+a slot-namespaced `metrics` sink, and the `before_step`/`after_step`/`on_epoch_start`/
+`on_epoch_end` lifecycle. The Policy registers each slot in `self.components` and fans all four
+hooks out over it, which is why a critic's Polyak update lives in `QCriticBase.before_step()`
+rather than being hand-driven from each `train_step`.
+
 Concrete actors in `networks/actor.py`:
 - `DeterministicActor` — flat MLP regression / BC point estimate (`DirectPolicy`).
-- `StochasticActor` — Categorical (discrete) or tanh-squashed diagonal-Normal (continuous); shared
-  by PPO, IQL, SAC.
+- `StochasticActor` — tanh-squashed diagonal-Normal; shared by PPO, IQL, SAC.
 - `ScoreContinuousActor` — continuous-time SDE (AMDP-style) score-matching actor (`AMDP`).
-- `ScoreDiscreteActor` — fixed-step DDPM-style discrete-time diffusion actor (`DIMEPolicy`).
+- `DiscreteDiffusionActorBase` — abstract fixed-step DDPM-style skeleton; concrete subclasses live
+  next to their algorithm (`OUDiffusionActor` in `policies/dime.py`, `VPDiffusionActor` in
+  `policies/sdac.py`).
 
 Score-based actors deliberately return a **raw, unsquashed** terminal state from `sample()`/
 `generate_action()` — squashing it into a canonical action is an algorithm decision the owning
 Policy makes on top (e.g. AMDP's `ErfSquash`), not something the actor architecture bakes in.
 
 Concrete critics in `networks/critic.py`, all subclassing `QCriticBase` (shared Polyak-averaged
-target net, `rho`/`polyak_tau`/`gamma` -- config/models.yaml-supplied, see below --
-mean-minus-`rho`*std pessimistic lower bound):
-- `MeanStdEnsembleCritic` — `n_models` independent MLP heads reduced by mean - rho*std; spread =
+target net; `polyak_tau`/`gamma` config/models.yaml-supplied, see below). Only a critic that
+actually reduces with a spread takes a coefficient for it, and the two spreads are named apart
+because they are different quantities:
+- `MeanStdEnsembleCritic` — `n_models` independent MLP heads reduced by mean - `rho`*std; spread =
   epistemic uncertainty. Default for every continuous-action off-policy algorithm here.
 - `MeanEnsembleCritic` / `MinEnsembleCritic` — same `n_models` MLP-head ensemble, reduced by plain
-  mean or TD3-style min instead; both ignore `rho` (std is forced to 0 in `_mean_std`).
+  mean or TD3-style min instead; neither takes a coefficient (a min has no scale to tune).
 - `QRDistributionalCritic` — single MLP head predicting quantile atoms, QR-DQN pinball loss
-  (Dabney et al., 2017); spread = aleatoric uncertainty.
+  (Dabney et al., 2017); spread = aleatoric, so its coefficient is `risk_aversion` (a
+  mean-variance risk measure over the return), not `rho`.
 - `C51Critic` — single MLP head predicting logits over a fixed categorical support
   (`v_min`..`v_max`, `num_atoms`), standard C51 (Bellemare, Dabney & Munos, 2017): categorical
-  Bellman projection (`categorical_projection`) + cross-entropy loss.
+  Bellman projection (`categorical_projection`) + cross-entropy loss; `risk_aversion` likewise.
 
-`_mean_std()`'s reduction feeds both `value()`/`target_value()` (always the pessimistic bound) and,
-via `pessimistic_score`, `score()`/the action-gradient used for actor updates — AMDP wants the
-pessimistic gradient, FlowQL/QAM want the plain mean.
+A critic exposes two pricing accessors, both meaningful for every representation:
+`expectation(s, a, target=False)` is E[Z(s,a)] and `value(s, a, target=False)` is the price a
+Policy improves against — the same thing unless the class reduces with a spread. A Policy takes
+`torch.func.grad` of whichever it means: `value()` for a pessimistic improvement direction (AMDP),
+`expectation()` where the gradient field *is* the policy and a bound would change the sampled
+distribution (NC-LQL's Langevin chain).
+
+Regression is three primitives, with the **Policy** owning the target and the critic owning only
+its representation (scalar, quantile atoms, categorical probabilities):
+
+```python
+with torch.no_grad():
+  boot   = critic.bootstrap(next_obs, next_act) + entropy_bonus   # target net, own representation
+  target = critic.bellman_target(reward, term, boot)              # transported one step
+critic.loss(obs, action, target, losses)                          # MSE / pinball / cross-entropy
+```
+
+`bootstrap()` returns a `Bootstrap` — prediction plus a per-sample value shift — so
+`+ entropy_bonus` means the same thing for a categorical critic, where a value shift moves the
+*support* rather than the probabilities (C51 overrides `bellman_target` with its projection and
+reads the shift there). `terminal_target(value)` lifts an arbitrary scalar into the same target
+representation, which is how NC-LQL's smoothing loss regresses its noisy levels onto the clean
+value through the ordinary `loss()`. The un-reduced `raw(s, a, target=False)` stays an
+implementation detail used only by a critic's own `loss()`, never by a Policy.
 
 ### Action scaling convention
 
@@ -256,16 +299,41 @@ every off-policy critic here relies on.
 Outer loop, per iteration: `buffer.rollout()` collects `rollout_steps` env steps →
 (on-policy only) `compute_gae()` → build a `SingleStepDataset`/`DataLoader` → run
 `epochs_per_rollout` passes of `train_epoch()` over it → (on-policy only) clear the buffer.
-`train_epoch()` calls `model.train_step(batch)` which returns `(losses, stats)`; every loss key
+`train_epoch()` calls `model.train_step(batch)` which returns `losses`; every loss key
 must match a key in `model.create_optimizer()` — each is zero-grad'd, backward'd
 (`retain_graph=True`, since e.g. an actor loss reads the critic's forward pass), grad-clipped, and
 stepped independently, so no optimizer step invalidates another loss's graph mid-loop. Periodic
 eval (`evaluate_and_log`) checkpoints `latest.pt` every eval and `best.pt` on a new best avg reward,
 under `checkpoints/<model>/<env>/<timestamp>/`.
 
+### Metrics (`src/barl/metrics.py`)
+
+`train_step` returns *only* losses — every diagnostic goes to a `Metrics` sink instead, and the
+training loop drains it once per step. Keys are `<owner>/<quantity>/<reduction>`, owner-first, so
+wandb's sidebar reads as one section per component (`critic/`, `actor/`, `entropy/`) plus one per
+algorithm (`amdp/`, `ppo/`, `iql/`).
+
+`Policy.build_component()` hands each slot a `child(slot)` view as `self.metrics`, so a component
+writes `self.metrics.dist("q", pred)` and it lands at `critic/q/*` **without naming itself** — the
+same mechanism that lets `AutotuneRegulator` key its optimizer off `self.slot` rather than a `name`
+kwarg. A Policy's own `self.metrics` is pre-namespaced to `algo_name()`. This is why a critic's
+`loss()` no longer takes a `log` dict.
+
+Families (`scalar`, `dist`, `vec`, `ensemble`, `ema_gap`, plus `Policy.record_optimizer`/
+`record_batch`) each emit **one primary key and put their expansion on the debug tier** —
+`log_every` paces the headline, `debug_every` the min/max/std/quantiles and gradient health.
+`Policy.before_step(tiers)` arms them; an unarmed family early-returns, so a step that won't be
+logged never pays for its reductions. Values stay 0-dim tensors until `drain()`, which crosses to
+the CPU once per device per step rather than one `.item()` per key.
+
+Two reductions that look alike are deliberately distinct: `critic/ensemble/disagreement` is spread
+*across ensemble heads* (epistemic), while a distributional critic's `critic/q/std` is spread of
+the return distribution itself (aleatoric).
+
 `Logger` (`src/barl/logger.py`) wraps `wandb` (source of truth for history/plots) with a live
 `rich` terminal panel driven off the same `log()`/`increment()` calls — nothing needs logging
-twice. `wandb.define_metric(step_metric=...)` alignment means step counters (`env_steps`,
+twice. `log_quiet()` is the wandb-only path used for the debug tier, whose key count would swamp
+the panel. `wandb.define_metric(step_metric=...)` alignment means step counters (`env_steps`,
 `grad_steps`) must be logged in the *same* `wandb.log()` call as the data they index, not a
 separate `increment()` call before/after.
 
@@ -293,7 +361,7 @@ Because the axes are just overrides, **no config file is ever edited to run a sw
 `DirectPolicy` (BC), `FlowBCPolicy`/`FlowQLPolicy` (flow-matching BC / flow-matching
 + Q), `AMDP` (direct-score regression against a critic's action-gradient, entropy +
 trust-region duals — see the extensive docstring in `amdp.py`), `IQLPolicy`, `PPOPolicy`,
-`SACPolicy`, `DIMEPolicy`. All discrete-action support was removed with `QPolicy` (DQN) --
+`SACPolicy`, `DIMEPolicy`, `SDAC`, `NCLQLPolicy`. All discrete-action support was removed with `QPolicy` (DQN) --
 every remaining Policy is continuous-action only. `on_policy = True` only on `PPOPolicy` --
 everything else is off-policy and relies on the replay buffer retaining older trajectories
 across iterations.

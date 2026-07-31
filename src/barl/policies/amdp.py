@@ -32,21 +32,14 @@ class AMDP(Policy):
 
     assert isinstance(env.action_space, gym.spaces.Box)
 
-    self.critic : QCriticBase = self.build_component("critic", QCriticBase, self.observation_dim, self.action_dim, pessimistic_score=True)
-    self.actor  : ScoreContinuousActor = self.build_component("actor", ScoreContinuousActor, self.observation_dim, self.action_dim)
+    self.critic : QCriticBase = self.build_component("critic", QCriticBase)
+    self.actor  : ScoreContinuousActor = self.build_component("actor", ScoreContinuousActor)
 
     self.actor_old = EMA(self.actor)
 
-
-    self.entropy : AutotuneRegulator = self.build_component("entropy", AutotuneRegulator, target=self.action_dim * self.entropy_scale, name="entropy")
-    self.tr_lambda : AutotuneRegulator = self.build_component("trust_region", AutotuneRegulator, name="trust_region")
+    self.entropy : AutotuneRegulator = self.build_component("entropy", AutotuneRegulator, target=self.action_dim * self.entropy_scale)
 
     self.squash = self.build_component("squash", Squash, erf_k=(2 * self.actor.terminal_var) ** -0.5)
-
-  def on_epoch_start(self):
-    self.critic.on_epoch_start()
-    # self.actor_old.on_epoch_start()
-    return super().on_epoch_start()
 
   def create_optimizer(self):
     return {
@@ -65,13 +58,11 @@ class AMDP(Policy):
     term     = batch["term"].to(self.device)
 
 
-    self.critic.step()
-    self.actor_old.step()
+    self.actor_old.step()  # a raw EMA, not a build_component slot -- not covered by before_step()
 
     alpha     = self.entropy.value()
-    tr_lambda = self.tr_lambda.value()
 
-    losses, log = {}, {}
+    losses = {}
 
     with bfloat16():
       with torch.no_grad():
@@ -81,7 +72,11 @@ class AMDP(Policy):
 
 
       with float32():
-        self.critic.loss(obs, action, reward, term, next_obs, next_action, entropy_bonus, log, losses)
+        with torch.no_grad():
+          bootstrap = self.critic.bootstrap(next_obs, next_action) + entropy_bonus
+          q_target  = self.critic.bellman_target(reward, term, bootstrap)
+
+        self.critic.loss(obs, action, q_target, losses)
         
       tau = torch.rand(obs.shape[0], device=obs.device)
 
@@ -97,12 +92,10 @@ class AMDP(Policy):
 
       # Taking next_X because freeee 
       u_tilde = self.actor.diffusion_act(next_obs, X_t, time_embed)
-      # u_old = self.actor_old.target.diffusion_act(obs, X_t, time_embed)
 
       def q_values(x):
         return self.critic.value(next_obs, self.squash(x)).sum()
       
-
       with float32():
 
         x_score : torch.Tensor = torch.func.grad(q_values)(next_X).detach()
@@ -111,28 +104,23 @@ class AMDP(Policy):
         target = sigma_tau * x_score.div(alpha)
         amdp_loss = (0.5 * (u - target).pow(2).sum(-1) / sigma_tau.squeeze(-1)).mean()
 
-        # tr_loss   = 0.5 * F.mse_loss(u.float(), u_old.float())
+        self.entropy.loss(entropy_penalty.detach(), losses)
 
-        # self.tr_lambda.loss(tr_loss, log, losses)
-        self.entropy.loss(entropy_penalty.detach(), log, losses)
+    losses["actor"]     = amdp_loss
 
-        actor_loss     = amdp_loss # + tr_lambda * (tr_loss - self.tr_lambda.target())
+    self.metrics.scalar("score_loss", amdp_loss)
+    self.metrics.dist("score_target", target)
+    self.actor.metrics.vec("u", u)
+    self.actor.metrics.vec("action", next_action, limit=1.0)
+    self.actor.metrics.dist("entropy", entropy_penalty)
+    self.critic.metrics.vec("score", x_score)
 
-    losses["actor"]     = actor_loss
+    return losses
 
-    log.update({
-      "stats/amdp":                     amdp_loss.detach(),
-      "stats/amdp_target" :             target.detach().mean(),
-      "stats/u_norm":                   u.detach().norm(dim=-1).mean(),  
-      "stats/score_norm":               x_score.detach().norm(dim=-1).mean(),
-      "stats/reward_mean" :             reward.mean(),
-      "stats/act_abs" :                 next_action.abs().mean(),
-    })
-    return losses, log
-
-  @torch.inference_mode()
+  @torch.no_grad()
   def inference_step(self, observation: torch.Tensor, step_info=None):
-    obs = observation.to(self.device)
-    X, ell = self.actor.generate_action(obs)
-    action = self.squash(X)
-    return action, { }
+    with bfloat16():
+      obs = observation.to(self.device)
+      X, ell = self.actor.generate_action(obs)
+      action = self.squash(X)
+      return action, { }

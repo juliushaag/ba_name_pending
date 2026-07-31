@@ -11,8 +11,49 @@ from abc import ABC, abstractmethod
 import gymnasium as gym
 import torch.optim.lr_scheduler as sched
 
+from barl.env_stats import EnvStats
+from barl.metrics import DEBUG, PRIMARY, Metrics
 
-class Actor(ABC):
+
+class Component:
+  """Mixin for anything Policy.build_component() constructs. Three jobs: consume
+  the run's EnvStats, which every component takes as its first positional
+  argument; give the owning Policy a uniform lifecycle to fan out to -- it
+  registers each slot it builds and forwards all four hooks below, so no Policy
+  has to hand-roll a critic's Polyak update from its own train_step; and hold a
+  `metrics` sink already namespaced to this component's slot, so writing
+  `self.metrics.dist("q", pred)` lands at `critic/q/*` without the component
+  ever naming itself."""
+
+  def __init__(self, env_stats: EnvStats = None, **kwargs):
+    super().__init__(**kwargs)
+    self.env_stats  = env_stats if env_stats is not None else EnvStats()
+    # The two every component wants, hoisted out of the dict. A component that
+    # needs them *before* super().__init__() (any critic building its
+    # q_function first) reads env_stats["obs_dim"]/["act_dim"] directly.
+    self.obs_dim    = self.env_stats.get("obs_dim")
+    self.action_dim = self.env_stats.get("act_dim")
+    # Both are overwritten by build_component with the real slot; the defaults
+    # only keep a component constructed outside a Policy usable.
+    self.slot       = type(self).__name__.lower()
+    self.metrics    = Metrics()
+
+  def before_step(self):
+    """Called once per gradient step, before the Policy's train_step."""
+    ...
+
+  def after_step(self):
+    """Called once per gradient step, after every optimizer has stepped."""
+    ...
+
+  def on_epoch_start(self):
+    ...
+
+  def on_epoch_end(self):
+    ...
+
+
+class Actor(Component, ABC):
   """A network that can produce actions -- pure architecture; every
   algorithm-level decision (loss, squash choice, etc.) stays on the owning
   Policy's train_step."""
@@ -32,16 +73,16 @@ class Actor(ABC):
     return next(self.parameters()).device
 
 
-class Critic(ABC):
+class Critic(Component, ABC):
   """A network that can price (s,a) -- pure architecture; Bellman targets
   and the regression loss itself live in each Policy's train_step."""
 
   @abstractmethod
-  def value(self, s, a) -> torch.Tensor: ...
-
-  @abstractmethod
-  def target_value(self, s, a) -> torch.Tensor:
-    """Polyak-averaged target net output."""
+  def value(self, s, a, target: bool = False) -> torch.Tensor:
+    """The only accessor an algorithm needs: a scalar price for (s, a), off the
+    live net or (`target=True`) the Polyak-averaged one. How that scalar is
+    arrived at -- ensemble reduction, quantile mean, categorical expectation,
+    pessimism -- is the implementation's business, never the caller's."""
     ...
 
   @abstractmethod
@@ -84,7 +125,7 @@ class Policy(nn.Module, ABC):
   # Construction
   # ------------------------------------------------------------------
 
-  def __init__(self, env: gym.Env, profile: str = None, **kwargs):
+  def __init__(self, env: gym.Env, profile: str = None, env_stats: EnvStats = None, **kwargs):
     super().__init__(**kwargs)
 
     from barl.model_config import get_overrides
@@ -93,6 +134,23 @@ class Policy(nn.Module, ABC):
     self._profile     = profile
     self._raw_kwargs  = kwargs
     self._overrides   = get_overrides()  # captured so a checkpoint reconstructs under them too
+
+    # A named param, not part of **kwargs -- _raw_kwargs is layered over every
+    # slot's resolved config, and env_stats is not a config value.
+    self.env_stats = env_stats if env_stats is not None else EnvStats.from_env(env)
+
+    # Every slot build_component() constructs, in build order -- what the
+    # lifecycle hooks below fan out over. A plain dict, so the components stay
+    # registered as submodules only through the attribute each Policy assigns.
+    self._components: dict[str, Component] = {}
+
+    # `_metrics` is the root every component's slot-namespaced view writes into;
+    # `metrics` is this algorithm's own view, so a Policy writing
+    # `self.metrics.scalar("clip_frac", x)` lands at `ppo/clip_frac`.
+    self._metrics = Metrics()
+    self.metrics  = self._metrics.child(self.algo_name())
+    self._batch_metrics   = self._metrics.child("batch")
+    self._optimizer_slots = None
 
     action_space      = env.action_space
     observation_space = env.observation_space
@@ -120,8 +178,8 @@ class Policy(nn.Module, ABC):
   def resolve_component(self, slot: str, **explicit_kwargs) -> tuple[type, dict]:
     """Resolves a named slot's class + kwargs from config/models.yaml (see
     model_config.py), then layers `self._raw_kwargs` and `explicit_kwargs`
-    on top (highest precedence -- for algorithm-fixed choices like
-    EnsembleCritic's `pessimistic_score` that must never be tunable)."""
+    on top (highest precedence -- for algorithm-fixed choices that must never
+    be tunable)."""
     from barl.model_config import resolve_slot
     cls, kwargs = resolve_slot(type(self).__name__, slot, self._profile)
     return cls, {**kwargs, **self._raw_kwargs, **explicit_kwargs}
@@ -136,24 +194,128 @@ class Policy(nn.Module, ABC):
     params = resolve_params(type(self).__name__, self._profile)
     return {**params, **self._raw_kwargs, **explicit_kwargs}
 
-  def build_component(self, slot: str, gate_cls: type, *args, **explicit_kwargs):
+  def build_component(self, slot: str, gate_cls: type, *args,
+                      env_stats: EnvStats = None, **explicit_kwargs):
     """Resolves + constructs a named slot (actor/critic/squash/...), gated to
     `gate_cls`: the resolved class must be `gate_cls` or a subclass (e.g.
     QCriticBase admits MeanStdEnsembleCritic, MeanEnsembleCritic,
-    MinEnsembleCritic, QRDistributionalCritic and C51Critic alike)."""
+    MinEnsembleCritic, QRDistributionalCritic and C51Critic alike).
+    `env_stats` overrides the run's own for a slot another component wraps and
+    feeds a transformed input (NC-LQL's level-conditioned Q sees a widened
+    action) -- pass an `EnvStats.derive()` of the run's, never an unrelated one."""
     cls, kwargs = self.resolve_component(slot, **explicit_kwargs)
     assert issubclass(cls, gate_cls), (
       f"config/models.yaml: {type(self).__name__}'s {slot!r} slot names {cls.__name__}, "
       f"which is not a subclass of {gate_cls.__name__} -- {type(self).__name__} can only "
       f"work with {gate_cls.__name__} (or a subclass of it) there."
     )
-    return cls(*args, **kwargs)
+    component = cls(env_stats if env_stats is not None else self.env_stats, *args, **kwargs)
+    component.slot    = slot
+    component.metrics = self._metrics.child(slot)
+    self._components[slot] = component
+    return component
+
+  # ------------------------------------------------------------------
+  # Metrics
+  # ------------------------------------------------------------------
+
+  @classmethod
+  def algo_name(cls) -> str:
+    """This algorithm's logging namespace -- `SACPolicy` -> `sac`, `AMDP` -> `amdp`."""
+    name = cls.__name__.lower()
+    return name[:-len("policy")] if name.endswith("policy") and len(name) > len("policy") else name
+
+  def optimizer_slots(self) -> dict[str, str]:
+    """Optimizer key -> owning component slot, by asking each slot which keys
+    it creates. Keys owned by no component (SDAC's `explore`) map to this
+    algorithm's own namespace. The throwaway optimizers are cheap -- torch
+    allocates no state until the first step()."""
+    if self._optimizer_slots is None:
+      owners = {}
+      for slot, component in self._components.items():
+        create = getattr(component, "create_optimizer", None)  # a Squash has none
+        for key in (create() if create else {}):
+          owners[key] = slot
+      self._optimizer_slots = owners
+    return self._optimizer_slots
+
+  def metrics_key(self, optimizer_key: str, field: str) -> str:
+    """`critic/loss` when the slot owns one optimizer key, `actor/loss/flow`
+    when it owns several -- so the common case stays flat."""
+    owners = self.optimizer_slots()
+    if optimizer_key not in owners:  # no component owns it -- always name it
+      return f"{self.algo_name()}/{field}/{optimizer_key}"
+    slot   = owners[optimizer_key]
+    shared = sum(1 for o in owners.values() if o == slot) > 1
+    return f"{slot}/{field}/{optimizer_key}" if shared else f"{slot}/{field}"
+
+  def record_optimizer(self, optimizer_key: str, loss, lr, grad_norm, params=None):
+    """The `opt` family. It lives here rather than on Metrics because the
+    optimizer-key -> slot map does, so a loss lands under the component that
+    owns it: `critic/loss`, `critic/lr`, `critic/grad_norm`."""
+    metrics = self._metrics
+    metrics.scalar(self.metrics_key(optimizer_key, "loss"), loss.detach())
+    metrics.scalar(self.metrics_key(optimizer_key, "lr"), lr)
+    metrics.scalar(self.metrics_key(optimizer_key, "grad_norm"), grad_norm)
+
+    if params is None or not metrics.active(DEBUG):
+      return
+    grads = [p.grad.detach().float() for p in params if p.grad is not None]
+    if not grads:
+      return
+    # Reduced per-tensor -- a flat cat() of every gradient is a full copy of the
+    # model, which is exactly what we don't want on a diagnostic path.
+    total   = sum(g.numel() for g in grads)
+    zeros   = sum((g == 0).sum() for g in grads)
+    nonfin  = sum((~torch.isfinite(g)).sum() for g in grads)
+    grad_max = torch.stack([g.abs().max() for g in grads]).max()
+    metrics.scalar(self.metrics_key(optimizer_key, "grad_max"), grad_max, tier=DEBUG)
+    metrics.scalar(self.metrics_key(optimizer_key, "grad_frac_zero"), zeros / total, tier=DEBUG)
+    metrics.scalar(self.metrics_key(optimizer_key, "grad_frac_nonfinite"), nonfin / total, tier=DEBUG)
+
+  def record_batch(self, batch: dict):
+    """The `batch/*` family -- what every algorithm trains against, recorded
+    once here rather than restated by each train_step."""
+    self._batch_metrics.dist("reward", batch["rew"])
+    self._batch_metrics.vec("action", batch["act"], limit=1.0)
+    self._batch_metrics.dist("term", batch["term"].float())
+
+  # ------------------------------------------------------------------
+  # Component lifecycle
+  # ------------------------------------------------------------------
+
+  # Fanned out over every slot build_component() made, so a component owns its
+  # own per-step/per-epoch bookkeeping (a critic's Polyak update, a Shadow
+  # resync) instead of each Policy remembering to drive it from train_step.
+
+  @property
+  def components(self) -> dict[str, "Component"]:
+    return self._components
+
+  def before_step(self, tiers: tuple = ()):
+    """`tiers` arms the metric sink for this step (see barl.metrics) -- an
+    unarmed family is a no-op, so a step that won't be logged never pays for
+    its reductions."""
+    self._metrics.arm(*tiers)
+    for component in self._components.values():
+      component.before_step()
+
+  def after_step(self):
+    for component in self._components.values():
+      component.after_step()
+
+  def drain_metrics(self) -> tuple[dict, dict]:
+    """(primary, debug) for the step just finished, each already on the CPU."""
+    return self._metrics.drain()
 
   def on_epoch_start(self):
     self._epoch_start_time = time.perf_counter()
+    for component in self._components.values():
+      component.on_epoch_start()
 
   def on_epoch_end(self):
-    ...
+    for component in self._components.values():
+      component.on_epoch_end()
 
   def epoch_time(self) -> float:
     """Wall-clock seconds since the last on_epoch_start() call."""
@@ -172,7 +334,7 @@ class Policy(nn.Module, ABC):
     }, path)
 
   @staticmethod
-  def load(type: str, path: str, env: gym.Env) -> "Policy":
+  def load(type: str, path: str, env: gym.Env, env_stats: EnvStats = None) -> "Policy":
     from barl.model_config import set_overrides
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
     # The run's dotted overrides are part of the architecture, so they have to
@@ -181,14 +343,15 @@ class Policy(nn.Module, ABC):
     # predating this key keeps whatever the resuming run set.
     if "overrides" in ckpt:
       set_overrides(ckpt["overrides"])
-    policy = Policy._classes[type](env, profile=ckpt.get("profile"))
+    # env_stats is a function of the env, so it is rebuilt rather than persisted.
+    policy = Policy._classes[type](env, profile=ckpt.get("profile"), env_stats=env_stats)
     policy.load_state_dict(ckpt["state_dict"])
     return policy
 
   @staticmethod
-  def load_any(path: str, env: gym.Env) -> "Policy":
+  def load_any(path: str, env: gym.Env, env_stats: EnvStats = None) -> "Policy":
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
-    return Policy.load(ckpt["policy_class"], path, env)
+    return Policy.load(ckpt["policy_class"], path, env, env_stats)
 
   # ------------------------------------------------------------------
   # Observation normalisation
@@ -232,7 +395,7 @@ class Policy(nn.Module, ABC):
   def num_params(self):
     return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-  @torch.inference_mode()
+  @torch.no_grad()
   def measure_latency(self, n: int = 10) -> float:
     """Rough per-epoch regression signal, not a rigorous benchmark."""
     was_training = self.training
@@ -274,12 +437,14 @@ class Policy(nn.Module, ABC):
     ...
 
   @abstractmethod
-  def train_step(self, batch: torch.DictType) -> tuple[dict, dict]:
-    """Returns (losses, stats) -- `losses` keys must exactly match create_optimizer()'s keys."""
+  def train_step(self, batch: torch.DictType) -> dict:
+    """Returns `losses`, whose keys must exactly match create_optimizer()'s.
+    Diagnostics go to `self.metrics` / a component's own `self.metrics`, not a
+    return value -- the training loop drains them once per step."""
     ...
 
   @abstractmethod
-  @torch.inference_mode()
+  @torch.no_grad()
   def inference_step(self, observation: torch.Tensor, step_info: Optional[dict] = None) -> tuple[torch.Tensor, dict]:
     """Returns (action, extras) where extras is a dict of per-step named tensors (e.g. entropy bounds) to log/persist."""
     ...
@@ -288,23 +453,33 @@ class Policy(nn.Module, ABC):
   # Evaluation
   # ------------------------------------------------------------------
 
-  @torch.inference_mode()
-  def evaluate(self, env: gym.Env, runs=3, **inference_kwargs):
+  @torch.no_grad()
+  def evaluate(self, env: gym.Env, runs=3, videos: int = None, **inference_kwargs):
+    """`videos` caps how many of the `runs` episodes render frames, chosen
+    uniformly at random up front (None renders all of them). env.render() costs
+    ~140x the env step itself, so rendering every episode to log a couple of
+    them dominates eval; unrecorded runs come back with `frames` empty and
+    still count towards the reward statistics."""
     was_training = self.training
     self.eval()
     run_data = []
 
-    for _ in range(runs):
+    recorded = set(range(runs)) if videos is None else set(
+      np.random.choice(runs, size=min(videos, runs), replace=False).tolist())
+
+    for run in range(runs):
       obs, _ = env.reset()
       done   = False
       data   = dict(frames=[], rewards=[])
+      render = run in recorded
 
       while not done:
         action, _ = self.inference_step(torch.from_numpy(obs).float().unsqueeze(0), **inference_kwargs)
         obs, reward, term, trunc, _ = env.step(self.scale_action(action)[0].cpu().numpy())
         done = term or trunc
         data["rewards"].append(reward)
-        data["frames"].append(env.render())
+        if render:
+          data["frames"].append(env.render())
 
       data["terminated"] = term
       run_data.append(data)

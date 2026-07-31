@@ -24,42 +24,42 @@ class IQLCritic(Critic, nn.Module):
   -- never samples an action from an actor. `advantage()` is an IQL-specific
   extension beyond the base Critic ABC, for IQLPolicy's AWR weighting."""
 
-  def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int, layers: int,
+  def __init__(self, env_stats, hidden_dim: int, layers: int,
                polyak_tau: float, gamma: float, **kwargs):
-    super().__init__(**kwargs)
+    super().__init__(env_stats, **kwargs)
 
     self.polyak_tau = polyak_tau
     self.gamma      = gamma
 
-    self.q_function = MLP(obs_dim + action_dim, 1, hidden_dim, layers)
-    self.v_function = MLP(obs_dim, 1, hidden_dim, layers)
+    self.q_function = MLP(self.obs_dim + self.action_dim, 1, hidden_dim, layers)
+    self.v_function = MLP(self.obs_dim, 1, hidden_dim, layers)
     self.q_ema = EMA(self.q_function, start_decay=1 - self.polyak_tau, end_decay=1 - self.polyak_tau, warmup_steps=1)
 
-  def step_ema(self):
+  def before_step(self):
     self.q_ema.step()
 
-  def value(self, s: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+  def value(self, s: torch.Tensor, a: torch.Tensor, target: bool = False) -> torch.Tensor:
     with torch.amp.autocast("cuda", torch.bfloat16):
-      return self.q_function(s, a)
+      return (self.q_ema if target else self.q_function)(s, a)
 
   def score(self, s: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
     # torch.func.grad, not a.requires_grad_(True) + eager .backward(), composes with vmap.
     a = a.detach()
     return torch.func.grad(lambda a: self.value(s, a).float().sum())(a)
 
-  def target_value(self, s: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+  def state_value(self, s: torch.Tensor) -> torch.Tensor:
+    """V(s), the expectile head -- IQL-specific, like `advantage()`: the Critic
+    ABC only knows how to price an (s, a) pair."""
     with torch.amp.autocast("cuda", torch.bfloat16):
-      return self.q_ema(s, a)
+      return self.v_function(s)
 
   def advantage(self, s: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
-    with torch.amp.autocast("cuda", torch.bfloat16):
-      v = self.v_function(s)
-    return self.target_value(s, a).float() - v.float()
+    return self.value(s, a, target=True).float() - self.state_value(s).float()
 
   def create_optimizer(self) -> dict:
     return {
-      "value": torch.optim.AdamW(self.v_function.parameters(), lr=3e-4, betas=(0.9, 0.95)),
-      "q":     torch.optim.AdamW(self.q_function.parameters(), lr=3e-4, betas=(0.9, 0.95)),
+      "value": torch.optim.AdamW(self.v_function.parameters(), lr=3e-4, betas=(0.9, 0.95), fused=True),
+      "q":     torch.optim.AdamW(self.q_function.parameters(), lr=3e-4, betas=(0.9, 0.95), fused=True),
     }
 
 
@@ -77,8 +77,8 @@ class IQLPolicy(Policy):
     self.tau  = params["tau"]
     self.beta = params["beta"]
 
-    self.critic = self.build_component("critic", IQLCritic, self.observation_dim, self.action_dim)
-    self.actor  = self.build_component("actor", StochasticActor, self.observation_dim, self.action_dim)
+    self.critic = self.build_component("critic", IQLCritic)
+    self.actor  = self.build_component("actor", StochasticActor)
 
   def create_optimizer(self):
     return {**self.critic.create_optimizer(), **self.actor.create_optimizer()}
@@ -93,19 +93,16 @@ class IQLPolicy(Policy):
     act_idx = action.float().view(action.shape[0], -1)
     act_enc = act_idx
 
-    self.critic.step_ema()
 
-    with torch.amp.autocast("cuda", torch.bfloat16):
-      with torch.no_grad():
-        next_v   = self.critic.v_function(next_obs)
-        target_q = self.critic.q_ema(obs, act_enc)
-      v = self.critic.v_function(obs)
+    with torch.no_grad():
+      next_v   = self.critic.state_value(next_obs)
+      target_q = self.critic.value(obs, act_enc, target=True)
+    v = self.critic.state_value(obs)
 
     adv    = target_q.float() - v.float()
     v_loss = asymmetric_l2_loss(adv, self.tau)
 
-    with torch.amp.autocast("cuda", torch.bfloat16):
-      qs = self.critic.q_function(obs, act_enc)
+    qs = self.critic.value(obs, act_enc)
 
     targets = reward + (1.0 - term) * self.critic.gamma * next_v
     q_loss  = F.mse_loss(qs.float(), targets.float())
@@ -117,19 +114,17 @@ class IQLPolicy(Policy):
     log_probs = self.actor.log_prob(dist, act_idx)
     act_loss  = torch.mean(exp_adv * -log_probs)
 
-    log = {
-      "train/loss/value": v_loss.detach(),
-      "train/loss/q":     q_loss.detach(),
-      "train/loss/actor": act_loss.detach(),
-      "stats/adv":         adv.detach().mean(),
-      "stats/adv_std":     adv.detach().std(),
-      "stats/q_values":    qs.detach().mean(),
-      "stats/targets":     targets.detach().mean(),
-      "stats/exp_adv":     exp_adv.detach().mean(),
-    }
-    return {"value": v_loss, "q": q_loss, "actor": act_loss}, log
+    self.metrics.dist("adv", adv)
+    self.metrics.dist("exp_adv", exp_adv)
+    self.critic.metrics.dist("q", qs)
+    self.critic.metrics.dist("q_target", targets)
+    self.critic.metrics.dist("v", v)
+    self.critic.metrics.ema_gap("ema", self.critic.q_ema)
+    self.actor.metrics.dist("log_prob", log_probs)
 
-  @torch.inference_mode()
+    return {"value": v_loss, "q": q_loss, "actor": act_loss}
+
+  @torch.no_grad()
   def inference_step(self, obs: torch.Tensor, step_info=None):
     obs = obs.to(self.device)
     if obs.dim() < 2:

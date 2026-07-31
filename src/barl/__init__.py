@@ -7,6 +7,7 @@ from barl.env import Environment, register_environment
 import barl.networks.actor
 import barl.networks.critic
 import barl.networks.squash
+import barl.schedule
 
 from barl.policies import *
 from barl.environments.mujoco_gym import *

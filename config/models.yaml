@@ -56,7 +56,7 @@ SACPolicy:
 
   components:
     actor:    {class: StochasticActor, hidden_dim: 512, layers: 3}
-    critic:   {class: MeanStdEnsembleCritic}
+    critic:   {class: C51Critic }
     entropy:  {class: AutotuneRegulator}
 
   profiles:
@@ -72,8 +72,8 @@ DIMEPolicy:
     entropy_scale: -4.0
 
   components:
-    actor:   {class: ScoreDiscreteActor}
-    critic:  {class: MinEnsembleCritic}
+    actor:   {class: OUDiffusionActor}
+    critic:  {class: C51Critic}
     squash:  {class: TanhSquash}
     entropy: {class: AutotuneRegulator, alpha_init: 0.001, min_alpha: 0.0001}
 
@@ -83,20 +83,21 @@ AMDP:
 
   components:
     actor:   {class: ScoreContinuousActor}
-    critic:  {class: MeanStdEnsembleCritic}
+    critic:  {class: C51Critic}
     squash:  {class: ErfSquash}
     entropy: {class: AutotuneRegulator}
     trust_region: {class: AutotuneRegulator, min_alpha: 1.0e-6, target: 0.2}
 
 SDAC:
   params:
-    entropy_scale: -1.0
-    num_candidates: 20
+    entropy_scale: -0.9
+    num_candidates: 32
+    num_bon: 32
     explore_init: 0.1
 
   components:
-    actor:   {class: ScoreDiscreteActor, latent_dim: 256}
-    critic:  {class: MinEnsembleCritic}
+    actor:   {class: VPDiffusionActor}
+    critic:  {class: MinEnsembleCritic, n_models: 2}
     squash:  {class: TanhSquash}
     entropy: {class: AutotuneRegulator}
 
@@ -132,3 +133,32 @@ FlowBCPolicy:
 DirectPolicy:
   components:
     actor: {class: DeterministicActor}
+
+
+NCLQLPolicy:
+  params:
+    level_embed_dim: 16
+
+    steps_per_level: 2
+
+    # eps, tied to the ladder: sqrt(step_size)/sigmas.end is the injected noise
+    # as a multiple of each level's own sigma (0.316 here -- sub-sigma, as
+    # annealed Langevin assumes). Retune it whenever `sigmas.end` moves.
+    step_size: 1.0e-5
+
+    # drift_scale applies when normalize_score is on (step length =
+    # drift_scale * sigma_i), temperature when it is off (the paper's w).
+    drift_scale: 0.5
+    temperature: 1000.0
+
+    normalize_score: True
+    clip_actions: True
+
+    action_limit: 1.0
+    init_scale: 1.0
+
+  components:
+    # Spans the canonical [-1, 1] action range down to a scale where the
+    # smoothed Q is effectively the clean one.
+    sigmas:  {class: ExponentialSchedule, start: 1.0, end: 0.01, steps: 10}
+    critic:   {class: MinEnsembleCritic, n_models: 2}

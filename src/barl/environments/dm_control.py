@@ -12,7 +12,13 @@ class DMControlEnvironment(Environment):
   its Dict observation into a single flat Box (every Policy/MLP here assumes
   that shape). Online-only, like MuJoCoGymEnvironment."""
 
+  # Same threshold as MuJoCoGymEnvironment: 3.8x on DogRun (1.0 ms/env-step),
+  # roughly break-even on cheetah/walker. Overridden to False per-env for those.
   use_async_vector_env = True
+
+  # Uniform across the whole suite: per-step reward in [0, 1] over a 1000-step
+  # horizon, so this one declaration covers every task below exactly.
+  stats = {"return_min": 0.0, "return_max": 1000.0}
 
   def domain_task(self) -> tuple[str, str]:
     raise NotImplementedError

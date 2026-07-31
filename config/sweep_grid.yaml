@@ -27,12 +27,15 @@ axes:
   env:  [HalfCheetah, Walker2d]
   seed: [0, 1, 2]
 
+  # Both algos below run MeanStdEnsembleCritic, the one critic that takes `rho`
+  # (the distributional pair calls its spread coefficient `risk_aversion`, and
+  # Mean/MinEnsembleCritic take neither -- so an axis has to match the class).
   model.components.critic.rho: [0.0, 2.0]
   # model.components.critic.class: [MeanStdEnsembleCritic, QRDistributionalCritic]
   # model.params.entropy_scale: [-1.0, -2.0]
   # run.utd_ratio: [0.5, 1.0]
 
-exclude:
-  # SAC's critic reduction ignores rho, so the second value would just be a
-  # duplicate run -- prune it rather than pay for it.
-  - {algo: SACPolicy, model.components.critic.rho: 0.0}
+exclude: []
+  # Prune combinations out of the full product, e.g. a value that would be a
+  # duplicate run for one algo:
+  # - {algo: SACPolicy, model.components.critic.rho: 0.0}

@@ -9,3 +9,4 @@ from .ppo import PPOPolicy
 from .sac import SACPolicy
 from .dime import DIMEPolicy
 from .sdac import SDAC
+from .lql import NCLQLPolicy

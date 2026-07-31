@@ -103,6 +103,13 @@ class Logger():
     self._latest.update(stats)
     self._maybe_render()
 
+  def log_quiet(self, stats : dict):
+    """wandb only, no terminal panel -- for the debug tier, whose ~200 keys
+    would swamp the live display without telling you anything at a glance."""
+    if not stats:
+      return
+    wandb.log({**stats, **self._steps})
+
   def message(self, text: str):
     """Prints a one-off line (e.g. "Iteration 3: ...") above the live
     stats panel, through the same Console the panel renders on so the two
@@ -140,8 +147,10 @@ class Logger():
       prefix = k.split("/")[0] if "/" in k else "misc"
       groups[prefix][k] = v
 
+    # Headline sections first, then one per component/algorithm alphabetically.
+    lead = [p for p in ("eval", "rollout", "batch", "buffer", "model") if p in groups]
     tables = [header]
-    for prefix in sorted(groups):
+    for prefix in lead + sorted(set(groups) - set(lead)):
       t = Table(title=f"[bold]{prefix}[/]", title_justify="left", show_header=False, box=None, pad_edge=False)
       t.add_column(style="cyan")
       t.add_column(justify="right")

@@ -8,7 +8,7 @@
 #   this file's entry for the slot's `class:`
 #     < config/models.yaml's per-policy `components: {<slot>: {...}}`
 #     < the active profile's override for that slot
-#     < kwargs the Policy passes itself (algorithm-fixed, e.g. pessimistic_score)
+#     < kwargs the Policy passes itself (algorithm-fixed, never tunable)
 #
 # There is no other defaults layer -- no per-policy fallback, no Python-level
 # HParam table. A policy slot only needs `class:` plus whatever it wants to
@@ -43,21 +43,6 @@ ScoreContinuousActor:
   tau_min: 0.0
   tau_max: 1.0
 
-ScoreDiscreteActor:
-  latent_dim: 512
-  layers: 3
-  num_steps: 20
-  beta_min: 0.12
-  beta_max: 0.18
-  beta_scale_min: 0.7
-  beta_scale_max: 1.8
-  learn_beta_scale: true
-  eta_init: 1.5811   # sqrt(2.5)
-  learn_eta: false
-  anchor_score: true
-  noise_start: 0.999
-  noise_end: 0.001
-
 DistilledFlowActor:
   latent_dim: 512
   flow_steps: 16
@@ -69,12 +54,35 @@ FlowBCActor:
   time_dim: 8
   hidden_layers: 4
 
+VPDiffusionActor:
+  latent_dim: 256
+  layers: 3
+  num_steps: 20
+  cosine_s: 0.008
+  ab_start: 0.999
+  ab_end: 0.001
+
+
+OUDiffusionActor:
+  latent_dim: 256
+  layers: 3
+  num_steps: 16
+  beta_min: 0.12
+  beta_max: 0.18
+  beta_scale_min: 0.7
+  beta_scale_max: 1.8
+  learn_beta_scale: true
+  prior_var: 2.5
+  anchor_score: true
+
+
 # --- Critics --------------------------------------------------------------
 #
-# rho/polyak_tau/gamma are required by QCriticBase itself, so every
-# QCriticBase subclass below has to carry them; the three ensemble critics
-# differ only in how they reduce their heads (mean-rho*std / mean / min), and
-# MeanEnsembleCritic + MinEnsembleCritic ignore `rho` entirely.
+# polyak_tau/gamma are required by QCriticBase itself, so every subclass below
+# carries them. Only a critic that actually reduces with a spread takes one
+# more: `rho` on MeanStdEnsembleCritic is epistemic pessimism across heads,
+# `risk_aversion` on the two distributional critics is a mean-variance risk
+# measure over the return distribution. Mean/MinEnsembleCritic take neither.
 
 MeanStdEnsembleCritic:
   hidden_dim: 2048
@@ -88,7 +96,6 @@ MeanEnsembleCritic:
   hidden_dim: 2048
   layers: 2
   n_models: 10
-  rho: 2.0
   polyak_tau: 0.005
   gamma: 0.99
 
@@ -96,7 +103,6 @@ MinEnsembleCritic:
   hidden_dim: 2048
   layers: 2
   n_models: 10
-  rho: 2.0
   polyak_tau: 0.005
   gamma: 0.99
 
@@ -104,7 +110,7 @@ QRDistributionalCritic:
   hidden_dim: 2048
   layers: 2
   num_quantiles: 100
-  rho: 2.0
+  risk_aversion: 2.0
   polyak_tau: 0.005
   gamma: 0.99
 
@@ -112,9 +118,7 @@ C51Critic:
   hidden_dim: 2048
   layers: 2
   num_atoms: 51
-  v_min: -100.0   # fixed support, unlike the other critics -- set per env's actual return range
-  v_max: 500.0
-  rho: 2.0
+  risk_aversion: 2.0
   polyak_tau: 0.005
   gamma: 0.99
 
@@ -127,6 +131,11 @@ IQLCritic:
   layers: 6
   polyak_tau: 0.005
   gamma: 0.99
+
+
+# NC-LQL has no critic entry of its own: its level ladder, embedding and
+# Langevin sampler all live on NCLQLPolicy, so what it needs from here is
+# whatever class fills its `q_net` slot (see config/models.yaml).
 
 # --- Duals / squashes -----------------------------------------------------
 #

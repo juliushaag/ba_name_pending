@@ -106,6 +106,11 @@ class MjxPlaygroundEnvironment(Environment):
 
   use_async_vector_env = False
 
+  # Playground's locomotion suites are broadly dm_control-shaped (bounded
+  # per-step reward over a ~1000-step horizon); override per subclass where a
+  # task is known to sit outside this.
+  stats = {"return_min": 0.0, "return_max": 1000.0}
+
   def playground_id(self) -> str:
     raise NotImplementedError
 

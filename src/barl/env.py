@@ -2,6 +2,7 @@ import enum
 from abc import ABC, abstractmethod
 
 from barl.dataset import SingleStepDataset
+from barl.env_stats import EnvStats
 from wrapt import decorator
 import gymnasium as gym
 
@@ -15,6 +16,12 @@ class Environment(ABC):
   # AsyncVectorEnv (one subprocess per sub-env) once per-step physics cost
   # dominates IPC overhead.
   use_async_vector_env = False
+
+  # Env facts no gym space can report -- `return_min`/`return_max` bound the
+  # achievable episode return, which is what C51Critic's fixed support needs.
+  # Merged down the MRO, so a family base can set a default and one subclass
+  # override a single key.
+  stats: dict = {}
 
   @abstractmethod
   def get_env(self) -> gym.Env:
@@ -39,7 +46,16 @@ class Environment(ABC):
   def available() -> list[str]:
     return list(Environment._classes.keys())
 
-  
+
+  def get_env_stats(self, env: gym.Env) -> EnvStats:
+    """The env-derived facts every component is built with -- spaces plus this
+    class's declared `stats`. Pass the same `env` that goes to Policy.make()."""
+    declared = {}
+    for klass in reversed(type(self).__mro__):
+      declared.update(klass.__dict__.get("stats") or {})
+    return EnvStats.from_env(env, max_episode_steps=self.get_max_traj_length(env), **declared)
+
+
   def get_max_traj_length(self, env, max_length = 1000):
     spec = getattr(env, "spec", None)
     if spec is not None:

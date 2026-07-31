@@ -31,11 +31,14 @@ class EMA(nn.Module):
     t = torch.clamp(self._step_count.float() / self._warmup_steps, max=1.0)
     self.decay.copy_(self._start_decay + t * (self._end_decay - self._start_decay))
 
-    tau = self.decay
-    for p_t, p_s in zip(self.target.parameters(), self.source.parameters()):
-      p_t.copy_(tau * p_t + (1.0 - tau) * p_s)  # .data in-place ops are disallowed under vmap
-    for b_t, b_s in zip(self.target.buffers(), self.source.buffers()):
-      b_t.copy_(b_s)
+    # lerp_(t, s, 1 - tau) == tau * t + (1 - tau) * s, batched into one kernel
+    # over the whole parameter list; still no .item()/.data, so vmap-safe.
+    torch._foreach_lerp_(list(self.target.parameters()),
+                         list(self.source.parameters()),
+                         1.0 - self.decay)
+    target_buffers, source_buffers = list(self.target.buffers()), list(self.source.buffers())
+    if target_buffers:
+      torch._foreach_copy_(target_buffers, source_buffers)
 
   def forward(self, *args, **kwargs):
     return self.target(*args, **kwargs)
@@ -54,10 +57,10 @@ class Shadow(nn.Module):
     
   @torch.no_grad()
   def on_epoch_start(self):
-    for p_t, p_s in zip(self.target.parameters(), self.source.parameters()):
-      p_t.copy_(p_s)
-    for b_t, b_s in zip(self.target.buffers(), self.source.buffers()):
-      b_t.copy_(b_s)
+    torch._foreach_copy_(list(self.target.parameters()), list(self.source.parameters()))
+    target_buffers, source_buffers = list(self.target.buffers()), list(self.source.buffers())
+    if target_buffers:
+      torch._foreach_copy_(target_buffers, source_buffers)
 
   def forward(self, *args, **kwargs):
     return self.target(*args, **kwargs)

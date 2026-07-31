@@ -19,16 +19,14 @@ class DistilledFlowActor(Actor, nn.Module):
   into a one-step network (`act_direct`, also pushed by the critic's value
   gradient) -- inference only ever runs `act_direct`."""
 
-  def __init__(self, obs_dim: int, action_dim: int,
-               latent_dim: int, flow_steps: int, time_dim: int, **kwargs):
-    super().__init__(**kwargs)
+  def __init__(self, env_stats, latent_dim: int, flow_steps: int, time_dim: int, **kwargs):
+    super().__init__(env_stats, **kwargs)
 
-    self.action_dim = action_dim
     self.flow_steps  = flow_steps
     self.time_dim    = time_dim
 
-    self.act_flow   = MLP(obs_dim + action_dim + time_dim, action_dim, latent_dim, 4, layernorm=False)
-    self.act_direct = MLP(obs_dim + action_dim, action_dim, latent_dim, 4)
+    self.act_flow   = MLP(self.obs_dim + self.action_dim + time_dim, self.action_dim, latent_dim, 4, layernorm=False)
+    self.act_direct = MLP(self.obs_dim + self.action_dim, self.action_dim, latent_dim, 4)
 
   def step_flow(self, obs: torch.Tensor, action: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     with torch.amp.autocast("cuda", torch.bfloat16):
@@ -42,12 +40,15 @@ class DistilledFlowActor(Actor, nn.Module):
     z = z if z is not None else torch.randn((B, self.action_dim), device=s.device)
     with torch.amp.autocast("cuda", torch.bfloat16):
       action = self.act_direct(s, z)
-    return action.clamp(-1.0, 1.0)
+    # Back to float32 before leaving the autocast block: this is the canonical
+    # action, and ReplayBuffer.rollout() calls .numpy() on it, which has no
+    # bfloat16 equivalent.
+    return action.float().clamp(-1.0, 1.0)
 
   def create_optimizer(self) -> dict:
     return {
-      "flow":       torch.optim.AdamW(self.act_flow.parameters(),   lr=3e-4, betas=(0.9, 0.95), weight_decay=1e-4),
-      "direct_act": torch.optim.AdamW(self.act_direct.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=1e-4),
+      "flow":       torch.optim.AdamW(self.act_flow.parameters(),   lr=3e-4, betas=(0.9, 0.95), weight_decay=1e-4, fused=True),
+      "direct_act": torch.optim.AdamW(self.act_direct.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=1e-4, fused=True),
     }
 
 
@@ -61,8 +62,8 @@ class FlowQLPolicy(Policy):
 
     self.alpha = self.resolve_params()["alpha"]
 
-    self.critic = self.build_component("critic", QCriticBase, self.observation_dim, self.action_dim, pessimistic_score=False)
-    self.actor  = self.build_component("actor", DistilledFlowActor, self.observation_dim, self.action_dim)
+    self.critic = self.build_component("critic", QCriticBase)
+    self.actor  = self.build_component("actor", DistilledFlowActor)
 
   def create_optimizer(self):
     return {**self.critic.create_optimizer(), **self.actor.create_optimizer()}
@@ -74,14 +75,15 @@ class FlowQLPolicy(Policy):
     reward   = batch["rew"].to(self.device)
     term     = batch["term"].to(self.device)
 
-    losses, log = {}, {}
+    losses = {}
 
     # No Polyak-averaged actor -- the live actor supplies the next-state action.
-    # No MaxEnt actor either, so the bootstrap penalty is plain 0.
+    # No MaxEnt actor either, so the bootstrap carries no entropy bonus.
     with torch.no_grad():
       next_action = self.actor.sample(next_obs)
+      q_target    = self.critic.bellman_target(reward, term, self.critic.bootstrap(next_obs, next_action))
 
-    self.critic.loss(obs, action, reward, term, next_obs, next_action, 0.0, log, losses)
+    self.critic.loss(obs, action, q_target, losses)
 
     # Flow teacher: BC loss, ignores the critic entirely.
     x_0 = torch.randn_like(action)
@@ -107,16 +109,15 @@ class FlowQLPolicy(Policy):
 
     losses["flow"]       = flow_loss
     losses["direct_act"] = direct_act_loss
-    log.update({
-      "train/loss/act_flow":     flow_loss.detach(),
-      "train/loss/act_direct":   direct_act_loss.detach(),
-      "stats/distill_loss":      distill_loss.detach(),
-      "stats/direct_act_q_loss": direct_act_q_loss.detach(),
-      "stats/direct_q_val":      q_val.detach().mean(),
-    })
-    return losses, log
 
-  @torch.inference_mode()
+    self.metrics.scalar("distill_loss", distill_loss)
+    self.metrics.scalar("direct_act_q_loss", direct_act_q_loss)
+    self.actor.metrics.vec("action", action_pred, limit=1.0)
+    self.critic.metrics.dist("q_new", q_val)
+
+    return losses
+
+  @torch.no_grad()
   def inference_step(self, observation: torch.Tensor, z: torch.Tensor = None):
     obs = self.normalize_obs(observation.to(self.device))
     return self.actor.sample(obs, z=z), {}
