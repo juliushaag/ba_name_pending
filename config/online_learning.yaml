@@ -17,10 +17,10 @@
 
 defaults:
   checkpoint: null          # path to resume from, or null to train from scratch
-  total_env_steps: 1000000  # stop once this many env steps have been collected
+  total_env_steps: 500000  # stop once this many env steps have been collected
   random_steps: 0       # random-action buffer fill before training starts (off-policy only, see main())
   rollout_steps: 5000      # env steps collected per outer iteration (across all num_envs)
-  num_envs: 128             # parallel rollout envs (policy inference is flat in
+  num_envs: 32             # parallel rollout envs (policy inference is flat in
                             # batch size out to ~512, so the whole batch costs
                             # what one env would; episodes persist across
                             # rollouts, so this no longer shortens the horizon)

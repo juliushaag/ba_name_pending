@@ -105,7 +105,7 @@ class OUDiffusionActor(DiscreteDiffusionActorBase):
     return x_new, inc
   
 @register_policy
-class DIMEPolicy(Policy):
+class DIME(Policy):
   """Diffusion-policy MaxEnt actor-critic over a ScoreDiscreteActor's
   DDPM-style reverse process, with an entropy dual (`log_alpha`, auto-tuned
   against `target_entropy`). Unlike AMDP, needs no squash-Jacobian correction:

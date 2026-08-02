@@ -117,7 +117,7 @@ QRDistributionalCritic:
 C51Critic:
   hidden_dim: 2048
   layers: 2
-  num_atoms: 51
+  num_atoms: 101
   risk_aversion: 2.0
   polyak_tau: 0.005
   gamma: 0.99
