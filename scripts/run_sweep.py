@@ -176,6 +176,7 @@ def run_one(script: str, combo: dict, tag: str, defaults: dict, env_defaults: di
   env_vars = os.environ.copy()
   if gpu_id is not None:
     env_vars["CUDA_VISIBLE_DEVICES"] = gpu_id
+    env_vars["PYTHONUNBUFFERED"] = 1
     tag = f"{tag}_gpu{gpu_id}"
 
   print(f"[{tag}] starting -- log: {log_path}\n[{tag}] $ {shlex.join(cmd)}")
