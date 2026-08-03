@@ -50,7 +50,7 @@ class DogWalk(DMControlEnvironment):
 
 @register_environment
 class DogTrot(DMControlEnvironment):
-  def domain_task(self): return ("dog", "Trot")
+  def domain_task(self): return ("dog", "trot")
 
 
 # Humanoid 
