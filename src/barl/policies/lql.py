@@ -10,7 +10,7 @@ import gymnasium as gym
 
 
 @register_policy
-class NCLQLPolicy(Policy):
+class NCLQL(Policy):
   """Noise-Conditioned Langevin Q-Learning (Ki et al. 2026).
 
   Actor-free. There is no policy network, no entropy estimate and no entropy

@@ -18,7 +18,7 @@ class DMControlEnvironment(Environment):
 
   # Uniform across the whole suite: per-step reward in [0, 1] over a 1000-step
   # horizon, so this one declaration covers every task below exactly.
-  stats = {"return_min": 0.0, "return_max": 1000.0}
+  stats = {"return_min": -200.0, "return_max": 200.0}
 
   def domain_task(self) -> tuple[str, str]:
     raise NotImplementedError

@@ -13,7 +13,7 @@ import gymnasium as gym
 
 
 @register_policy
-class SACPolicy(Policy):
+class SAC(Policy):
   """Soft Actor-Critic (Haarnoja et al., 2018): entropy-regularized
   off-policy actor-critic, reparameterized tanh-Gaussian actor, automatic
   temperature tuning. Twin-critic pessimism reuses MeanStdEnsembleCritic's
@@ -61,8 +61,6 @@ class SACPolicy(Policy):
 
     losses = {}
     alpha = self.entropy.value()
-
-    
 
     with bfloat16():
 

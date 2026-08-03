@@ -47,10 +47,10 @@
 # QR-DQN vs. standard fixed-support categorical C51).
 
 aliases:
-  SACSmall: {policy: SACPolicy, profile: Small}
-  SACLarge: {policy: SACPolicy, profile: Large}
+  SACSmall: {policy: SAC, profile: Small}
+  SACLarge: {policy: SAC, profile: Large}
 
-SACPolicy:
+SAC:
   params:
     entropy_scale: -1.0
 
@@ -67,13 +67,13 @@ SACPolicy:
       actor:  {hidden_dim: 512, layers: 3}
       critic: {hidden_dim: 512, layers: 3, n_models: 5}
 
-DIMEPolicy:
+DIME:
   params:
     entropy_scale: -4.0
 
   components:
     actor:   {class: OUDiffusionActor}
-    critic:  {class: C51Critic}
+    critic:  {class: C51Critic }
     squash:  {class: TanhSquash}
     entropy: {class: AutotuneRegulator, alpha_init: 0.001, min_alpha: 0.0001}
 
@@ -83,7 +83,7 @@ AMDP:
 
   components:
     actor:   {class: ScoreContinuousActor}
-    critic:  {class: C51Critic}
+    critic:  {class: C51Critic }
     squash:  {class: ErfSquash}
     entropy: {class: AutotuneRegulator}
     trust_region: {class: AutotuneRegulator, min_alpha: 1.0e-6, target: 0.2}
@@ -135,7 +135,7 @@ DirectPolicy:
     actor: {class: DeterministicActor}
 
 
-NCLQLPolicy:
+NCLQL:
   params:
     level_embed_dim: 16
 

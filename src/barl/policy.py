@@ -278,8 +278,7 @@ class Policy(nn.Module, ABC):
     once here rather than restated by each train_step."""
     self._batch_metrics.dist("reward", batch["rew"])
     self._batch_metrics.vec("action", batch["act"], limit=1.0)
-    self._batch_metrics.dist("term", batch["term"].float())
-
+    
   # ------------------------------------------------------------------
   # Component lifecycle
   # ------------------------------------------------------------------

@@ -98,7 +98,7 @@ class AMDP(Policy):
       
       with float32():
 
-        x_score : torch.Tensor = torch.func.grad(q_values)(next_X).detach()
+        x_score, q_new = torch.func.grad_and_value(q_values)(next_X).detach()
 
         u      = sigma_tau * u_tilde
         target = sigma_tau * x_score.div(alpha)
@@ -108,6 +108,7 @@ class AMDP(Policy):
 
     losses["actor"]     = amdp_loss
 
+    self.critic.metrics.dist("q_new", q_new)
     self.metrics.scalar("score_loss", amdp_loss)
     self.metrics.dist("score_target", target)
     self.actor.metrics.vec("u", u)
