@@ -25,11 +25,6 @@ class MuJoCoGymEnvironment(Environment):
   def get_dataset(self) -> SingleStepDataset:
     raise NotImplementedError(f"{type(self).__name__} has no offline dataset -- MuJoCo Gym is online-only.")
 
-
-# `stats` return ranges below are generous brackets around what a converged
-# agent reaches, not tight bounds -- they set C51Critic's fixed support, which
-# clamps anything outside it, so erring wide is the safe direction.
-
 @register_environment
 class HalfCheetah(MuJoCoGymEnvironment):
   # 0.06 ms/env-step -- measured 16.1k env-steps/s sync vs 13.4k async.

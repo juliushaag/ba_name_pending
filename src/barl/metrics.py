@@ -88,6 +88,11 @@ class Metrics:
     self._put(PRIMARY, f"{name}/std", x.std() if x.numel() > 1 else x.new_zeros(()))
     self._put(PRIMARY, f"{name}/min", x.min())
     self._put(PRIMARY, f"{name}/max", x.max())
+
+    l = x.min() + 1e-3
+    u = x.max() - 1e-3
+        
+    self._put(PRIMARY, f"{name}/edge_sat", torch.logical_and(x > u, x < l).float().mean())
       
   def vec(self, name: str, x: torch.Tensor, limit: float = None):
     """Per-sample vectors: actions, score fields, flow velocities."""

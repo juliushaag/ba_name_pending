@@ -90,7 +90,7 @@ def build_axes(kwargs) -> tuple[str | None, dict, list[dict]]:
   if kwargs.envs:
     axes["env"] = kwargs.envs
   if kwargs.seeds is not None:
-    axes["seed"] = list(range(kwargs.seeds))
+    axes["seed"] = list(i + 42 for i in range(kwargs.seeds))
 
   for assignment in kwargs.set or []:
     key, sep, value = assignment.partition("=")

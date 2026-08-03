@@ -277,7 +277,7 @@ class Policy(nn.Module, ABC):
     """The `batch/*` family -- what every algorithm trains against, recorded
     once here rather than restated by each train_step."""
     self._batch_metrics.dist("reward", batch["rew"])
-    self._batch_metrics.vec("action", batch["act"], limit=1.0)
+    self._batch_metrics.dist("action", batch["act"])
     
   # ------------------------------------------------------------------
   # Component lifecycle
@@ -453,40 +453,88 @@ class Policy(nn.Module, ABC):
   # ------------------------------------------------------------------
 
   @torch.no_grad()
-  def evaluate(self, env: gym.Env, runs=3, videos: int = None, **inference_kwargs):
-    """`videos` caps how many of the `runs` episodes render frames, chosen
-    uniformly at random up front (None renders all of them). env.render() costs
-    ~140x the env step itself, so rendering every episode to log a couple of
-    them dominates eval; unrecorded runs come back with `frames` empty and
-    still count towards the reward statistics."""
+  def evaluate(self, env: gym.Env, runs=3, videos: int = None, render_env: gym.Env = None,
+               **inference_kwargs):
+    """`runs` episodes total: `runs - videos` unrendered on `env` plus `videos`
+    rendered on `render_env` (defaulting to `env`), all counting towards the
+    reward statistics. `videos=None` renders every run.
+
+    Both may be a single gym.Env or a VectorEnv, and being able to hand this a
+    VectorEnv is the point: a single env spends ~90% of eval blocked on batch-1
+    device round-trips rather than on the physics. The rendered episodes stay on
+    their own env because env.render() costs ~140x the env step and a VectorEnv
+    can only render all of its sub-envs at once."""
     was_training = self.training
     self.eval()
-    run_data = []
 
-    recorded = set(range(runs)) if videos is None else set(
-      np.random.choice(runs, size=min(videos, runs), replace=False).tolist())
-
-    for run in range(runs):
-      obs, _ = env.reset()
-      done   = False
-      data   = dict(frames=[], rewards=[])
-      render = run in recorded
-
-      while not done:
-        action, _ = self.inference_step(torch.from_numpy(obs).float().unsqueeze(0), **inference_kwargs)
-        obs, reward, term, trunc, _ = env.step(self.scale_action(action)[0].cpu().numpy())
-        done = term or trunc
-        data["rewards"].append(reward)
-        if render:
-          data["frames"].append(env.render())
-
-      data["terminated"] = term
-      run_data.append(data)
+    n_videos = runs if videos is None else min(videos, runs)
+    run_data  = self._run_episodes(env, runs - n_videos, render=False, **inference_kwargs)
+    run_data += self._run_episodes(render_env if render_env is not None else env,
+                                   n_videos, render=True, **inference_kwargs)
 
     if was_training:
       self.train()
 
     return run_data
+
+  @torch.no_grad()
+  def _run_episodes(self, env: gym.Env, n: int, render: bool, **inference_kwargs) -> list[dict]:
+    """`n` complete episodes, in parallel waves of `num_envs` if `env` is a
+    VectorEnv. A slot that finishes before the rest of its wave is reset and
+    stops recording -- autoreset_mode=DISABLED asserts rather than letting a
+    finished slot be stepped again -- so a wave costs its longest episode."""
+    if n <= 0:
+      return []
+
+    is_vec = isinstance(env, gym.vector.VectorEnv)
+    n_envs = env.num_envs if is_vec else 1
+
+    def reset(**kwargs):
+      obs, _ = env.reset(**kwargs)
+      return obs if is_vec else obs[None, ...]
+
+    # Same reason as ReplayBuffer.rollout(): scaling on the device costs a
+    # second D2H round-trip per step, a quarter of this loop's wall clock, for
+    # an affine map on a tensor that is already back on the host.
+    act_scale_np = act_bias_np = None
+    if not self.action_discrete:
+      act_scale_np = self.act_scale.detach().cpu().numpy()
+      act_bias_np  = self.act_bias.detach().cpu().numpy()
+
+    out = []
+    while len(out) < n:
+      wave = min(n_envs, n - len(out))
+      obs  = reset()
+      data = [dict(frames=[], rewards=[], terminated=False) for _ in range(n_envs)]
+      live = np.zeros(n_envs, dtype=bool)
+      live[:wave] = True
+
+      while live.any():
+        action, _ = self.inference_step(torch.from_numpy(obs).float(), **inference_kwargs)
+        action_np  = action.cpu().numpy()
+        env_action = action_np if act_scale_np is None else action_np * act_scale_np + act_bias_np
+        obs, reward, term, trunc, _ = env.step(env_action if is_vec else env_action[0])
+
+        if not is_vec:
+          obs, reward, term, trunc = obs[None, ...], np.array([reward]), np.array([term]), np.array([trunc])
+
+        frames = (env.call("render") if is_vec else [env.render()]) if render else None
+
+        done = term | trunc
+        for i in np.flatnonzero(live):
+          data[i]["rewards"].append(reward[i])
+          if render:
+            data[i]["frames"].append(frames[i])
+          if done[i]:
+            data[i]["terminated"] = bool(term[i])
+            live[i] = False
+
+        if live.any() and done.any():
+          obs = reset(options={"reset_mask": done}) if is_vec else reset()
+
+      out += data[:wave]
+
+    return out
 
 
 def register_policy(cls: type):

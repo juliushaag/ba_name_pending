@@ -64,51 +64,45 @@ class AMDP(Policy):
 
     losses = {}
 
-    with bfloat16():
+    with float32():
       with torch.no_grad():
+        # These could be stacked for perf
         next_X, entropy_penalty = self.actor.generate_action(next_obs)
+        X, _ = self.actor.generate_action(obs)
+
         entropy_bonus = (alpha * entropy_penalty).detach()
         next_action = self.squash(next_X)
 
+        bootstrap = self.critic.bootstrap(next_obs, next_action) + entropy_bonus
+        q_target  = self.critic.bellman_target(reward, term, bootstrap)
 
-      with float32():
-        with torch.no_grad():
-          bootstrap = self.critic.bootstrap(next_obs, next_action) + entropy_bonus
-          q_target  = self.critic.bellman_target(reward, term, bootstrap)
+      self.critic.loss(obs, action, q_target, losses)
 
-        self.critic.loss(obs, action, q_target, losses)
-        
-      tau = torch.rand(obs.shape[0], device=obs.device)
+    with bfloat16():
+      X_t, tau = self.actor.sample_noised(X)
+      
+      time_embed = sinusoidal_emb(tau.view(X.shape[0], 1), self.actor.time_dim)
+
+      # Could take next_X because freeee, hacky need to check whether this hurts accuracy
+      u_tilde = self.actor.diffusion_act(obs, X_t, time_embed)
+
+    def q_values(x):
+      return self.critic.value(obs, self.squash(x)).sum()
+    
+    with float32():
+
+      x_score, q_new = torch.func.grad_and_value(q_values)(X)
 
       sigma_tau = self.actor.sigma_fn(tau).unsqueeze(-1)
-      sig_sq_tau = self.actor.sigma_sq_int_fn(tau).unsqueeze(-1)
-      sig_sq_one = self.actor.sigma_sq_int_fn(torch.full((obs.shape[0],), self.actor.tau_max, device=obs.device)).unsqueeze(-1)
 
-      # !!! Very important to sample X from the policy NOT from the batch !!!
-      var = (sig_sq_tau - (sig_sq_tau ** 2 / sig_sq_one)).clamp_min(0.0)
-      X_t = next_X * (sig_sq_tau / sig_sq_one) + var.sqrt() * torch.randn_like(next_X)
+      u      = sigma_tau * u_tilde
+      target = sigma_tau * x_score.div(alpha)
+      amdp_loss = (0.5 * (u - target.detach()).pow(2).sum(-1) / sigma_tau.squeeze(-1)).mean()
 
-      time_embed = sinusoidal_emb(tau.view(obs.shape[0], 1), self.actor.time_dim)
-
-      # Taking next_X because freeee 
-      u_tilde = self.actor.diffusion_act(next_obs, X_t, time_embed)
-
-      def q_values(x):
-        return self.critic.value(next_obs, self.squash(x)).sum()
-      
-      with float32():
-
-        x_score, q_new = torch.func.grad_and_value(q_values)(next_X).detach()
-
-        u      = sigma_tau * u_tilde
-        target = sigma_tau * x_score.div(alpha)
-        amdp_loss = (0.5 * (u - target).pow(2).sum(-1) / sigma_tau.squeeze(-1)).mean()
-
-        self.entropy.loss(entropy_penalty.detach(), losses)
+      self.entropy.loss(entropy_penalty.detach(), losses)
 
     losses["actor"]     = amdp_loss
 
-    self.critic.metrics.dist("q_new", q_new)
     self.metrics.scalar("score_loss", amdp_loss)
     self.metrics.dist("score_target", target)
     self.actor.metrics.vec("u", u)

@@ -87,7 +87,6 @@ class SAC(Policy):
 
     self.actor.metrics.dist("entropy", entropy)
     self.actor.metrics.vec("action", new_action, limit=1.0)
-    self.critic.metrics.dist("q_new", q_new)
 
     return losses
 

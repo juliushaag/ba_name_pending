@@ -35,9 +35,9 @@ StochasticActor:
   squash_cls: TanhSquash
 
 ScoreContinuousActor:
-  latent_dim: 512
+  latent_dim: 256
   layers: 3
-  max_steps: 32
+  max_steps: 16
   sigma_min: 2.0
   sigma_max: 2.5
   tau_min: 0.0
@@ -57,7 +57,7 @@ FlowBCActor:
 VPDiffusionActor:
   latent_dim: 256
   layers: 3
-  num_steps: 20
+  num_steps: 16
   cosine_s: 0.008
   ab_start: 0.999
   ab_end: 0.001
@@ -81,8 +81,12 @@ OUDiffusionActor:
 # polyak_tau/gamma are required by QCriticBase itself, so every subclass below
 # carries them. Only a critic that actually reduces with a spread takes one
 # more: `rho` on MeanStdEnsembleCritic is epistemic pessimism across heads,
-# `risk_aversion` on the two distributional critics is a mean-variance risk
-# measure over the return distribution. Mean/MinEnsembleCritic take neither.
+# `risk_aversion` on QRDistributionalCritic/C51Critic is a mean-variance risk
+# measure over the return distribution. Mean/MinEnsembleCritic take neither,
+# and neither does HLGaussCritic -- its histogram is a discretized scalar
+# regression, not a return distribution, so its spread is `sigma`, not a risk
+# preference. CrossQCritic keeps polyak_tau only because QCriticBase requires
+# it; the value is unused, since CrossQ has no target network to Polyak.
 
 MeanStdEnsembleCritic:
   hidden_dim: 2048
@@ -115,10 +119,36 @@ QRDistributionalCritic:
   gamma: 0.99
 
 C51Critic:
-  hidden_dim: 2048
+  hidden_dim: 512
   layers: 2
   num_atoms: 101
   risk_aversion: 2.0
+  polyak_tau: 0.005
+  gamma: 0.99
+
+HLGaussCritic:
+  hidden_dim: 512
+  layers: 2
+  num_bins: 101
+  # sigma = this * bin width. Farebrother et al. (2024) sweep it and land on
+  # 0.75: small enough that neighbouring bins stay distinguishable, wide enough
+  # that the target spans several of them and the head gets a gradient
+  # everywhere rather than only at the argmax bin.
+  sigma_to_bin_ratio: 0.75
+  polyak_tau: 0.005
+  gamma: 0.99
+
+CrossQCritic:
+  hidden_dim: 2048
+  layers: 2
+  n_models: 2
+  lr: 0.001
+  adam_beta1: 0.5
+  momentum: 0.01
+  # BatchRenorm's r/d clipping opens over this many steps; until then it is
+  # plain BatchNorm. Long relative to the run so the running statistics are
+  # settled before they start correcting the batch ones.
+  warmup_steps: 100000
   polyak_tau: 0.005
   gamma: 0.99
 

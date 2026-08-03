@@ -42,9 +42,13 @@
 #
 # Critic slots accept any QCriticBase subclass from src/barl/networks/critic.py:
 # MeanStdEnsembleCritic / MeanEnsembleCritic / MinEnsembleCritic (n_models MLP
-# heads, differing only in mean/min/mean-minus-rho*std reduction), or
+# heads, differing only in mean/min/mean-minus-rho*std reduction),
 # QRDistributionalCritic / C51Critic (single-head return-distribution critics,
-# QR-DQN vs. standard fixed-support categorical C51).
+# QR-DQN vs. standard fixed-support categorical C51), or HLGaussCritic (a
+# scalar Bellman target discretized onto a Gaussian-smoothed histogram and
+# fitted by cross-entropy -- classification-as-regression, not distributional).
+# CrossQCritic is the exception: it has no target network and prices both
+# batches in one forward, so only CrossQ's train_step can drive it.
 
 aliases:
   SACSmall: {policy: SAC, profile: Small}
@@ -56,7 +60,7 @@ SAC:
 
   components:
     actor:    {class: StochasticActor, hidden_dim: 512, layers: 3}
-    critic:   {class: C51Critic }
+    critic:   {class: HLGaussCritic }
     entropy:  {class: AutotuneRegulator}
 
   profiles:
@@ -67,23 +71,24 @@ SAC:
       actor:  {hidden_dim: 512, layers: 3}
       critic: {hidden_dim: 512, layers: 3, n_models: 5}
 
+
 DIME:
   params:
     entropy_scale: -4.0
 
   components:
     actor:   {class: OUDiffusionActor}
-    critic:  {class: C51Critic }
+    critic:  {class: HLGaussCritic }
     squash:  {class: TanhSquash}
     entropy: {class: AutotuneRegulator, alpha_init: 0.001, min_alpha: 0.0001}
 
 AMDP:
   params:
-    entropy_scale: -1.5
+    entropy_scale: -1.0
 
   components:
     actor:   {class: ScoreContinuousActor}
-    critic:  {class: C51Critic }
+    critic:  {class: HLGaussCritic }
     squash:  {class: ErfSquash}
     entropy: {class: AutotuneRegulator}
     trust_region: {class: AutotuneRegulator, min_alpha: 1.0e-6, target: 0.2}
@@ -97,7 +102,7 @@ SDAC:
 
   components:
     actor:   {class: VPDiffusionActor}
-    critic:  {class: MinEnsembleCritic, n_models: 2}
+    critic:  {class: HLGaussCritic }
     squash:  {class: TanhSquash}
     entropy: {class: AutotuneRegulator}
 

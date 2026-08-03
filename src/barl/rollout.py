@@ -18,8 +18,8 @@ class RandomPolicy:
 
   def __init__(self, action_space: gym.Space):
     self.action_space = action_space
-    self.discrete = isinstance(action_space, gym.spaces.Discrete)
-    if not self.discrete:
+    self.action_discrete = isinstance(action_space, gym.spaces.Discrete)
+    if not self.action_discrete:
       low  = torch.as_tensor(action_space.low,  dtype=torch.float32)
       high = torch.as_tensor(action_space.high, dtype=torch.float32)
       self.act_scale = (high - low) / 2
@@ -30,7 +30,7 @@ class RandomPolicy:
 
   def inference_step(self, observation: torch.Tensor, step_info=None):
     batch = observation.shape[0]
-    if self.discrete:
+    if self.action_discrete:
       action = torch.randint(0, self.action_space.n, (batch, 1))
     else:
       # canonical [-1, 1] per dimension -- same convention every real actor outputs.
@@ -38,7 +38,7 @@ class RandomPolicy:
     return action, {}
 
   def scale_action(self, raw_action: torch.Tensor) -> torch.Tensor:
-    if self.discrete:
+    if self.action_discrete:
       return raw_action
     return raw_action * self.act_scale + self.act_bias
 
@@ -67,6 +67,7 @@ class ReplayBuffer():
     self._n_transitions = 0
     self._length_cumsum_cache = None
     self._flat_cache = None
+    self._dest_cache = dict()
     # Live env/episode state carried across rollout() calls -- see rollout().
     self._rollout_state = None
 
@@ -112,6 +113,21 @@ class ReplayBuffer():
       self._length_cumsum_cache = np.cumsum([len(t) for t in self._buffer])
     return self._length_cumsum_cache
 
+  def _cat(self, key: str, arrays: list[np.ndarray], dtype) -> np.ndarray:
+    """np.concatenate into a destination reused across rebuilds. Letting it
+    allocate a fresh one each time cost 4x the copy itself at a full buffer
+    (438 ms vs 108 ms for a 1M-transition DogRun observation array) -- faulting
+    in ~900 MB of new pages, then freeing them again one rollout later."""
+    rows = sum(len(a) for a in arrays)
+    tail = arrays[0].shape[1:]
+
+    buf = self._dest_cache.get(key)
+    if buf is None or buf.shape[1:] != tail or buf.dtype != dtype or len(buf) < rows:
+      buf = np.empty((rows, *tail), dtype=dtype)
+      self._dest_cache[key] = buf
+
+    return np.concatenate(arrays, out=buf[:rows])
+
   def _flat(self) -> dict:
     """The whole buffer flattened into contiguous per-field arrays, so sample()
     is one fancy-index per field instead of a Python loop building `batch_size`
@@ -127,7 +143,7 @@ class ReplayBuffer():
       trajs = self._buffer
       lengths = np.array([len(t) for t in trajs])
 
-      observations = np.concatenate([t.observations for t in trajs]).astype(np.float32, copy=False)
+      observations = self._cat("obs", [t.observations for t in trajs], np.float32)
       # Each chunk contributes len(t) + 1 rows; a transition's row is its chunk's
       # start offset plus its within-chunk index.
       starts  = np.concatenate([[0], np.cumsum(lengths + 1)[:-1]])
@@ -136,19 +152,18 @@ class ReplayBuffer():
       term = np.zeros(int(lengths.sum()), dtype=bool)
       term[np.cumsum(lengths) - 1] = [t.terminated for t in trajs]
 
-      actions = np.concatenate([t.actions for t in trajs])
-      if not np.issubdtype(actions.dtype, np.integer):
-        actions = actions.astype(np.float32, copy=False)
+      act_chunks = [t.actions for t in trajs]
+      act_dtype  = act_chunks[0].dtype if np.issubdtype(act_chunks[0].dtype, np.integer) else np.float32
 
       self._flat_cache = dict(
         observations=observations,
         obs_row=obs_row,
-        act=actions,
-        rew=np.concatenate([t.rewards for t in trajs]).astype(np.float32, copy=False),
+        act=self._cat("act", act_chunks, act_dtype),
+        rew=self._cat("rew", [t.rewards for t in trajs], np.float32),
         term=term,
         # Intersected, not just the first chunk's: a random_fill() prefix stores
         # no extras at all, and a field only some chunks carry can't be batched.
-        extras={k: np.concatenate([t.extras[k] for t in trajs]).astype(np.float32, copy=False)
+        extras={k: self._cat(f"extras/{k}", [t.extras[k] for t in trajs], np.float32)
                 for k in set.intersection(*(set(t.extras) for t in trajs))},
       )
     return self._flat_cache
@@ -247,6 +262,16 @@ class ReplayBuffer():
       staging.copy_(torch.from_numpy(o))
       return staging if device is None else staging.to(device, non_blocking=True)
 
+    # Host-side copies of the policy's action bounds. Calling scale_action() on
+    # the device instead costs a second D2H round-trip per step -- 15% of this
+    # loop's wall clock uncompiled and 32% under compile_inference, where the
+    # extra kernel also falls outside the CUDA graph -- for an affine map on a
+    # tensor that came back to the host one line earlier.
+    act_scale_np = act_bias_np = None
+    if not policy.action_discrete:
+      act_scale_np = policy.act_scale.detach().cpu().numpy()
+      act_bias_np  = policy.act_bias.detach().cpu().numpy()
+
     # Running scalar (not per-dimension) sums -- cheap "is anything blowing up" signal.
     rew_sum = rew_sq_sum = 0.0
     obs_sum = obs_sq_sum = 0.0
@@ -276,7 +301,7 @@ class ReplayBuffer():
       n_act      += act64.size
 
       # Only the env needs real-scale actions -- everything stored/returned here is canonical.
-      env_action_np = policy.scale_action(action).cpu().numpy()
+      env_action_np = action_np if act_scale_np is None else action_np * act_scale_np + act_bias_np
       env_action = env_action_np[0] if not is_vec else env_action_np
       next_obs, reward, term, trunc, _ = env.step(env_action)
 

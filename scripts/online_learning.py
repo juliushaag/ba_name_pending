@@ -28,10 +28,6 @@ from barl.env import Environment
 from barl.rollout import ReplayBuffer
 
 torch.set_float32_matmul_precision("high")
-
-# Every Normal/Distribution built in a train_step validates its constraints with
-# a .all() reduction, i.e. a GPU sync per construction -- ~6 ms each, and SAC
-# builds two per step. Nothing here relies on the resulting exceptions.
 torch.distributions.Distribution.set_default_validate_args(False)
 
 DEFAULT_CONFIG = os.path.join(os.path.dirname(__file__), "..", "config", "online_learning.yaml")
@@ -74,8 +70,10 @@ def assign_grads(params: list[torch.Tensor], grads: tuple[torch.Tensor, ...]) ->
     p.grad = g
 
 
-def evaluate_and_log(model: Policy, env: gym.Env, log: Logger, ckpt_dir: str, best_reward: float, cfg: dict) -> float:
-  data_runs = model.evaluate(env, runs=cfg["eval_runs"], videos=cfg.get("eval_videos", 2))
+def evaluate_and_log(model: Policy, envs: tuple, log: Logger, ckpt_dir: str, best_reward: float, cfg: dict) -> float:
+  eval_env, render_env = envs
+  data_runs = model.evaluate(eval_env, runs=cfg["eval_runs"], videos=cfg.get("eval_videos", 2),
+                             render_env=render_env)
 
   rewards     = [np.sum(run["rewards"]) for run in data_runs]
   avg_reward  = float(np.mean(rewards))
@@ -86,8 +84,8 @@ def evaluate_and_log(model: Policy, env: gym.Env, log: Logger, ckpt_dir: str, be
     "eval/success_rate":   np.mean([int(not bool(run["terminated"])) for run in data_runs]),
   })
 
-  # Only the randomly-recorded runs carry frames; keys are positional so a given
-  # slot stays the same wandb panel across evals.
+  # Only the runs that went to render_env carry frames; keys are positional so a
+  # given slot stays the same wandb panel across evals.
   for i, run in enumerate(r for r in data_runs if r["frames"]):
     log.log_video(f"eval/video_{i}", run["frames"])
 
@@ -101,7 +99,7 @@ def evaluate_and_log(model: Policy, env: gym.Env, log: Logger, ckpt_dir: str, be
   return best_reward
 
 def train_batch(model: Policy, opts: dict[str, torch.optim.Optimizer], scheds: dict[str, torch.optim.lr_scheduler.LambdaLR],
-                 batch, batch_idx: int, log: Logger, env: gym.Env, ckpt_dir: str, best_reward: float, cfg: dict) -> float:
+                 batch, batch_idx: int, log: Logger, eval_envs: tuple, ckpt_dir: str, best_reward: float, cfg: dict) -> float:
   """One gradient step: loss compute, backward+clip+step per loss key, stat
   logging, grad_steps increment, periodic eval trigger. Shared by the
   on-policy epoch loop (train_epoch) and the off-policy fixed-UTD loop in
@@ -134,14 +132,13 @@ def train_batch(model: Policy, opts: dict[str, torch.optim.Optimizer], scheds: d
   model.after_step()
 
   primary, debug = model.drain_metrics()
-  log.log(primary)
-  log.log_quiet(debug)
+  log.log(primary, debug)
 
-  log.increment({"grad_steps": 1})
+  log.advance({"grad_steps": 1})
 
   if log.get_step("grad_steps") % cfg["eval_every"] == 0:
     model.eval()
-    best_reward = evaluate_and_log(model, env, log, ckpt_dir, best_reward, cfg)
+    best_reward = evaluate_and_log(model, eval_envs, log, ckpt_dir, best_reward, cfg)
     model.train()
 
   return best_reward
@@ -159,14 +156,14 @@ def log_model_stats(model: Policy, log: Logger, num_steps: int, cfg: dict) -> No
 
 
 def train_epoch(model: Policy, opts: dict[str, torch.optim.Optimizer], scheds: dict[str, torch.optim.lr_scheduler.LambdaLR],
-                 train_loader, log: Logger, env: gym.Env, ckpt_dir: str, best_reward: float, cfg: dict) -> float:
+                 train_loader, log: Logger, eval_envs: tuple, ckpt_dir: str, best_reward: float, cfg: dict) -> float:
 
   model.on_epoch_start()
   model.train()
   num_steps = 0
   for b, batch in enumerate(train_loader):
     num_steps += 1
-    best_reward = train_batch(model, opts, scheds, batch, b, log, env, ckpt_dir, best_reward, cfg)
+    best_reward = train_batch(model, opts, scheds, batch, b, log, eval_envs, ckpt_dir, best_reward, cfg)
 
   model.on_epoch_end()
 
@@ -239,7 +236,7 @@ def main(cfg: dict):
 
   environment: Environment = Environment.make(ENV)
 
-  env = environment.get_env()  # single env: used for eval (rendering) and action/obs spaces
+  env = environment.get_env()  # single env: action/obs spaces and EnvStats
 
   rollout_env = environment.get_vector_env(1 if cfg.get("validate") else cfg["num_envs"])
 
@@ -276,6 +273,16 @@ def main(cfg: dict):
     rollout_env.close()
     return
 
+  # Eval runs the whole `eval_runs` batch in parallel instead of one episode at
+  # a time -- at batch size 1 ~90% of an eval is device round-trip latency, not
+  # physics. The rendered episodes get their own (synchronous, see
+  # get_vector_env) env because a VectorEnv can only render all of its sub-envs
+  # at once. Both are built once and reused across every eval, since spawning an
+  # AsyncVectorEnv is not free.
+  n_videos   = cfg["eval_runs"] if cfg.get("eval_videos") is None else min(cfg["eval_videos"], cfg["eval_runs"])
+  eval_envs  = (environment.get_vector_env(cfg["eval_runs"] - n_videos) if cfg["eval_runs"] > n_videos else None,
+                environment.get_vector_env(n_videos, asynchronous=False) if n_videos else None)
+
   tags = [MODEL, ENV, "online"]
   if cfg.get("sweep_tag"):
     tags.append(cfg["sweep_tag"])
@@ -311,7 +318,7 @@ def main(cfg: dict):
   if not model.on_policy and cfg.get("random_steps", 0) > 0:
     env_stats["live"].update(
       buffer.random_fill(rollout_env, n_steps=cfg["random_steps"] // cfg["num_envs"], seed=seed))
-    log.increment({"env_steps": cfg["random_steps"]})
+    log.advance({"env_steps": cfg["random_steps"]})
     log.message(f"Random-filled buffer with {cfg['random_steps']} env steps before training")
 
   best_reward = float("-inf")
@@ -320,7 +327,7 @@ def main(cfg: dict):
 
     rollout_stats = buffer.rollout(model, env=rollout_env, n_steps=cfg["rollout_steps"] // cfg["num_envs"],
                     seed=seed if it == 0 else None)
-    log.increment({"env_steps": cfg["rollout_steps"]})
+    log.advance({"env_steps": cfg["rollout_steps"]})
     log.log({f"rollout/{k}": v for k, v in rollout_stats.items()})
     # Every component holds a reference to this same EnvStats, so one update
     # is all it takes for them to see the current rollout's numbers.
@@ -351,7 +358,7 @@ def main(cfg: dict):
       )
 
       for _ in range(cfg["epochs_per_rollout"]):
-        best_reward = train_epoch(model, opts, scheds, train_loader, log, env, ckpt_dir, best_reward, cfg)
+        best_reward = train_epoch(model, opts, scheds, train_loader, log, eval_envs, ckpt_dir, best_reward, cfg)
 
       buffer.buffer = []  # never replay trajectories from a stale policy version
 
@@ -360,7 +367,7 @@ def main(cfg: dict):
       model.train()
       for b in range(grad_steps_this_iter):
         batch = buffer.sample(cfg["batch_size"])
-        best_reward = train_batch(model, opts, scheds, batch, b, log, env, ckpt_dir, best_reward, cfg)
+        best_reward = train_batch(model, opts, scheds, batch, b, log, eval_envs, ckpt_dir, best_reward, cfg)
       model.on_epoch_end()
 
       log_model_stats(model, log, grad_steps_this_iter, cfg)
@@ -370,6 +377,9 @@ def main(cfg: dict):
   model.save(os.path.join(ckpt_dir, "final.pt"))
   env.close()
   rollout_env.close()
+  for e in eval_envs:
+    if e is not None:
+      e.close()
   log.finish()
 
 

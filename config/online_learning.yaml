@@ -29,7 +29,7 @@ defaults:
                              # so this is a budget, not an exact count)
   epochs_per_rollout: 32    # on-policy only: train_epoch passes over the buffer per outer iteration
 
-  utd_ratio: 1.0            # off-policy only: grad steps per outer iteration = round(rollout_steps * utd_ratio)
+  utd_ratio: 2.0            # off-policy only: grad steps per outer iteration = round(rollout_steps * utd_ratio)
 
   lr_warmup_steps: 1000     # grad steps of linear 0 -> base_lr ramp before the sine decay to 0 kicks in
 
@@ -40,13 +40,13 @@ defaults:
                             # Separate from `compile` because a rollout-heavy
                             # actor gains far more here (3-15x) than train_step
                             # does, and the two fail independently. Adds one
-                            # warmup per batch shape -- num_envs, then 1 at the
-                            # first eval.
-  eval_every: 10000         # grad steps between eval2s 
-  eval_runs: 10
-  eval_videos: 2            # of those runs, how many render frames (chosen at
-                            # random). Rendering costs ~140x the env step, so
-                            # this is most of an eval's wall clock. null = all.
+                            # warmup per batch shape -- num_envs, 1 for
+                            # measure_latency, then the two eval widths below.
+  eval_every: 25000         # grad steps between eval2s
+  eval_runs: 10             # episodes per eval, run in parallel
+  eval_videos: 2            # of those runs, how many render frames (they run on
+                            # their own env). Rendering costs ~140x the env step,
+                            # so this is most of an eval's wall clock. null = all.
   log_every: 10             # grad steps between primary-tier logs (one headline key per quantity)
   debug_every: 200          # grad steps between debug-tier logs (min/max/std/quantiles, grad health)
 

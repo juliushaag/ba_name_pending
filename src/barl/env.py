@@ -31,10 +31,15 @@ class Environment(ABC):
   def get_dataset(self) -> SingleStepDataset:
     ...
 
-  def get_vector_env(self, num_envs: int) -> gym.vector.VectorEnv:
+  def get_vector_env(self, num_envs: int, asynchronous: bool = None) -> gym.vector.VectorEnv:
     """autoreset_mode=DISABLED is mandatory -- ReplayBuffer.rollout() resets
-    finished sub-envs itself via reset_mask."""
-    cls = gym.vector.AsyncVectorEnv if self.use_async_vector_env else gym.vector.SyncVectorEnv
+    finished sub-envs itself via reset_mask. `asynchronous` overrides
+    `use_async_vector_env` for a caller the class-level choice doesn't suit --
+    a rendering env has to be synchronous, since a forked worker's render()
+    comes back as an EOFError (MuJoCo's EGL context does not survive the
+    fork) and its frames would go through the pipe at ~900 KB a step."""
+    use_async = self.use_async_vector_env if asynchronous is None else asynchronous
+    cls = gym.vector.AsyncVectorEnv if use_async else gym.vector.SyncVectorEnv
     return cls([self.get_env for _ in range(num_envs)], autoreset_mode=gym.vector.AutoresetMode.DISABLED)
 
   @staticmethod

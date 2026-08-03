@@ -84,31 +84,33 @@ class Logger():
     wandb.define_metric(key, step_metric=step_key)
     self._step_key_dict[key] = step_key
 
-  def increment(self, steps):
+  def advance(self, steps):
+    """Bumps the step counters without touching wandb. They are x-axes
+    (define_metric(step_metric=...)), so wandb only needs them alongside the
+    data they index -- and a wandb.log() call costs ~150 us whatever it carries,
+    which at one per grad step is minutes of CPU over a run."""
     for k, v in steps.items():
       if k not in self._steps:
         raise KeyError(f"Unknown step key '{k}'")
 
       self._steps[k] += v
 
-    wandb.log({**self._steps})
     self._maybe_render()
 
-  def log(self, stats : dict):
+  def log(self, stats : dict, quiet : dict = None):
+    """One wandb.log() per call. `quiet` is the debug tier: shipped to wandb
+    but kept out of the terminal panel, whose ~200 extra keys would swamp the
+    display without telling you anything at a glance."""
+    if not stats and not quiet:
+      return
+
     # Step counters ride in the SAME wandb.log() call as the data -- logging them
-    # via a separate increment() risks an off-by-one/misaligned plot (define_metric
-    # aligns a key's x-axis to whatever step value was logged alongside it).
-    wandb.log({**stats, **self._steps})
+    # separately risks an off-by-one/misaligned plot (define_metric aligns a
+    # key's x-axis to whatever step value was logged alongside it).
+    wandb.log({**stats, **(quiet or {}), **self._steps})
 
     self._latest.update(stats)
     self._maybe_render()
-
-  def log_quiet(self, stats : dict):
-    """wandb only, no terminal panel -- for the debug tier, whose ~200 keys
-    would swamp the live display without telling you anything at a glance."""
-    if not stats:
-      return
-    wandb.log({**stats, **self._steps})
 
   def message(self, text: str):
     """Prints a one-off line (e.g. "Iteration 3: ...") above the live

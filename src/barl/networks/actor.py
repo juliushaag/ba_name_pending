@@ -57,7 +57,7 @@ class StochasticActor(Actor, nn.Module):
   def log_prob(self, dist: torch.distributions.Distribution, action: torch.Tensor) -> torch.Tensor:
     """`action` is the squashed (canonical [-1, 1]) value; inverts the squash
     and applies the change-of-variables correction."""
-    x = self.squash.inverse(action)
+    x = self.squash.inverse(action.clip(-0.99, 0.99))
     log_prob = dist.log_prob(x) - self.squash.log_abs_det_jacobian(x, action)
     return log_prob.sum(dim=-1)
 
@@ -100,6 +100,10 @@ class ScoreContinuousActor(Actor, nn.Module):
     self.diffusion_act = MLP(self.obs_dim + self.action_dim + self.time_dim, self.action_dim,
                              latent_dim, layers, layernorm=layernorm)
 
+    # u approx 0 at the beginning
+    nn.init.zeros_(self.diffusion_act.layers[-1].weight)
+    nn.init.zeros_(self.diffusion_act.layers[-1].bias)
+
     taus   = torch.linspace(tau_min, tau_max, max_steps + 1)
     sig_sq = self.sigma_sq_int_fn(taus)                        # exact, rebased to tau_min
     self.register_buffer("taus",     taus)
@@ -115,6 +119,19 @@ class ScoreContinuousActor(Actor, nn.Module):
   def sigma_sq_int_fn(self, tau):
     """\int_{tau_min}^{tau} sigma^2(t) dt -- matches what the sampler injects."""
     return self._raw_int(tau) - self._int_base
+
+  def sample_noised(self, X) -> torch.Tensor:
+
+    
+    tau = self.tau_min + torch.rand(X.shape[0], device=X.device) * (self.tau_max - self.tau_min)
+    sig_sq_tau = self.sigma_sq_int_fn(tau).unsqueeze(-1)
+    sig_sq_one = self.sigma_sq_int_fn(torch.full((X.shape[0],), self.tau_max, device=X.device)).unsqueeze(-1)
+
+    # !!! Very important to sample X from the policy NOT from the batch !!!
+    var = (sig_sq_tau - (sig_sq_tau ** 2 / sig_sq_one)).clamp_min(0.0)
+    X_t = X * (sig_sq_tau / sig_sq_one) + var.sqrt() * torch.randn_like(X)
+
+    return X_t, tau
   
   @property
   def terminal_var(self) -> float:
@@ -138,7 +155,8 @@ class ScoreContinuousActor(Actor, nn.Module):
         v       = self.step_var[i]
 
         X        = X + v * u_tilde + v.sqrt() * torch.randn_like(u_tilde)
-        path_int = path_int + (v * (u_tilde ** 2).sum(-1)).unsqueeze(1)   # = \int ||u||^2 dtau
+
+        path_int = path_int + (v * (u_tilde ** 2).sum(-1)).unsqueeze(1)
 
       return X, math.log(2) * self.action_dim - 0.5 * path_int
 

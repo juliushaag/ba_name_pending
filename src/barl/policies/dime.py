@@ -145,28 +145,37 @@ class DIME(Policy):
 
     with bfloat16():
 
-      next_X, entropy = self.actor.generate(next_obs)
-      next_action = self.squash(next_X)
- 
-      entropy_bonus = (alpha * entropy).detach()
 
       with torch.no_grad():
+        
+        next_X, entropy = self.actor.generate(next_obs)
+        entropy = entropy + self.squash.inverse(next_X).sum(-1, keepdim=True)
+
+        next_action = self.squash(next_X)
+  
+        entropy_bonus = (alpha * entropy).detach()
+
         bootstrap = self.critic.bootstrap(next_obs, next_action) + entropy_bonus
         q_target  = self.critic.bellman_target(reward, term, bootstrap)
 
       self.critic.loss(obs, action, q_target, losses)
 
-      q_new = self.critic.value(next_obs, next_action)
 
       with float32():
-        dime_loss = -(q_new + (alpha * entropy)).mean()
+        new_X, new_entropy = self.actor.generate(obs)
+        new_entropy = new_entropy + self.squash.inverse(new_X).sum(-1, keepdim=True)
+
+      q_new = self.critic.value(obs, self.squash(new_X))
+
+      with float32():
+
+        dime_loss = -(q_new + (alpha * new_entropy)).mean()
         self.entropy.loss(entropy.detach(), losses)
     
     losses["actor"]  = dime_loss
 
     self.actor.metrics.dist("entropy", entropy)
-    self.actor.metrics.vec("action", next_action, limit=1.0)
-    self.critic.metrics.dist("q_new", q_new)
+    self.actor.metrics.vec("action", action, limit=1.0)
 
     return losses
 

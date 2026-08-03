@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from barl.networks.registry import register_component
 
@@ -47,7 +48,7 @@ class TanhSquash(Squash):
   def log_abs_det_jacobian(self, x: torch.Tensor, y: torch.Tensor = None, eps: float = 1e-6) -> torch.Tensor:
     if y is None:
       y = self.forward(x)
-    return torch.log((1 - y.pow(2)).clamp_min(eps))
+    return 2.0 * (math.log(2.0) - x - F.softplus(-2.0 * x))
 
 
 @register_component
