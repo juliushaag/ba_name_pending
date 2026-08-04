@@ -34,7 +34,10 @@ class StochasticActor(Actor):
   barl's deliberate deviation from canonical SAC, kept as-is."""
 
   def __init__(self, env_stats, hidden_dim: int, layers: int, squash_cls: str,
-               lr: float = 3e-4, norm: str = None, norm_kwargs: dict = None,
+               lr: float = 3e-4,
+               activation: str = "silu", norm: str = None, norm_stem: bool = False,
+               dropout: float = 0.0, final_activation: bool = False,
+               residual: bool = False, norm_kwargs: dict = None,
                *, rngs: nnx.Rngs, **kwargs):
     super().__init__(env_stats, **kwargs)
 
@@ -42,8 +45,10 @@ class StochasticActor(Actor):
     self.log_std = nnx.Param(jnp.zeros((self.action_dim,), jnp.float32))
     self.squash  = get_component(squash_cls)(env_stats)
 
-    self.net = MLP(self.obs_dim, self.action_dim, hidden_dim, layers, norm=norm,
-                   rngs=rngs, **(norm_kwargs or {}))
+    self.net = MLP(self.obs_dim, self.action_dim, hidden_dim, layers,
+                   activation=activation, norm=norm, norm_stem=norm_stem,
+                   dropout=dropout, final_activation=final_activation,
+                   residual=residual, rngs=rngs, **(norm_kwargs or {}))
     self.rngs = rngs
 
   def dist(self, s):
@@ -89,8 +94,10 @@ class ScoreContinuousActor(Actor):
 
   def __init__(self, env_stats, latent_dim: int, layers: int, max_steps: int,
                sigma_min: float, sigma_max: float, tau_min: float, tau_max: float,
-               bound_c: float = 50.0, layernorm: bool = False, lr: float = 3e-4,
-               norm: str = None, norm_kwargs: dict = None,
+               bound_c: float = 50.0, lr: float = 3e-4,
+               activation: str = "silu", norm: str = "none", norm_stem: bool = False,
+               dropout: float = 0.0, final_activation: bool = False,
+               residual: bool = False, norm_kwargs: dict = None,
                *, rngs: nnx.Rngs, **kwargs):
 
     super().__init__(env_stats, **kwargs)
@@ -105,8 +112,9 @@ class ScoreContinuousActor(Actor):
 
     self.diffusion_act = MLP(self.obs_dim + self.action_dim + self.time_dim,
                              self.action_dim, latent_dim, layers,
-                             layernorm=layernorm, norm=norm,
-                             rngs=rngs, **(norm_kwargs or {}))
+                             activation=activation, norm=norm, norm_stem=norm_stem,
+                             dropout=dropout, final_activation=final_activation,
+                             residual=residual, rngs=rngs, **(norm_kwargs or {}))
 
     # u ~ 0 at the beginning.
     self.diffusion_act.head.kernel[...] = jnp.zeros_like(self.diffusion_act.head.kernel[...])
@@ -201,8 +209,10 @@ class DiscreteDiffusionActorBase(Actor, ABC):
   the graph rather than a side effect on the module."""
 
   def __init__(self, env_stats, latent_dim: int, layers: int, num_steps: int,
-               time_dim: int = 8, lr: float = 3e-4, layernorm: bool = False,
-               norm: str = None, norm_kwargs: dict = None,
+               time_dim: int = 8, lr: float = 3e-4,
+               activation: str = "silu", norm: str = "none", norm_stem: bool = False,
+               dropout: float = 0.0, final_activation: bool = False,
+               residual: bool = False, norm_kwargs: dict = None,
                *, rngs: nnx.Rngs, **kwargs):
     super().__init__(env_stats, **kwargs)
 
@@ -211,7 +221,9 @@ class DiscreteDiffusionActorBase(Actor, ABC):
     self.lr        = float(lr)
 
     self.diffusion_act = MLP(self.obs_dim + self.action_dim + time_dim, self.action_dim,
-                             latent_dim, layers, layernorm=layernorm, norm=norm,
+                             latent_dim, layers, activation=activation, norm=norm,
+                             norm_stem=norm_stem, dropout=dropout,
+                             final_activation=final_activation, residual=residual,
                              rngs=rngs, **(norm_kwargs or {}))
     self.tau_table = Buffer(jnp.arange(num_steps + 1, dtype=jnp.float32) / num_steps)
     self.rngs = rngs

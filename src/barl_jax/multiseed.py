@@ -22,7 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-from barl_jax.rollout import ReplayBuffer
+from barl_jax.rollout import ReplayBuffer, summarize_rollout
 
 
 def stack(pairs):
@@ -109,6 +109,15 @@ class MultiSeedReplay(ReplayBuffer):
   def save_trajectory(self, traj):
     self.seeds[traj.id // self.num_envs].save_trajectory(traj)
 
+  def last_rollout_per_seed(self) -> list[dict]:
+    """The statistics of the most recent rollout(), split per seed: seed i's
+    own numbers over the block of sub-env slots its policy drove. The blend
+    rollout() returns reads as a per-seed number once each seed logs to its own
+    wandb run, but isn't one."""
+    acc = self._rollout_per_env
+    return [summarize_rollout(acc, slice(i * self.num_envs, (i + 1) * self.num_envs))
+            for i in range(self.num_seeds)]
+
   @property
   def n_transitions(self) -> int:
     return sum(buffer.n_transitions for buffer in self.seeds)
@@ -116,6 +125,9 @@ class MultiSeedReplay(ReplayBuffer):
   def min_transitions(self) -> int:
     """The shortest seed's buffer -- what actually bounds sampling."""
     return min(buffer.n_transitions for buffer in self.seeds)
+
+  def transitions_per_seed(self) -> list[int]:
+    return [buffer.n_transitions for buffer in self.seeds]
 
   def n_chunks(self) -> int:
     return sum(len(buffer.buffer) for buffer in self.seeds)
@@ -133,20 +145,22 @@ class MultiSeedReplay(ReplayBuffer):
             for key in per_seed[0]}
 
 
-def split_metrics(metrics: dict, num_seeds: int) -> tuple[dict, dict]:
+def split_metrics(metrics: dict, num_seeds: int) -> tuple[dict, list[dict]]:
   """A vmapped step returns every metric with a leading seed axis. Returns
-  (aggregate, per_seed): the mean plus a spread for the headline panel, and the
-  individual values keyed `seed<i>/...` for the ones worth keeping apart."""
-  aggregate, extra = {}, {}
+  (aggregate, per_seed): the mean, for the terminal panel, and one dict per
+  seed under the *plain* key names, for that seed's own wandb run.
+
+  Keys arriving without a seed axis (a scalar the step did not vmap) are
+  broadcast to every seed, so each run's history is complete on its own."""
+  aggregate, per_seed = {}, [{} for _ in range(num_seeds)]
   for key, value in metrics.items():
     value = np.asarray(value)
-    if value.ndim == 0 or num_seeds == 1:
-      # One seed has nothing to aggregate over; keep the key exactly as a
-      # single-seed run would log it.
-      aggregate[key] = value.reshape(()) if value.ndim else value
+    if value.ndim == 0 or value.shape[0] != num_seeds:
+      aggregate[key] = value.reshape(()) if value.ndim == 0 else value
+      for seed in per_seed:
+        seed[key] = aggregate[key]
       continue
     aggregate[key] = value.mean()
-    extra[f"{key}/seed_std"] = value.std()
     for i in range(num_seeds):
-      extra[f"seed{i}/{key}"] = value[i]
-  return aggregate, extra
+      per_seed[i][key] = value[i]
+  return aggregate, per_seed

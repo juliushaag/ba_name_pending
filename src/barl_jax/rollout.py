@@ -56,6 +56,32 @@ class Trajectory:
     return len(self.actions)
 
 
+def summarize_rollout(acc: dict, slots: slice = slice(None)) -> dict:
+  """Per-sub-env-slot sums -> the reported rollout statistics, over `slots`.
+
+  The same function serves the whole rollout and one seed's block of slots, so
+  a per-seed number and the blended one can never be computed differently."""
+  def mean_std(key):
+    n = float(acc[f"n_{key}"][slots].sum())
+    if n == 0:
+      return float("nan"), float("nan")
+    mean = float(acc[f"{key}_sum"][slots].sum()) / n
+    var  = float(acc[f"{key}_sq_sum"][slots].sum()) / n - mean ** 2
+    return mean, math.sqrt(max(var, 0.0))
+
+  rew_mean, rew_std = mean_std("rew")
+  obs_mean, obs_std = mean_std("obs")
+  act_mean, act_std = mean_std("act")
+  seen = float(acc["n_act"][slots].sum()) > 0
+  return dict(
+    avg_reward=rew_mean, reward_std=rew_std,
+    obs_mean=obs_mean,   obs_std=obs_std,
+    act_mean=act_mean,   act_std=act_std,
+    act_min=float(acc["act_min"][slots].min()) if seen else float("nan"),
+    act_max=float(acc["act_max"][slots].max()) if seen else float("nan"),
+  )
+
+
 class ReplayBuffer():
 
   def __init__(self, max_transitions : int, traj_len : int):
@@ -69,6 +95,9 @@ class ReplayBuffer():
     self._dest_cache = dict()
     # Live env/episode state carried across rollout() calls -- see rollout().
     self._rollout_state = None
+    # Per-sub-env-slot sums from the last rollout(), for a caller that owns a
+    # subset of the slots (MultiSeedReplay.last_rollout_per_seed).
+    self._rollout_per_env = None
 
   @property
   def buffer(self) -> list[Trajectory]:
@@ -267,31 +296,35 @@ class ReplayBuffer():
     # that came back to the host one line earlier.
     act_scale_np, act_bias_np = policy.action_bounds_numpy()
 
-    # Running scalar (not per-dimension) sums -- cheap "is anything blowing up" signal.
-    rew_sum = rew_sq_sum = 0.0
-    obs_sum = obs_sq_sum = 0.0
-    act_sum = act_sq_sum = 0.0
-    act_min, act_max = float("inf"), float("-inf")
-    n_rew = n_obs = n_act = 0
+    # Running scalar (not per-dimension) sums -- cheap "is anything blowing up"
+    # signal. Kept per *sub-env slot* rather than as one running total: a
+    # MultiSeedReplay owns a block of slots per seed (see StackedPolicy), so
+    # only this granularity lets it report each seed's own rollout rather than
+    # a blend of all of them. `_summarize` collapses them either way.
+    zeros = lambda: np.zeros(n_envs, dtype=np.float64)
+    acc = dict(rew_sum=zeros(), rew_sq_sum=zeros(), n_rew=zeros(),
+               obs_sum=zeros(), obs_sq_sum=zeros(), n_obs=zeros(),
+               act_sum=zeros(), act_sq_sum=zeros(), n_act=zeros(),
+               act_min=np.full(n_envs, np.inf), act_max=np.full(n_envs, -np.inf))
 
     for _ in range(n_steps):
 
-      obs64 = obs.astype(np.float64)
-      obs_sum    += obs64.sum()
-      obs_sq_sum += (obs64 ** 2).sum()
-      n_obs      += obs64.size
+      obs64 = obs.astype(np.float64).reshape(n_envs, -1)
+      acc["obs_sum"]    += obs64.sum(axis=1)
+      acc["obs_sq_sum"] += (obs64 ** 2).sum(axis=1)
+      acc["n_obs"]      += obs64.shape[1]
 
       key, subkey = jax.random.split(key)
       action, step_extras = act(to_device(obs), subkey)
       action_np = np.asarray(action)  # canonical [-1, 1] -- stored in the buffer as-is
       step_extras = {k: np.asarray(v) for k, v in step_extras.items()}
 
-      act64 = action_np.astype(np.float64)
-      act_sum    += act64.sum()
-      act_sq_sum += (act64 ** 2).sum()
-      act_min     = min(act_min, float(act64.min()))
-      act_max     = max(act_max, float(act64.max()))
-      n_act      += act64.size
+      act64 = action_np.astype(np.float64).reshape(n_envs, -1)
+      acc["act_sum"]    += act64.sum(axis=1)
+      acc["act_sq_sum"] += (act64 ** 2).sum(axis=1)
+      acc["act_min"]     = np.minimum(acc["act_min"], act64.min(axis=1))
+      acc["act_max"]     = np.maximum(acc["act_max"], act64.max(axis=1))
+      acc["n_act"]      += act64.shape[1]
 
       # Only the env needs real-scale actions -- everything stored/returned here is canonical.
       env_action_np = action_np if act_scale_np is None else action_np * act_scale_np + act_bias_np
@@ -304,10 +337,10 @@ class ReplayBuffer():
       if not is_vec:
         next_obs, reward, term, trunc = next_obs[None, ...], np.array([reward]), np.array([term]), np.array([trunc])
 
-      rew64 = reward.astype(np.float64)
-      rew_sum    += rew64.sum()
-      rew_sq_sum += (rew64 ** 2).sum()
-      n_rew      += rew64.size
+      rew64 = reward.astype(np.float64).reshape(n_envs)
+      acc["rew_sum"]    += rew64
+      acc["rew_sq_sum"] += rew64 ** 2
+      acc["n_rew"]      += 1
 
       done = term | trunc
       finished_idx = []
@@ -382,20 +415,8 @@ class ReplayBuffer():
 
     self._rollout_state = dict(env=env, obs=obs)
 
-    def _mean_std(s, sq, n):
-      if n == 0:
-        return float("nan"), float("nan")
-      mean = s / n
-      return mean, math.sqrt(max(sq / n - mean ** 2, 0.0))
-
-    rew_mean, rew_std = _mean_std(rew_sum, rew_sq_sum, n_rew)
-    obs_mean, obs_std = _mean_std(obs_sum, obs_sq_sum, n_obs)
-    act_mean, act_std = _mean_std(act_sum, act_sq_sum, n_act)
-
-    return dict(
-      avg_reward=rew_mean, reward_std=rew_std,
-      obs_mean=obs_mean,   obs_std=obs_std,
-      act_mean=act_mean,   act_std=act_std,
-      act_min=act_min if n_act else float("nan"),
-      act_max=act_max if n_act else float("nan"),
-    )
+    # The per-slot sums stay off the return value -- random_fill() feeds that
+    # dict straight into EnvStats["live"], which wants scalars. A caller owning
+    # a subset of the slots reads them through last_rollout_per_seed() instead.
+    self._rollout_per_env = acc
+    return summarize_rollout(acc)

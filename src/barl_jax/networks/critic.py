@@ -12,12 +12,12 @@ from barl_jax.policy import Buffer, Critic
 
 
 class Bootstrap:
-  """What `bellman_target()` consumes: a target-net prediction in the critic's
+  """What `bellman_target()` consumes: a next-state prediction in the critic's
   own representation, plus a per-sample value shift. Keeping the shift separate
-  is what lets a Policy write `critic.bootstrap(...) + alpha * entropy` no
-  matter which critic it holds -- for a fixed categorical support a value shift
-  moves the support, not the probabilities, so plain addition would silently
-  corrupt it."""
+  is what lets a Policy write `bootstrap + alpha * entropy` no matter which
+  critic it holds -- for a fixed categorical support a value shift moves the
+  support, not the probabilities, so plain addition would silently corrupt
+  it."""
 
   def __init__(self, pred, shift=0.0):
     self.pred  = pred
@@ -31,8 +31,14 @@ class Bootstrap:
 
 class QCriticBase(Critic):
   """Shared scaffolding for every concrete critic below: the bootstrap ->
-  bellman_target -> loss regression path, and the target network -- which is
-  optional. Not instantiated directly.
+  bellman_target -> loss regression path. Not instantiated directly.
+
+  There is no target network. The bootstrap is priced by the live weights, in
+  the *same* forward as the prediction it trains (see `raw_pair`), which is
+  CrossQ's (Bhatt et al., ICLR 2024) replacement for one: a batch-statistic
+  normalization then sees both batches as a single population, so the bootstrap
+  cannot drift off-distribution from the prediction -- the instability target
+  networks exist to damp.
 
   Two accessors, both meaningful for every representation: `expectation()` is
   E[Z(s,a)], `value()` is the price a Policy improves against -- the same thing
@@ -42,85 +48,32 @@ class QCriticBase(Critic):
   `reduce_expectation(raw)` and (optionally) `reduce_value(raw)` turn an
   un-reduced prediction into a scalar, and `loss_from_raw(raw, target, losses)`
   regresses one. Keeping those separate from the forward pass is what lets
-  `td_loss()` price both batches in a single call when there is no target net."""
+  `td_loss()` price both batches in a single call."""
 
-  def __init__(self, env_stats, q_function, *, polyak_tau: float, gamma: float,
-               lr: float = 3e-4, polyak_ramp: bool = True, use_target: bool = True,
-               **kwargs):
+  def __init__(self, env_stats, q_function, *, gamma: float, lr: float = 3e-4,
+               adam_b1: float = 0.5, **kwargs):
     super().__init__(env_stats, **kwargs)
 
-    self.polyak_tau  = float(polyak_tau)
-    self.gamma       = float(gamma)
-    self.lr          = float(lr)
-    self.polyak_ramp = bool(polyak_ramp)
-    self.use_target  = bool(use_target)
+    self.gamma   = float(gamma)
+    self.lr      = float(lr)
+    # 0.5, not Adam's 0.9: with no target network the critic tracks a
+    # faster-moving bootstrap, and heavy first-moment momentum lags it. This is
+    # the b1 CrossQ (and dime_am's configs/alg/*.yaml) use.
+    self.adam_b1 = float(adam_b1)
 
     self.q_function = q_function
-    if self.use_target:
-      # Named `*_target` so the TRAINABLE filter excludes it from every optimizer --
-      # nnx.update() preserves a Variable's original type, so the clone's leaves
-      # stay nnx.Param and cannot be retyped into something the filter would skip.
-      self.q_target = nnx.clone(q_function)
-      self.polyak_step = Buffer(jnp.zeros((), jnp.float32))
-
-  # ------------------------------------------------------------------
-  # Target network
-  # ------------------------------------------------------------------
-
-  # `polyak_ramp` reproduces a quirk of the torch implementation rather than
-  # its config: QCriticBase there built `EMA(q_function)` with EMA's *default*
-  # decay and never passed `polyak_tau` on, so the effective interpolation
-  # weight ramped 0.1 -> 0.01 over 5000 steps and the configured
-  # `polyak_tau: 0.005` was dead for every critic. Keeping it the default here
-  # is what makes a torch-vs-JAX learning-curve comparison mean something;
-  # set `polyak_ramp: false` in config/components.yaml to honour `polyak_tau`.
-  _RAMP_START, _RAMP_END, _RAMP_STEPS = 0.9, 0.99, 5000
-
-  def polyak_weight(self):
-    assert self.use_target, "no target network to Polyak towards (use_target=False)"
-    if not self.polyak_ramp:
-      return self.polyak_tau
-    t = jnp.minimum(self.polyak_step[...] / self._RAMP_STEPS, 1.0)
-    decay = self._RAMP_START + t * (self._RAMP_END - self._RAMP_START)
-    return 1.0 - decay
-
-  def before_step(self):
-    """Polyak update, driven by the Policy's lifecycle fan-out rather than by
-    each train_step. A no-op without a target network."""
-    if not self.use_target:
-      return
-    self.polyak_step[...] = self.polyak_step[...] + 1
-    online = nnx.state(self.q_function, nnx.Param)
-    target = nnx.state(self.q_target, nnx.Param)
-    nnx.update(self.q_target, optax.incremental_update(online, target, self.polyak_weight()))
-
-  def target_gap(self, name: str = "ema"):
-    """How far the Polyak target has drifted from the live net."""
-    if not self.use_target:
-      return
-    self.metrics.gap(name,
-                     nnx.state(self.q_function, nnx.Param),
-                     nnx.state(self.q_target, nnx.Param))
 
   # ------------------------------------------------------------------
   # Pricing
   # ------------------------------------------------------------------
 
-  def raw(self, s, a, target: bool = False):
-    """Un-reduced prediction: (n_models, B, 1) ensemble heads, or (B, num_bins)
-    logits. A critic's own loss() and nothing else -- a Policy prices with
-    value()/expectation(). `target=True` falls back to the live net when there
-    is no target network, so callers never have to ask."""
-    net = self.q_target if (target and self.use_target) else self.q_function
-    return net(s, a)
+  def raw(self, s, a):
+    return self.q_function(s, a)
 
   def raw_pair(self, s, a, next_s, next_a):
     """Both batches through the network in **one** forward, returned as the two
-    un-reduced halves. This is CrossQ's trick (Bhatt et al., ICLR 2024): with a
-    batch-statistic normalization inside, computing them separately lets the
-    bootstrap drift off-distribution from the prediction it trains -- which is
-    the instability target networks exist to damp. Sharing the moments removes
-    the need for the target net rather than papering over its absence."""
+    un-reduced halves -- see the class docstring for why they must share a
+    forward rather than be priced separately."""
     batch = s.shape[0]
     joint = self.raw(jnp.concatenate([s, next_s], axis=0),
                      jnp.concatenate([a, next_a], axis=0))
@@ -137,23 +90,18 @@ class QCriticBase(Critic):
     unless the subclass reduces with a spread."""
     return self.reduce_expectation(raw)
 
-  def expectation(self, s, a, target: bool = False):
-    return self.reduce_expectation(self.raw(s, a, target=target))
+  def expectation(self, s, a):
+    return self.reduce_expectation(self.raw(s, a))
 
-  def value(self, s, a, target: bool = False):
-    return self.reduce_value(self.raw(s, a, target=target))
+  def value(self, s, a ):
+    return self.reduce_value(self.raw(s, a))
 
   def create_optimizer(self) -> dict:
-    return {"q": optax.adam(self.lr)}
+    return {"q": optax.adam(self.lr, b1=self.adam_b1)}
 
   # ------------------------------------------------------------------
   # Regression
   # ------------------------------------------------------------------
-
-  def bootstrap(self, next_obs, next_act) -> Bootstrap:
-    """The target net's next-state prediction, for a Policy to add its entropy
-    bonus to before handing it to bellman_target()."""
-    return self.bootstrap_from_raw(self.raw(next_obs, next_act, target=True))
 
   def bootstrap_from_raw(self, next_raw) -> Bootstrap:
     """A Bootstrap from an already-computed next-state prediction. Overridden by
@@ -180,20 +128,11 @@ class QCriticBase(Critic):
 
   def td_loss(self, obs, action, next_obs, next_action, reward, term,
               losses: dict, shift=0.0) -> None:
-    """The whole TD update: price both batches, transport one step, regress.
-
-    Which of the two paths runs is the critic's business, not the Policy's --
-    that is the point of having it here. With a target network the prediction
-    and the bootstrap are separate forwards through separate weights; without
-    one they are a single forward through the live weights (see `raw_pair`), so
-    any batch-statistic normalization sees both batches as one population.
+    """The whole TD update: price both batches in one forward, transport one
+    step, regress. Living here rather than in each Policy is what keeps the
+    single-forward requirement (see `raw_pair`) out of every train_step.
 
     `shift` is the Policy's per-sample value shift, e.g. an entropy bonus."""
-    if self.use_target:
-      bootstrap = self.bootstrap(next_obs, next_action) + shift
-      self.loss(obs, action, self.bellman_target(reward, term, bootstrap), losses)
-      return
-
     pred_raw, next_raw = self.raw_pair(obs, action, next_obs, next_action)
     bootstrap = self.bootstrap_from_raw(next_raw) + shift
     self.loss_from_raw(pred_raw, self.bellman_target(reward, term, bootstrap), losses)
@@ -211,12 +150,16 @@ class EnsembleCriticBase(QCriticBase):
   `value()`'s reduction differs between them. Not instantiated directly."""
 
   def __init__(self, env_stats, hidden_dim: int, layers: int, n_models: int,
-               norm: str = None, norm_kwargs: dict = None, dropout: float = 0.0, *,
-               rngs: nnx.Rngs, **kwargs):
+               activation: str = "silu", norm: str = None, norm_stem: bool = False,
+               dropout: float = 0.0, final_activation: bool = False,
+               residual: bool = False, norm_kwargs: dict = None,
+               *, rngs: nnx.Rngs, **kwargs):
     q_function = _EnsembleQ(n_models,
                             env_stats["obs_dim"] + env_stats["act_dim"],
-                            hidden_dim, layers, norm=norm, dropout=dropout,
-                            norm_kwargs=norm_kwargs, rngs=rngs)
+                            hidden_dim, layers, activation=activation, norm=norm, norm_stem=norm_stem,
+                            dropout=dropout, final_activation=final_activation,
+                            residual=residual, norm_kwargs=norm_kwargs,
+                            rngs=rngs)
     super().__init__(env_stats, q_function, rngs=rngs, **kwargs)
     self.n_models = n_models
 
@@ -231,7 +174,6 @@ class EnsembleCriticBase(QCriticBase):
     self.metrics.dist("q", pred.mean(axis=0))
     self.metrics.dist("q_target", tgt)
     self.metrics.ensemble("ensemble", pred, rho=getattr(self, "rho", 0.0))
-    self.target_gap()
 
 
 class _EnsembleQ(nnx.Module):
@@ -239,11 +181,15 @@ class _EnsembleQ(nnx.Module):
   single-head critic's does."""
 
   def __init__(self, n_models: int, in_dim: int, hidden_dim: int, layers: int,
-               norm: str = None, norm_kwargs: dict = None, dropout: float = 0.0,
+               activation: str = "silu", norm: str = None, norm_stem: bool = False,
+               dropout: float = 0.0, final_activation: bool = False,
+               residual: bool = False, norm_kwargs: dict = None,
                *, rngs: nnx.Rngs):
     self.ensemble = Ensemble(n_models, MLP, input_dim=in_dim, output_dim=1,
                              latent_dim=hidden_dim, hidden_layers=layers,
-                             norm=norm, dropout=dropout, rngs=rngs, **(norm_kwargs or {}))
+                             activation=activation, norm=norm, norm_stem=norm_stem,
+                             dropout=dropout, final_activation=final_activation,
+                             residual=residual, rngs=rngs, **(norm_kwargs or {}))
 
   def __call__(self, s, a):
     return self.ensemble(jnp.concatenate([s, a], axis=-1))
@@ -301,7 +247,9 @@ class HLGaussCritic(QCriticBase):
 
   def __init__(self, env_stats, hidden_dim: int, layers: int, num_bins: int,
                sigma_to_bin_ratio: float, v_min: float = None, v_max: float = None,
-               norm: str = None, norm_kwargs: dict = None, dropout: float = 0.0,
+               activation: str = "silu", norm: str = None, norm_stem: bool = False,
+               dropout: float = 0.0, final_activation: bool = False,
+               residual: bool = False, norm_kwargs: dict = None,
                *, rngs: nnx.Rngs, **kwargs):
     # Read off the argument rather than self.env_stats: the support has to
     # exist before super().__init__().
@@ -316,8 +264,10 @@ class HLGaussCritic(QCriticBase):
       )
 
     q_function = _SingleHeadQ(env_stats["obs_dim"] + env_stats["act_dim"],
-                              num_bins, hidden_dim, layers, norm=norm, dropout=dropout,
-                              norm_kwargs=norm_kwargs, rngs=rngs)
+                              num_bins, hidden_dim, layers,
+                              activation=activation, norm=norm, norm_stem=norm_stem,
+                              dropout=dropout, final_activation=final_activation,
+                              residual=residual, norm_kwargs=norm_kwargs, rngs=rngs)
     super().__init__(env_stats, q_function, rngs=rngs, **kwargs)
 
     self.v_min, self.v_max = float(v_min), float(v_max)
@@ -345,8 +295,8 @@ class HLGaussCritic(QCriticBase):
     mass  = cdf[:, 1:] - cdf[:, :-1]
     return mass / jnp.maximum(mass.sum(axis=-1, keepdims=True), 1e-8)
 
-  def probs(self, s, a, target: bool = False):
-    return jax.nn.softmax(self.raw(s, a, target=target).astype(jnp.float32), axis=-1)
+  def probs(self, s, a):
+    return jax.nn.softmax(self.raw(s, a).astype(jnp.float32), axis=-1)
 
   def reduce_expectation(self, raw):
     probs = jax.nn.softmax(raw.astype(jnp.float32), axis=-1)
@@ -366,15 +316,18 @@ class HLGaussCritic(QCriticBase):
     probs = jax.nn.softmax(pred_logits, axis=-1)
     self.metrics.dist("q", (probs * self.centres[...]).sum(axis=-1, keepdims=True))
     self.metrics.dist("q_target", (tgt * self.centres[...]).sum(axis=-1, keepdims=True))
-    self.target_gap()
 
 
 class _SingleHeadQ(nnx.Module):
   def __init__(self, in_dim: int, out_dim: int, hidden_dim: int, layers: int,
-               norm: str = None, norm_kwargs: dict = None, dropout: float = 0.0,
+               activation: str = "silu", norm: str = None, norm_stem: bool = False,
+               dropout: float = 0.0, final_activation: bool = False,
+               residual: bool = False, norm_kwargs: dict = None,
                *, rngs: nnx.Rngs):
-    self.net = MLP(in_dim, out_dim, hidden_dim, layers, layernorm=False, norm=norm,
-                   dropout=dropout, rngs=rngs, **(norm_kwargs or {}))
+    self.net = MLP(in_dim, out_dim, hidden_dim, layers,
+                   activation=activation, norm=norm, norm_stem=norm_stem,
+                   dropout=dropout, final_activation=final_activation,
+                   residual=residual, rngs=rngs, **(norm_kwargs or {}))
 
   def __call__(self, s, a):
     return self.net(jnp.concatenate([s, a], axis=-1))

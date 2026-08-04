@@ -1,4 +1,5 @@
 import enum
+import multiprocessing as mp
 from abc import ABC, abstractmethod
 
 from barl_jax.env_stats import EnvStats
@@ -38,8 +39,21 @@ class Environment(ABC):
     comes back as an EOFError (MuJoCo's EGL context does not survive the
     fork) and its frames would go through the pipe at ~900 KB a step."""
     use_async = self.use_async_vector_env if asynchronous is None else asynchronous
-    cls = gym.vector.AsyncVectorEnv if use_async else gym.vector.SyncVectorEnv
-    return cls([self.get_env for _ in range(num_envs)], autoreset_mode=gym.vector.AutoresetMode.DISABLED)
+    if not use_async:
+      return gym.vector.SyncVectorEnv([self.get_env for _ in range(num_envs)],
+                                      autoreset_mode=gym.vector.AutoresetMode.DISABLED)
+    # Not the default `fork`: JAX is multithreaded by the time this is called,
+    # and forking a multithreaded parent is what python warns will "likely lead
+    # to a deadlock" -- a worker can inherit a lock held by a thread that does
+    # not exist on its side. forkserver's workers fork from a clean
+    # single-threaded server process instead, and unlike spawn they don't each
+    # re-import jax/mujoco, which at num_envs in the hundreds is the difference
+    # between seconds and minutes of startup.
+    methods = mp.get_all_start_methods()
+    context = "forkserver" if "forkserver" in methods else "spawn"
+    return gym.vector.AsyncVectorEnv([self.get_env for _ in range(num_envs)],
+                                     autoreset_mode=gym.vector.AutoresetMode.DISABLED,
+                                     context=context)
 
   @staticmethod
   def make(name : str) -> "Environment":

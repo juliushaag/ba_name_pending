@@ -29,8 +29,15 @@ from barl_jax.policy import TRAINABLE, Policy
 from barl_jax.train import train_step
 
 # graphdef and tiers are static; state and batch carry the seed axis.
+#
+# `state` is donated: it is threaded in and straight back out every step and
+# never read again by the caller, so letting XLA write the update into the
+# input's buffers saves re-allocating the whole parameter+optimizer tree once
+# per gradient step. The contract that makes this safe is that **every** caller
+# rebinds the returned state over the one it passed in -- a caller that kept
+# the old reference would find it a deleted buffer.
 seeded_step = jax.jit(jax.vmap(train_step, in_axes=(None, 0, 0, None)),
-                      static_argnums=(0, 3))
+                      static_argnums=(0, 3), donate_argnums=(1,))
 
 
 class Run:
@@ -128,16 +135,18 @@ def evaluate(run: Run, envs, log, ckpt_dir, best):
       for v, r in enumerate(x for x in runs if x["frames"]):
         log.log_video(f"eval/video_{v}", r["frames"])
 
+  # Eval is already per-seed -- each seed was rolled out on its own above -- so
+  # it goes straight to that seed's run rather than being averaged first.
   rewards = np.asarray(rewards)
-  headline = {"eval/avg_cum_reward": rewards.mean(),
-              "eval/avg_length": np.mean(lengths),
-              "eval/success_rate": np.mean(successes)}
-  quiet = {}
-  if run.num_seeds > 1:
-    headline["eval/seed_std"] = rewards.std()
-    quiet = {f"seed{i}/eval/avg_cum_reward": r for i, r in enumerate(rewards)}
-  log.log(headline, quiet)
-  log.summary("best_reward", float(np.max(best)))
+  per_seed = [{"eval/avg_cum_reward": float(rewards[i]),
+               "eval/avg_length":     float(lengths[i]),
+               "eval/success_rate":   float(successes[i])} for i in range(run.num_seeds)]
+  panel = {"eval/avg_cum_reward": rewards.mean(),
+           "eval/avg_length":     np.mean(lengths),
+           "eval/success_rate":   np.mean(successes)}
+  log.log_per_seed(per_seed, panel=panel)
+  for i, seed_best in enumerate(best):
+    log.summary("best_reward", float(seed_best), seed_index=i)
   return best
 
 
@@ -171,7 +180,9 @@ def train(run: Run):
             **{f"env_stats/{k}": v for k, v in run.env_stats.static().items()
                if not isinstance(v, np.ndarray)},
             "env_obs": str(run.env.observation_space), "env_act": str(run.env.action_space)},
-    group=cfg.get("sweep_tag"))
+    # One wandb run per vmapped seed, grouped under this {model, env, config}
+    # so the group view aggregates them. The sweep stays findable via its tag.
+    group=name, seeds=[run.base_seed + i for i in range(num_seeds)])
 
   log.register("eval/*", "env_steps")
   log.register("rollout/*", "env_steps")
@@ -202,17 +213,24 @@ def train(run: Run):
     rollout_stats = run.buffer.rollout(actor, env=run.rollout_env, n_steps=steps_per_iter,
                                        seed=run.base_seed if it == 0 else None)
     log.advance({"env_steps": cfg["rollout_steps"]})
-    log.log({f"rollout/{k}": v for k, v in rollout_stats.items()})
+    # Seed i drove its own block of sub-env slots, so its rollout is its own --
+    # only the panel averages them.
+    log.log_per_seed([{f"rollout/{k}": v for k, v in seed.items()}
+                      for seed in run.buffer.last_rollout_per_seed()],
+                     panel={f"rollout/{k}": v for k, v in rollout_stats.items()})
     # Every component holds a reference to this same EnvStats, so one update is
-    # all it takes for them to see the current rollout's numbers.
+    # all it takes for them to see the current rollout's numbers. Deliberately
+    # the blend: the components are shared across the seed axis (the tunables
+    # live in one graphdef), so there is no per-seed EnvStats to feed.
     run.env_stats["live"].update(rollout_stats)
 
     grad_steps_this_iter = round(cfg["rollout_steps"] * cfg["utd_ratio"])
     log.message(f"Rollout done: {run.buffer.n_chunks()} chunks, "
                 f"{run.buffer.min_transitions()} transitions per seed, "
                 f"~{grad_steps_this_iter} grad steps this iter")
-    log.log({"buffer/transitions": run.buffer.min_transitions(),
-             "buffer/utd_ratio": grad_steps_this_iter / cfg["rollout_steps"]})
+    log.log({"buffer/utd_ratio": grad_steps_this_iter / cfg["rollout_steps"]})
+    log.log_per_seed([{"buffer/transitions": n} for n in run.buffer.transitions_per_seed()],
+                     panel={"buffer/transitions": run.buffer.min_transitions()})
 
     epoch_start, eval_time = time.perf_counter(), 0.0
     for _ in range(grad_steps_this_iter):
@@ -225,15 +243,16 @@ def train(run: Run):
 
       if tiers:
         primary, debug = to_host(primary), to_host(debug)
-        primary, primary_extra = split_metrics(primary, num_seeds)
-        debug, debug_extra = split_metrics(debug, num_seeds)
-        # Panel shows the seed mean; spread and individual seeds are wandb-only,
-        # or every headline key would be doubled on screen.
-        log.log(primary, {**debug, **primary_extra, **debug_extra})
+        primary_mean, primary_seeds = split_metrics(primary, num_seeds)
+        _,            debug_seeds   = split_metrics(debug, num_seeds)
+        # Each seed's own values go to its own wandb run under the plain key
+        # names; the panel shows the seed mean, which wandb's group view
+        # recomputes rather than being logged a second time.
+        log.log_per_seed(primary_seeds, debug_seeds, panel=primary_mean)
 
       log.advance({"grad_steps": 1})
 
-      if log.get_step("grad_steps") % cfg["eval_every"] == 0:
+      if log.get_step("env_steps") % cfg["eval_every"] == 0:
         eval_start = time.perf_counter()
         best = evaluate(run, eval_envs, log, ckpt_dir, best)
         eval_time += time.perf_counter() - eval_start
@@ -271,7 +290,11 @@ def validate(run: Run):
                      seed=run.base_seed)
 
   batch = run.buffer.sample(cfg["batch_size"])
-  _, losses, primary, debug = seeded_step(run.graphdef, run.state, batch, (PRIMARY, DEBUG))
+  # Rebound rather than discarded even though nothing here reads it again:
+  # seeded_step donates the state it is given (see its definition), so keeping
+  # the old reference would leave run.state pointing at a deleted buffer.
+  run.state, losses, primary, debug = seeded_step(run.graphdef, run.state, batch,
+                                                  (PRIMARY, DEBUG))
   losses = jax.device_get(losses)
 
   for key, value in sorted(losses.items()):

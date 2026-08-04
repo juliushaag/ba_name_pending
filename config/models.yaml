@@ -40,15 +40,14 @@
 # either a plain Policy class below, or one of the `aliases:` shortcuts,
 # which resolve to a (policy, profile) pair.
 #
-# Critic slots accept any QCriticBase subclass from src/barl/networks/critic.py:
-# MeanStdEnsembleCritic / MeanEnsembleCritic / MinEnsembleCritic (n_models MLP
-# heads, differing only in mean/min/mean-minus-rho*std reduction),
-# QRDistributionalCritic / C51Critic (single-head return-distribution critics,
-# QR-DQN vs. standard fixed-support categorical C51), or HLGaussCritic (a
-# scalar Bellman target discretized onto a Gaussian-smoothed histogram and
-# fitted by cross-entropy -- classification-as-regression, not distributional).
-# CrossQCritic is the exception: it has no target network and prices both
-# batches in one forward, so only CrossQ's train_step can drive it.
+# Critic slots accept any QCriticBase subclass from
+# src/barl_jax/networks/critic.py: MeanStdEnsembleCritic / MeanEnsembleCritic /
+# MinEnsembleCritic (n_models MLP heads, differing only in
+# mean/min/mean-minus-rho*std reduction), or HLGaussCritic (a scalar Bellman
+# target discretized onto a Gaussian-smoothed histogram and fitted by
+# cross-entropy -- classification-as-regression, not distributional).
+# None of them has a target network; a CrossQ-style critic is not a separate
+# class, just `norm: batchrenorm` (see config/components.yaml).
 
 aliases:
   SACSmall: {policy: SAC, profile: Small}
@@ -86,6 +85,12 @@ AMDP:
   params:
     entropy_scale: -1.0
 
+    # Per-sample norm clip on the critic's action gradient before it becomes
+    # the adjoint target (dime_am's Q_score_clipping). The threshold is the
+    # tighter of this norm and the batch's percentile of the per-sample norms.
+    q_score_max_norm: 5.0
+    q_score_max_percentile: 95.0
+
   components:
     actor:   {class: ScoreContinuousActor}
     critic:  {class: HLGaussCritic }
@@ -106,6 +111,34 @@ SDAC:
     squash:  {class: TanhSquash}
     entropy: {class: AutotuneRegulator}
 
+NCLQL:
+  params:
+    level_embed_dim: 16
+
+    steps_per_level: 2
+
+    # eps, tied to the ladder: sqrt(step_size)/sigmas.end is the injected noise
+    # as a multiple of each level's own sigma (0.316 here -- sub-sigma, as
+    # annealed Langevin assumes). Retune it whenever `sigmas.end` moves.
+    step_size: 1.0e-5
+
+    # drift_scale applies when normalize_score is on (step length =
+    # drift_scale * sigma_i), temperature when it is off (the paper's w).
+    drift_scale: 0.5
+    temperature: 1000.0
+
+    normalize_score: True
+    clip_actions: True
+
+    action_limit: 1.0
+    init_scale: 1.0
+
+  components:
+    # Spans the canonical [-1, 1] action range down to a scale where the
+    # smoothed Q is effectively the clean one.
+    sigmas:  {class: ExponentialSchedule, start: 1.0, end: 0.01, steps: 10}
+    critic:   {class: MinEnsembleCritic, n_models: 2}
+    
 PPOPolicy:
   params:
     gamma: 0.99
@@ -140,30 +173,3 @@ DirectPolicy:
     actor: {class: DeterministicActor}
 
 
-NCLQL:
-  params:
-    level_embed_dim: 16
-
-    steps_per_level: 2
-
-    # eps, tied to the ladder: sqrt(step_size)/sigmas.end is the injected noise
-    # as a multiple of each level's own sigma (0.316 here -- sub-sigma, as
-    # annealed Langevin assumes). Retune it whenever `sigmas.end` moves.
-    step_size: 1.0e-5
-
-    # drift_scale applies when normalize_score is on (step length =
-    # drift_scale * sigma_i), temperature when it is off (the paper's w).
-    drift_scale: 0.5
-    temperature: 1000.0
-
-    normalize_score: True
-    clip_actions: True
-
-    action_limit: 1.0
-    init_scale: 1.0
-
-  components:
-    # Spans the canonical [-1, 1] action range down to a scale where the
-    # smoothed Q is effectively the clean one.
-    sigmas:  {class: ExponentialSchedule, start: 1.0, end: 0.01, steps: 10}
-    critic:   {class: MinEnsembleCritic, n_models: 2}

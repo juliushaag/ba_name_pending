@@ -1,6 +1,6 @@
 # Per-component-class baseline kwargs -- the one and only defaults layer in
 # the whole config chain. Top-level keys are component class names exactly as
-# registered in src/barl/networks/registry.py (`class:` values in
+# registered in src/barl_jax/networks/registry.py (`class:` values in
 # config/models.yaml); each block is that class's full kwarg set.
 #
 # Full resolution order for a slot (lowest -> highest precedence):
@@ -14,7 +14,7 @@
 # HParam table. A policy slot only needs `class:` plus whatever it wants to
 # differ from the baseline here, and
 #
-#   uv run python scripts/print_config.py <model> [--profile P]
+#   uv run python scripts/jax/print_config.py <model> [--profile P]
 #
 # prints every resolved kwarg annotated with which of the layers above it came
 # from, so no value is ever unattributable.
@@ -22,6 +22,25 @@
 # A class missing from this file isn't an error -- its slot just has to spell
 # every kwarg out in models.yaml. Adding an entry here is what makes swapping a
 # slot's `class:` a one-word edit (and therefore a sweepable axis).
+
+# --- The MLP surface ------------------------------------------------------
+#
+# Every block below that builds an MLP accepts this whole set, so a network's
+# shape is configured where the component is, not in Python:
+#
+#   activation        silu / relu / gelu / tanh / relu6
+#   norm              none / layer / batch / batchrenorm
+#   norm_stem         also normalize the stem's output (CrossQ-style nets do)
+#   dropout           per-hidden-layer dropout, DroQ-style; off at eval
+#   final_activation  activation after the head
+#   residual          pre-norm residual blocks instead of a plain stack
+#   norm_kwargs       passed to the chosen norm, e.g.
+#                     {momentum: 0.01, warmup_steps: 100000} for batchrenorm
+#
+# Each is listed explicitly in the blocks below rather than left to a Python
+# default, so `print_config.py` shows the whole network and a sweep can vary
+# any of them (`--set model.components.critic.activation=relu`).
+
 
 # --- Actors ---------------------------------------------------------------
 
@@ -33,10 +52,22 @@ StochasticActor:
   hidden_dim: 256
   layers: 4
   squash_cls: TanhSquash
+  activation: silu
+  norm: layer
+  norm_stem: false
+  dropout: 0.0
+  final_activation: false
+  residual: false
 
 ScoreContinuousActor:
   latent_dim: 256
   layers: 3
+  activation: silu
+  norm: none
+  norm_stem: false
+  dropout: 0.0
+  final_activation: false
+  residual: false
   max_steps: 16
   sigma_min: 2.0
   sigma_max: 2.5
@@ -58,6 +89,12 @@ VPDiffusionActor:
   latent_dim: 256
   layers: 3
   num_steps: 16
+  activation: silu
+  norm: none
+  norm_stem: false
+  dropout: 0.0
+  final_activation: false
+  residual: false
   cosine_s: 0.008
   ab_start: 0.999
   ab_end: 0.001
@@ -67,6 +104,12 @@ OUDiffusionActor:
   latent_dim: 256
   layers: 3
   num_steps: 16
+  activation: silu
+  norm: none
+  norm_stem: false
+  dropout: 0.0
+  final_activation: false
+  residual: false
   beta_min: 0.12
   beta_max: 0.18
   beta_scale_min: 0.7
@@ -78,36 +121,64 @@ OUDiffusionActor:
 
 # --- Critics --------------------------------------------------------------
 #
-# polyak_tau/gamma are required by QCriticBase itself, so every subclass below
-# carries them. Only a critic that actually reduces with a spread takes one
-# more: `rho` on MeanStdEnsembleCritic is epistemic pessimism across heads,
+# `gamma` is required by QCriticBase itself, so every subclass below carries
+# it. Only a critic that actually reduces with a spread takes one more: `rho`
+# on MeanStdEnsembleCritic is epistemic pessimism across heads,
 # `risk_aversion` on QRDistributionalCritic/C51Critic is a mean-variance risk
 # measure over the return distribution. Mean/MinEnsembleCritic take neither,
 # and neither does HLGaussCritic -- its histogram is a discretized scalar
 # regression, not a return distribution, so its spread is `sigma`, not a risk
-# preference. CrossQCritic keeps polyak_tau only because QCriticBase requires
-# it; the value is unused, since CrossQ has no target network to Polyak.
+# preference.
+#
+# No critic here has a target network: the bootstrap is priced by the live
+# weights in the same forward as the prediction it trains, CrossQ's (Bhatt et
+# al., ICLR 2024) replacement for one. That makes `norm` load-bearing rather
+# than cosmetic -- "batchrenorm" is what the single shared forward buys you,
+# and is why there is no separate CrossQCritic class.
 
 MeanStdEnsembleCritic:
+  activation: silu
+  norm: layer
+  norm_stem: false
+  dropout: 0.0
+  final_activation: false
+  residual: false
   hidden_dim: 2048
   layers: 2
   n_models: 10
   rho: 2.0
-  polyak_tau: 0.005
   gamma: 0.99
 
 MeanEnsembleCritic:
+  activation: silu
+  norm: layer
+  norm_stem: false
+  dropout: 0.0
+  final_activation: false
+  residual: false
   hidden_dim: 2048
   layers: 2
   n_models: 10
-  polyak_tau: 0.005
   gamma: 0.99
 
+# CrossQ-style: BatchRenorm heads, min over 2 of them. Every BatchRenorm layer
+# sees the (s,a) and (s',a') batches as a single population, which is the
+# property a target network otherwise exists to provide.
 MinEnsembleCritic:
+  activation: silu
+  norm: batchrenorm
+  norm_stem: false
+  dropout: 0.0
+  final_activation: false
+  residual: false
+  # BatchRenorm's r/d clipping opens over warmup_steps; until then it is
+  # plain BatchNorm, so the running statistics are settled before they
+  # start correcting the batch ones. `momentum` is the weight on the
+  # *batch* moment (torch convention), i.e. flax's 0.99.
+  norm_kwargs: {momentum: 0.01, warmup_steps: 100000}
   hidden_dim: 2048
   layers: 2
-  n_models: 10
-  polyak_tau: 0.005
+  n_models: 2
   gamma: 0.99
 
 QRDistributionalCritic:
@@ -115,7 +186,6 @@ QRDistributionalCritic:
   layers: 2
   num_quantiles: 100
   risk_aversion: 2.0
-  polyak_tau: 0.005
   gamma: 0.99
 
 C51Critic:
@@ -123,33 +193,29 @@ C51Critic:
   layers: 2
   num_atoms: 101
   risk_aversion: 2.0
-  polyak_tau: 0.005
+  norm: batchrenorm
   gamma: 0.99
 
 HLGaussCritic:
-  hidden_dim: 512
+  activation: tanh
+  norm: batchrenorm
+  norm_stem: false
+  dropout: 0.0
+  final_activation: false
+  residual: false
+  # BatchRenorm's r/d clipping opens over warmup_steps; until then it is
+  # plain BatchNorm, so the running statistics are settled before they
+  # start correcting the batch ones. `momentum` is the weight on the
+  # *batch* moment (torch convention), i.e. flax's 0.99.
+  norm_kwargs: {momentum: 0.01, warmup_steps: 100000}
+  hidden_dim: 2048
   layers: 2
-  num_bins: 101
+  num_bins: 1001
   # sigma = this * bin width. Farebrother et al. (2024) sweep it and land on
   # 0.75: small enough that neighbouring bins stay distinguishable, wide enough
   # that the target spans several of them and the head gets a gradient
   # everywhere rather than only at the argmax bin.
   sigma_to_bin_ratio: 0.75
-  polyak_tau: 0.005
-  gamma: 0.99
-
-CrossQCritic:
-  hidden_dim: 2048
-  layers: 2
-  n_models: 2
-  lr: 0.001
-  adam_beta1: 0.5
-  momentum: 0.01
-  # BatchRenorm's r/d clipping opens over this many steps; until then it is
-  # plain BatchNorm. Long relative to the run so the running statistics are
-  # settled before they start correcting the batch ones.
-  warmup_steps: 100000
-  polyak_tau: 0.005
   gamma: 0.99
 
 PPOCritic:
@@ -159,7 +225,6 @@ PPOCritic:
 IQLCritic:
   hidden_dim: 256
   layers: 6
-  polyak_tau: 0.005
   gamma: 0.99
 
 

@@ -135,6 +135,18 @@ class DIME(Policy):
     self.entropy: AutotuneRegulator = self.build_component(
       "entropy", AutotuneRegulator, target=self.action_dim * self.entropy_scale)
 
+  def _squash_correction(self, X):
+    """The change of variables taking the entropy of the raw terminal state to
+    the entropy of the squashed action: H(y) = H(x) + E[log|dy/dx|].
+
+    `log_abs_det_jacobian`, not `inverse`. The reference implementation
+    (dime_am, od_sampling.single_sample) adds Tanh().forward_log_det_jacobian
+    here; atanh of `X` is not a change of variables at all -- and since `X` is
+    the *pre*-tanh latent, TanhSquash.inverse's clamp pinned every |x| > 1 to a
+    constant +-7.25, so most of the batch contributed no gradient and a wrong
+    value."""
+    return self.squash.log_abs_det_jacobian(X).sum(axis=-1, keepdims=True)
+
   def train_step(self, batch):
     obs      = self.normalize_obs(batch["obs"])
     next_obs = self.normalize_obs(batch["next_obs"])
@@ -147,10 +159,7 @@ class DIME(Policy):
 
     # ---- critic: the bootstrap sample is a target, not a path to train through
     next_X, entropy = jax.lax.stop_gradient(self.actor.generate(next_obs))
-    # Faithful to the torch implementation, which adds atanh(X) rather than the
-    # change-of-variables term -log|dy/dx| the class docstring implies. Ported
-    # as it runs; see the note in the port plan before changing it.
-    entropy = entropy + self.squash.inverse(next_X).sum(axis=-1, keepdims=True)
+    entropy = entropy + self._squash_correction(next_X)
     next_action = self.squash(next_X)
 
     entropy_bonus = jax.lax.stop_gradient(alpha * entropy)
@@ -159,7 +168,7 @@ class DIME(Policy):
 
     # ---- actor: backprop through the reverse chain into the diffusion net
     new_X, new_entropy = self.actor.generate(obs)
-    new_entropy = new_entropy + self.squash.inverse(new_X).sum(axis=-1, keepdims=True)
+    new_entropy = new_entropy + self._squash_correction(new_X)
 
     q_new = frozen(self.critic).value(obs, self.squash(new_X))
     dime_loss = -(q_new + jax.lax.stop_gradient(alpha) * new_entropy).mean()

@@ -158,11 +158,11 @@ class Critic(Component, nnx.Module, ABC):
   and the regression loss itself live in each Policy's train_step."""
 
   @abstractmethod
-  def value(self, s, a, target: bool = False):
-    """The only accessor an algorithm needs: a scalar price for (s, a), off the
-    live net or (`target=True`) the Polyak-averaged one. How that scalar is
-    arrived at -- ensemble reduction, quantile mean, categorical expectation,
-    pessimism -- is the implementation's business, never the caller's."""
+  def value(self, s, a):
+    """The only accessor an algorithm needs: a scalar price for (s, a). How that
+    scalar is arrived at -- ensemble reduction, quantile mean, categorical
+    expectation, pessimism -- is the implementation's business, never the
+    caller's."""
     ...
 
 

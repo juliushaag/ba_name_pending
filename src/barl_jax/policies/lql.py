@@ -171,7 +171,7 @@ class NCLQL(Policy):
       keys[2], action.shape, action.dtype)
 
     smoothing_target = jax.lax.stop_gradient(self.critic.terminal_target(
-      self.critic.expectation(obs, self.augment_action(action, clean), target=True)))
+      self.critic.expectation(obs, self.augment_action(action, clean))))
 
     self.critic.loss(obs, self.augment_action(noisy, idx), smoothing_target, losses)
     smoothing_loss = losses.pop("q")

@@ -235,7 +235,7 @@ def resolved_flat(name: str) -> dict:
 
 def _accepted_kwargs(cls: type) -> tuple[set[str], bool]:
   """Named __init__ parameters across `cls`'s whole MRO (a subclass routes
-  e.g. QCriticBase's `polyak_tau` through its own **kwargs), plus whether anything
+  e.g. QCriticBase's `gamma` through its own **kwargs), plus whether anything
   in that chain has a **kwargs catch-all at all."""
   names, catchall = set(), False
   for klass in cls.__mro__:

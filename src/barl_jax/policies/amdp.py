@@ -1,5 +1,7 @@
 import gymnasium as gym
 import jax
+import jax.numpy as jnp
+from flax import nnx
 
 from barl_jax.networks.actor import ScoreContinuousActor
 from barl_jax.networks.critic import QCriticBase
@@ -7,6 +9,18 @@ from barl_jax.networks.flow import sinusoidal_emb
 from barl_jax.networks.regulator import AutotuneRegulator
 from barl_jax.networks.squash import Squash
 from barl_jax.policy import Policy, frozen, register_policy
+
+
+def clip_score(score, max_norm: float, percentile: float):
+  """Per-sample norm clip on the critic's action gradient, the quantity the
+  adjoint target is built from. The threshold is the tighter of `max_norm` and
+  this batch's `percentile` of the per-sample norms, so a batch that is
+  uniformly explosive is still pulled down rather than passing because every
+  sample is equally bad. Returns the clipped score and the fraction clipped."""
+  norms      = jnp.linalg.norm(score, axis=-1, keepdims=True)
+  threshold  = jnp.minimum(jnp.percentile(norms, percentile), max_norm)
+  scale      = jnp.where(norms > threshold, threshold / (norms + 1e-6), 1.0)
+  return score * scale, jnp.mean(scale < 1.0)
 
 
 @register_policy
@@ -28,7 +42,9 @@ class AMDP(Policy):
     assert isinstance(env.action_space, gym.spaces.Box)
 
     params = self.resolve_params()
-    self.entropy_scale = params["entropy_scale"]
+    self.entropy_scale          = params["entropy_scale"]
+    self.q_score_max_norm       = params["q_score_max_norm"]
+    self.q_score_max_percentile = params["q_score_max_percentile"]
 
     self.critic: QCriticBase = self.build_component("critic", QCriticBase)
     self.actor: ScoreContinuousActor = self.build_component("actor", ScoreContinuousActor)
@@ -69,12 +85,18 @@ class AMDP(Policy):
 
     # The score is a gradient w.r.t. the *action*; the critic must not be
     # trained through the actor loss.
-    critic = frozen(self.critic)
-
-    def q_values(x):
+    #
+    # nnx.value_and_grad rather than jax's, and the critic passed explicitly
+    # rather than captured: an ensemble critic runs nnx.vmap internally, and a
+    # raw jax.value_and_grad over a closure holding the module makes that vmap
+    # re-extract it at a different trace level ("Cannot extract graph node from
+    # different trace level"). Same reason as NCLQL.critic_score.
+    def q_values(critic, x):
       return critic.value(obs, self.squash(x)).sum()
 
-    q_new, x_score = jax.value_and_grad(q_values)(X)
+    q_new, x_score = nnx.value_and_grad(q_values, argnums=1)(frozen(self.critic), X)
+    x_score, clipped_frac = clip_score(x_score, self.q_score_max_norm,
+                                       self.q_score_max_percentile)
 
     sigma_tau = self.actor.sigma_fn(tau)[:, None]
 
@@ -94,6 +116,7 @@ class AMDP(Policy):
     self.actor.metrics.vec("action", next_action, limit=1.0)
     self.actor.metrics.dist("entropy", entropy_penalty)
     self.critic.metrics.vec("score", x_score)
+    self.metrics.scalar("score_clipped_frac", clipped_frac)
 
     return losses
 

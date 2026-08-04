@@ -64,7 +64,7 @@ def train_step(graphdef, state, batch, tiers):
                    if labels.get(path) == key]
       if PRIMARY in tiers:
         primary[policy.metrics_key(key, "loss")] = losses[key]
-        primary[policy.metrics_key(key, "grad_norm")] = optax.global_norm(partition)
+        primary[policy.metrics_key(key, "grad_norm")] = optax.tree.norm(partition)
       if DEBUG in tiers and partition:
         # Reduced per-tensor: a flat concatenate of every gradient is a full
         # copy of the model, which is exactly what a diagnostic path shouldn't do.

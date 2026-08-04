@@ -31,11 +31,11 @@ echo "Job ID: $SLURM_JOB_ID | Partition: $SLURM_JOB_PARTITION | GPUs: $CUDA_VISI
 uv run python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
 
 # --- Run your script -------------------------------------------------
+# Runs sequentially, algo by algo; --seeds N is N seeds vmapped inside each run.
 uv run python scripts/run_sweep.py \
-    --algos SACPolicy DIMEPolicy AMDP SDAC NCLQLPolicy\
+    --algos SAC DIME AMDP SDAC NCLQL \
     --envs HumanoidStand HumanoidRun HumanoidWalk DogTrot DogStand DogWalk DogRun \
-    --seeds 2 \
-    --max_parallel 8
+    --seeds 2
 
 # --- Copy results back to persistent storage --------------------------
 mkdir -p ~/results/$SLURM_JOB_ID

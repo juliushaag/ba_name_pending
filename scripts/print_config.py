@@ -5,8 +5,8 @@ import yaml
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 
-import barl  # noqa: F401  -- populates the policy/component registries
-import barl.model_config as model_config
+import barl_jax  # noqa: F401  -- populates the policy/component registries
+import barl_jax.model_config as model_config
 
 
 def print_model(name: str) -> None:

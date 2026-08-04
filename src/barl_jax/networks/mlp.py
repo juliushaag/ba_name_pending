@@ -29,12 +29,18 @@ def Linear(in_features: int, out_features: int, *, rngs: nnx.Rngs) -> nnx.Linear
   return nnx.Linear(in_features, out_features, kernel_init=init, bias_init=init, rngs=rngs)
 
 
-def _resolve_norm(norm: str | None, layernorm: bool) -> str:
-  """`norm` is the real setting; `layernorm` is the original boolean kept so
-  every existing config keeps meaning what it meant."""
-  if norm is not None:
-    return norm
-  return "layer" if layernorm else "none"
+def _resolve_norm(norm: str | None) -> str:
+  """Unset means the framework default, LayerNorm."""
+  return "layer" if norm is None else norm
+
+
+# The full MLP surface, restated as named parameters by every component that
+# builds one (see e.g. StochasticActor). Named rather than passed through a
+# **kwargs catch-all on purpose: model_config.validate() reports a kwarg no
+# __init__ in the MRO accepts, and a catch-all would swallow every typo in a
+# `components:` block silently. Keep this list and those signatures in step.
+MLP_KWARGS = ("activation", "norm", "norm_stem", "dropout",
+              "final_activation", "residual", "norm_kwargs")
 
 
 class ResidualBlock(nnx.Module):
@@ -61,13 +67,12 @@ class ResidualBlock(nnx.Module):
 class MLP(nnx.Module):
 
   def __init__(self, input_dim: int, output_dim: int, latent_dim: int, hidden_layers: int,
-               activation: str = "silu", layernorm: bool = True, norm: str = None,
-               norm_input: bool = False, norm_stem: bool = False, dropout: float = 0.0,
+               activation: str = "silu", norm: str = None,
+               norm_stem: bool = False, dropout: float = 0.0,
                final_activation: bool = False, residual: bool = False,
                *, rngs: nnx.Rngs, **norm_kwargs):
     """`norm` selects the normalization ("none" / "layer" / "batch" /
-    "batchrenorm"); leaving it unset falls back to the original `layernorm`
-    boolean, so every existing config is unchanged.
+    "batchrenorm"); leaving it unset gives LayerNorm.
 
     `dropout` is applied to each hidden layer's output, before its norm and
     activation -- the ordering DroQ (Hiraoka et al., 2022) uses to get
@@ -87,13 +92,12 @@ class MLP(nnx.Module):
     assert activation in _ACTIVATIONS, f"{activation} not in available activations {list(_ACTIVATIONS)}"
 
     act  = _ACTIVATIONS[activation]
-    norm = _resolve_norm(norm, layernorm)
+    norm = _resolve_norm(norm)
 
     self.input_dim        = input_dim
     self.output_dim       = output_dim
     self.latent_dim       = latent_dim
     self.hidden_layers    = hidden_layers
-    self.layernorm        = layernorm
     self.norm             = norm
     self.dropout_rate     = dropout
     self.final_activation = final_activation
@@ -102,8 +106,6 @@ class MLP(nnx.Module):
 
     normed = norm != "none"
     mk = lambda dim: make_norm(norm, dim, rngs=rngs, **norm_kwargs)
-
-    self.input_norm = mk(input_dim) if norm_input else None
 
     # A residual stem is a bare linear embedding of the stream -- the activation
     # the plain path puts here would be immediately followed by each block's own.
@@ -133,9 +135,6 @@ class MLP(nnx.Module):
 
   def __call__(self, *x):
     h = x[0] if len(x) == 1 else jnp.concatenate(x, axis=-1)
-
-    if self.input_norm is not None:
-      h = self.input_norm(h)
 
     h = self.stem(h)
     if self.stem_norm is not None:

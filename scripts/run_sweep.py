@@ -6,18 +6,23 @@ import re
 import shlex
 import subprocess
 import sys
-import threading
-from concurrent.futures import ThreadPoolExecutor
 
 import yaml
 
-# Launches a grid of training runs as separate, truly concurrent OS processes
-# (own interpreter + CUDA context each), unlike scripts/online_learning.py's
-# in-process sequential `runs:` list. The grid is a cross product over named
-# axes: `algo`/`env`/`seed`, plus any number of `model.<dotted>` axes (which
-# become that run's model_overrides, see barl.model_config.set_overrides) and
-# `run.<key>` axes (which override the run config's own keys). Nothing has to
-# be edited in place to sweep a tunable.
+# Launches a grid of training runs **one at a time**, each its own OS process
+# (own interpreter + CUDA context), so a run has the whole GPU to itself. The
+# grid is a cross product over named axes: `algo`/`env`/`seed`, plus any number
+# of `model.<dotted>` axes (which become that run's model_overrides, see
+# barl_jax.model_config.set_overrides) and `run.<key>` axes (which override the
+# run config's own keys). Nothing has to be edited in place to sweep a tunable.
+#
+# Seeds are *not* an axis: `--seeds N` runs N of them vmapped inside each
+# process (see barl_jax/multiseed.py), which is both cheaper than N processes
+# and bit-identical to running each alone. The `seed` axis that remains is the
+# *base* seed those N count up from, and is grid-file-only.
+#
+# Combos come out algo-major -- every env/override for SAC finishes before DIME
+# starts -- so a sweep can be read top to bottom as it runs.
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(SCRIPT_DIR, "..", "config")
@@ -59,21 +64,8 @@ def _resolve_model_snapshot(model_name: str, overrides: dict | None = None) -> d
   return out
 
 
-def detect_gpus() -> list[str]:
-  """Best-effort GPU index detection via nvidia-smi, without depending on torch. Returns [] if
-  nvidia-smi isn't available/fails, meaning: don't restrict CUDA_VISIBLE_DEVICES at all."""
-  try:
-    out = subprocess.run(
-      ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-      capture_output=True, text=True, check=True,
-    )
-    return [line.strip() for line in out.stdout.splitlines() if line.strip()]
-  except (OSError, subprocess.CalledProcessError):
-    return []
-
-
 def build_axes(kwargs) -> tuple[str | None, dict, list[dict]]:
-  """The sweep's axes from either a --grid file or the --algos/--envs/--seeds
+  """The sweep's axes from either a --grid file or the --algos/--envs
   shorthand, plus any --set values as single-valued axes. Returns
   (base_config_path, axes, exclude)."""
   base, axes, exclude = None, {}, []
@@ -89,8 +81,6 @@ def build_axes(kwargs) -> tuple[str | None, dict, list[dict]]:
     axes["algo"] = kwargs.algos
   if kwargs.envs:
     axes["env"] = kwargs.envs
-  if kwargs.seeds is not None:
-    axes["seed"] = list(i + 42 for i in range(kwargs.seeds))
 
   for assignment in kwargs.set or []:
     key, sep, value = assignment.partition("=")
@@ -115,7 +105,7 @@ def build_axes(kwargs) -> tuple[str | None, dict, list[dict]]:
   axes.setdefault("seed", [0])
 
   # Checked only once the CLI axes are in, since an exclude may well name an
-  # axis the grid file leaves to --algos/--envs/--seeds.
+  # axis the grid file leaves to --algos/--envs.
   unknown = [k for ex in exclude for k in ex if k not in axes]
   if unknown:
     raise SystemExit(f"{kwargs.grid}: exclude names non-axis key(s) {unknown} -- it would never "
@@ -126,12 +116,18 @@ def build_axes(kwargs) -> tuple[str | None, dict, list[dict]]:
 
 def build_combos(axes: dict, exclude: list[dict]) -> list[dict]:
   combos = [dict(zip(axes, values)) for values in itertools.product(*axes.values())]
-  return [c for c in combos
-          if not any(all(c.get(k) == v for k, v in ex.items()) for ex in exclude)]
+  combos = [c for c in combos
+            if not any(all(c.get(k) == v for k, v in ex.items()) for ex in exclude)]
+  # Algo-major regardless of which order the axes were declared in, so runs
+  # come out grouped the way `--algos SAC DIME AMDP` reads. Stable sort, so
+  # within one algo the product's own order survives.
+  order = {algo: i for i, algo in enumerate(axes["algo"])}
+  return sorted(combos, key=lambda c: order[c["algo"]])
 
 
-def name_combos(combos: list[dict], axes: dict) -> list[str]:
-  """One filesystem-safe tag per combo: algo_env_seedN, plus key=value for
+def name_combos(combos: list[dict], axes: dict, num_seeds: int) -> list[str]:
+  """One filesystem-safe tag per combo: algo_env, plus the seed count when
+  there's more than one, the base seed when that axis varies, and key=value for
   every *varying* non-reserved axis (a fixed --set value is the same in every
   run, so it only clutters the name -- it's recorded in the per-run YAML)."""
   varying = [k for k, v in axes.items() if k not in RESERVED_AXES and len(v) > 1]
@@ -143,17 +139,23 @@ def name_combos(combos: list[dict], axes: dict) -> list[str]:
 
   tags = []
   for combo in combos:
-    parts = [str(combo["algo"]), str(combo["env"]), f"seed{combo['seed']}"]
+    parts = [str(combo["algo"]), str(combo["env"])]
+    if len(axes["seed"]) > 1:
+      parts.append(f"base{combo['seed']}")
+    if num_seeds > 1:
+      parts.append(f"{num_seeds}seeds")
     parts += [f"{short[k]}={combo[k]}" for k in varying]
     tags.append(re.sub(r"[^A-Za-z0-9.=_-]", "-", "_".join(parts)))
   return tags
 
 
 def run_one(script: str, combo: dict, tag: str, defaults: dict, env_defaults: dict, sweep_dir: str,
-            gpu_id: str | None = None, stream: bool = False) -> int:
+            num_seeds: int, gpu_id: str | None = None, stream: bool = False) -> int:
   model, env = combo["algo"], combo["env"]
 
-  run_entry = {"model": model, "env": env, "seed": combo["seed"]}
+  # `seed` is the base the run's `num_seeds` vmapped seeds count up from
+  # (barl_jax.trainer.Run: base_seed + i), not one seed per process.
+  run_entry = {"model": model, "env": env, "seed": combo["seed"], "num_seeds": num_seeds}
   run_entry.update({k.partition(".")[2]: v for k, v in combo.items() if k.startswith("run.")})
 
   overrides = {k.partition(".")[2]: v for k, v in combo.items() if k.startswith("model.")}
@@ -176,7 +178,6 @@ def run_one(script: str, combo: dict, tag: str, defaults: dict, env_defaults: di
   env_vars = os.environ.copy()
   if gpu_id is not None:
     env_vars["CUDA_VISIBLE_DEVICES"] = gpu_id
-    env_vars["PYTHONUNBUFFERED"] = 1
     tag = f"{tag}_gpu{gpu_id}"
 
   print(f"[{tag}] starting -- log: {log_path}\n[{tag}] $ {shlex.join(cmd)}")
@@ -203,34 +204,35 @@ def run_one(script: str, combo: dict, tag: str, defaults: dict, env_defaults: di
 if __name__ == "__main__":
 
   args = argparse.ArgumentParser(
-    description="Launch a grid of training runs in parallel, one OS process each.",
-    epilog="Axes: algo/env/seed, plus model.<dotted path> (a model override, e.g. "
-           "model.components.critic.rho) and run.<key> (a run-config key, e.g. run.utd_ratio).")
+    description="Launch a grid of training runs sequentially, one OS process at a time, "
+                "algo by algo.",
+    epilog="Axes: algo/env, plus model.<dotted path> (a model override, e.g. "
+           "model.components.critic.rho) and run.<key> (a run-config key, e.g. run.utd_ratio). "
+           "Seeds are not an axis -- --seeds N vmaps N of them inside each run.")
   args.add_argument("--grid", default=None,
                      help="YAML sweep spec: {base: <run config>, axes: {name: [values]}, "
                           "exclude: [{axis: value, ...}]}. Combined with any --algos/--envs/"
-                          "--seeds/--set given, which win per axis.")
-  args.add_argument("--algos", nargs="+", help="`algo` axis, e.g. SACPolicy PPOPolicy")
+                          "--set given, which win per axis.")
+  args.add_argument("--algos", nargs="+", help="`algo` axis, e.g. SAC DIME AMDP")
   args.add_argument("--envs", nargs="+", help="`env` axis, e.g. HalfCheetah CheetahRun")
-  args.add_argument("--seeds", type=int, default=None,
-                     help="`seed` axis as a count -- runs seed 0..seeds-1 (default: seed 0 only)")
+  args.add_argument("--seeds", type=int, default=1,
+                     help="Seeds per run, vmapped inside the one process rather than run as "
+                          "separate ones -- so `--algos SAC DIME --seeds 5` is 2 runs of 5 "
+                          "seeds, not 10 runs. Bit-identical to running each seed alone.")
   args.add_argument("--set", action="append", metavar="AXIS=VALUE",
                      help="Pin one axis to a single value across the whole sweep, e.g. "
                           "--set model.components.critic.rho=0.0 --set run.batch_size=512. "
                           "Repeatable.")
   args.add_argument("--script", default="online_learning",
-                     choices=["online_learning", "offline_learning", "offline_to_online"],
+                     choices=["online_learning"],
                      help="Which training script to launch each run with")
   args.add_argument("--config", default=None,
                      help="Base config providing `defaults:`/`env_defaults:` for every run "
                           "(default: --grid's `base:`, else config/<script>.yaml)")
-  args.add_argument("--max_parallel", type=int, default=3,
-                     help="Max concurrent runs per GPU (0 = unlimited per GPU). Total concurrency "
-                          "is this times the number of GPUs in --gpus / detected via nvidia-smi.")
-  args.add_argument("--gpus", nargs="+", default=None,
-                     help="GPU indices to spread runs across, e.g. --gpus 0 1 2 3 -- each run gets "
-                          "CUDA_VISIBLE_DEVICES set to exactly one of these. Default: autodetect "
-                          "via nvidia-smi; if that finds none, CUDA_VISIBLE_DEVICES is left untouched.")
+  args.add_argument("--gpu", default=None,
+                     help="GPU index to pin every run to via CUDA_VISIBLE_DEVICES, e.g. --gpu 1. "
+                          "Default: leave CUDA_VISIBLE_DEVICES untouched, so a run sees whatever "
+                          "the environment already gives it.")
   args.add_argument("--dry_run", action="store_true",
                      help="Print the runs the grid expands to and exit, without launching anything.")
   args.add_argument("--validate", action="store_true",
@@ -247,10 +249,13 @@ if __name__ == "__main__":
   if kwargs.validate:
     axes = {k: (v if k in ("algo", "env") else v[:1]) for k, v in axes.items()}
 
+  if kwargs.seeds < 1:
+    raise SystemExit(f"--seeds must be at least 1, got {kwargs.seeds}")
+
   combos = build_combos(axes, exclude)
   if not combos:
     raise SystemExit("grid is empty -- every combination was excluded")
-  tags = name_combos(combos, axes)
+  tags = name_combos(combos, axes, kwargs.seeds)
 
   base_config_path = kwargs.config or grid_base or os.path.join(CONFIG_DIR, f"{kwargs.script}.yaml")
   with open(base_config_path) as f:
@@ -268,21 +273,11 @@ if __name__ == "__main__":
   sweep_tag = "sweep-" + datetime.datetime.now().strftime("%m-%d-%H-%M")
   defaults = {**defaults, "sweep_tag": sweep_tag}
 
-  gpus = kwargs.gpus if kwargs.gpus is not None else detect_gpus()
-  per_gpu_limit = kwargs.max_parallel if kwargs.max_parallel > 0 else None
-
-  if gpus:
-    semaphores = {g: threading.Semaphore(per_gpu_limit) for g in gpus} if per_gpu_limit else None
-    max_workers = (per_gpu_limit * len(gpus)) if per_gpu_limit else len(combos)
-    gpu_desc = f", gpus={gpus}, max_parallel_per_gpu={per_gpu_limit or 'unlimited'}"
-  else:
-    semaphores = None
-    max_workers = per_gpu_limit or len(combos)
-    gpu_desc = ""
-
   axis_desc = " x ".join(f"{len(v)} {k}" for k, v in axes.items() if len(v) > 1) or "1 run"
   kind = "validate run(s)" if kwargs.validate else "runs"
-  print(f"Launching {len(combos)} {kind} ({axis_desc}), max_parallel={max_workers}{gpu_desc}, "
+  seed_desc = f", {kwargs.seeds} seeds vmapped each" if kwargs.seeds > 1 else ""
+  gpu_desc  = f", gpu={kwargs.gpu}" if kwargs.gpu is not None else ""
+  print(f"Running {len(combos)} {kind} ({axis_desc}) one at a time{seed_desc}{gpu_desc}, "
         f"logs under {sweep_dir}")
 
   if kwargs.dry_run:
@@ -292,24 +287,11 @@ if __name__ == "__main__":
 
   os.makedirs(sweep_dir, exist_ok=True)
 
-  def run_one_gated(script, combo, tag, defaults, env_defaults, sweep_dir, gpu_id, stream):
-    sem = semaphores[gpu_id] if semaphores else None
-    if sem is not None:
-      sem.acquire()
-    try:
-      return run_one(script, combo, tag, defaults, env_defaults, sweep_dir,
-                     gpu_id=gpu_id, stream=stream)
-    finally:
-      if sem is not None:
-        sem.release()
-
-  with ThreadPoolExecutor(max_workers=max_workers) as pool:
-    futures = [
-      pool.submit(run_one_gated, kwargs.script, combo, tag, defaults, env_defaults,
-                  sweep_dir, gpus[i % len(gpus)] if gpus else None, kwargs.validate)
-      for i, (combo, tag) in enumerate(zip(combos, tags))
-    ]
-    results = [f.result() for f in futures]
+  results = []
+  for i, (combo, tag) in enumerate(zip(combos, tags)):
+    print(f"--- {i + 1}/{len(combos)}")
+    results.append(run_one(kwargs.script, combo, tag, defaults, env_defaults, sweep_dir,
+                           num_seeds=kwargs.seeds, gpu_id=kwargs.gpu, stream=kwargs.validate))
 
   failed = sum(1 for r in results if r != 0)
   print(f"Done: {len(results) - failed}/{len(results)} succeeded"

@@ -157,9 +157,13 @@ Score-based actors deliberately return a **raw, unsquashed** terminal state from
 Policy makes on top (e.g. AMDP's `ErfSquash`), not something the actor architecture bakes in.
 
 Concrete critics in `networks/critic.py`, all subclassing `QCriticBase` (shared Polyak-averaged
-target net; `polyak_tau`/`gamma` config/models.yaml-supplied, see below). Only a critic that
-actually reduces with a spread takes a coefficient for it, and the two spreads are named apart
-because they are different quantities:
+target net: `polyak_tau`/`polyak_tau_init`/`target_warmup_steps`/`gamma`, all
+`config/components.yaml`-supplied, see below) via one of two head-building bases — `MLPCriticBase`
+(one MLP over `[s, a]`, `output_dim` wide) or `EnsembleCriticBase` (`n_models` vmapped MLP heads).
+Both own the head's shape kwargs (`hidden_dim`/`layers`/`activation`/`layernorm`/`residual`), so a
+concrete critic declares only what its own representation needs. Only a critic that actually
+reduces with a spread takes a coefficient for it, and the two spreads are named apart because they
+are different quantities:
 - `MeanStdEnsembleCritic` — `n_models` independent MLP heads reduced by mean - `rho`*std; spread =
   epistemic uncertainty. Default for every continuous-action off-policy algorithm here.
 - `MeanEnsembleCritic` / `MinEnsembleCritic` — same `n_models` MLP-head ensemble, reduced by plain
@@ -208,16 +212,22 @@ action) can feed the result straight to its critic with no further conversion.
 
 ### Tunables all live in YAML -- there is no Python-level HParam system
 
-Every tunable value -- both architecture kwargs (`hidden_dim`, `layers`, ...) and algorithm
-tunables that used to be a separate `HParam`-declared axis (`rho`, `gamma`, `tr_lambda_init`, PPO's
-`clip_eps`, ...) -- is a required, no-default keyword argument supplied from YAML, across exactly
-two files: `config/components.yaml` (baseline kwargs per component *class*) under
-`config/models.yaml` (per *policy* slots/params/profiles). There is no Python-level fallback
-anywhere in this chain; a value listed in neither file is a `KeyError`/`TypeError` at construction
-time.
+Every tunable value -- architecture kwargs (`hidden_dim`, `layers`, `activation`, `layernorm`,
+`residual`), optimizer kwargs (`lr`, `weight_decay`, `adam_beta1`, `adam_beta2`, `grad_clip`), and
+algorithm tunables that used to be a separate `HParam`-declared axis (`rho`, `gamma`,
+`tr_lambda_init`, PPO's `clip_eps`, ...) -- is a required, no-default **keyword-only** argument
+supplied from YAML, across exactly two files: `config/components.yaml` (baseline kwargs per
+component *class*) under `config/models.yaml` (per *policy* slots/params/profiles). There is no
+Python-level fallback anywhere in this chain; a value listed in neither file is a
+`KeyError`/`TypeError` at construction time, and `model_config.validate()` reports it before a run
+starts (keyword-only-and-defaultless is exactly the marker that check keys off).
+`config/components.yaml`'s `_`-prefixed top-level keys are YAML anchors the class entries
+`<<:`-merge, not components; nothing resolves against them.
 
-- **Component-level tunables** (things an `Actor`/`Critic` itself needs, e.g. `QCriticBase`'s
-  `rho`/`polyak_tau`/`gamma`, `ScoreContinuousActor`'s `sigma_min`/`sigma_max`/`tau_min`/`tau_max`)
+- **Component-level tunables** (everything an `Actor`/`Critic` itself needs — its architecture,
+  its process's own constants, its target net's update law, and its optimizer's `lr`/
+  `weight_decay`/`adam_beta1`/`adam_beta2`/`grad_clip` via the `Optimized` mixin in
+  `networks/optim.py`, which every component owning an optimizer mixes in *before* `Component`)
   resolve through `Policy.build_component()`/`resolve_component()` → `model_config.resolve_slot()`,
   which layers, lowest precedence first: `config/components.yaml`'s entry for the slot's `class:` <
   the slot dict in `config/models.yaml` < the active profile's override for that slot < the
@@ -301,7 +311,9 @@ Outer loop, per iteration: `buffer.rollout()` collects `rollout_steps` env steps
 `epochs_per_rollout` passes of `train_epoch()` over it → (on-policy only) clear the buffer.
 `train_epoch()` calls `model.train_step(batch)` which returns `losses`; every loss key
 must match a key in `model.create_optimizer()` — each is zero-grad'd, backward'd
-(`retain_graph=True`, since e.g. an actor loss reads the critic's forward pass), grad-clipped, and
+(`retain_graph=True`, since e.g. an actor loss reads the critic's forward pass), grad-clipped to
+`Policy.grad_clip(key, cfg["grad_clip"])` (the owning component's own `grad_clip` from
+`config/components.yaml`, falling back to the run config for keys no component owns), and
 stepped independently, so no optimizer step invalidates another loss's graph mid-loop. Periodic
 eval (`evaluate_and_log`) checkpoints `latest.pt` every eval and `best.pt` on a new best avg reward,
 under `checkpoints/<model>/<env>/<timestamp>/`.
