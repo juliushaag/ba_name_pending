@@ -2,17 +2,23 @@ import argparse
 import datetime
 import itertools
 import os
+import queue
 import re
 import shlex
 import subprocess
 import sys
+import threading
 
 import yaml
 
-# Launches a grid of training runs **one at a time**, each its own OS process
-# (own interpreter + CUDA context), so a run has the whole GPU to itself. The
-# grid is a cross product over named axes: `algo`/`env`/`seed`, plus any number
-# of `model.<dotted>` axes (which become that run's model_overrides, see
+# Launches a grid of training runs as **one sequential worker per GPU**: each
+# worker pulls the next combo off a shared queue, runs it as its own OS process
+# (own interpreter + CUDA context) pinned to that worker's GPU via
+# CUDA_VISIBLE_DEVICES, and only then takes the next one -- so a run never
+# shares a GPU, and N GPUs finish the grid ~N times faster. With no --gpus it's
+# a single worker, i.e. the whole sweep strictly one at a time. The grid is a
+# cross product over named axes: `algo`/`env`/`seed`, plus any number of
+# `model.<dotted>` axes (which become that run's model_overrides, see
 # barl_jax.model_config.set_overrides) and `run.<key>` axes (which override the
 # run config's own keys). Nothing has to be edited in place to sweep a tunable.
 #
@@ -21,13 +27,34 @@ import yaml
 # and bit-identical to running each alone. The `seed` axis that remains is the
 # *base* seed those N count up from, and is grid-file-only.
 #
-# Combos come out algo-major -- every env/override for SAC finishes before DIME
-# starts -- so a sweep can be read top to bottom as it runs.
+# Combos are queued algo-major -- every env/override for SAC is handed out
+# before DIME's -- so a sweep reads top to bottom as it runs, modulo whatever
+# reordering parallel workers finishing at different times introduces.
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(SCRIPT_DIR, "..", "config")
 
 RESERVED_AXES = ("algo", "env", "seed")
+
+# Workers write to the same terminal, so multi-line output is emitted under this.
+PRINT_LOCK = threading.Lock()
+
+
+def emit(text: str) -> None:
+  with PRINT_LOCK:
+    print(text, flush=True)
+
+
+def detect_gpus() -> list[str]:
+  try:
+    out = subprocess.run(["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+                         capture_output=True, text=True, check=True).stdout
+  except (OSError, subprocess.CalledProcessError) as e:
+    raise SystemExit(f"--gpus auto: could not query nvidia-smi ({e}) -- pass GPU indices explicitly")
+  gpus = [line.strip() for line in out.splitlines() if line.strip()]
+  if not gpus:
+    raise SystemExit("--gpus auto: nvidia-smi reported no GPUs")
+  return gpus
 
 
 def _resolve_model_snapshot(model_name: str, overrides: dict | None = None) -> dict:
@@ -150,7 +177,8 @@ def name_combos(combos: list[dict], axes: dict, num_seeds: int) -> list[str]:
 
 
 def run_one(script: str, combo: dict, tag: str, defaults: dict, env_defaults: dict, sweep_dir: str,
-            num_seeds: int, gpu_id: str | None = None, stream: bool = False) -> int:
+            num_seeds: int, gpu_id: str | None = None, stream: bool = False,
+            progress: str = "") -> int:
   model, env = combo["algo"], combo["env"]
 
   # `seed` is the base the run's `num_seeds` vmapped seeds count up from
@@ -176,19 +204,20 @@ def run_one(script: str, combo: dict, tag: str, defaults: dict, env_defaults: di
   cmd = [sys.executable, script_path, "--config", run_config_path]
 
   env_vars = os.environ.copy()
+  label = tag
   if gpu_id is not None:
     env_vars["CUDA_VISIBLE_DEVICES"] = gpu_id
-    tag = f"{tag}_gpu{gpu_id}"
+    label = f"gpu{gpu_id}|{tag}"
 
-  print(f"[{tag}] starting -- log: {log_path}\n[{tag}] $ {shlex.join(cmd)}")
+  emit(f"[{label}] starting {progress} -- log: {log_path}\n[{label}] $ {shlex.join(cmd)}")
   with open(log_path, "w") as logf:
     if stream:
-      # --validate runs: tee each line (tag-prefixed) to the terminal as well as the log file.
+      # --validate runs: tee each line (label-prefixed) to the terminal as well as the log file.
       proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars,
       )
       for line in proc.stdout:
-        print(f"[{tag}] {line}", end="")
+        emit(f"[{label}] {line.rstrip()}")
         logf.write(line)
       proc.wait()
     else:
@@ -197,13 +226,12 @@ def run_one(script: str, combo: dict, tag: str, defaults: dict, env_defaults: di
       )
 
   status = "OK" if proc.returncode == 0 else f"FAILED (exit {proc.returncode})"
-  print(f"[{tag}] {status}")
-
-  if proc.returncode != 0:
+  if proc.returncode == 0:
+    emit(f"[{label}] {status}")
+  else:
     with open(log_path, "r") as logf:
-      print(logf.read(), flush=True)
+      emit(f"[{label}] {status}\n{logf.read()}")
 
-    
   return proc.returncode
 
 
@@ -235,10 +263,13 @@ if __name__ == "__main__":
   args.add_argument("--config", default=None,
                      help="Base config providing `defaults:`/`env_defaults:` for every run "
                           "(default: --grid's `base:`, else config/<script>.yaml)")
-  args.add_argument("--gpu", default=None,
-                     help="GPU index to pin every run to via CUDA_VISIBLE_DEVICES, e.g. --gpu 1. "
-                          "Default: leave CUDA_VISIBLE_DEVICES untouched, so a run sees whatever "
-                          "the environment already gives it.")
+  args.add_argument("--gpus", nargs="+", default=None, metavar="INDEX",
+                     help="Run one sequential worker per GPU, each pinned via "
+                          "CUDA_VISIBLE_DEVICES: `--gpus 0 1 3` runs 3 runs at a time, one per "
+                          "GPU, each worker taking the next combo only when its own finishes. "
+                          "`--gpus auto` uses every GPU nvidia-smi reports. Default: one worker, "
+                          "CUDA_VISIBLE_DEVICES untouched, so a run sees whatever the environment "
+                          "already gives it.")
   args.add_argument("--dry_run", action="store_true",
                      help="Print the runs the grid expands to and exit, without launching anything.")
   args.add_argument("--validate", action="store_true",
@@ -249,6 +280,12 @@ if __name__ == "__main__":
                           "{algo, env} combination.")
 
   kwargs = args.parse_args()
+
+  gpus = kwargs.gpus
+  if gpus == ["auto"]:
+    gpus = detect_gpus()
+  if gpus and len(set(gpus)) != len(gpus):
+    raise SystemExit(f"--gpus lists a GPU twice ({' '.join(gpus)}) -- that's two runs on one GPU")
 
   grid_base, axes, exclude = build_axes(kwargs)
 
@@ -282,8 +319,9 @@ if __name__ == "__main__":
   axis_desc = " x ".join(f"{len(v)} {k}" for k, v in axes.items() if len(v) > 1) or "1 run"
   kind = "validate run(s)" if kwargs.validate else "runs"
   seed_desc = f", {kwargs.seeds} seeds vmapped each" if kwargs.seeds > 1 else ""
-  gpu_desc  = f", gpu={kwargs.gpu}" if kwargs.gpu is not None else ""
-  print(f"Running {len(combos)} {kind} ({axis_desc}) one at a time{seed_desc}{gpu_desc}, "
+  pace_desc = (f"{len(gpus)} at a time, one per gpu ({', '.join(gpus)})" if gpus
+               else "one at a time")
+  print(f"Running {len(combos)} {kind} ({axis_desc}) {pace_desc}{seed_desc}, "
         f"logs under {sweep_dir}")
 
   if kwargs.dry_run:
@@ -293,12 +331,31 @@ if __name__ == "__main__":
 
   os.makedirs(sweep_dir, exist_ok=True)
 
-  results = []
+  pending: queue.Queue = queue.Queue()
   for i, (combo, tag) in enumerate(zip(combos, tags)):
-    print(f"--- {i + 1}/{len(combos)}")
-    results.append(run_one(kwargs.script, combo, tag, defaults, env_defaults, sweep_dir,
-                           num_seeds=kwargs.seeds, gpu_id=kwargs.gpu, stream=kwargs.validate))
+    pending.put((i, combo, tag))
 
-  failed = sum(1 for r in results if r != 0)
+  results: dict[int, int] = {}
+
+  def worker(gpu_id: str | None) -> None:
+    while True:
+      try:
+        i, combo, tag = pending.get_nowait()
+      except queue.Empty:
+        return
+      results[i] = run_one(kwargs.script, combo, tag, defaults, env_defaults, sweep_dir,
+                           num_seeds=kwargs.seeds, gpu_id=gpu_id, stream=kwargs.validate,
+                           progress=f"{i + 1}/{len(combos)}")
+
+  # One worker per GPU, each blocking on its own subprocess -- so a GPU holds
+  # exactly one run at a time and picks up the next combo the moment it's free.
+  threads = [threading.Thread(target=worker, args=(gpu_id,), daemon=True)
+             for gpu_id in (gpus or [None])]
+  for t in threads:
+    t.start()
+  for t in threads:
+    t.join()
+
+  failed = sum(1 for r in results.values() if r != 0)
   print(f"Done: {len(results) - failed}/{len(results)} succeeded"
         + (f", {failed} failed -- see logs in {sweep_dir}" if failed else ""))

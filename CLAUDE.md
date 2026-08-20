@@ -37,13 +37,18 @@ uv run python scripts/online_learning.py                              # uses con
 uv run python scripts/online_learning.py --config path/to/other.yaml
 ```
 
-Launch a grid of `{algo x env x seed}` runs as truly parallel OS processes (each in its own
-subprocess with its own CUDA context), logs under `sweeps/<timestamp>/`:
+Launch a grid of `{algo x env}` runs as separate OS processes (each with its own CUDA context),
+one sequential worker per GPU, logs under `sweeps/<timestamp>/`:
 
 ```bash
 uv run python scripts/run_sweep.py --algos SACPolicy PPOPolicy --envs HalfCheetah CheetahRun --seeds 3
-uv run python scripts/run_sweep.py --algos SACPolicy --envs HalfCheetah --max_parallel 4
+uv run python scripts/run_sweep.py --algos SACPolicy --envs HalfCheetah --gpus 0 1   # or --gpus auto
 ```
+
+Without `--gpus` the whole grid runs strictly one at a time with `CUDA_VISIBLE_DEVICES` untouched.
+With it, each listed GPU gets one worker that pins its subprocess to that GPU and only takes the
+next combo once its own finishes — so a run never shares a GPU. `--seeds N` is *not* a process
+axis: those N seeds are vmapped inside a single run.
 
 Anything in `config/models.yaml` is sweepable as a `model.<dotted path>` axis and anything in the
 run config as a `run.<key>` axis, either inline or via a `--grid` spec file (see
@@ -367,6 +372,12 @@ grid is a cross product over named axes — `algo`/`env`/`seed`, plus any number
 (`config/sweep_grid.yaml` is a documented example), with an `exclude:` list for pruning
 combinations out of the full product. `--dry_run` prints the expansion without launching anything.
 Because the axes are just overrides, **no config file is ever edited to run a sweep**.
+
+Combos go onto one shared queue (algo-major) and are drained by one worker thread per `--gpus`
+entry; a worker sets `CUDA_VISIBLE_DEVICES` to its own GPU, blocks on the subprocess, then takes
+the next combo — so parallelism is exactly "one run per GPU at a time", never two on one device.
+Terminal output from concurrent workers is `gpu<id>|<tag>`-prefixed and emitted under a lock, and
+each run still gets its own `sweeps/<timestamp>/<tag>.log`.
 
 ### Registered algorithms (`src/barl/policies/`)
 
