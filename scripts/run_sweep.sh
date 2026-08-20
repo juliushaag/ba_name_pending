@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=ml_job                 # name shown in squeue
-#SBATCH --partition=gpu_a100              # bwUniCluster 3.0 GPU queues:
+#SBATCH --partition=gpu_a100_il              # bwUniCluster 3.0 GPU queues:
                                            #   dev_gpu_h100  -> quick tests, short walltime, 4x H100 nodes
                                            #   gpu_h100      -> production runs, 4x H100 nodes (AMD EPYC 9454)
                                            #   gpu_h100_short-> shorter max walltime, higher priority
@@ -9,7 +9,7 @@
                                            #   gpu_mi300     -> AMD Instinct MI300A APU nodes
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:2                      # number of GPUs (nodes have 4x GPU each, request only what you need)
+#SBATCH --gres=gpu:3                      # number of GPUs (nodes have 4x GPU each, request only what you need)
 
 #SBATCH --output=logs/%x/%j/term.out           # stdout -> logs/ml_job_<jobid>.out
 #SBATCH --error=logs/%x/%j/term.err            # stderr
@@ -34,8 +34,8 @@ uv run python -c "import torch; print('CUDA available:', torch.cuda.is_available
 # --- Run your script -------------------------------------------------
 # Runs sequentially, algo by algo; --seeds N is N seeds vmapped inside each run.
 uv run python scripts/run_sweep.py \
-    --algos SDAC NCLQL \
-    --envs HumanoidRun \
+    --algos SAC SDAC NCLQL \
+    --envs WalkerRun \
     --seeds 5
 
 # --- Copy results back to persistent storage --------------------------
