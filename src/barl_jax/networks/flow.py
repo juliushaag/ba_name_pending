@@ -35,6 +35,7 @@ class TimeEmbedding(nnx.Module):
   def __init__(self, time_dim: int, kind: str = "sin", num_freqs: int = 16,
                freq_min: float = 0.1, freq_max: float = 100.0, hidden: int = 32,
                concat_input: bool = True, *, rngs: nnx.Rngs):
+               
     from barl_jax.networks.mlp import Linear   # circular at module import time
 
     assert kind in ("sin", "fourier", "learned"), \

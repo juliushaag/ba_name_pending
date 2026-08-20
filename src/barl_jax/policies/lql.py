@@ -4,55 +4,11 @@ import jax.numpy as jnp
 from flax import nnx
 
 from barl_jax.networks.critic import ConcatQ, QCriticBase
-from barl_jax.networks.flow import sinusoidal_emb
-from barl_jax.networks.mlp import _ACTIVATIONS, Linear
+from barl_jax.networks.flow import TimeEmbedding
+
 from barl_jax.networks.registry import register_component
 from barl_jax.policy import Buffer, Policy, frozen, register_policy
 from barl_jax.schedule import Schedule
-
-
-class _NoiseConditionedQ(nnx.Module):
-  """`n_models` Q heads sharing one level encoder, presented to QCriticBase as
-  an ordinary `q_function(s, a)`.
-
-  The level encoder is the reference's (ku-dmlab/NCLQL, NoiseConditionedQNet):
-  a sinusoidal encoding of the level index through `Linear -> act -> Linear`,
-  concatenated to `(obs, act)`. Deviation worth knowing: the reference builds
-  one encoder *per* Q network, since q1/q2 are separate haiku transforms; here
-  the heads are a vmapped Ensemble over one module, so they share it. The
-  encoder sees only the level index, which is the same input for both heads, so
-  what is lost is one extra set of 2x16 weights, not information.
-
-  `augment` is split out so a caller can build the augmented action once and
-  hand it to the base's `raw`/`raw_batches` unchanged."""
-
-  def __init__(self, n_models: int, obs_dim: int, act_dim: int, latent_dim: int,
-               layers: int, time_dim: int, activation: str,
-               norm: str, norm_input: bool, norm_stem: bool, norm_after_act: bool, dropout: float,
-               final_activation: bool, residual: bool, norm_kwargs: dict, dtype: str,
-               *, rngs: nnx.Rngs):
-    self.time_dim = int(time_dim)
-    self.act_fn   = _ACTIVATIONS[activation]
-    # The time embedding stays float32: it is two tiny Linears on a (B, time_dim)
-    # input, so there is nothing to gain and it feeds every head.
-    self.te_in    = Linear(time_dim, 2 * time_dim, rngs=rngs)
-    self.te_out   = Linear(2 * time_dim, time_dim, rngs=rngs)
-    self.heads    = ConcatQ(obs_dim + act_dim + time_dim, 1, latent_dim, layers,
-                            n_models=n_models, activation=activation, norm=norm,
-                            norm_input=norm_input, norm_stem=norm_stem,
-                            norm_after_act=norm_after_act, dropout=dropout,
-                            final_activation=final_activation, residual=residual,
-                            norm_kwargs=norm_kwargs, dtype=dtype, rngs=rngs)
-
-  def augment(self, act, level):
-    if not isinstance(level, jax.Array):
-      level = jnp.full((act.shape[0],), level, jnp.int32)
-    te = sinusoidal_emb(level.astype(jnp.float32)[:, None], self.time_dim)
-    te = self.te_out(self.act_fn(self.te_in(te)))
-    return jnp.concatenate([act, te], axis=-1)
-
-  def __call__(self, s, a):
-    return self.heads(s, a)
 
 
 @register_component
@@ -81,25 +37,41 @@ class NCLQLCritic(QCriticBase):
                time_dim: int = 16, polyak_tau: float = 0.005,
                activation: str = "mish", norm: str = "none",
                norm_input: bool = False, norm_stem: bool = False, norm_after_act: bool = True,
-               dropout: float = 0.0, final_activation: bool = False,
-               residual: bool = False, norm_kwargs: dict = None, dtype: str = "float32",
+              norm_kwargs: dict | None = None, dtype: str = "float32",
                *, rngs: nnx.Rngs, **kwargs):
-    q_function = _NoiseConditionedQ(n_models, env_stats["obs_dim"], env_stats["act_dim"],
-                                    latent_dim, layers, time_dim, activation,
-                                    norm, norm_input, norm_stem, norm_after_act, dropout, final_activation,
-                                    residual, norm_kwargs, dtype, rngs=rngs)
+    
+    self.time_dim = int(time_dim)
+    
+    self.time_embed = TimeEmbedding(
+      time_dim=int(time_dim),
+      kind="fourier",
+
+    )
+
+    q_function = ConcatQ(
+      env_stats["obs_dim"] + env_stats["act_dim"] + time_dim, 1, latent_dim, layers,
+      n_models=n_models, activation=activation, norm=norm,
+      norm_input=norm_input, norm_stem=norm_stem,
+      norm_after_act=norm_after_act, norm_kwargs=norm_kwargs, dtype=dtype, rngs=rngs
+    )
+
     super().__init__(env_stats, q_function, rngs=rngs, **kwargs)
 
     self.n_models   = int(n_models)
     self.polyak_tau = float(polyak_tau)
-    # `_target` is what keeps this out of every optimizer -- see policy.is_target.
+
     self.q_target = nnx.clone(q_function)
 
   # ---- level conditioning -------------------------------------------------
 
   def augment(self, act, level):
-    """Raw action + level -> the augmented action `raw`/`raw_batches` take."""
-    return self.q_function.augment(act, level)
+
+    if not isinstance(level, jax.Array):
+      level = jnp.full((act.shape[0],), level, jnp.int32)
+    te = self.time_embed(level.astype(jnp.float32)[:, None])
+
+    return jnp.concatenate([act, te], axis=-1)
+    
 
   def expectation_at(self, obs, act, level):
     """E[Q] at a level, augmenting internally. The Langevin chain differentiates
@@ -172,7 +144,7 @@ class NCLQL(Policy):
     params = self.resolve_params()
 
     self.steps_per_level = params["steps_per_level"]
-    self.noise_levels       = float(params["noise_levels"])
+    self.noise_levels    = float(params["noise_levels"])
     self.step_size       = float(params["step_size"])
     self.temperature     = float(params["temperature"])
     self.normalize_score = params["normalize_score"]
@@ -268,12 +240,6 @@ class NCLQL(Policy):
     next_obs = self.normalize_obs(batch["next_obs"])
     action   = batch["act"]
     term     = batch["term"]
-    # Scaled here, before anything reads it, so the whole Bellman target moves
-    # with it -- the reference's `reward *= self.reward_scale` at the top of its
-    # update. It sets the scale Q settles at (r/(1-gamma) at the fixed point),
-    # which is what keeps the critic's outputs in a range its normalization and
-    # the Langevin step sizes were tuned for. `batch/reward/*` still logs the
-    # env's own reward, not this.
     reward   = batch["rew"] * self.reward_scale
 
     losses = {}
@@ -288,15 +254,11 @@ class NCLQL(Policy):
     noisy = action + self.sigmas[...][idx][:, None] * jax.random.normal(
       keys[2], action.shape, action.dtype)
 
-    # Both *trained* batches in one forward -- the clean prediction the TD loss
-    # regresses and the noised one the smoothing loss does. They are the only
-    # two that carry a gradient; the bootstrap comes from the target net below,
-    # so it is not part of this population.
+
     pred_clean, pred_noisy = self.critic.raw_batches(
       (obs, self.augment_action(action, self.clean_level)),
       (obs, self.augment_action(noisy, idx)))
 
-    # -- bootstrap loss: min over the *target* heads, the reference's q_backup --
     bootstrap = self.critic.target_bootstrap(next_obs, next_action, self.clean_level)
     self.critic.loss_from_raw(pred_clean,
                               self.critic.bellman_target(reward, term, bootstrap), losses)
