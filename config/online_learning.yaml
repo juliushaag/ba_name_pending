@@ -38,12 +38,12 @@ defaults:
   batch_size: 256
  
   eval_every: 100000         # grad steps between eval2s
-  eval_runs: 20             # episodes per eval, run in parallel
+  eval_runs: 20             # episodes per eval, run in parallel  
   eval_videos: 1            # of those runs, how many render frames (they run on
                             # their own env). Rendering costs ~140x the env step,
                             # so this is most of an eval's wall clock. null = all.
-  log_every: 100             # grad steps between primary-tier logs (one headline key per quantity)
-  debug_every: 200          # grad steps between debug-tier logs (min/max/std/quantiles, grad health)
+  log_every: 250             # grad steps between primary-tier logs (one headline key per quantity)
+  debug_every: 1000          # grad steps between debug-tier logs (min/max/std/quantiles, grad health)
 
 # Per-env overrides of anything above, applied to every run on that env (in
 # this file's `runs:` and in every scripts/run_sweep.py grid alike) -- so a

@@ -196,7 +196,7 @@ HLGaussCritic:
 # normalization, mish, lr 1e-4, tau 0.005.
 NCLQLCritic:
   latent_dim: 256
-  layers: 2
+  layers: 3
   n_models: 2
   time_dim: 16
   polyak_tau: 0.005
