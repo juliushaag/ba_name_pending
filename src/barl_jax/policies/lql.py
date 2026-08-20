@@ -39,9 +39,9 @@ class NCLQLCritic(QCriticBase):
                norm_input: bool = False, norm_stem: bool = False, norm_after_act: bool = True,
               norm_kwargs: dict | None = None, dtype: str = "float32",
                *, rngs: nnx.Rngs, **kwargs):
-    
+
     self.time_dim = int(time_dim)
-    
+
     self.time_embed = TimeEmbedding(
       time_dim=self.time_dim,
       kind=time_embed,
@@ -77,7 +77,7 @@ class NCLQLCritic(QCriticBase):
       te = self.time_embed_target(level.astype(jnp.float32)[:, None])
 
     return jnp.concatenate([act, te], axis=-1)
-    
+
 
   def loss_from_raw(self, raw, target, losses: dict) -> None:
     pred = raw.astype(jnp.float32)
@@ -135,7 +135,7 @@ class NCLQL(Policy):
     self.action_limit    = params["action_limit"]
     self.init_scale      = params["init_scale"]
 
-   
+
     self.sigmas_sched: Schedule = self.build_component("sigmas", Schedule, steps=self.noise_levels)
 
     sigmas = self.sigmas_sched.ladder()
@@ -159,7 +159,7 @@ class NCLQL(Policy):
     def q(critic, a):
       pred = critic.raw(obs, critic.augment(a, level)).mean(axis=0)
       return pred.sum()
-    
+
     return nnx.grad(q, argnums=1)(frozen(self.critic), act)
 
   def sample(self, obs, key):

@@ -14,7 +14,6 @@ an enclosing jit the step is dispatched op-by-op and costs ~4x more at N=1 and
 import datetime
 import os
 import time
-from functools import partial
 
 import jax
 import numpy as np
@@ -112,7 +111,7 @@ def evaluate(run: Run, envs, log, ckpt_dir, best):
   # tens of minutes with nothing on stdout, and telling "stalled" from "running
   # normally, just slow" after the fact otherwise means reading a stack trace.
   started = time.perf_counter()
-  log.message(f"Eval start @ grad_step {log.get_step('grad_steps')} "
+  log.message(f"Eval start @ env_step {log.get_step('env_steps')} "
               f"(every {cfg['eval_every']}), {run.num_seeds} seeds x {cfg['eval_runs']} episodes")
 
   for i in range(run.num_seeds):
@@ -150,7 +149,7 @@ def evaluate(run: Run, envs, log, ckpt_dir, best):
   log.log_per_seed(per_seed, panel=panel)
   for i, seed_best in enumerate(best):
     log.summary("best_reward", float(seed_best), seed_index=i)
-  log.message(f"Eval done  @ grad_step {log.get_step('grad_steps')} "
+  log.message(f"Eval done  @ env_step {log.get_step('env_steps')} "
               f"in {time.perf_counter() - started:.1f}s")
   return best
 
@@ -168,13 +167,7 @@ def train(run: Run):
     name += f"_x{num_seeds}"
 
   n_videos  = cfg["eval_runs"] if cfg.get("eval_videos") is None else min(cfg["eval_videos"], cfg["eval_runs"])
-  # The rendering env must stay synchronous (a worker's render() comes back as
-  # an EOFError); the unrendered one is parallel as before.
-  #
-  # Sized to the full `eval_runs`, not `eval_runs - n_videos`: only seed 0 ever
-  # renders, so every other seed asks this env for all `eval_runs` episodes at
-  # once. A smaller one served them in two waves, and a wave costs a full
-  # episode of stepping *every* sub-env to record the one slot still live.
+  
   needs_unrendered = cfg["eval_runs"] > n_videos or num_seeds > 1
   eval_envs = (run.environment.get_vector_env(cfg["eval_runs"]) if needs_unrendered else None,
                run.environment.get_vector_env(n_videos, asynchronous=False) if n_videos else None)
@@ -193,9 +186,8 @@ def train(run: Run):
             **{f"env_stats/{k}": v for k, v in run.env_stats.static().items()
                if not isinstance(v, np.ndarray)},
             "env_obs": str(run.env.observation_space), "env_act": str(run.env.action_space)},
-    # One wandb run per vmapped seed, grouped under this {model, env, config}
-    # so the group view aggregates them. The sweep stays findable via its tag.
-    group=name, seeds=[run.base_seed + i for i in range(num_seeds)])
+    group=name, seeds=[run.base_seed + i for i in range(num_seeds)]
+  )
 
   log.register("eval/*", "env_steps")
   log.register("rollout/*", "env_steps")
@@ -220,21 +212,18 @@ def train(run: Run):
     log.message(f"Random-filled the buffer with {cfg['random_steps']} env steps before training")
 
   best = [float("-inf")] * num_seeds
+  eval_every, next_eval = cfg["eval_every"], cfg["eval_every"]
   it = 0
   while log.get_step("env_steps") < cfg["total_env_steps"]:
     actor = StackedPolicy(run.graphdef, run.state, num_seeds, run.num_envs, run.reference)
     rollout_stats = run.buffer.rollout(actor, env=run.rollout_env, n_steps=steps_per_iter,
                                        seed=run.base_seed if it == 0 else None)
     log.advance({"env_steps": cfg["rollout_steps"]})
-    # Seed i drove its own block of sub-env slots, so its rollout is its own --
-    # only the panel averages them.
+
     log.log_per_seed([{f"rollout/{k}": v for k, v in seed.items()}
                       for seed in run.buffer.last_rollout_per_seed()],
                      panel={f"rollout/{k}": v for k, v in rollout_stats.items()})
-    # Every component holds a reference to this same EnvStats, so one update is
-    # all it takes for them to see the current rollout's numbers. Deliberately
-    # the blend: the components are shared across the seed axis (the tunables
-    # live in one graphdef), so there is no per-seed EnvStats to feed.
+   
     run.env_stats["live"].update(rollout_stats)
 
     grad_steps_this_iter = round(cfg["rollout_steps"] * cfg["utd_ratio"])
@@ -245,7 +234,7 @@ def train(run: Run):
     log.log_per_seed([{"buffer/transitions": n} for n in run.buffer.transitions_per_seed()],
                      panel={"buffer/transitions": run.buffer.min_transitions()})
 
-    epoch_start, eval_time = time.perf_counter(), 0.0
+    epoch_start = time.perf_counter()
     for _ in range(grad_steps_this_iter):
       gstep = log.get_step("grad_steps")
       tiers = (tuple([PRIMARY] if gstep % cfg["log_every"] == 0 else [])
@@ -258,29 +247,20 @@ def train(run: Run):
         primary, debug = to_host(primary), to_host(debug)
         primary_mean, primary_seeds = split_metrics(primary, num_seeds)
         _,            debug_seeds   = split_metrics(debug, num_seeds)
-        # Each seed's own values go to its own wandb run under the plain key
-        # names; the panel shows the seed mean, which wandb's group view
-        # recomputes rather than being logged a second time.
+      
         log.log_per_seed(primary_seeds, debug_seeds, panel=primary_mean)
 
       log.advance({"grad_steps": 1})
 
-      # grad_steps, not env_steps: env_steps only advances once per rollout, so
-      # it is *constant* across this whole loop -- the moment it landed on a
-      # multiple of eval_every, this fired on every one of the iteration's
-      # grad steps and ran thousands of evaluations back to back. grad_steps
-      # advances by one here, so a multiple is hit exactly once.
-      if log.get_step("grad_steps") % cfg["eval_every"] == 0:
-        eval_start = time.perf_counter()
-        best = evaluate(run, eval_envs, log, ckpt_dir, best)
-        eval_time += time.perf_counter() - eval_start
+    epoch_time = time.perf_counter() - epoch_start
 
-    # Evaluation is excluded: it runs each seed separately on the host, so
-    # leaving it in made the *training* cost look several times worse the more
-    # seeds were vmapped -- the opposite of what the number is read for.
-    epoch_time = time.perf_counter() - epoch_start - eval_time
-    # batch_size samples per seed per step: counting the seed axis is what keeps
-    # this comparable to a single-seed run's.
+    eval_time = 0.0
+    if log.get_step("env_steps") >= next_eval:
+      eval_start = time.perf_counter()
+      best = evaluate(run, eval_envs, log, ckpt_dir, best)
+      eval_time = time.perf_counter() - eval_start
+      next_eval = (log.get_step("env_steps") // eval_every + 1) * eval_every
+    
     n_samples = max(1, grad_steps_this_iter * cfg["batch_size"] * num_seeds)
     stats = {"model/num_params": run.reference.num_params(),
              "model/epoch_time_s": epoch_time,
@@ -308,9 +288,6 @@ def validate(run: Run):
                      seed=run.base_seed)
 
   batch = run.buffer.sample(cfg["batch_size"])
-  # Rebound rather than discarded even though nothing here reads it again:
-  # seeded_step donates the state it is given (see its definition), so keeping
-  # the old reference would leave run.state pointing at a deleted buffer.
   run.state, losses, primary, debug = seeded_step(run.graphdef, run.state, batch,
                                                   (PRIMARY, DEBUG))
   losses = jax.device_get(losses)

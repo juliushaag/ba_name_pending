@@ -60,7 +60,7 @@ def train_step(graphdef, state, batch, tiers):
         primary[policy.metrics_key(key, "loss")] = losses[key]
         primary[policy.metrics_key(key, "grad_norm")] = optax.tree.norm(partition)
       if DEBUG in tiers and partition:
-       
+
         total   = sum(g.size for g in partition)
         zeros   = sum((g == 0).sum() for g in partition)
         nonfin  = sum((~jnp.isfinite(g)).sum() for g in partition)

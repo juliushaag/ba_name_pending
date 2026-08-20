@@ -45,7 +45,12 @@ defaults:
 
   batch_size: 256
  
-  eval_every: 100000         # grad steps between eval2s
+  eval_every: 100000        # ENV steps between evals, checked once per outer
+                            # iteration (a rollout can jump over a threshold, so
+                            # the next due point is recomputed, never
+                            # incremented). Was grad steps before -- at
+                            # utd_ratio 1.0 and rollout_steps 5000 the same
+                            # number is now half as frequent.
   eval_runs: 20             # episodes per eval, run in parallel  
   eval_videos: 1            # of those runs, how many render frames (they run on
                             # their own env). Rendering costs ~140x the env step,

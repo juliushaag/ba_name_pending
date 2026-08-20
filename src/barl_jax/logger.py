@@ -61,8 +61,7 @@ class Logger():
       for seed in self._seeds
     ]
 
-    self._step_key_dict = dict()
-    self._steps = { k : 0 for k in step_keys}
+    self._steps = {k: 0 for k in step_keys}
 
     for k in self._steps:
       self._each("define_metric", k)
@@ -88,20 +87,6 @@ class Logger():
 
   def get_step(self, step_key : str):
     return self._steps[step_key]
-
-  def _ensure_step_key(self, key: str, step_key: str):
-
-    if step_key not in self._steps:
-        raise KeyError(
-            f"Unknown step key '{key}'. "
-            f"Known keys: {list(self._steps.keys())}"
-        )
-
-    if self._step_key_dict.get(key) == step_key:
-      return
-
-    self._each("define_metric", key, step_metric=step_key)
-    self._step_key_dict[key] = step_key
 
   def advance(self, steps):
     """Bumps the step counters without touching wandb. They are x-axes

@@ -1,4 +1,3 @@
-import enum
 import multiprocessing as mp
 from abc import ABC, abstractmethod
 
@@ -101,7 +100,7 @@ class Environment(ABC):
             return max_steps
 
     return max_length
-  
+
 def register_environment(cls : type):
 
   name = cls.__name__

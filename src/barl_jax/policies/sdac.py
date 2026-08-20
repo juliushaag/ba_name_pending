@@ -135,7 +135,7 @@ class SDAC(Policy):
 
     keys = jax.random.split(self.rngs.noise(), 6)
 
-    
+
     # Both ends are best-of-N, and the bootstrap especially: acting takes the
     # argmax over `num_bon` samples, so a target built from a single sample
     # prices a strictly worse policy than the one collecting the data -- an
@@ -198,7 +198,7 @@ class SDAC(Policy):
     self.metrics.scalar("noise_entropy", jax.lax.stop_gradient(self.noise_entropy()))
     self.metrics.scalar("q_scale", q_scale)
     self.metrics.dist("weight_ess", 1.0 / (weight.squeeze(-1) ** 2).sum(axis=0))
-   
+
     norm = lambda x: jnp.linalg.norm(x, axis=-1).mean()
     weighted = (weight * noise).sum(axis=0)
     self.metrics.scalar("signal_ratio", norm(weighted) / (norm(noise) + 1e-8))
