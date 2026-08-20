@@ -11,323 +11,334 @@ from barl_jax.networks.registry import register_component
 from barl_jax.policy import Buffer, Critic
 
 
-class Bootstrap:
-  """What `bellman_target()` consumes: a next-state prediction in the critic's
-  own representation, plus a per-sample value shift. Keeping the shift separate
-  is what lets a Policy write `bootstrap + alpha * entropy` no matter which
-  critic it holds -- for a fixed categorical support a value shift moves the
-  support, not the probabilities, so plain addition would silently corrupt
-  it."""
-
-  def __init__(self, pred, shift=0.0):
-    self.pred  = pred
-    self.shift = shift
-
-  def __add__(self, other) -> "Bootstrap":
-    return Bootstrap(self.pred, self.shift + other)
-
-  __radd__ = __add__
-
-
 class QCriticBase(Critic):
-  """Shared scaffolding for every concrete critic below: the bootstrap ->
-  bellman_target -> loss regression path. Not instantiated directly.
 
-  There is no target network. The bootstrap is priced by the live weights, in
-  the *same* forward as the prediction it trains (see `raw_pair`), which is
-  CrossQ's (Bhatt et al., ICLR 2024) replacement for one: a batch-statistic
-  normalization then sees both batches as a single population, so the bootstrap
-  cannot drift off-distribution from the prediction -- the instability target
-  networks exist to damp.
-
-  Two accessors, both meaningful for every representation: `expectation()` is
-  E[Z(s,a)], `value()` is the price a Policy improves against -- the same thing
-  unless a subclass reduces with a spread.
-
-  A subclass supplies three hooks and gets everything else from here:
-  `reduce_expectation(raw)` and (optionally) `reduce_value(raw)` turn an
-  un-reduced prediction into a scalar, and `loss_from_raw(raw, target, losses)`
-  regresses one. Keeping those separate from the forward pass is what lets
-  `td_loss()` price both batches in a single call."""
-
-  def __init__(self, env_stats, q_function, *, gamma: float, lr: float = 3e-4,
+  def __init__(self, env_stats, q_function, *, gamma: float, lr: float,
                adam_b1: float = 0.5, **kwargs):
     super().__init__(env_stats, **kwargs)
 
     self.gamma   = float(gamma)
     self.lr      = float(lr)
-    # 0.5, not Adam's 0.9: with no target network the critic tracks a
-    # faster-moving bootstrap, and heavy first-moment momentum lags it. This is
-    # the b1 CrossQ (and dime_am's configs/alg/*.yaml) use.
     self.adam_b1 = float(adam_b1)
 
     self.q_function = q_function
 
-  # ------------------------------------------------------------------
-  # Pricing
-  # ------------------------------------------------------------------
+  # ---- pricing -------------------------------------------------------------
 
   def raw(self, s, a):
     return self.q_function(s, a)
 
-  def raw_pair(self, s, a, next_s, next_a):
-    """Both batches through the network in **one** forward, returned as the two
-    un-reduced halves -- see the class docstring for why they must share a
-    forward rather than be priced separately."""
-    batch = s.shape[0]
-    joint = self.raw(jnp.concatenate([s, next_s], axis=0),
-                     jnp.concatenate([a, next_a], axis=0))
-    return joint[..., :batch, :], joint[..., batch:, :]
-
-  # ---- reductions: raw -> scalar, kept separate from the forward pass -------
-
-  def reduce_expectation(self, raw):
-    """E[Z] from an un-reduced prediction."""
-    raise NotImplementedError
+  def raw_batches(self, *pairs):
+    sizes = [s.shape[0] for s, _ in pairs]
+    joint = self.raw(jnp.concatenate([s for s, _ in pairs], axis=0),
+                     jnp.concatenate([a for _, a in pairs], axis=0))
+    out, start = [], 0
+    for n in sizes:
+      out.append(joint[..., start:start + n, :])
+      start += n
+    return out
 
   def reduce_value(self, raw):
-    """The price a Policy improves against -- the same as the expectation
-    unless the subclass reduces with a spread."""
-    return self.reduce_expectation(raw)
+    raise NotImplementedError
 
-  def expectation(self, s, a):
-    return self.reduce_expectation(self.raw(s, a))
-
-  def value(self, s, a ):
+  def value(self, s, a):
     return self.reduce_value(self.raw(s, a))
 
   def create_optimizer(self) -> dict:
     return {"q": optax.adam(self.lr, b1=self.adam_b1)}
 
-  # ------------------------------------------------------------------
-  # Regression
-  # ------------------------------------------------------------------
+  # ---- regression ----------------------------------------------------------
 
-  def bootstrap_from_raw(self, next_raw) -> Bootstrap:
-    """A Bootstrap from an already-computed next-state prediction. Overridden by
-    a critic that transports its own representation rather than a scalar."""
-    return Bootstrap(jax.lax.stop_gradient(self.reduce_value(next_raw)))
+  def bootstrap_from_raw(self, next_raw):
+    return jax.lax.stop_gradient(self.reduce_value(next_raw))
 
-  def bellman_target(self, reward, term, bootstrap: Bootstrap):
+  def bellman_target(self, reward, term, bootstrap, shift=0.0):
     reward = reward.reshape(-1, 1)
     term   = term.reshape(-1, 1).astype(reward.dtype)
-    return reward + (1.0 - term) * self.gamma * (bootstrap.pred + bootstrap.shift)
-
-  def terminal_target(self, value):
-    """`value` itself, lifted into this critic's target representation -- the
-    Bellman target of a transition that doesn't bootstrap."""
-    return value
+    return reward + (1.0 - term) * self.gamma * (bootstrap + shift)
 
   def loss_from_raw(self, raw, target, losses: dict) -> None:
-    """Regress an already-computed prediction onto `target`, in whatever
-    representation this critic uses."""
     raise NotImplementedError
-
-  def loss(self, obs, action, target, losses: dict) -> None:
-    self.loss_from_raw(self.raw(obs, action), target, losses)
 
   def td_loss(self, obs, action, next_obs, next_action, reward, term,
               losses: dict, shift=0.0) -> None:
-    """The whole TD update: price both batches in one forward, transport one
-    step, regress. Living here rather than in each Policy is what keeps the
-    single-forward requirement (see `raw_pair`) out of every train_step.
-
-    `shift` is the Policy's per-sample value shift, e.g. an entropy bonus."""
-    pred_raw, next_raw = self.raw_pair(obs, action, next_obs, next_action)
-    bootstrap = self.bootstrap_from_raw(next_raw) + shift
-    self.loss_from_raw(pred_raw, self.bellman_target(reward, term, bootstrap), losses)
+    pred_raw, next_raw = self.raw_batches((obs, action), (next_obs, next_action))
+    target = self.bellman_target(reward, term, self.bootstrap_from_raw(next_raw), shift)
+    self.loss_from_raw(pred_raw, target, losses)
 
 
-# ----------------------------------------------------------------------
-# Ensemble critics
-# ----------------------------------------------------------------------
+class ConcatQ(nnx.Module):
+  """`q_function(s, a)` over concatenated inputs: `n_models` vmapped MLP heads
+  with a leading model axis. `n_models: 1` is the single-head case -- it keeps
+  the axis, so every critic reduces over heads the same way."""
 
-
-class EnsembleCriticBase(QCriticBase):
-  """Shared __init__/loss for the reduction variants below -- `n_models`
-  independent MLP heads, all regressed to the same scalar Bellman target
-  (epistemic disagreement across heads, not a return distribution). Only
-  `value()`'s reduction differs between them. Not instantiated directly."""
-
-  def __init__(self, env_stats, hidden_dim: int, layers: int, n_models: int,
-               activation: str = "silu", norm: str = None, norm_stem: bool = False,
+  def __init__(self, in_dim: int, out_dim: int, latent_dim: int, layers: int, n_models: int,
+               activation: str = "silu", norm: str = None,
+               norm_input: bool = False, norm_stem: bool = False, norm_after_act: bool = True,
                dropout: float = 0.0, final_activation: bool = False,
-               residual: bool = False, norm_kwargs: dict = None,
-               *, rngs: nnx.Rngs, **kwargs):
-    q_function = _EnsembleQ(n_models,
-                            env_stats["obs_dim"] + env_stats["act_dim"],
-                            hidden_dim, layers, activation=activation, norm=norm, norm_stem=norm_stem,
-                            dropout=dropout, final_activation=final_activation,
-                            residual=residual, norm_kwargs=norm_kwargs,
-                            rngs=rngs)
-    super().__init__(env_stats, q_function, rngs=rngs, **kwargs)
-    self.n_models = n_models
-
-  def reduce_expectation(self, raw):
-    return raw.astype(jnp.float32).mean(axis=0)
-
-  def loss_from_raw(self, raw, target, losses: dict) -> None:
-    pred = raw.astype(jnp.float32)
-    tgt  = jax.lax.stop_gradient(target).astype(jnp.float32)
-    losses["q"] = ((pred - jnp.broadcast_to(tgt, pred.shape)) ** 2).mean()
-
-    self.metrics.dist("q", pred.mean(axis=0))
-    self.metrics.dist("q_target", tgt)
-    self.metrics.ensemble("ensemble", pred, rho=getattr(self, "rho", 0.0))
-
-
-class _EnsembleQ(nnx.Module):
-  """The ensemble itself, wrapped so `q_function(s, a)` reads the same as a
-  single-head critic's does."""
-
-  def __init__(self, n_models: int, in_dim: int, hidden_dim: int, layers: int,
-               activation: str = "silu", norm: str = None, norm_stem: bool = False,
-               dropout: float = 0.0, final_activation: bool = False,
-               residual: bool = False, norm_kwargs: dict = None,
+               residual: bool = False, norm_kwargs: dict = None, dtype: str = "float32",
                *, rngs: nnx.Rngs):
-    self.ensemble = Ensemble(n_models, MLP, input_dim=in_dim, output_dim=1,
-                             latent_dim=hidden_dim, hidden_layers=layers,
-                             activation=activation, norm=norm, norm_stem=norm_stem,
-                             dropout=dropout, final_activation=final_activation,
-                             residual=residual, rngs=rngs, **(norm_kwargs or {}))
+    self.net = Ensemble(n_models, MLP, input_dim=in_dim, output_dim=out_dim,
+                        latent_dim=latent_dim, hidden_layers=layers,
+                        activation=activation, norm=norm, norm_input=norm_input,
+                         norm_stem=norm_stem, norm_after_act=norm_after_act,
+                        dropout=dropout, final_activation=final_activation,
+                        residual=residual, dtype=dtype, rngs=rngs, **(norm_kwargs or {}))
 
   def __call__(self, s, a):
-    return self.ensemble(jnp.concatenate([s, a], axis=-1))
+    return self.net(jnp.concatenate([s, a], axis=-1))
+
+
+# ----------------------------------------------------------------------
+# Scalar critic
+# ----------------------------------------------------------------------
 
 
 @register_component
-class MeanStdEnsembleCritic(EnsembleCriticBase):
-  """Q(s,a) critic backed by `n_models` independent MLP heads; spread =
-  epistemic uncertainty, pessimism = mean - rho*std."""
+class EnsembleCritic(QCriticBase):
+  """`n_models` MLP heads predicting a scalar Q, reduced by mean - `rho`*std.
 
-  def __init__(self, env_stats, hidden_dim: int, layers: int, n_models: int, *,
-               rho: float, **kwargs):
-    super().__init__(env_stats, hidden_dim, layers, n_models, **kwargs)
-    self.rho = float(rho)
+  The non-distributional counterpart to C51EnsembleCritic, on the same
+  scaffolding and with the same slot kwargs, so swapping one for the other is a
+  one-word `class:` edit -- which is what makes "does the distributional part
+  earn its keep here" an A/B rather than a rewrite. The spread it reduces with
+  is *epistemic*, disagreement between independently initialized heads, where a
+  distributional critic's is the return's own.
+
+  `rho` subsumes the usual reductions rather than needing a class each: 0.0 is
+  the plain mean, and at `n_models: 2` the population std is |q1 - q2|/2, so
+  `rho: 1.0` is exactly the min-over-heads that C51EnsembleCritic takes."""
+
+  def __init__(self, env_stats, latent_dim: int, layers: int, n_models: int, rho: float,
+               activation: str = "silu", norm: str = None,
+               norm_input: bool = False, norm_stem: bool = False, norm_after_act: bool = True,
+               dropout: float = 0.0, final_activation: bool = False,
+               residual: bool = False, norm_kwargs: dict = None, dtype: str = "float32",
+               *, rngs: nnx.Rngs, **kwargs):
+
+    q_function = ConcatQ(env_stats["obs_dim"] + env_stats["act_dim"], 1,
+                         latent_dim, layers, n_models=n_models,
+                         activation=activation, norm=norm, norm_input=norm_input,
+                         norm_stem=norm_stem, norm_after_act=norm_after_act,
+                         dropout=dropout, final_activation=final_activation,
+                         residual=residual, norm_kwargs=norm_kwargs, dtype=dtype, rngs=rngs)
+
+    super().__init__(env_stats, q_function, rngs=rngs, **kwargs)
+
+    self.n_models = int(n_models)
+    self.rho      = float(rho)
 
   def reduce_value(self, raw):
     raw = raw.astype(jnp.float32)
-    var = raw.var(axis=0)
-    return raw.mean(axis=0) - self.rho * jnp.sqrt(jnp.maximum(var, 1e-8))
+    # maximum(): sqrt is not differentiable at 0, which is exactly where two
+    # heads that happen to agree on a state would put the variance.
+    std = jnp.sqrt(jnp.maximum(raw.var(axis=0), 1e-8))
+    return raw.mean(axis=0) - self.rho * std
+
+  def loss_from_raw(self, raw, target, losses: dict) -> None:
+    pred = raw.astype(jnp.float32)                             # (n_models, B, 1)
+    tgt  = jax.lax.stop_gradient(target).astype(jnp.float32)   # (B, 1), shared by every head
+    losses["q"] = ((pred - tgt) ** 2).mean()
+
+    self.metrics.dist("q", pred.mean(axis=0))
+    self.metrics.dist("q_target", tgt)
+    self.metrics.ensemble("ensemble", pred, rho=self.rho)
 
 
-@register_component
-class MeanEnsembleCritic(EnsembleCriticBase):
-  """Same ensemble, reduced by plain mean -- no pessimism, so value() is the
-  ensemble expectation and there is no `rho` to set."""
+# ----------------------------------------------------------------------
+# Classification-as-regression critics
+# ----------------------------------------------------------------------
 
 
-@register_component
-class MinEnsembleCritic(EnsembleCriticBase):
-  """Same ensemble, reduced by TD3-style min-over-heads -- its pessimism has no
-  scale to tune, so there is no `rho` here either."""
+class CategoricalCriticBase(QCriticBase):
+  """A head emitting logits over a **fixed support**, fitted by cross-entropy
+  against a target distribution.
+
+  Both concrete critics below are this; they differ only in how a target
+  becomes that distribution. C51 transports the whole categorical through a
+  projection, HL-Gauss discretizes a scalar onto a Gaussian-smoothed histogram
+  -- so `bellman_target` is the entire difference, and everything about pricing
+  and the loss is shared, including the `n_models` heads and their reduction."""
+
+  def __init__(self, env_stats, q_function, support, n_models: int,
+               entropy_coef: float = 0.0, **kwargs):
+    super().__init__(env_stats, q_function, **kwargs)
+
+    self.support      = Buffer(support)
+    self.n_models     = int(n_models)
+    self.entropy_coef = float(entropy_coef)
+
+  def probs(self, raw):
+    return jax.nn.softmax(raw.astype(jnp.float32), axis=-1)
+
+  def expectations(self, raw):
+    """E[Z] **per head**, `(n_models, B, 1)`."""
+    return (self.probs(raw) * self.support[...]).sum(axis=-1, keepdims=True)
 
   def reduce_value(self, raw):
-    return raw.astype(jnp.float32).min(axis=0)
+    """min over the heads. The target averages them instead (see each
+    `bellman_target`, and C51Critic's `pessimistic_target` to put the min there
+    too), so both regress onto one well-posed target while the price a Policy
+    improves against stays pessimistic -- C51's reference behaviour, and the
+    same reduction EnsembleCritic's `rho: 1.0` gives."""
+    return self.expectations(raw).min(axis=0)
+
+  def loss_from_raw(self, raw, target, losses: dict) -> None:
+    logp = jax.nn.log_softmax(raw.astype(jnp.float32), axis=-1)
+    tgt  = jax.lax.stop_gradient(target).astype(jnp.float32)
+
+    # sum(-1) is the per-sample cross-entropy, mean(-1) averages the batch, and
+    # sum() adds up the heads -- a no-op on the scalar a single head leaves.
+    reduce = lambda x: x.sum(axis=-1).mean(axis=-1).sum()
+
+    losses["q"] = reduce(-(tgt * logp))
+    if self.entropy_coef:
+      losses["q"] += self.entropy_coef * reduce(jnp.exp(logp) * logp)
+
+    exp = self.expectations(raw)
+
+    self.metrics.dist("q", exp.mean(axis=0))
+    self.metrics.dist("q_target", (tgt * self.support[...]).sum(axis=-1, keepdims=True))
+    self.metrics.ensemble("ensemble", exp)
 
 
-# ----------------------------------------------------------------------
-# HL-Gauss
-# ----------------------------------------------------------------------
+def categorical_projection(next_probs, atoms, reward, term, gamma, shift, v_min, v_max):
+  num_atoms = atoms.shape[0]
+  delta_z   = (v_max - v_min) / (num_atoms - 1)
+
+  reward = reward.reshape(-1, 1)
+  term   = term.reshape(-1, 1).astype(reward.dtype)
+  # `shift` rides inside the discount exactly as in QCriticBase.bellman_target,
+  # so an entropy bonus means the same thing here as for a scalar critic -- it
+  # moves the *support*, not the probabilities.
+  tz = jnp.clip(reward + (1.0 - term) * gamma * (atoms.reshape(1, -1) + shift), v_min, v_max)
+
+  b = (tz - v_min) / delta_z
+  l = jnp.clip(jnp.floor(b), 0, num_atoms - 1).astype(jnp.int32)
+  u = jnp.clip(jnp.ceil(b),  0, num_atoms - 1).astype(jnp.int32)
+
+  # An atom landing exactly on a support point must not have its mass split
+  # between l and u (they are equal there) or it would be counted twice.
+  on_atom = (l == u)
+  m_l = jnp.where(on_atom, next_probs, next_probs * (u.astype(b.dtype) - b))
+  m_u = jnp.where(on_atom, 0.0,        next_probs * (b - l.astype(b.dtype)))
+
+  proj = jnp.zeros_like(next_probs)
+  batch_idx = jnp.arange(next_probs.shape[-2])[:, None]
+  proj = proj.at[..., batch_idx, l].add(m_l)
+  proj = proj.at[..., batch_idx, u].add(m_u)
+  return proj
 
 
 @register_component
-class HLGaussCritic(QCriticBase):
-  """HL-Gauss (Farebrother et al., 2024, "Stop Regressing"): scalar regression
-  recast as classification. A single MLP head predicts logits over `num_bins`
-  equal-width bins spanning [v_min, v_max]; the *scalar* Bellman target is
-  spread over them by integrating N(target, sigma^2) across each bin, and the
-  loss is cross-entropy against that.
+class C51Critic(CategoricalCriticBase):
+  """`n_models` C51 heads over a fixed categorical support, trained by the
+  distributional Bellman operator (Bellemare, Dabney & Munos, 2017).
 
-  Unlike a distributional critic this is not a distributional Bellman operator
-  -- it bootstraps a scalar E[Z] and only discretizes at the very end -- so it
-  has no return distribution to be risk-averse about and takes no spread
-  coefficient. `sigma_to_bin_ratio` is the paper's parameterization: sigma is
-  that multiple of the bin width, and ~0.75 is what it recommends."""
+  Genuinely distributional: it transports the whole next-state distribution
+  rather than a scalar, so its spread is the return's own. The two reductions
+  are deliberately different, following dime_am: the target averages the heads'
+  projected distributions so both regress onto one well-posed target, while the
+  price a Policy improves against is the `min` over their expectations.
+  `pessimistic_target` moves that `min` into the target as well, for an
+  algorithm whose bootstrap action is itself selected by the critic and so has
+  no other brake on over-estimation.
 
-  def __init__(self, env_stats, hidden_dim: int, layers: int, num_bins: int,
-               sigma_to_bin_ratio: float, v_min: float = None, v_max: float = None,
-               activation: str = "silu", norm: str = None, norm_stem: bool = False,
+  Deviations from dime_am worth knowing: its net emits post-softmax
+  probabilities and takes log(p + 1e-15), where this keeps logits and uses
+  log_softmax -- identical in exact arithmetic, stable in float32. And barl's
+  MLP normalizes *before* the activation where the reference normalizes after,
+  and has a stem the reference lacks, so `layers` here is one Linear deeper
+  than the reference's `hs` of the same length; `norm_stem: true` is the
+  closest match."""
+
+  def __init__(self, env_stats, latent_dim: int, layers: int, n_models: int,
+               num_atoms: int, entropy_coef: float, pessimistic_target: bool,
+               activation: str = "silu", norm: str = None,
+               norm_input: bool = False, norm_stem: bool = False, norm_after_act: bool = True,
                dropout: float = 0.0, final_activation: bool = False,
-               residual: bool = False, norm_kwargs: dict = None,
+               residual: bool = False, norm_kwargs: dict = None, dtype: str = "float32",
                *, rngs: nnx.Rngs, **kwargs):
-    # Read off the argument rather than self.env_stats: the support has to
-    # exist before super().__init__().
-    v_min = (env_stats or {}).get("return_min") if v_min is None else v_min
-    v_max = (env_stats or {}).get("return_max") if v_max is None else v_max
-    if v_min is None or v_max is None:
-      raise ValueError(
-        "HLGaussCritic's support is fixed and must be known at construction time, but neither "
-        f"config/models.yaml (v_min/v_max on the slot) nor this env's EnvStats "
-        f"(return_min/return_max, declared via Environment.stats) supplies it -- got "
-        f"v_min={v_min!r}, v_max={v_max!r}."
-      )
 
-    q_function = _SingleHeadQ(env_stats["obs_dim"] + env_stats["act_dim"],
-                              num_bins, hidden_dim, layers,
-                              activation=activation, norm=norm, norm_stem=norm_stem,
-                              dropout=dropout, final_activation=final_activation,
-                              residual=residual, norm_kwargs=norm_kwargs, rngs=rngs)
-    super().__init__(env_stats, q_function, rngs=rngs, **kwargs)
+    v_min, v_max = env_stats["return_min"], env_stats["return_max"]
+
+    q_function = ConcatQ(env_stats["obs_dim"] + env_stats["act_dim"], num_atoms,
+                         latent_dim, layers, n_models=n_models,
+                         activation=activation, norm=norm, norm_input=norm_input,
+                         norm_stem=norm_stem, norm_after_act=norm_after_act,
+                         dropout=dropout, final_activation=final_activation,
+                         residual=residual, norm_kwargs=norm_kwargs, dtype=dtype, rngs=rngs)
+
+    super().__init__(env_stats, q_function,
+                     jnp.linspace(v_min, v_max, num_atoms, dtype=jnp.float32),
+                     n_models=int(n_models), entropy_coef=entropy_coef,
+                     rngs=rngs, **kwargs)
+
+    self.num_atoms = int(num_atoms)
+    self.v_min, self.v_max = float(v_min), float(v_max)
+    self.pessimistic_target = bool(pessimistic_target)
+
+  def bootstrap_from_raw(self, next_raw):
+    """The next-state *distribution*, per head -- not a scalar."""
+    return jax.lax.stop_gradient(self.probs(next_raw))
+
+  def bellman_target(self, reward, term, bootstrap, shift=0.0):
+    if self.pessimistic_target:
+      # Transport the whole distribution of the head with the lower E[Z], per
+      # sample. A pointwise min over probabilities is not a distribution;
+      # picking a head keeps one, and the mean below is then a no-op.
+      exp = (bootstrap * self.support[...]).sum(axis=-1, keepdims=True)   # (n, B, 1)
+      bootstrap = jnp.take_along_axis(bootstrap, jnp.argmin(exp, axis=0, keepdims=True),
+                                      axis=0)                             # (1, B, atoms)
+    projected = categorical_projection(bootstrap, self.support[...], reward, term,
+                                       self.gamma, shift, self.v_min, self.v_max)
+    return projected.mean(axis=0)
+
+
+@register_component
+class HLGaussCritic(CategoricalCriticBase):
+  """`n_models` heads over a fixed histogram support, fitted by cross-entropy
+  against a Gaussian-smoothed discretization of the scalar Bellman target
+  (Farebrother et al., 2024).
+
+  Unlike C51 this is *not* distributional: it bootstraps a scalar E[Z] and only
+  discretizes at the very end, so `sigma` is label smoothing, not a return
+  spread -- and the spread its heads disagree by is epistemic, as in
+  EnsembleCritic. The ensemble is this codebase's, not the paper's, and exists
+  so all three critics differ only in the return representation."""
+
+  def __init__(self, env_stats, latent_dim: int, layers: int, n_models: int,
+               num_bins: int, sigma_to_bin_ratio: float,
+               activation: str = "silu", norm: str = None,
+               norm_input: bool = False, norm_stem: bool = False, norm_after_act: bool = True,
+               dropout: float = 0.0, final_activation: bool = False,
+               residual: bool = False, norm_kwargs: dict = None, dtype: str = "float32",
+               *, rngs: nnx.Rngs, **kwargs):
+
+    v_min, v_max = env_stats["return_min"], env_stats["return_max"]
+    edges = jnp.linspace(v_min, v_max, num_bins + 1, dtype=jnp.float32)
+
+    q_function = ConcatQ(env_stats["obs_dim"] + env_stats["act_dim"], num_bins,
+                         latent_dim, layers, n_models=n_models,
+                         activation=activation, norm=norm, norm_input=norm_input,
+                         norm_stem=norm_stem, norm_after_act=norm_after_act,
+                         dropout=dropout, final_activation=final_activation,
+                         residual=residual, norm_kwargs=norm_kwargs, dtype=dtype, rngs=rngs)
+
+    super().__init__(env_stats, q_function, (edges[:-1] + edges[1:]) / 2,
+                     n_models=n_models, rngs=rngs, **kwargs)
 
     self.v_min, self.v_max = float(v_min), float(v_max)
-    self.num_bins  = int(num_bins)
-    self.bin_width = (self.v_max - self.v_min) / num_bins
-    self.sigma     = sigma_to_bin_ratio * self.bin_width
-
-    edges = jnp.linspace(self.v_min, self.v_max, num_bins + 1, dtype=jnp.float32)
-    self.edges   = Buffer(edges)
-    self.centres = Buffer((edges[:-1] + edges[1:]) / 2)
+    self.num_bins = int(num_bins)
+    self.sigma    = sigma_to_bin_ratio * (self.v_max - self.v_min) / num_bins
+    self.edges    = Buffer(edges)
 
   def _to_histogram(self, value):
-    """A scalar target -> the categorical it is regressed onto: the mass
-    N(value, sigma^2) puts in each bin, renormalized by the total that landed
-    in-support so the tails clipped at either edge don't shrink the target.
-
-    The clip is load-bearing, not cosmetic. sigma is a fraction of one bin, so
-    a target even a few bins outside the support puts *no* representable mass
-    inside it -- every bin underflows to 0, and an all-zero target is a
-    cross-entropy term with no gradient, i.e. a transition silently dropped
-    from the loss. Clipping first pins it to the edge bin instead."""
     value = jnp.clip(value.reshape(-1, 1), self.v_min, self.v_max)
     z     = (self.edges[...] - value) / (self.sigma * math.sqrt(2.0))
     cdf   = 0.5 * (1.0 + jax.scipy.special.erf(z))
     mass  = cdf[:, 1:] - cdf[:, :-1]
     return mass / jnp.maximum(mass.sum(axis=-1, keepdims=True), 1e-8)
 
-  def probs(self, s, a):
-    return jax.nn.softmax(self.raw(s, a).astype(jnp.float32), axis=-1)
-
-  def reduce_expectation(self, raw):
-    probs = jax.nn.softmax(raw.astype(jnp.float32), axis=-1)
-    return (probs * self.centres[...]).sum(axis=-1, keepdims=True)
-
-  def bellman_target(self, reward, term, bootstrap: Bootstrap):
-    return self._to_histogram(super().bellman_target(reward, term, bootstrap))
-
-  def terminal_target(self, value):
-    return self._to_histogram(value)
-
-  def loss_from_raw(self, raw, target, losses: dict) -> None:
-    pred_logits = raw.astype(jnp.float32)
-    tgt = jax.lax.stop_gradient(target)
-    losses["q"] = -(tgt * jax.nn.log_softmax(pred_logits, axis=-1)).sum(axis=-1).mean()
-
-    probs = jax.nn.softmax(pred_logits, axis=-1)
-    self.metrics.dist("q", (probs * self.centres[...]).sum(axis=-1, keepdims=True))
-    self.metrics.dist("q_target", (tgt * self.centres[...]).sum(axis=-1, keepdims=True))
-
-
-class _SingleHeadQ(nnx.Module):
-  def __init__(self, in_dim: int, out_dim: int, hidden_dim: int, layers: int,
-               activation: str = "silu", norm: str = None, norm_stem: bool = False,
-               dropout: float = 0.0, final_activation: bool = False,
-               residual: bool = False, norm_kwargs: dict = None,
-               *, rngs: nnx.Rngs):
-    self.net = MLP(in_dim, out_dim, hidden_dim, layers,
-                   activation=activation, norm=norm, norm_stem=norm_stem,
-                   dropout=dropout, final_activation=final_activation,
-                   residual=residual, rngs=rngs, **(norm_kwargs or {}))
-
-  def __call__(self, s, a):
-    return self.net(jnp.concatenate([s, a], axis=-1))
+  def bellman_target(self, reward, term, bootstrap, shift=0.0):
+    return self._to_histogram(super().bellman_target(reward, term, bootstrap, shift))

@@ -33,10 +33,13 @@ class BatchRenorm(nnx.Module):
   average -- note flax's own BatchNorm takes the opposite convention, where
   0.99 means the same thing."""
 
-  def __init__(self, num_features: int, *, momentum: float = 0.01, epsilon: float = 1e-5,
+  # epsilon is dime_am's 1e-3, not flax's 1e-5: it enters the r/d ratios as well
+  # as the denominator, so the two are not interchangeable here.
+  def __init__(self, num_features: int, *, momentum: float = 0.01, epsilon: float = 1e-3,
                r_max: float = 3.0, d_max: float = 5.0, warmup_steps: int = 100_000,
-               use_running_average: bool = False, rngs: nnx.Rngs = None):
+               use_running_average: bool = False, dtype=jnp.float32, rngs: nnx.Rngs = None):
     self.num_features = num_features
+    self.dtype        = dtype
     self.momentum     = float(momentum)
     self.epsilon      = float(epsilon)
     self.r_max        = float(r_max)
@@ -59,15 +62,27 @@ class BatchRenorm(nnx.Module):
     t = jnp.minimum(self.steps[...] / self.warmup_steps, 1.0)
     return 1.0 + t * (self.r_max - 1.0), t * self.d_max
 
+  def _apply(self, x, a, b):
+    """The whole normalization folded into one per-channel affine.
+
+    Algebraically identical to `((x - mean)/std * r + d) * scale + bias`, but
+    `a` and `b` are `(C,)` and computed in float32, so under a reduced compute
+    dtype the statistics never round-trip a full (B, C) activation through
+    float32 -- and it is one fused multiply-add over the big tensor instead of
+    four elementwise passes."""
+    return x * a.astype(x.dtype) + b.astype(x.dtype)
+
   def __call__(self, x, use_running_average: bool = None):
     use_running = self.use_running_average if use_running_average is None else use_running_average
 
     if use_running:
-      normed = (x - self.mean[...]) * jax.lax.rsqrt(self.var[...] + self.epsilon)
-      return normed * self.scale[...] + self.bias[...]
+      a = self.scale[...] * jax.lax.rsqrt(self.var[...] + self.epsilon)
+      return self._apply(x, a, self.bias[...] - self.mean[...] * a)
 
-    batch_mean = x.mean(axis=0)
-    batch_var  = x.var(axis=0)
+    # Accumulated in float32 whatever `x` is: a bf16 sum over a batch this wide
+    # loses the moments outright, and the running statistics are float32.
+    batch_mean = x.mean(axis=0, dtype=jnp.float32)
+    batch_var  = x.var(axis=0, dtype=jnp.float32)
     batch_std  = jnp.sqrt(batch_var + self.epsilon)
 
     running_std = jnp.sqrt(self.var[...] + self.epsilon)
@@ -82,21 +97,25 @@ class BatchRenorm(nnx.Module):
     self.var[...]   = self.var[...] + self.momentum * (jax.lax.stop_gradient(batch_var) - self.var[...])
     self.steps[...] = self.steps[...] + 1
 
-    normed = (x - batch_mean) / batch_std * r + d
-    return normed * self.scale[...] + self.bias[...]
+    a = r * self.scale[...] / batch_std
+    return self._apply(x, a, self.bias[...] + d * self.scale[...] - batch_mean * a)
 
 
 def BatchNorm(num_features: int, *, momentum: float = 0.01, epsilon: float = 1e-5,
-              use_running_average: bool = False, rngs: nnx.Rngs, **_) -> nnx.BatchNorm:
+              use_running_average: bool = False, dtype=jnp.float32,
+              rngs: nnx.Rngs, **_) -> nnx.BatchNorm:
   """flax's BatchNorm, with `momentum` in the same sense as BatchRenorm above
   (weight on the batch moment) rather than flax's own decay convention."""
   return nnx.BatchNorm(num_features, momentum=1.0 - momentum, epsilon=epsilon,
-                       use_running_average=use_running_average, rngs=rngs)
+                       use_running_average=use_running_average,
+                       dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
 
 
-def LayerNorm(num_features: int, *, epsilon: float = 1e-5, rngs: nnx.Rngs, **_) -> nnx.LayerNorm:
+def LayerNorm(num_features: int, *, epsilon: float = 1e-5, dtype=jnp.float32,
+              rngs: nnx.Rngs, **_) -> nnx.LayerNorm:
   # torch's LayerNorm eps default is 1e-5; flax's is 1e-6.
-  return nnx.LayerNorm(num_features, epsilon=epsilon, rngs=rngs)
+  return nnx.LayerNorm(num_features, epsilon=epsilon,
+                       dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
 
 
 NORMS = {

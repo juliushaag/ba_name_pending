@@ -5,7 +5,6 @@ from flax import nnx
 
 from barl_jax.networks.actor import ScoreContinuousActor
 from barl_jax.networks.critic import QCriticBase
-from barl_jax.networks.flow import sinusoidal_emb
 from barl_jax.networks.regulator import AutotuneRegulator
 from barl_jax.networks.squash import Squash
 from barl_jax.policy import Policy, frozen, register_policy
@@ -80,7 +79,10 @@ class AMDP(Policy):
 
     # --- actor: regress the SDE's vector field onto the critic's action score
     X_t, tau = self.actor.sample_noised(X)
-    time_embed = sinusoidal_emb(tau.reshape(X.shape[0], 1), self.actor.time_dim)
+    # The actor's own module, not a fresh sinusoidal_emb: a `fourier`/`learned`
+    # embedding carries parameters, and a second copy would not be the one the
+    # sampler used.
+    time_embed = self.actor.time_emb(tau.reshape(X.shape[0], 1))
     u_tilde = self.actor.diffusion_act(obs, X_t, time_embed)
 
     # The score is a gradient w.r.t. the *action*; the critic must not be

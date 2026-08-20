@@ -49,86 +49,85 @@
 # None of them has a target network; a CrossQ-style critic is not a separate
 # class, just `norm: batchrenorm` (see config/components.yaml).
 
-aliases:
-  SACSmall: {policy: SAC, profile: Small}
-  SACLarge: {policy: SAC, profile: Large}
-
 SAC:
   params:
     entropy_scale: -1.0
 
   components:
-    actor:    {class: StochasticActor, hidden_dim: 512, layers: 3}
-    critic:   {class: HLGaussCritic }
-    entropy:  {class: AutotuneRegulator}
-
-  profiles:
-    Small:
-      actor:  {hidden_dim: 128, layers: 2}
-      critic: {hidden_dim: 128, layers: 2, n_models: 2}
-    Large:
-      actor:  {hidden_dim: 512, layers: 3}
-      critic: {hidden_dim: 512, layers: 3, n_models: 5}
-
+    actor:    {class: StochasticActor, latent_dim: 512, layers: 3}
+    critic:   {class: C51Critic }
+    entropy:  {class: AutotuneRegulator }
 
 DIME:
   params:
     entropy_scale: -4.0
 
   components:
-    actor:   {class: OUDiffusionActor}
-    critic:  {class: HLGaussCritic }
-    squash:  {class: TanhSquash}
-    entropy: {class: AutotuneRegulator, alpha_init: 0.001, min_alpha: 0.0001}
+    actor:   {class: OUDiffusionActor, latent_dim: 512, layers : 3 }
+    critic:  {class: C51Critic }
+    squash:  {class: TanhSquash }
+    entropy: {class: AutotuneRegulator }
 
 AMDP:
   params:
     entropy_scale: -1.0
 
-    # Per-sample norm clip on the critic's action gradient before it becomes
-    # the adjoint target (dime_am's Q_score_clipping). The threshold is the
-    # tighter of this norm and the batch's percentile of the per-sample norms.
     q_score_max_norm: 5.0
     q_score_max_percentile: 95.0
 
   components:
-    actor:   {class: ScoreContinuousActor}
-    critic:  {class: HLGaussCritic }
-    squash:  {class: ErfSquash}
-    entropy: {class: AutotuneRegulator}
-    trust_region: {class: AutotuneRegulator, min_alpha: 1.0e-6, target: 0.2}
-
+    actor:   {class: ScoreContinuousActor, latent_dim: 512, layers : 3 }
+    critic:  {class: C51Critic }
+    squash:  {class: ErfSquash }
+    entropy: {class: AutotuneRegulator }
+    
 SDAC:
   params:
     entropy_scale: -0.9
+
     num_candidates: 32
-    num_bon: 32
+    num_bon: 8
+
+    # Reciprocal std of the (q_scale-normalized) softmax logits, so < 1 sharpens.
+    # 0.25 puts the candidate weights at ESS ~2.5 of K=32, i.e. ~half the DSM
+    # target is fittable signal; 1.0 left ESS ~15 and ~7%.
+    softmax_temp: 0.25
+
+    # Per-sample probability that the DSM fit's x_0 is the replay action rather
+    # than the policy's own best-of-N latent.
+    x0_data_frac: 0.5
+
     explore_init: 0.1
+    explore_min: 1.0e-3
+    explore_max: 1.0
 
   components:
-    actor:   {class: VPDiffusionActor}
-    critic:  {class: HLGaussCritic }
-    squash:  {class: TanhSquash}
-    entropy: {class: AutotuneRegulator}
+    actor:   {class: VPDiffusionActor, latent_dim: 512, layers: 3, num_steps: 20, activation: Mish}
+    critic:  {class: C51Critic, pessimistic_target: true}
+    squash:  {class: TanhSquash }
+    entropy: {class: AutotuneRegulator }
 
 NCLQL:
   params:
-    level_embed_dim: 16
-
+    noise_levels: 10
     steps_per_level: 2
 
-    # eps, tied to the ladder: sqrt(step_size)/sigmas.end is the injected noise
-    # as a multiple of each level's own sigma (0.316 here -- sub-sigma, as
-    # annealed Langevin assumes). Retune it whenever `sigmas.end` moves.
-    step_size: 1.0e-5
+    # The reference's `step_lr`: the level's step is step_size*(sigma_i/sigma_L)^2,
+    # the drift is half of that times `temperature`, and the injected noise is
+    # its square root. Tied to the ladder, so retune whenever `sigmas` moves.
+    step_size: 1.0e-4
 
-    # drift_scale applies when normalize_score is on (step length =
-    # drift_scale * sigma_i), temperature when it is off (the paper's w).
-    drift_scale: 0.5
-    temperature: 1000.0
+    # The paper's `w`, a temperature on Q. It scales the drift whether or not
+    # the score is normalized -- normalization replaces the score's *direction
+    # vector*, not the step length.
+    temperature: 500.0
 
     normalize_score: True
     clip_actions: True
+
+    # Applied to the reward before the Bellman target, so it sets the scale Q
+    # settles at. The reference's `reward_scale`.
+    reward_scale: 0.2
 
     action_limit: 1.0
     init_scale: 1.0
@@ -136,40 +135,5 @@ NCLQL:
   components:
     # Spans the canonical [-1, 1] action range down to a scale where the
     # smoothed Q is effectively the clean one.
-    sigmas:  {class: ExponentialSchedule, start: 1.0, end: 0.01, steps: 10}
-    critic:   {class: MinEnsembleCritic, n_models: 2}
-    
-PPOPolicy:
-  params:
-    gamma: 0.99
-    lam: 0.95
-    clip_eps: 0.2
-    entropy_coef: 0.05
-  components:
-    actor:  {class: StochasticActor}
-    critic: {class: PPOCritic}
-
-IQLPolicy:
-  params:
-    tau: 0.7
-    beta: 3.0
-  components:
-    actor:  {class: StochasticActor, layers: 6}
-    critic: {class: IQLCritic}
-
-FlowQLPolicy:
-  params:
-    alpha: 100.0
-  components:
-    actor:  {class: DistilledFlowActor}
-    critic: {class: MeanStdEnsembleCritic, hidden_dim: 512, layers: 4}
-
-FlowBCPolicy:
-  components:
-    actor: {class: FlowBCActor}
-
-DirectPolicy:
-  components:
-    actor: {class: DeterministicActor}
-
-
+    sigmas:  { class: ExponentialSchedule, start: 0.1, end: 0.001, steps: 10 }
+    critic:  { class: NCLQLCritic }

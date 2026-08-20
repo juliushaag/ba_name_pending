@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import optax
 from flax import nnx
 
-from barl_jax.networks.flow import sinusoidal_emb
+from barl_jax.networks.flow import TimeEmbedding
 from barl_jax.networks.mlp import MLP
 from barl_jax.networks.registry import get_component, register_component
 from barl_jax.policy import Actor, Buffer, Critic
@@ -33,11 +33,12 @@ class StochasticActor(Actor):
   `log_std` is a state-independent parameter rather than a network head --
   barl's deliberate deviation from canonical SAC, kept as-is."""
 
-  def __init__(self, env_stats, hidden_dim: int, layers: int, squash_cls: str,
+  def __init__(self, env_stats, latent_dim: int, layers: int, squash_cls: str,
                lr: float = 3e-4,
-               activation: str = "silu", norm: str = None, norm_stem: bool = False,
+               activation: str = "silu", norm: str = None,
+               norm_input: bool = False, norm_stem: bool = False, norm_after_act: bool = True,
                dropout: float = 0.0, final_activation: bool = False,
-               residual: bool = False, norm_kwargs: dict = None,
+               residual: bool = False, norm_kwargs: dict = None, dtype: str = "float32",
                *, rngs: nnx.Rngs, **kwargs):
     super().__init__(env_stats, **kwargs)
 
@@ -45,10 +46,11 @@ class StochasticActor(Actor):
     self.log_std = nnx.Param(jnp.zeros((self.action_dim,), jnp.float32))
     self.squash  = get_component(squash_cls)(env_stats)
 
-    self.net = MLP(self.obs_dim, self.action_dim, hidden_dim, layers,
-                   activation=activation, norm=norm, norm_stem=norm_stem,
+    self.net = MLP(self.obs_dim, self.action_dim, latent_dim, layers,
+                   activation=activation, norm=norm, norm_input=norm_input,
+                         norm_stem=norm_stem, norm_after_act=norm_after_act,
                    dropout=dropout, final_activation=final_activation,
-                   residual=residual, rngs=rngs, **(norm_kwargs or {}))
+                   residual=residual, dtype=dtype, rngs=rngs, **(norm_kwargs or {}))
     self.rngs = rngs
 
   def dist(self, s):
@@ -95,26 +97,31 @@ class ScoreContinuousActor(Actor):
   def __init__(self, env_stats, latent_dim: int, layers: int, max_steps: int,
                sigma_min: float, sigma_max: float, tau_min: float, tau_max: float,
                bound_c: float = 50.0, lr: float = 3e-4,
-               activation: str = "silu", norm: str = "none", norm_stem: bool = False,
+               time_dim: int = 8, time_embed: str = "sin", time_kwargs: dict = None,
+               activation: str = "silu", norm: str = "none",
+               norm_input: bool = False, norm_stem: bool = False, norm_after_act: bool = True,
                dropout: float = 0.0, final_activation: bool = False,
-               residual: bool = False, norm_kwargs: dict = None,
+               residual: bool = False, norm_kwargs: dict = None, dtype: str = "float32",
                *, rngs: nnx.Rngs, **kwargs):
 
     super().__init__(env_stats, **kwargs)
 
     self.sigma_min, self.sigma_max = float(sigma_min), float(sigma_max)
     self.tau_min,   self.tau_max   = float(tau_min),   float(tau_max)
-    self.max_steps, self.time_dim  = int(max_steps), 8
+    self.max_steps, self.time_dim  = int(max_steps), int(time_dim)
     self.bound_c   = float(bound_c)
     self.lr        = float(lr)
     self._log_r    = math.log(sigma_max / sigma_min)
     self._int_base = float(self._raw_int(jnp.asarray(tau_min, jnp.float32)))
 
+    self.time_emb = TimeEmbedding(self.time_dim, time_embed, rngs=rngs, **(time_kwargs or {}))
+
     self.diffusion_act = MLP(self.obs_dim + self.action_dim + self.time_dim,
                              self.action_dim, latent_dim, layers,
-                             activation=activation, norm=norm, norm_stem=norm_stem,
+                             activation=activation, norm=norm, norm_input=norm_input,
+                             norm_stem=norm_stem, norm_after_act=norm_after_act,
                              dropout=dropout, final_activation=final_activation,
-                             residual=residual, rngs=rngs, **(norm_kwargs or {}))
+                             residual=residual, dtype=dtype, rngs=rngs, **(norm_kwargs or {}))
 
     # u ~ 0 at the beginning.
     self.diffusion_act.head.kernel[...] = jnp.zeros_like(self.diffusion_act.head.kernel[...])
@@ -128,10 +135,18 @@ class ScoreContinuousActor(Actor):
     self.rngs     = rngs
 
   def sigma_fn(self, tau):
-    return self.sigma_min * (self.sigma_max / self.sigma_min) ** tau
+    """dime_am's `get_geometric_scheduler`: sigma(t) = sigma_min * r^(1-t) *
+    sqrt(2 log r), which *decreases* over the path. barl previously used the
+    increasing sigma_min * r^t with no sqrt(2 log r) factor -- a different
+    process, not a reparameterization of this one."""
+    r = self.sigma_max / self.sigma_min
+    return self.sigma_min * r ** (1.0 - tau) * math.sqrt(2.0 * self._log_r)
 
   def _raw_int(self, tau):
-    return self.sigma_min ** 2 * ((self.sigma_max / self.sigma_min) ** (2 * tau) - 1) / (2 * self._log_r)
+    """int_0^tau sigma^2 = sigma_max^2 (1 - r^(-2 tau)), the reference's
+    `sigma_t_0(t)^2`, in closed form."""
+    r = self.sigma_max / self.sigma_min
+    return self.sigma_max ** 2 * (1.0 - r ** (-2.0 * tau))
 
   def sigma_sq_int_fn(self, tau):
     """int_{tau_min}^{tau} sigma^2(t) dt -- matches what the sampler injects."""
@@ -144,9 +159,7 @@ class ScoreContinuousActor(Actor):
     tau = self.tau_min + jax.random.uniform(k_tau, (X.shape[0],), jnp.float32) * (self.tau_max - self.tau_min)
     sig_sq_tau = self.sigma_sq_int_fn(tau)[:, None]
     sig_sq_one = self.sigma_sq_int_fn(jnp.full((X.shape[0],), self.tau_max, jnp.float32))[:, None]
-
-    # Sample X from the policy, NOT from the batch -- the bridge is toward the
-    # policy's own terminal sample.
+    
     var = jnp.maximum(sig_sq_tau - (sig_sq_tau ** 2 / sig_sq_one), 0.0)
     X_t = X * (sig_sq_tau / sig_sq_one) + jnp.sqrt(var) * jax.random.normal(k_eps, X.shape, X.dtype)
 
@@ -175,7 +188,7 @@ class ScoreContinuousActor(Actor):
     path_int = jnp.zeros((B, 1), jnp.float32)
 
     for i in range(self.max_steps):
-      emb     = sinusoidal_emb(jnp.broadcast_to(self.taus[...][i], (B, 1)), self.time_dim)
+      emb     = self.time_emb(jnp.broadcast_to(self.taus[...][i], (B, 1)))
       u_tilde = self.bound_control(self.diffusion_act(obs, X, emb), X, self.sigma[...][i])
       v       = self.step_var[...][i]
 
@@ -209,10 +222,12 @@ class DiscreteDiffusionActorBase(Actor, ABC):
   the graph rather than a side effect on the module."""
 
   def __init__(self, env_stats, latent_dim: int, layers: int, num_steps: int,
-               time_dim: int = 8, lr: float = 3e-4,
-               activation: str = "silu", norm: str = "none", norm_stem: bool = False,
+               time_dim: int = 8, time_embed: str = "sin", time_kwargs: dict = None,
+               lr: float = 3e-4,
+               activation: str = "silu", norm: str = "none",
+               norm_input: bool = False, norm_stem: bool = False, norm_after_act: bool = True,
                dropout: float = 0.0, final_activation: bool = False,
-               residual: bool = False, norm_kwargs: dict = None,
+               residual: bool = False, norm_kwargs: dict = None, dtype: str = "float32",
                *, rngs: nnx.Rngs, **kwargs):
     super().__init__(env_stats, **kwargs)
 
@@ -220,11 +235,14 @@ class DiscreteDiffusionActorBase(Actor, ABC):
     self.time_dim  = int(time_dim)
     self.lr        = float(lr)
 
+    self.time_emb = TimeEmbedding(self.time_dim, time_embed, rngs=rngs, **(time_kwargs or {}))
+
     self.diffusion_act = MLP(self.obs_dim + self.action_dim + time_dim, self.action_dim,
                              latent_dim, layers, activation=activation, norm=norm,
-                             norm_stem=norm_stem, dropout=dropout,
+                             norm_input=norm_input, norm_stem=norm_stem,
+                             norm_after_act=norm_after_act, dropout=dropout,
                              final_activation=final_activation, residual=residual,
-                             rngs=rngs, **(norm_kwargs or {}))
+                             dtype=dtype, rngs=rngs, **(norm_kwargs or {}))
     self.tau_table = Buffer(jnp.arange(num_steps + 1, dtype=jnp.float32) / num_steps)
     self.rngs = rngs
 
@@ -257,7 +275,7 @@ class DiscreteDiffusionActorBase(Actor, ABC):
     return tau[:, None]
 
   def predict_raw(self, obs, x, n):
-    emb = sinusoidal_emb(self._tau(n, x.shape[0]), self.time_dim)
+    emb = self.time_emb(self._tau(n, x.shape[0]))
     return self.diffusion_act(obs, x, emb)
 
   def predict_score(self, obs, x, n):
@@ -269,9 +287,15 @@ class DiscreteDiffusionActorBase(Actor, ABC):
     return g * x0 + jnp.sqrt(nu) * jax.random.normal(key, x0.shape, x0.dtype)
 
   def sample_phi0(self, x_n, n, num_candidates: int, key):
+    # Posterior of x_0 given x_n under the same N(0, I) prior `prior_sample`
+    # draws from. A flat prior instead spreads the candidates by sqrt(nu)/g,
+    # which is 31 at the top of a VP ladder ending at alpha_bar 1e-3 -- every
+    # candidate then squashes to the same +-1 corner and the weights that carry
+    # the whole learning signal go exactly uniform.
     g, nu = self.marginal_coef(n)
-    eps = jax.random.normal(key, (num_candidates, *x_n.shape), x_n.dtype)
-    return (x_n / g)[None] + (jnp.sqrt(nu) / g)[None] * eps
+    denom = g ** 2 + nu
+    eps   = jax.random.normal(key, (num_candidates, *x_n.shape), x_n.dtype)
+    return (g / denom * x_n)[None] + jnp.sqrt(nu / denom)[None] * eps
 
   def score_target(self, x0, x_n, n):
     g, nu = self.marginal_coef(n)

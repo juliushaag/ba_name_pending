@@ -17,7 +17,7 @@
 
 defaults:
   checkpoint: null          # path to resume from, or null to train from scratch
-  total_env_steps: 500000  # stop once this many env steps have been collected
+  total_env_steps: 1000000  # stop once this many env steps have been collected
   random_steps: 5000    # random-action buffer fill before training starts (off-policy only, see
                         # main()). dime_am's `learning_starts`; training on a buffer holding only
                         # the first few on-policy steps is what it exists to avoid.
@@ -38,8 +38,8 @@ defaults:
   batch_size: 256
  
   eval_every: 25000         # grad steps between eval2s
-  eval_runs: 10             # episodes per eval, run in parallel
-  eval_videos: 2            # of those runs, how many render frames (they run on
+  eval_runs: 20             # episodes per eval, run in parallel
+  eval_videos: 1            # of those runs, how many render frames (they run on
                             # their own env). Rendering costs ~140x the env step,
                             # so this is most of an eval's wall clock. null = all.
   log_every: 10             # grad steps between primary-tier logs (one headline key per quantity)

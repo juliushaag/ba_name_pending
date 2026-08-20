@@ -30,8 +30,12 @@ class AutotuneRegulator(Component, nnx.Module):
 
     self.target_value = float(target)
     # max_alpha/min_alpha are accepted because config/components.yaml sets them,
-    # but value() has never clamped -- the torch original computed the same two
-    # bounds and ignored them too. Kept as config, not as dead state.
+    # but value() does not clamp -- dime_am's dual is unbounded too, and pinning
+    # alpha at a floor injects a constant entropy bonus into the Bellman target
+    # that a near-zero-reward env cannot outvote. Kept as config, not as dead
+    # state, so a bound can be reinstated without a config migration.
+    self.min_alpha = float(min_alpha)
+    self.max_alpha = float(max_alpha)
 
   def value(self):
     return jnp.exp(self.log_alpha[...])

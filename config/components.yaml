@@ -1,76 +1,39 @@
-# Per-component-class baseline kwargs -- the one and only defaults layer in
-# the whole config chain. Top-level keys are component class names exactly as
-# registered in src/barl_jax/networks/registry.py (`class:` values in
-# config/models.yaml); each block is that class's full kwarg set.
-#
-# Full resolution order for a slot (lowest -> highest precedence):
-#
-#   this file's entry for the slot's `class:`
-#     < config/models.yaml's per-policy `components: {<slot>: {...}}`
-#     < the active profile's override for that slot
-#     < kwargs the Policy passes itself (algorithm-fixed, never tunable)
-#
-# There is no other defaults layer -- no per-policy fallback, no Python-level
-# HParam table. A policy slot only needs `class:` plus whatever it wants to
-# differ from the baseline here, and
-#
-#   uv run python scripts/jax/print_config.py <model> [--profile P]
-#
-# prints every resolved kwarg annotated with which of the layers above it came
-# from, so no value is ever unattributable.
-#
-# A class missing from this file isn't an error -- its slot just has to spell
-# every kwarg out in models.yaml. Adding an entry here is what makes swapping a
-# slot's `class:` a one-word edit (and therefore a sweepable axis).
 
-# --- The MLP surface ------------------------------------------------------
-#
-# Every block below that builds an MLP accepts this whole set, so a network's
-# shape is configured where the component is, not in Python:
-#
-#   activation        silu / relu / gelu / tanh / relu6
-#   norm              none / layer / batch / batchrenorm
-#   norm_stem         also normalize the stem's output (CrossQ-style nets do)
-#   dropout           per-hidden-layer dropout, DroQ-style; off at eval
-#   final_activation  activation after the head
-#   residual          pre-norm residual blocks instead of a plain stack
-#   norm_kwargs       passed to the chosen norm, e.g.
-#                     {momentum: 0.01, warmup_steps: 100000} for batchrenorm
-#
-# Each is listed explicitly in the blocks below rather than left to a Python
-# default, so `print_config.py` shows the whole network and a sweep can vary
-# any of them (`--set model.components.critic.activation=relu`).
-
-
-# --- Actors ---------------------------------------------------------------
-
-DeterministicActor:
-  hidden_dim: 128
-  layers: 4
 
 StochasticActor:
-  hidden_dim: 256
-  layers: 4
+  latent_dim: 512
+  layers: 3
   squash_cls: TanhSquash
   activation: silu
   norm: layer
   norm_stem: false
+  norm_input: false
+  norm_after_act: true
   dropout: 0.0
   final_activation: false
   residual: false
+  dtype: float32
 
 ScoreContinuousActor:
-  latent_dim: 256
+
+  latent_dim: 512
   layers: 3
   activation: silu
   norm: none
   norm_stem: false
+  norm_input: false
+  norm_after_act: true
   dropout: 0.0
   final_activation: false
   residual: false
+  dtype: float32
+
   max_steps: 16
-  sigma_min: 2.0
-  sigma_max: 2.5
+  time_dim: 8
+  time_embed: sin
+  time_kwargs: {num_freqs: 16, freq_min: 0.1, freq_max: 100.0, hidden: 32, concat_input: true}
+  sigma_min: 0.01
+  sigma_max: 2.0
   tau_min: 0.0
   tau_max: 1.0
 
@@ -86,30 +49,43 @@ FlowBCActor:
   hidden_layers: 4
 
 VPDiffusionActor:
-  latent_dim: 256
+  latent_dim: 512
   layers: 3
   num_steps: 16
-  activation: silu
+  time_dim: 8
+  time_embed: sin
+  time_kwargs: {num_freqs: 20, freq_min: 0.1, freq_max: 100.0, hidden: 32, concat_input: true}
+  activation: gelu
   norm: none
   norm_stem: false
+  norm_input: false
+  norm_after_act: true
   dropout: 0.0
   final_activation: false
   residual: false
+  dtype: float32
+
   cosine_s: 0.008
   ab_start: 0.999
   ab_end: 0.001
 
-
 OUDiffusionActor:
-  latent_dim: 256
+  latent_dim: 512
   layers: 3
   num_steps: 16
-  activation: silu
+  time_dim: 8
+  time_embed: sin
+  time_kwargs: {num_freqs: 20, freq_min: 0.1, freq_max: 100.0, hidden: 32, concat_input: true}
+  activation: gelu
   norm: none
   norm_stem: false
+  norm_input: false
+  norm_after_act: true
   dropout: 0.0
   final_activation: false
   residual: false
+  dtype: float32
+
   beta_min: 0.12
   beta_max: 0.18
   beta_scale_min: 0.7
@@ -121,116 +97,125 @@ OUDiffusionActor:
 
 # --- Critics --------------------------------------------------------------
 #
-# `gamma` is required by QCriticBase itself, so every subclass below carries
-# it. Only a critic that actually reduces with a spread takes one more: `rho`
-# on MeanStdEnsembleCritic is epistemic pessimism across heads,
-# `risk_aversion` on QRDistributionalCritic/C51Critic is a mean-variance risk
-# measure over the return distribution. Mean/MinEnsembleCritic take neither,
-# and neither does HLGaussCritic -- its histogram is a discretized scalar
-# regression, not a return distribution, so its spread is `sigma`, not a risk
-# preference.
+# `gamma` is required by QCriticBase itself, so every subclass below carries it.
+# Only EnsembleCritic reduces with a spread, and its `rho` is epistemic
+# pessimism *across heads* -- not a risk preference over the return. C51 needs
+# none: it reduces by min over its heads. Nor does HLGaussCritic, whose spread
+# `sigma` is label smoothing on a discretized scalar regression.
 #
 # No critic here has a target network: the bootstrap is priced by the live
 # weights in the same forward as the prediction it trains, CrossQ's (Bhatt et
 # al., ICLR 2024) replacement for one. That makes `norm` load-bearing rather
-# than cosmetic -- "batchrenorm" is what the single shared forward buys you,
-# and is why there is no separate CrossQCritic class.
+# than cosmetic -- "batchrenorm" is what the single shared forward buys you.
 
-MeanStdEnsembleCritic:
-  activation: silu
-  norm: layer
-  norm_stem: false
-  dropout: 0.0
-  final_activation: false
-  residual: false
-  hidden_dim: 2048
-  layers: 2
-  n_models: 10
-  rho: 2.0
-  gamma: 0.99
+# Deliberately identical to C51Critic below apart from `rho` replacing
+# `num_atoms`/`entropy_coef`, so `--set model.components.critic.class=EnsembleCritic`
+# changes the return representation and nothing else.
+EnsembleCritic:
 
-MeanEnsembleCritic:
-  activation: silu
-  norm: layer
-  norm_stem: false
-  dropout: 0.0
-  final_activation: false
-  residual: false
-  hidden_dim: 2048
-  layers: 2
-  n_models: 10
-  gamma: 0.99
+  lr: 3.0e-4
 
-# CrossQ-style: BatchRenorm heads, min over 2 of them. Every BatchRenorm layer
-# sees the (s,a) and (s',a') batches as a single population, which is the
-# property a target network otherwise exists to provide.
-MinEnsembleCritic:
-  activation: silu
-  norm: batchrenorm
-  norm_stem: false
-  dropout: 0.0
-  final_activation: false
-  residual: false
-  # BatchRenorm's r/d clipping opens over warmup_steps; until then it is
-  # plain BatchNorm, so the running statistics are settled before they
-  # start correcting the batch ones. `momentum` is the weight on the
-  # *batch* moment (torch convention), i.e. flax's 0.99.
-  norm_kwargs: {momentum: 0.01, warmup_steps: 100000}
-  hidden_dim: 2048
+  activation: relu
+  latent_dim: 2048
   layers: 2
   n_models: 2
+  rho: 1.0
   gamma: 0.99
 
-QRDistributionalCritic:
-  hidden_dim: 2048
-  layers: 2
-  num_quantiles: 100
-  risk_aversion: 2.0
-  gamma: 0.99
+  dtype: bfloat16
 
-C51Critic:
-  hidden_dim: 512
-  layers: 2
-  num_atoms: 101
-  risk_aversion: 2.0
   norm: batchrenorm
-  gamma: 0.99
-
-HLGaussCritic:
-  activation: tanh
-  norm: batchrenorm
-  norm_stem: false
+  norm_stem: true
+  norm_input: true
+  norm_after_act: true
   dropout: 0.0
   final_activation: false
   residual: false
-  # BatchRenorm's r/d clipping opens over warmup_steps; until then it is
-  # plain BatchNorm, so the running statistics are settled before they
-  # start correcting the batch ones. `momentum` is the weight on the
-  # *batch* moment (torch convention), i.e. flax's 0.99.
+
   norm_kwargs: {momentum: 0.01, warmup_steps: 100000}
-  hidden_dim: 2048
+
+C51Critic:
+
+  lr: 3.0e-4
+  activation: gelu
+  latent_dim: 2048
   layers: 2
-  num_bins: 1001
-  # sigma = this * bin width. Farebrother et al. (2024) sweep it and land on
-  # 0.75: small enough that neighbouring bins stay distinguishable, wide enough
-  # that the target spans several of them and the head gets a gradient
-  # everywhere rather than only at the argmax bin.
+  n_models: 2
+  num_atoms: 101
+  entropy_coef: 0.005
+  gamma: 0.99
+
+  # Put the heads' `min` in the Bellman target too, not just in the price a
+  # policy improves against. Off here because SAC/DIME/AMDP all learn this env
+  # with the averaging target; SDAC turns it on (see config/models.yaml).
+  pessimistic_target: false
+
+  dtype: bfloat16
+
+  norm: batchrenorm
+  norm_stem: true
+  norm_input: true
+  norm_after_act: true
+  dropout: 0.0
+  final_activation: false
+  residual: false
+
+  norm_kwargs: {momentum: 0.01, warmup_steps: 100000}
+
+HLGaussCritic:
+
+  lr: 3.0e-4
+  
+  activation: gelu
+  latent_dim: 2048
+  layers: 2
+  n_models: 2
+  num_bins: 151
   sigma_to_bin_ratio: 0.75
   gamma: 0.99
 
-PPOCritic:
-  hidden_dim: 256
-  layers: 4
+  dtype: bfloat16
 
-IQLCritic:
-  hidden_dim: 256
-  layers: 6
+  norm: batchrenorm
+  norm_stem: true
+  norm_input: true
+  norm_after_act: true
+  dropout: 0.0
+  final_activation: false
+  residual: false
+
+  norm_kwargs: {momentum: 0.01, warmup_steps: 100000}
+
+
+# NC-LQL's own critic (src/barl_jax/policies/lql.py), matching ku-dmlab/NCLQL:
+# two heads with a Polyak target network -- the one critic here that has one,
+# because NC-LQL has no actor to keep the bootstrap action on-distribution --
+# reduced by `min` for the bootstrap and by `mean` for the Langevin score.
+# Noise conditioning is inside it: `time_dim` sets the width of the sinusoidal
+# level encoding concatenated to (obs, act). Defaults are the reference's: no
+# normalization, mish, lr 1e-4, tau 0.005.
+NCLQLCritic:
+  latent_dim: 256
+  layers: 2
+  n_models: 2
+  time_dim: 16
+  polyak_tau: 0.005
+  
+  lr: 1.0e-4
+
   gamma: 0.99
 
+  dtype: float32
 
-# NC-LQL has no critic entry of its own: its level ladder, embedding and
-# Langevin sampler all live on NCLQLPolicy, so what it needs from here is
-# whatever class fills its `q_net` slot (see config/models.yaml).
+  activation: mish
+  norm: none
+  norm_stem: false
+  norm_input: false
+  norm_after_act: true
+  dropout: 0.0
+  final_activation: false
+  residual: false
+
 
 # --- Duals / squashes -----------------------------------------------------
 #
@@ -239,10 +224,10 @@ IQLCritic:
 # weight for those and only the trust-region slot sets one in models.yaml.
 
 AutotuneRegulator:
-  lr: 3.0e-4
-  alpha_init: 0.05
-  min_alpha: 0.01
-  max_alpha: 10.0
+  lr: 1.0e-3
+  alpha_init: 1.0
+  min_alpha: 0.0000001
+  max_alpha: 500.0
 
 TanhSquash: {}
 

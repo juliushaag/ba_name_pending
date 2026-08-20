@@ -28,14 +28,6 @@ from barl_jax.multiseed import MultiSeedReplay, StackedPolicy, split_metrics, st
 from barl_jax.policy import TRAINABLE, Policy
 from barl_jax.train import train_step
 
-# graphdef and tiers are static; state and batch carry the seed axis.
-#
-# `state` is donated: it is threaded in and straight back out every step and
-# never read again by the caller, so letting XLA write the update into the
-# input's buffers saves re-allocating the whole parameter+optimizer tree once
-# per gradient step. The contract that makes this safe is that **every** caller
-# rebinds the returned state over the one it passed in -- a caller that kept
-# the old reference would find it a deleted buffer.
 seeded_step = jax.jit(jax.vmap(train_step, in_axes=(None, 0, 0, None)),
                       static_argnums=(0, 3), donate_argnums=(1,))
 
@@ -116,10 +108,21 @@ def evaluate(run: Run, envs, log, ckpt_dir, best):
   eval_env, render_env = envs
   rewards, lengths, successes = [], [], []
 
+  # Entry/exit are logged because an eval is the one phase that can stall for
+  # tens of minutes with nothing on stdout, and telling "stalled" from "running
+  # normally, just slow" after the fact otherwise means reading a stack trace.
+  started = time.perf_counter()
+  log.message(f"Eval start @ grad_step {log.get_step('grad_steps')} "
+              f"(every {cfg['eval_every']}), {run.num_seeds} seeds x {cfg['eval_runs']} episodes")
+
   for i in range(run.num_seeds):
     policy, _ = unstack(run.graphdef, run.state, i)
+    # Only seed 0's video is ever logged, so only seed 0 renders one. Every seed
+    # rendering a full episode and discarding all but the first cost a whole
+    # extra rendered episode per seed per eval -- ~5 s each at 1000 frames.
+    videos = cfg.get("eval_videos", 2) if i == 0 else 0
     runs = policy.evaluate(eval_env, runs=cfg["eval_runs"],
-                           videos=cfg.get("eval_videos", 2), render_env=render_env)
+                           videos=videos, render_env=render_env)
     reward = float(np.mean([np.sum(r["rewards"]) for r in runs]))
     rewards.append(reward)
     lengths.append(np.mean([len(r["rewards"]) for r in runs]))
@@ -147,6 +150,8 @@ def evaluate(run: Run, envs, log, ckpt_dir, best):
   log.log_per_seed(per_seed, panel=panel)
   for i, seed_best in enumerate(best):
     log.summary("best_reward", float(seed_best), seed_index=i)
+  log.message(f"Eval done  @ grad_step {log.get_step('grad_steps')} "
+              f"in {time.perf_counter() - started:.1f}s")
   return best
 
 
@@ -163,7 +168,10 @@ def train(run: Run):
     name += f"_x{num_seeds}"
 
   n_videos  = cfg["eval_runs"] if cfg.get("eval_videos") is None else min(cfg["eval_videos"], cfg["eval_runs"])
-  eval_envs = (run.environment.get_vector_env(cfg["eval_runs"] - n_videos) if cfg["eval_runs"] > n_videos else None,
+  # The rendering env must stay synchronous (a worker's render() comes back as
+  # an EOFError); the unrendered one is parallel as before.
+  eval_envs = (run.environment.get_vector_env(cfg["eval_runs"] - n_videos)
+               if cfg["eval_runs"] > n_videos else None,
                run.environment.get_vector_env(n_videos, asynchronous=False) if n_videos else None)
 
   tags = [run.model_name, run.env_name, "online", "jax"]
@@ -252,7 +260,12 @@ def train(run: Run):
 
       log.advance({"grad_steps": 1})
 
-      if log.get_step("env_steps") % cfg["eval_every"] == 0:
+      # grad_steps, not env_steps: env_steps only advances once per rollout, so
+      # it is *constant* across this whole loop -- the moment it landed on a
+      # multiple of eval_every, this fired on every one of the iteration's
+      # grad steps and ran thousands of evaluations back to back. grad_steps
+      # advances by one here, so a multiple is hit exactly once.
+      if log.get_step("grad_steps") % cfg["eval_every"] == 0:
         eval_start = time.perf_counter()
         best = evaluate(run, eval_envs, log, ckpt_dir, best)
         eval_time += time.perf_counter() - eval_start
