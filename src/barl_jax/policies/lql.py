@@ -102,6 +102,8 @@ class NCLQLCritic(QCriticBase):
 class NCLQL(Policy):
   """Noise-Conditioned Langevin Q-Learning (Ki et al. 2026).
 
+  Reference implementation: https://github.com/ku-dmlab/NCLQL/tree/main
+
   Actor-free. There is no policy network, no entropy estimate and no entropy
   dual -- the whole actor + AutotuneRegulator apparatus disappears, because
   grad_a log pi_soft(a|s) = grad_a Q(s,a) means the target score is already

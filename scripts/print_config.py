@@ -27,6 +27,7 @@ def print_model(name: str) -> None:
       print(f"    {key:<{width}}  {info['value']!r:<12}  {info['source']}"
             + (f"   (shadows {shadowed})" if shadowed else ""))
 
+  print_block("training", cfg["training"])
   print_block("params", cfg["params"])
   for slot, slot_cfg in cfg["components"].items():
     print_block(f"components.{slot}  [{slot_cfg['class']}]", slot_cfg["kwargs"])

@@ -21,6 +21,8 @@ def _inv_sigmoid(y: float) -> float:
 class SDAC(Policy):
   """Soft Diffusion Actor-Critic (Ma et al. 2025).
 
+  Reference implementation https://github.com/mahaitongdae/diffusion_policy_online_rl/
+
   The actor is fitted by a *soft* denoising loss: K noises are drawn per
   transition, the x0 each implies is reconstructed from x_t and priced by the
   critic, and the denoiser is regressed back onto those same noises under the
@@ -31,10 +33,14 @@ class SDAC(Policy):
   Two deliberate departures from the reference remain, both stated so the
   comparison against its numbers stays falsifiable:
 
-  * **Temperature.** The reference divides Q by a constant (its initial alpha);
-    this divides by `softmax_temp` times the critic's own within-state spread
-    across the K candidates, which makes the weighting invariant to the scale Q
-    happens to have reached. `sdac/q_scale` logs that spread.
+  * **Temperature.** The reference scales Q by `alpha_init / alpha` -- the
+    constant 5.0 over the *current* learned alpha (`q_min * 5. /
+    jnp.exp(log_alpha)`, relax/algorithm/sdac.py) -- so its weighting already
+    tracks the entropy dual as that dual anneals. This divides by
+    `softmax_temp` times the critic's own within-state spread across the K
+    candidates instead, which makes the weighting invariant to the scale Q
+    happens to have reached rather than tied to alpha. `sdac/q_scale` logs
+    that spread.
   * **Bounding.** The reference clips the reconstruction into the action box;
     this squashes it. Both bound, but a clip has zero gradient outside the box
     where tanh merely saturates -- watch `sdac/cand_saturation`, and

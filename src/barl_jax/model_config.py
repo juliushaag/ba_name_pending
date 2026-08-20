@@ -23,6 +23,22 @@ _COMPONENTS_PATH = os.path.join(_CONFIG_DIR, "components.yaml")
 # contents of that file.
 COMPONENT_DEFAULTS_KEY = "component_defaults"
 
+# The run-config keys a policy is allowed to set from its own `training:` block in
+# config/models.yaml -- the ones that are a property of the *algorithm* rather
+# than of the experiment. Everything else about a run (how long it trains, how
+# many envs, how often it evaluates, what it logs) stays in
+# config/online_learning.yaml, which is the whole point of the whitelist: a key
+# outside it in a model's `training:` block is a typo or a misplaced knob, and
+# validate() says so rather than letting it silently do nothing.
+TRAINING_KEYS = frozenset({
+  "rollout_steps",       # env steps per outer iteration
+  "batch_size",
+  "utd_ratio",           # grad steps per env step (off-policy)
+  "epochs_per_rollout",  # on-policy passes over the buffer
+  "random_steps",        # uniform-action buffer fill before training
+  "lr_warmup_steps",
+})
+
 _models_cache: dict = None
 _components_cache: dict = None
 _models_override: dict | None = None
@@ -155,6 +171,29 @@ def _params_layers(policy_name: str, profile: str | None) -> list[tuple[str, dic
   return layers
 
 
+def _training_layers(policy_name: str, profile: str | None) -> list[tuple[str, dict]]:
+  policy_cfg = _models().get(policy_name) or {}
+  layers = [(f"models.yaml: {policy_name}.training", dict(policy_cfg.get("training", {})))]
+  if profile is not None:
+    layers.append((f"models.yaml: {policy_name}.profiles.{profile}.training",
+                   dict(_profile_cfg(policy_name, profile).get("training", {}))))
+  return layers
+
+
+def resolve_training(name: str) -> dict:
+  """The run-config keys `name` sets for itself (models.yaml's `training:` block,
+  profile-overridable), as one flat dict -- restricted to TRAINING_KEYS.
+
+  Unlike resolve_slot/resolve_params this takes a *model* string rather than a
+  policy class name, because its caller is barl_jax.config.load_config, which
+  only ever has the `model:` a run entry named. It deliberately sits *below*
+  the run config's own levels: a model states what its algorithm needs, and
+  config/online_learning.yaml's env_defaults/run entry (and therefore any
+  scripts/run_sweep.py `run.` axis) still wins over it."""
+  policy_name, profile = resolve_model_name(name)
+  return {k: v for k, v in _merge(_training_layers(policy_name, profile)).items() if k in TRAINING_KEYS}
+
+
 def _merge(layers: list[tuple[str, dict]]) -> dict:
   merged: dict = {}
   for _, kwargs in layers:
@@ -208,6 +247,7 @@ def explain(name: str) -> dict:
     "policy": policy_name,
     "profile": profile,
     "params": annotate(_params_layers(policy_name, profile)),
+    "training": annotate(_training_layers(policy_name, profile)),
     "components": components,
   }
 
@@ -226,6 +266,7 @@ def resolved_flat(name: str) -> dict:
   rather than by which layer happened to define them."""
   policy_name, profile = resolve_model_name(name)
   out = {f"params.{k}": v for k, v in resolve_params(policy_name, profile).items()}
+  out.update({f"training.{k}": v for k, v in resolve_training(name).items()})
   for slot in (_models().get(policy_name) or {}).get("components", {}):
     cls, kwargs = resolve_slot(policy_name, slot, profile)
     out[f"components.{slot}.class"] = cls.__name__
@@ -303,6 +344,14 @@ def validate(name: str) -> list[str]:
     return problems + [f"config/models.yaml has no block for {policy_name!r}"]
 
   slots = policy_cfg.get("components", {})
+
+  # A `training:` key outside TRAINING_KEYS lands in no run config and changes nothing --
+  # the same silent no-op a typo'd sweep axis would be.
+  for source, block in _training_layers(policy_name, profile):
+    problems += [f"{source}: {key!r} is not a training key a model may set "
+                 f"({', '.join(sorted(TRAINING_KEYS))}) -- run-level knobs outside that set "
+                 f"belong in config/online_learning.yaml"
+                 for key in sorted(set(block) - TRAINING_KEYS)]
 
   for key in _overrides:
     parts = key.split(".")
