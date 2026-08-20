@@ -67,7 +67,7 @@ class SDAC(Policy):
   is applied in squashed space so its entropy needs no Jacobian correction."""
 
   # The exploration std is the Policy's own parameter -- no slot owns it.
-  policy_params = {"explore_raw": "explore"}
+  policy_params = {"explore_raw": "explore"}  # noqa: RUF012
 
   def __init__(self, env: gym.Env, **kwargs):
     super().__init__(env, **kwargs)
@@ -83,7 +83,6 @@ class SDAC(Policy):
     self.explore_init   = params["explore_init"]
     self.explore_min    = float(params["explore_min"])
     self.explore_max    = float(params["explore_max"])
-
     self.actor: VPDiffusionActor = self.build_component("actor", VPDiffusionActor)
     self.critic: QCriticBase     = self.build_component("critic", QCriticBase)
     self.squash: Squash          = self.build_component("squash", Squash)

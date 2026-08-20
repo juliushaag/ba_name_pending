@@ -8,7 +8,7 @@ from barl_jax.networks.flow import TimeEmbedding
 
 from barl_jax.networks.registry import register_component
 from barl_jax.policy import Buffer, Policy, frozen, register_policy
-from barl_jax.schedule import Schedule
+from barl_jax.networks.schedule import Schedule
 
 
 @register_component
@@ -45,7 +45,7 @@ class NCLQLCritic(QCriticBase):
     self.time_embed = TimeEmbedding(
       time_dim=int(time_dim),
       kind="fourier",
-
+      rngs=rngs,
     )
 
     q_function = ConcatQ(
@@ -60,15 +60,20 @@ class NCLQLCritic(QCriticBase):
     self.n_models   = int(n_models)
     self.polyak_tau = float(polyak_tau)
 
+    self.time_embed_target = nnx.clone(self.time_embed)
     self.q_target = nnx.clone(q_function)
 
   # ---- level conditioning -------------------------------------------------
 
-  def augment(self, act, level):
+  def augment(self, act, level, target=False):
 
     if not isinstance(level, jax.Array):
       level = jnp.full((act.shape[0],), level, jnp.int32)
-    te = self.time_embed(level.astype(jnp.float32)[:, None])
+
+    if not target:
+      te = self.time_embed(level.astype(jnp.float32)[:, None])
+    else:
+      te = self.time_embed_target(level.astype(jnp.float32)[:, None])
 
     return jnp.concatenate([act, te], axis=-1)
     
@@ -107,14 +112,23 @@ class NCLQLCritic(QCriticBase):
     """`min` over the *target* heads, the reference's `q_backup` input. The
     chain that produced `next_act` ran on the live critic; only the value it is
     scored with comes from the target."""
-    raw = self.q_target(next_obs, self.q_target.augment(next_act, level))
+    raw = self.q_target(next_obs, self.augment(next_act, level, target=True))
     return jax.lax.stop_gradient(self.reduce_value(raw))
 
   def after_step(self):
     """Polyak the target toward the live weights, once per gradient step."""
+
+    """Q-Function"""
     live = nnx.state(self.q_function, nnx.Param)
     tgt  = nnx.state(self.q_target, nnx.Param)
+
     nnx.update(self.q_target,
+               jax.tree.map(lambda t, l: t + self.polyak_tau * (l - t), tgt, live))
+    """Time-Embedding"""
+    live = nnx.state(self.time_embed, nnx.Param)
+    tgt  = nnx.state(self.time_embed_target, nnx.Param)
+    
+    nnx.update(self.time_embed_target,
                jax.tree.map(lambda t, l: t + self.polyak_tau * (l - t), tgt, live))
 
 
@@ -153,18 +167,13 @@ class NCLQL(Policy):
     self.action_limit    = params["action_limit"]
     self.init_scale      = params["init_scale"]
 
-    # The ladder sigma_1 > ... > sigma_L. The paper reports only its two
-    # endpoints (Table 6), so the spacing is the `sigmas` slot's `class:` --
-    # ExponentialSchedule is the geometric Song & Ermon (2019) default.
+   
     self.sigmas_sched: Schedule = self.build_component("sigmas", Schedule, steps=self.noise_levels)
 
     sigmas = self.sigmas_sched.ladder()
     self.sigmas = Buffer(sigmas)
-    # alpha_i / eps = sigma_i^2 / sigma_L^2   (Definition 2)
     self.alpha_ratio = Buffer((sigmas / sigmas[-1]) ** 2)
 
-    # Noise conditioning lives in the critic (NCLQLCritic.augment), so this
-    # takes the env's own act_dim rather than a widened one.
     self.critic: NCLQLCritic = self.build_component("critic", NCLQLCritic)
 
   @property
@@ -179,36 +188,11 @@ class NCLQL(Policy):
     return self.critic.augment(act, level)
 
   def critic_score(self, obs, act, level):
-    """expectation(), not value(): the Langevin chain *is* the policy here, so a
-    pessimistic bound would sample from a different distribution than exp(wQ)/Z
-    rather than merely shrink a value estimate.
-
-    nnx.grad rather than jax.grad, and the critic passed explicitly rather than
-    captured: an ensemble critic runs nnx.vmap internally, and a raw jax.grad
-    over a closure holding the module makes that vmap re-extract it at a
-    different trace level ("Cannot extract graph node from different trace
-    level")."""
     def q(critic, a):
       return critic.expectation_at(obs, a, level).sum()
     return nnx.grad(q, argnums=1)(frozen(self.critic), act)
 
   def sample(self, obs, key):
-    """Annealed Langevin dynamics (Definition 2 / Algorithm 6) -- the policy:
-
-        alpha_i = eps * sigma_i^2 / sigma_L^2
-        a_{i,t} = a_{i,t-1} + drift_i(a_{i,t-1}) + sqrt(alpha_i) * z_t
-
-    with hand-off a_{i+1,0} <- a_{i,T} across levels, so coarse levels take
-    large, heavily-perturbed jumps across a smoothed landscape and the final
-    level is a near-deterministic refinement whose stationary law is exp(wQ)/Z.
-
-    `normalize_score` replaces the score by its unit vector and *nothing else*
-    -- the `(alpha_i/2) * w` in front stays, exactly as in the reference
-    implementation (ku-dmlab/NCLQL, AnnealedLangevinDynamics.sample). It was
-    previously rescaled to `drift_scale * sigma_i` instead, which dropped both
-    alpha_i and the temperature: at the finest level that is a step of
-    0.5*sigma_L against the reference's 0.5*step_lr*w, some two orders of
-    magnitude smaller, so the chain barely climbed at all."""
     key, init_key = jax.random.split(key)
     a = self.init_scale * (2.0 * jax.random.uniform(
       init_key, (obs.shape[0], self.action_dim), jnp.float32) - 1.0)
@@ -245,8 +229,6 @@ class NCLQL(Policy):
     losses = {}
     keys = jax.random.split(self.rngs.noise(), 3)
 
-    # The Langevin chain differentiates the critic w.r.t. the *action*; its
-    # result is a target, so nothing in it trains the critic.
     next_action, score_norm = self.sample(next_obs, keys[0])
     next_action = jax.lax.stop_gradient(next_action)
 
@@ -257,17 +239,16 @@ class NCLQL(Policy):
 
     pred_clean, pred_noisy = self.critic.raw_batches(
       (obs, self.augment_action(action, self.clean_level)),
-      (obs, self.augment_action(noisy, idx)))
+      (obs, self.augment_action(noisy, idx))
+    )
 
     bootstrap = self.critic.target_bootstrap(next_obs, next_action, self.clean_level)
+
     self.critic.loss_from_raw(pred_clean,
                               self.critic.bellman_target(reward, term, bootstrap), losses)
+
     td_loss = losses.pop("q")
 
-    # -- smoothing loss: regress the noised level onto the clean value, which is
-    # what makes the critic noise-conditioned. The clean value is the prediction
-    # already computed above rather than a fresh forward -- it is the same
-    # quantity, and recomputing it was the redundant third pass.
     smoothing_target = jax.lax.stop_gradient(self.critic.reduce_expectation(pred_clean))
 
     self.critic.loss_from_raw(pred_noisy, smoothing_target, losses)

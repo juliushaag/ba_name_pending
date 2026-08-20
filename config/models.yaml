@@ -88,13 +88,8 @@ SDAC:
     num_candidates: 32
     num_bon: 8
 
-    # Reciprocal std of the (q_scale-normalized) softmax logits, so < 1 sharpens.
-    # 0.25 puts the candidate weights at ESS ~2.5 of K=32, i.e. ~half the DSM
-    # target is fittable signal; 1.0 left ESS ~15 and ~7%.
     softmax_temp: 0.25
 
-    # Per-sample probability that the DSM fit's x_0 is the replay action rather
-    # than the policy's own best-of-N latent.
     x0_data_frac: 0.5
 
     explore_init: 0.1
@@ -125,9 +120,7 @@ NCLQL:
     normalize_score: True
     clip_actions: True
 
-    # Applied to the reward before the Bellman target, so it sets the scale Q
-    # settles at. The reference's `reward_scale`.
-    reward_scale: 0.2
+    reward_scale: 1.0
 
     action_limit: 1.0
     init_scale: 1.0

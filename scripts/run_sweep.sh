@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=ml_job                 # name shown in squeue
-#SBATCH --partition=gpu_a100_il              # bwUniCluster 3.0 GPU queues:
+#SBATCH --partition=gpu_a100              # bwUniCluster 3.0 GPU queues:
                                            #   dev_gpu_h100  -> quick tests, short walltime, 4x H100 nodes
                                            #   gpu_h100      -> production runs, 4x H100 nodes (AMD EPYC 9454)
                                            #   gpu_h100_short-> shorter max walltime, higher priority
@@ -9,15 +9,16 @@
                                            #   gpu_mi300     -> AMD Instinct MI300A APU nodes
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=64                 # CPU cores for data loading etc. (nodes have 96 cores total)
-#SBATCH --gres=gpu:4                      # number of GPUs (nodes have 4x GPU each, request only what you need)
-#SBATCH --mem=496gb                        # host RAM (H100 nodes have up to 768 GiB total)
+#SBATCH --gres=gpu:2                      # number of GPUs (nodes have 4x GPU each, request only what you need)
+
 #SBATCH --output=logs/%x/%j/term.out           # stdout -> logs/ml_job_<jobid>.out
 #SBATCH --error=logs/%x/%j/term.err            # stderr
+
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=ulqho@student.kit.edu
 #SBATCH --signal=B:USR1@300
-#SBATCH --time=48:00:00                   # HH:MM:SS, check current queue limits with `sinfo` / scontrol
+
+#SBATCH --time=6:00:00                   # HH:MM:SS, check current queue limits with `sinfo` / scontrol
 
 set -euo pipefail
 trap 'cp -r "$TMPDIR/results" ~/results/$SLURM_JOB_ID/ 2>/dev/null' EXIT
@@ -33,9 +34,9 @@ uv run python -c "import torch; print('CUDA available:', torch.cuda.is_available
 # --- Run your script -------------------------------------------------
 # Runs sequentially, algo by algo; --seeds N is N seeds vmapped inside each run.
 uv run python scripts/run_sweep.py \
-    --algos SAC DIME AMDP SDAC NCLQL \
-    --envs HumanoidStand HumanoidRun HumanoidWalk DogTrot DogStand DogWalk DogRun \
-    --seeds 2
+    --algos SDAC NCLQL \
+    --envs HumanoidRun \
+    --seeds 5
 
 # --- Copy results back to persistent storage --------------------------
 mkdir -p ~/results/$SLURM_JOB_ID

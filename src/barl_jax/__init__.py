@@ -15,7 +15,7 @@ import barl_jax.networks.actor
 import barl_jax.networks.critic
 import barl_jax.networks.squash
 import barl_jax.networks.regulator
-import barl_jax.schedule
+import barl_jax.networks.schedule
 
 from barl_jax.policies import *
 from barl_jax.environments.mujoco_gym import *

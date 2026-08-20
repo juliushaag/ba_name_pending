@@ -32,7 +32,7 @@ class Schedule(Component, nnx.Module, ABC):
   runs `start` -> `end` over the remaining `steps - warmup`, then stays flat at
   `end` (so a `steps` estimate that undershoots the real run is harmless)."""
 
-  def __init__(self, env_stats=None, start: float = 1.0, end: float = None,
+  def __init__(self, env_stats=None, start: float = 1.0, end: float | None = None,
                steps: int = 1, warmup: int = 0, **kw):
 
     super().__init__(env_stats, **kw)
@@ -60,7 +60,7 @@ class Schedule(Component, nnx.Module, ABC):
   def lerp(self, w: float) -> float:
     return self.start + w * (self.end - self.start)
 
-  def ladder(self, n: int = None, dtype=jnp.float32):
+  def ladder(self, n: int | None  = None, dtype=jnp.float32):
     """`n` points spanning the curve endpoint-inclusive, ignoring `warmup` --
     the ladder view, for schedules used as a fixed set of levels."""
     n  = self.steps if n is None else n
