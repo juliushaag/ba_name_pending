@@ -263,7 +263,7 @@ if __name__ == "__main__":
   args.add_argument("--config", default=None,
                      help="Base config providing `defaults:`/`env_defaults:` for every run "
                           "(default: --grid's `base:`, else config/<script>.yaml)")
-  args.add_argument("--gpus", nargs="+", default=None, metavar="INDEX",
+  args.add_argument("--gpus", nargs="+", default="auto", metavar="INDEX",
                      help="Run one sequential worker per GPU, each pinned via "
                           "CUDA_VISIBLE_DEVICES: `--gpus 0 1 3` runs 3 runs at a time, one per "
                           "GPU, each worker taking the next combo only when its own finishes. "
