@@ -39,9 +39,6 @@ def train_step(graphdef, state, batch, tiers):
 
   def loss_fn(policy):
     total, losses = scalar_loss(policy)
-    # Popped inside the differentiated function so the traced values ride out
-    # as aux rather than escaping on a Python object. `tiers` is static, so an
-    # unarmed family is compiled away rather than merely skipped.
     sown, sown_debug = nnx.pop(policy, Metric, DebugMetric)
     return total, (losses, sown, sown_debug)
 
@@ -53,9 +50,6 @@ def train_step(graphdef, state, batch, tiers):
   primary = collect(sown)
   debug   = collect(sown_debug)
 
-  # Per-key loss and gradient norm, taken before the update on each key's own
-  # partition -- the same quantity clip_grad_norm_ returned per optimizer in
-  # the torch loop.
   if tiers:
     labels = dict(nnx.to_flat_state(policy.optimizer_labels()))
     flat_grads = nnx.to_flat_state(grads)
@@ -66,8 +60,7 @@ def train_step(graphdef, state, batch, tiers):
         primary[policy.metrics_key(key, "loss")] = losses[key]
         primary[policy.metrics_key(key, "grad_norm")] = optax.tree.norm(partition)
       if DEBUG in tiers and partition:
-        # Reduced per-tensor: a flat concatenate of every gradient is a full
-        # copy of the model, which is exactly what a diagnostic path shouldn't do.
+       
         total   = sum(g.size for g in partition)
         zeros   = sum((g == 0).sum() for g in partition)
         nonfin  = sum((~jnp.isfinite(g)).sum() for g in partition)
@@ -79,13 +72,6 @@ def train_step(graphdef, state, batch, tiers):
   opt.update(policy, grads)
   policy.after_step()
 
-  # Each metric dict is returned alongside a single array holding the same
-  # values in the same order. The caller reads keys off the dict -- which costs
-  # nothing, they are Python strings -- and transfers only the array. Bringing
-  # the dict itself across would issue one device-to-host copy per key, ~47 per
-  # logged step, which measured more than the gradient step. Stacking outside
-  # the jit does not help: it is an eager dispatch of its own, and measured
-  # worse still. The torch version drained in one crossing for the same reason.
   return nnx.state((policy, opt)), losses, (primary, _pack(primary)), (debug, _pack(debug))
 
 

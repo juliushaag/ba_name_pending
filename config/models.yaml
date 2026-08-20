@@ -118,7 +118,7 @@ NCLQL:
     normalize_score: True
     clip_actions: True
 
-    reward_scale: 1.0
+    reward_scale: 5.0
 
     action_limit: 1.0
     init_scale: 1.0
