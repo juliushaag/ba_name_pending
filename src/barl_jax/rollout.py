@@ -5,7 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from barl_jax.policy import Policy
+from barl_jax.policy import Policy, sanitize_action
 
 import gymnasium as gym
 
@@ -72,13 +72,19 @@ def summarize_rollout(acc: dict, slots: slice = slice(None)) -> dict:
   rew_mean, rew_std = mean_std("rew")
   obs_mean, obs_std = mean_std("obs")
   act_mean, act_std = mean_std("act")
-  seen = float(acc["n_act"][slots].sum()) > 0
+  n_act = float(acc["n_act"][slots].sum())
+  seen  = n_act > 0
   return dict(
     avg_reward=rew_mean, reward_std=rew_std,
     obs_mean=obs_mean,   obs_std=obs_std,
     act_mean=act_mean,   act_std=act_std,
     act_min=float(acc["act_min"][slots].min()) if seen else float("nan"),
     act_max=float(acc["act_max"][slots].max()) if seen else float("nan"),
+    # Fractions of action components the failsafe had to repair. Both are 0.0 in
+    # any healthy run; act_nonfinite > 0 means the actor produced NaN/inf and is
+    # a bug, not a tuning problem.
+    act_nonfinite=float(acc["act_nonfinite"][slots].sum()) / n_act if seen else 0.0,
+    act_clipped=float(acc["act_clipped"][slots].sum()) / n_act if seen else 0.0,
   )
 
 
@@ -305,7 +311,8 @@ class ReplayBuffer():
     acc = dict(rew_sum=zeros(), rew_sq_sum=zeros(), n_rew=zeros(),
                obs_sum=zeros(), obs_sq_sum=zeros(), n_obs=zeros(),
                act_sum=zeros(), act_sq_sum=zeros(), n_act=zeros(),
-               act_min=np.full(n_envs, np.inf), act_max=np.full(n_envs, -np.inf))
+               act_min=np.full(n_envs, np.inf), act_max=np.full(n_envs, -np.inf),
+               act_nonfinite=zeros(), act_clipped=zeros())
 
     for _ in range(n_steps):
 
@@ -325,6 +332,14 @@ class ReplayBuffer():
       acc["act_min"]     = np.minimum(acc["act_min"], act64.min(axis=1))
       acc["act_max"]     = np.maximum(acc["act_max"], act64.max(axis=1))
       acc["n_act"]      += act64.shape[1]
+
+      # Failsafe on the one path that leaves the framework. Counted, not just
+      # clamped: silently repairing a NaN action would hide the actor blowing up
+      # behind a policy that merely looks bad, and this is the last place the
+      # distinction is still visible.
+      acc["act_nonfinite"] += (~np.isfinite(act64)).sum(axis=1)
+      acc["act_clipped"]   += (np.abs(act64) > 1.0).sum(axis=1)
+      action_np = sanitize_action(action_np, xp=np)
 
       # Only the env needs real-scale actions -- everything stored/returned here is canonical.
       env_action_np = action_np if act_scale_np is None else action_np * act_scale_np + act_bias_np

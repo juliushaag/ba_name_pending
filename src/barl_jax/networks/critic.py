@@ -8,13 +8,22 @@ from flax import nnx
 from barl_jax.networks.ensemble import Ensemble
 from barl_jax.networks.mlp import MLP
 from barl_jax.networks.registry import register_component
-from barl_jax.policy import Buffer, Critic
+from barl_jax.policy import TARGET_SUFFIX, Buffer, Critic, frozen
 
 
 class QCriticBase(Critic):
+  """`polyak_tau > 0` opts this critic into a Polyak-averaged target network.
+
+  At the default `0.0` nothing is cloned: no target modules, no extra state, no
+  work in `after_step()`, and `td_loss` keeps the single fused forward over
+  `[(s,a), (s',a')]` that CrossQ's shared BatchRenorm pass exists to exploit.
+  That is why the two are mutually exclusive rather than merely discouraged --
+  they are alternative answers to the same overestimation problem, and running
+  both gives two half-cancelling mechanisms and a plausible-looking curve."""
 
   def __init__(self, env_stats, q_function, *, gamma: float, lr: float,
-               adam_b1: float = 0.5, **kwargs):
+               adam_b1: float = 0.5, polyak_tau: float = 0.0, target_delay: int = 1,
+               norm: str = None, **kwargs):
     super().__init__(env_stats, **kwargs)
 
     self.gamma   = float(gamma)
@@ -22,6 +31,62 @@ class QCriticBase(Critic):
     self.adam_b1 = float(adam_b1)
 
     self.q_function = q_function
+
+    self.polyak_tau   = float(polyak_tau)
+    self.target_delay = int(target_delay)
+
+    if self.polyak_tau > 0.0:
+      if norm in ("batch", "batchrenorm"):
+        raise ValueError(
+          f"{type(self).__name__}: polyak_tau={polyak_tau} with norm={norm!r}. A target net "
+          f"and CrossQ-style running-statistic normalization are alternative answers to the "
+          f"same problem -- the target's separate forward pass removes the shared "
+          f"[(s,a), (s',a')] batch that makes BatchRenorm worth having. Pick one: either "
+          f"polyak_tau: 0.0, or norm: layer/none.")
+      for name, module in self.target_modules().items():
+        setattr(self, f"{name}{TARGET_SUFFIX}", nnx.clone(module))
+      self.target_steps = Buffer(jnp.zeros((), jnp.int32))
+
+  # ---- target network ------------------------------------------------------
+
+  @property
+  def has_target(self) -> bool:
+    return self.polyak_tau > 0.0
+
+  def target_modules(self) -> dict:
+    """Live modules to keep a Polyak copy of, keyed by the name their copy takes
+    (`q` -> `self.q_target`). The `_target` suffix is what keeps the clone out of
+    TRAINABLE, so a subclass adding an entry gets that for free. Called from
+    `__init__`, so anything it names must already be assigned."""
+    return {"q": self.q_function}
+
+  def target_raw(self, s, a):
+    """The bootstrap's un-reduced prediction: from the target copy if there is
+    one, else from a frozen view of the live net -- so `td_loss` has one path."""
+    net = self.q_target if self.has_target else frozen(self.q_function)
+    return jax.lax.stop_gradient(net(s, a))
+
+  def after_step(self):
+    if not self.has_target:
+      return
+
+    self.target_steps[...] += 1
+    # `target_delay` is a Python int, so the cadence is resolved at trace time;
+    # only the counter comparison is traced.
+    due = ((self.target_steps[...] % self.target_delay) == 0 if self.target_delay > 1
+           else True)
+
+    for name, live_module in self.target_modules().items():
+      target_module = getattr(self, f"{name}{TARGET_SUFFIX}")
+      live = nnx.state(live_module, nnx.Param)
+      tgt  = nnx.state(target_module, nnx.Param)
+
+      blend = lambda t, l: t + self.polyak_tau * (l - t)
+      step  = (jax.tree.map(lambda t, l: jnp.where(due, blend(t, l), t), tgt, live)
+               if self.target_delay > 1 else jax.tree.map(blend, tgt, live))
+      nnx.update(target_module, step)
+
+      self.metrics.gap(f"{name}{TARGET_SUFFIX}", live, tgt)
 
   # ---- pricing -------------------------------------------------------------
 
@@ -62,7 +127,13 @@ class QCriticBase(Critic):
 
   def td_loss(self, obs, action, next_obs, next_action, reward, term,
               losses: dict, shift=0.0) -> None:
-    pred_raw, next_raw = self.raw_batches((obs, action), (next_obs, next_action))
+    if self.has_target:
+      # The bootstrap comes from a different network, so there is no shared
+      # forward to fuse -- two separate passes is the whole point of a target.
+      pred_raw = self.raw(obs, action)
+      next_raw = self.target_raw(next_obs, next_action)
+    else:
+      pred_raw, next_raw = self.raw_batches((obs, action), (next_obs, next_action))
     target = self.bellman_target(reward, term, self.bootstrap_from_raw(next_raw), shift)
     self.loss_from_raw(pred_raw, target, losses)
 
@@ -123,7 +194,7 @@ class EnsembleCritic(QCriticBase):
                          dropout=dropout, final_activation=final_activation,
                          residual=residual, norm_kwargs=norm_kwargs, dtype=dtype, rngs=rngs)
 
-    super().__init__(env_stats, q_function, rngs=rngs, **kwargs)
+    super().__init__(env_stats, q_function, norm=norm, rngs=rngs, **kwargs)
 
     self.n_models = int(n_models)
     self.rho      = float(rho)
@@ -143,6 +214,19 @@ class EnsembleCritic(QCriticBase):
     self.metrics.dist("q", pred.mean(axis=0))
     self.metrics.dist("q_target", tgt)
     self.metrics.ensemble("ensemble", pred, rho=self.rho)
+
+
+@register_component
+class TargetEnsembleCritic(EnsembleCritic):
+  """`EnsembleCritic` that bootstraps from a Polyak target instead of leaning on
+  CrossQ's shared-forward BatchRenorm.
+
+  It exists as a class rather than as two keys in a slot because the two
+  mechanisms are mutually exclusive (`QCriticBase` raises if both are on) and
+  setting `polyak_tau` while leaving `norm: batchrenorm` is the easy mistake --
+  it does not fail, it just half-cancels and produces a plausible curve. Pairing
+  them in one `config/components.yaml` baseline makes the swap one word:
+  `class: EnsembleCritic` -> `class: TargetEnsembleCritic`."""
 
 
 # ----------------------------------------------------------------------
@@ -272,7 +356,7 @@ class C51Critic(CategoricalCriticBase):
     super().__init__(env_stats, q_function,
                      jnp.linspace(v_min, v_max, num_atoms, dtype=jnp.float32),
                      n_models=int(n_models), entropy_coef=entropy_coef,
-                     rngs=rngs, **kwargs)
+                     norm=norm, rngs=rngs, **kwargs)
 
     self.num_atoms = int(num_atoms)
     self.v_min, self.v_max = float(v_min), float(v_max)
@@ -326,7 +410,7 @@ class HLGaussCritic(CategoricalCriticBase):
                          residual=residual, norm_kwargs=norm_kwargs, dtype=dtype, rngs=rngs)
 
     super().__init__(env_stats, q_function, (edges[:-1] + edges[1:]) / 2,
-                     n_models=n_models, rngs=rngs, **kwargs)
+                     n_models=n_models, norm=norm, rngs=rngs, **kwargs)
 
     self.v_min, self.v_max = float(v_min), float(v_max)
     self.num_bins = int(num_bins)

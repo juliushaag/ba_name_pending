@@ -212,10 +212,10 @@ class DiscreteDiffusionActorBase(Actor, ABC):
 
   Subclasses supply the noise process -- its marginal coefficients, how a raw
   network output becomes a score, what the prior is, and one reverse step --
-  and get the forward/DSM helpers and the reverse loop from here. The concrete
-  actors live next to their algorithms (OUDiffusionActor in policies/dime.py,
-  VPDiffusionActor in policies/sdac.py) because their schedules are part of
-  those papers, not a shared architecture.
+  and get the forward/DSM helpers and the reverse loop from here. `DDPMActor`
+  below covers every variance-preserving ladder; an actor whose process is part
+  of its own paper rather than a shared architecture lives next to that
+  algorithm instead (OUDiffusionActor in policies/dime.py).
 
   Every method that draws noise takes an explicit `key`. The reverse loop is
   differentiated through by DIME, so the draws have to be ordinary values in
@@ -304,6 +304,41 @@ class DiscreteDiffusionActorBase(Actor, ABC):
   def dsm_weight(self, n):
     return self.marginal_coef(n)[1]
 
+  # ---- derived forward API (eps parameterization) -------------------------
+  # The duals of the four above. The DDPM literature states its losses in eps
+  # space where this codebase states them in score space; since every schedule
+  # here defines `to_score` as -raw/sqrt(nu), `predict_raw` already *is*
+  # eps_theta, so these are renamings and one division rather than a second
+  # parameterization to keep in sync.
+
+  def predict_eps(self, obs, x, n):
+    return self.predict_raw(obs, x, n).astype(jnp.float32)
+
+  def eps_from_score(self, score, n):
+    return -score * jnp.sqrt(self.marginal_coef(n)[1])
+
+  def x0_from_eps(self, x_n, eps, n):
+    g, nu = self.marginal_coef(n)
+    return (x_n - jnp.sqrt(nu) * eps) / g
+
+  def eps_regression(self, obs, x_n, n, eps_target, weights=None):
+    """Weighted eps-space regression against a supplied target. `weights`
+    broadcasts over the batch and over any leading candidate axis; None is the
+    plain DDPM loss. Reduction is sum-over-action-dims then mean, matching the
+    score-space losses here -- note the references mean over both, which is this
+    divided by `action_dim`."""
+    squared_error = (self.predict_eps(obs, x_n, n) - eps_target) ** 2
+    if weights is not None:
+      squared_error = weights * squared_error
+    return squared_error.sum(axis=-1).mean()
+
+  def eps_loss(self, obs, x0, n, key, weights=None):
+    """Denoising regression onto the noise that produced x_n. Draws its own eps
+    rather than calling `diffuse`, which discards the draw the target needs."""
+    eps = jax.random.normal(key, x0.shape, x0.dtype)
+    g, nu = self.marginal_coef(n)
+    return self.eps_regression(obs, g * x0 + jnp.sqrt(nu) * eps, n, eps, weights)
+
   # ---- shared reverse loop -----------------------------------------------
   def generate(self, obs, x=None, n_stop: int = 0, key=None):
     key = self.rngs.noise() if key is None else key
@@ -323,3 +358,125 @@ class DiscreteDiffusionActorBase(Actor, ABC):
 
   def create_optimizer(self) -> dict:
     return {"actor": optax.adam(self.lr)}
+
+
+def _from_betas(betas):
+  """A beta ladder as the alpha_bar it implies, with the clean end prepended."""
+  return jnp.concatenate([jnp.ones((1,), jnp.float32), jnp.cumprod(1.0 - betas)])
+
+
+def alpha_bar_ladder(schedule: str, num_steps: int, *, scale: float, cosine_s: float,
+                     ab_start: float, ab_end: float):
+  """alpha_bar over n = 0..num_steps, index 0 being the clean end.
+
+  alpha_bar is the parameterization rather than beta because it is what both
+  families here are actually defined by: `vp_cosine` prescribes alpha_bar
+  directly (and deliberately does *not* start at exactly 1), while the beta
+  schedules prescribe increments. Everything downstream reads alpha_bar and
+  derives alpha_t = ab_t / ab_prev, so the two meet immediately."""
+  if schedule == "vp_cosine":
+    # A cosine curve rescaled into [ab_end, ab_start] -- not the Nichol-Dhariwal
+    # cosine beta schedule, which this would otherwise be confused with.
+    t = jnp.linspace(0.0, 1.0, num_steps + 1, dtype=jnp.float32)
+    f = jnp.cos((t + cosine_s) / (1 + cosine_s) * math.pi / 2) ** 2
+    return ab_end + (ab_start - ab_end) * (f / f[0])
+
+  if schedule == "linear":
+    return _from_betas(scale * jnp.linspace(1e-4, 0.999, num_steps, dtype=jnp.float32))
+
+  if schedule == "cosine":
+    t  = jnp.linspace(0.0, 1.0, num_steps + 1, dtype=jnp.float32)
+    f  = jnp.cos((t + cosine_s) / (1 + cosine_s) * math.pi / 2) ** 2
+    ab = f / f[0]
+    return _from_betas(jnp.clip(scale * (1.0 - ab[1:] / ab[:-1]), 0.0, 0.999))
+
+  if schedule == "vp":
+    b_min, b_max = 0.1, 10.0
+    t = jnp.arange(1, num_steps + 1, dtype=jnp.float32)
+    alpha = jnp.exp(-b_min / num_steps
+                    - 0.5 * (b_max - b_min) * (2 * t - 1) / num_steps ** 2)
+    return _from_betas(jnp.clip(scale * (1.0 - alpha), 0.0, 0.999))
+
+  raise ValueError(
+    f"beta_schedule must be vp_cosine/linear/cosine/vp, got {schedule!r}")
+
+
+@register_component
+class DDPMActor(DiscreteDiffusionActorBase):
+  """Fixed-step DDPM over an alpha_bar ladder, with the standard ancestral
+  sampler.
+
+  One class covers every variance-preserving discrete diffusion actor here,
+  because they differ only in three things and none of them is the update rule:
+  the ladder (`beta_schedule`), the prior's scale, and whether the reconstructed
+  x0 is clipped back into the canonical action box each reverse step. The
+  posterior mean itself is shared -- see `reverse_step` for why the clip is the
+  only reason its two branches are written differently.
+
+  `VPDiffusionActor` below is this class with the settings SDAC was tuned on."""
+
+  def __init__(self, env_stats, latent_dim: int, layers: int, num_steps: int,
+               beta_schedule: str = "linear", beta_scale: float = 0.3,
+               cosine_s: float = 0.008, ab_start: float = 0.999, ab_end: float = 0.001,
+               clip_denoised: bool = True, prior_scale: float = 0.5,
+               *, rngs: nnx.Rngs, **kwargs):
+    super().__init__(env_stats, latent_dim, layers, num_steps, rngs=rngs, **kwargs)
+
+    self.alpha_bar = Buffer(alpha_bar_ladder(
+      beta_schedule, num_steps,
+      scale=beta_scale, cosine_s=cosine_s, ab_start=ab_start, ab_end=ab_end))
+
+    self.clip_denoised = bool(clip_denoised)
+    self.prior_scale   = float(prior_scale)
+
+  def marginal_coef(self, n):
+    ab = self.alpha_bar[...][n][..., None]
+    return jnp.sqrt(ab), 1.0 - ab
+
+  def to_score(self, raw, x, n):
+    return -raw / jnp.sqrt(self.marginal_coef(n)[1])      # raw == eps_theta
+
+  def prior_sample(self, batch: int, key):
+    noise = jax.random.normal(key, (batch, self.action_dim), jnp.float32)
+    return self.prior_scale * noise if self.prior_scale != 1.0 else noise
+
+  def reverse_step(self, obs, x, n, key):
+    ab_t, ab_prev = self.alpha_bar[...][n], self.alpha_bar[...][n - 1]
+    a_t    = ab_t / ab_prev
+    beta_t = 1.0 - a_t
+
+    if self.clip_denoised:
+      # x0 form, because the clip is a projection onto the action box that has
+      # no expression in terms of the score alone.
+      x0   = jnp.clip(self.x0_from_eps(x, self.predict_eps(obs, x, n), n), -1.0, 1.0)
+      mean = ((jnp.sqrt(ab_prev) * beta_t) * x0
+              + (jnp.sqrt(a_t) * (1.0 - ab_prev)) * x) / (1.0 - ab_t)
+    else:
+      # Algebraically the same posterior mean in eps form, in fewer ops. Kept
+      # verbatim rather than folded into the branch above: it is the expression
+      # SDAC's published numbers were produced with, and in float32 "equal" and
+      # "identical" are not the same claim.
+      mean = (x + beta_t * self.predict_score(obs, x, n)) / jnp.sqrt(a_t)
+
+    if n > 1:
+      # sigma_t^2 -- Eq. 8 omits the sqrt. `n` is a Python int here (the reverse
+      # loop is unrolled), so this branch is resolved at trace time.
+      var  = (1.0 - ab_prev) / (1.0 - ab_t) * beta_t
+      mean = mean + jnp.sqrt(var) * jax.random.normal(key, x.shape, x.dtype)
+
+    return mean, 0.0
+
+
+@register_component
+class VPDiffusionActor(DDPMActor):
+  """Variance-preserving cosine ladder + DDPM ancestral sampler, unit prior, no
+  x0 clip. Fixed schedule (Ma et al. Table 4); the settings SDAC was tuned on,
+  named so that config and checkpoints keep referring to them by name."""
+
+  def __init__(self, env_stats, latent_dim: int, layers: int, num_steps: int,
+               cosine_s: float = 0.008, ab_start: float = 0.999, ab_end: float = 0.001,
+               *, rngs: nnx.Rngs, **kwargs):
+    super().__init__(env_stats, latent_dim, layers, num_steps,
+                     beta_schedule="vp_cosine", cosine_s=cosine_s,
+                     ab_start=ab_start, ab_end=ab_end,
+                     clip_denoised=False, prior_scale=1.0, rngs=rngs, **kwargs)

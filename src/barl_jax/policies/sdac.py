@@ -8,47 +8,9 @@ from flax import nnx
 
 from barl_jax.networks.actor import DiscreteDiffusionActorBase
 from barl_jax.networks.critic import QCriticBase
-from barl_jax.networks.registry import register_component
 from barl_jax.networks.regulator import AutotuneRegulator
 from barl_jax.networks.squash import Squash
-from barl_jax.policy import Buffer, Policy, frozen, register_policy
-
-
-@register_component
-class VPDiffusionActor(DiscreteDiffusionActorBase):
-  """Variance-preserving cosine ladder + DDPM ancestral sampler. The network
-  predicts eps; `to_score` converts. Fixed schedule (Ma et al. Table 4)."""
-
-  def __init__(self, env_stats, latent_dim: int, layers: int, num_steps: int,
-               cosine_s: float = 0.008, ab_start: float = 0.999, ab_end: float = 0.001,
-               *, rngs: nnx.Rngs, **kwargs):
-    super().__init__(env_stats, latent_dim, layers, num_steps, rngs=rngs, **kwargs)
-
-    tt = jnp.linspace(0.0, 1.0, num_steps + 1, dtype=jnp.float32)
-    f  = jnp.cos((tt + cosine_s) / (1 + cosine_s) * math.pi / 2) ** 2
-    self.alpha_bar = Buffer(ab_end + (ab_start - ab_end) * (f / f[0]))
-
-  def marginal_coef(self, n):
-    ab = self.alpha_bar[...][n][..., None]
-    return jnp.sqrt(ab), 1.0 - ab
-
-  def to_score(self, raw, x, n):
-    return -raw / jnp.sqrt(self.marginal_coef(n)[1])      # raw == eps_theta
-
-  def prior_sample(self, batch: int, key):
-    return jax.random.normal(key, (batch, self.action_dim), jnp.float32)
-
-  def reverse_step(self, obs, x, n, key):
-    ab_t, ab_prev = self.alpha_bar[...][n], self.alpha_bar[...][n - 1]
-    a_t    = ab_t / ab_prev
-    beta_t = 1.0 - a_t
-    mean   = (x + beta_t * self.predict_score(obs, x, n)) / jnp.sqrt(a_t)
-    if n > 1:
-      # sigma_t^2 -- Eq. 8 omits the sqrt. `n` is a Python int here (the reverse
-      # loop is unrolled), so this branch is resolved at trace time.
-      var  = (1.0 - ab_prev) / (1.0 - ab_t) * beta_t
-      mean = mean + jnp.sqrt(var) * jax.random.normal(key, x.shape, x.dtype)
-    return mean, 0.0
+from barl_jax.policy import Policy, frozen, register_policy
 
 
 def _inv_sigmoid(y: float) -> float:
@@ -59,12 +21,25 @@ def _inv_sigmoid(y: float) -> float:
 class SDAC(Policy):
   """Soft Diffusion Actor-Critic (Ma et al. 2025).
 
-  The actor is fitted by a *soft* denoising-score-matching loss: K posterior
-  candidates are drawn per transition, priced by the critic, and the regression
-  target is their softmax-weighted score, at a temperature carried in units of
-  the critic's own within-state spread. Acting is best-of-N over
-  fresh diffusion samples plus a learned per-dimension exploration noise, which
-  is applied in squashed space so its entropy needs no Jacobian correction."""
+  The actor is fitted by a *soft* denoising loss: K noises are drawn per
+  transition, the x0 each implies is reconstructed from x_t and priced by the
+  critic, and the denoiser is regressed back onto those same noises under the
+  resulting softmax weights. Acting is best-of-N over fresh diffusion samples
+  plus a learned per-dimension exploration noise, which is applied in squashed
+  space so its entropy needs no Jacobian correction.
+
+  Two deliberate departures from the reference remain, both stated so the
+  comparison against its numbers stays falsifiable:
+
+  * **Temperature.** The reference divides Q by a constant (its initial alpha);
+    this divides by `softmax_temp` times the critic's own within-state spread
+    across the K candidates, which makes the weighting invariant to the scale Q
+    happens to have reached. `sdac/q_scale` logs that spread.
+  * **Bounding.** The reference clips the reconstruction into the action box;
+    this squashes it. Both bound, but a clip has zero gradient outside the box
+    where tanh merely saturates -- watch `sdac/cand_saturation`, and
+    `sdac/weight_ess` for the failure it causes (every candidate on the same
+    corner prices identically and the weights go uniform)."""
 
   # The exploration std is the Policy's own parameter -- no slot owns it.
   policy_params = {"explore_raw": "explore"}  # noqa: RUF012
@@ -79,11 +54,16 @@ class SDAC(Policy):
     self.num_candidates = params["num_candidates"]   # K: phi_{0|t} candidates for the softmax weight
     self.num_bon        = params["num_bon"]          # N: best-of-N action selection
     self.softmax_temp   = float(params["softmax_temp"])
-    self.x0_data_frac   = float(params["x0_data_frac"])
     self.explore_init   = params["explore_init"]
     self.explore_min    = float(params["explore_min"])
     self.explore_max    = float(params["explore_max"])
-    self.actor: VPDiffusionActor = self.build_component("actor", VPDiffusionActor)
+    # Gated on the base, not VPDiffusionActor: everything SDAC calls
+    # (diffuse/x0_from_eps/predict_eps/sample) is part of the shared skeleton,
+    # so the noise process is swappable -- which is what makes "is the cosine
+    # ladder or the reference's linear one responsible" testable as a `class:`
+    # override rather than an edit.
+    self.actor: DiscreteDiffusionActorBase = self.build_component(
+      "actor", DiscreteDiffusionActorBase)
     self.critic: QCriticBase     = self.build_component("critic", QCriticBase)
     self.squash: Squash          = self.build_component("squash", Squash)
     self.entropy: AutotuneRegulator = self.build_component(
@@ -94,9 +74,6 @@ class SDAC(Policy):
       (self.action_dim,), _inv_sigmoid((self.explore_init - lo) / (hi - lo)), jnp.float32))
 
   EXPLORE_RAW_LIMIT = 10.0
-
-  # Keeps arctanh of a replay action that `explore` clipped to exactly +-1 finite.
-  ACTION_CLIP = 1.0 - 1e-3
 
   @property
   def explore_std(self):
@@ -150,31 +127,41 @@ class SDAC(Policy):
     B, K   = obs.shape[0], self.num_candidates
     losses = {}
 
-    keys = jax.random.split(self.rngs.noise(), 7)
+    keys = jax.random.split(self.rngs.noise(), 6)
 
     
-    obs_rep = self._tile(obs, self.num_bon)
-    joint   = jax.lax.stop_gradient(
-      self.actor.sample(jnp.concatenate([next_obs, obs_rep], axis=0), keys[0]))
-    next_raw  = joint[:B]
-    policy_x0 = self.pick_best(obs_rep, joint[B:], self.num_bon)
+    # Both ends are best-of-N, and the bootstrap especially: acting takes the
+    # argmax over `num_bon` samples, so a target built from a single sample
+    # prices a strictly worse policy than the one collecting the data -- an
+    # underestimate that grows as the actor improves, and that the critic's
+    # `pessimistic_target` then compounds. The reference selects its target
+    # action with the same Q-scored best-of-N it acts with.
+    obs_rep  = self._tile(obs, self.num_bon)
+    next_rep = self._tile(next_obs, self.num_bon)
+    joint    = jax.lax.stop_gradient(
+      self.actor.sample(jnp.concatenate([next_rep, obs_rep], axis=0), keys[0]))
+
+    split     = self.num_bon * B
+    next_raw  = self.pick_best(next_rep, joint[:split], self.num_bon)
+    policy_x0 = self.pick_best(obs_rep, joint[split:], self.num_bon)
 
     # ---- critic ------------------------------------------------------------
     next_action = jax.lax.stop_gradient(self.explore(self.squash(next_raw), keys[1]))
     self.critic.td_loss(obs, action, next_obs, next_action, reward, term, losses)
 
     # ---- actor: soft DSM ---------------------------------------------------
-    data_x0 = self.squash.inverse(jnp.clip(action, -self.ACTION_CLIP, self.ACTION_CLIP))
-    x_0 = jnp.where(jax.random.uniform(keys[6], (B, 1)) < self.x0_data_frac,
-                    data_x0, policy_x0)
-
     t   = jax.random.randint(keys[2], (B,), 1, self.actor.num_steps + 1)
-    x_t = jax.lax.stop_gradient(self.actor.diffuse(x_0, t, keys[3]))
+    x_t = jax.lax.stop_gradient(self.actor.diffuse(policy_x0, t, keys[3]))
 
-    a0_samples = jax.lax.stop_gradient(
-      self.actor.sample_phi0(x_t, t, K, keys[4]))                          # (K, B, D), RAW
+    # The reference's candidate mechanism: draw K noises, reconstruct the x0 each
+    # one implies from x_t, price those, and regress the denoiser back onto the
+    # *same* noises under the resulting weights. Candidate k and target k are
+    # therefore the same draw -- which is what makes the softmax a reweighting of
+    # the denoising target rather than a separate scoring step.
+    noise      = jax.random.normal(keys[4], (K, B, self.action_dim), x_t.dtype)
+    a0_raw     = jax.lax.stop_gradient(self.actor.x0_from_eps(x_t[None], noise, t))
+    candidates = self.squash(a0_raw)                                       # (K, B, D)
 
-    candidates = self.squash(a0_samples)                                   # (K, B, D)
     qv = frozen(self.critic).value(
       jnp.broadcast_to(obs[None], (K, B, obs.shape[-1])).reshape(K * B, -1),
       candidates.reshape(K * B, -1),
@@ -183,12 +170,12 @@ class SDAC(Policy):
     q_scale = jax.lax.stop_gradient(qv.std(axis=0).mean()) + 1e-6
     weight  = jax.lax.stop_gradient(
       jax.nn.softmax(qv / (self.softmax_temp * q_scale), axis=0)[..., None])  # (K, B, 1), sums to 1 over K
-    target = jax.lax.stop_gradient(self.actor.score_target(a0_samples, x_t[None], t))
-    dsm_w  = jax.lax.stop_gradient(self.actor.dsm_weight(t))               # (B, 1)
 
-    score_pred = self.actor.predict_score(obs, x_t, t)                     # (B, D)
-
-    sdac_loss = (weight * dsm_w * (score_pred[None] - target) ** 2).sum(axis=-1).sum(axis=0).mean()
+    # eps space rather than score space: the two are the same objective, since
+    # score = -eps/sqrt(nu) makes the score loss's `dsm_weight` factor exactly
+    # the nu that cancels. Stated as the reference states it, one less conversion.
+    eps_pred  = self.actor.predict_eps(obs, x_t, t)                        # (B, D)
+    sdac_loss = (weight * (eps_pred[None] - noise) ** 2).sum(axis=-1).sum(axis=0).mean()
 
     # ---- exploration std ---------------------------------------------------
     a_bon    = self.squash(policy_x0)
@@ -207,13 +194,13 @@ class SDAC(Policy):
     self.metrics.dist("weight_ess", 1.0 / (weight.squeeze(-1) ** 2).sum(axis=0))
    
     norm = lambda x: jnp.linalg.norm(x, axis=-1).mean()
-    weighted = (weight * target).sum(axis=0)
-    self.metrics.scalar("signal_ratio", norm(weighted) / (norm(target) + 1e-8))
+    weighted = (weight * noise).sum(axis=0)
+    self.metrics.scalar("signal_ratio", norm(weighted) / (norm(noise) + 1e-8))
     self.metrics.scalar("tilt_ratio",
-                        norm(weighted - target.mean(axis=0)) / (norm(target.std(axis=0)) + 1e-8))
+                        norm(weighted - noise.mean(axis=0)) / (norm(noise.std(axis=0)) + 1e-8))
     self.metrics.scalar("cand_saturation", (jnp.abs(candidates) > 0.99).mean())
-    self.actor.metrics.vec("score_pred", score_pred)
-    self.actor.metrics.vec("score_target", target.reshape(-1, target.shape[-1]))
+    self.actor.metrics.vec("eps_pred", eps_pred)
+    self.actor.metrics.vec("eps_target", noise.reshape(-1, noise.shape[-1]))
     self.actor.metrics.vec("action", next_action, limit=1.0)
 
     return losses

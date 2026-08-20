@@ -40,6 +40,23 @@ def is_target(path, _value) -> bool:
 TRAINABLE = nnx.All(nnx.Param, nnx.Not(is_target))
 
 
+def sanitize_action(action, xp=jnp):
+  """Force a canonical action into the contract every consumer already assumes:
+  finite, and inside [-1, 1] per dimension.
+
+  A failsafe, not a fix. A NaN action reaching `env.step()` is unrecoverable --
+  MuJoCo either raises or silently poisons the physics state, and the run dies
+  thousands of steps later somewhere unrelated -- so the cost of clamping is
+  bounded and the cost of not clamping is not. NaN maps to 0 (the neutral
+  action) rather than to a bound, since a bound is a *decision* and 0 is the
+  absence of one; infinities saturate to the bound they were heading for.
+
+  `xp` selects the array module: the rollout loop scales host-side in numpy and
+  must not be pulled back onto the device to do this. Both modules implement
+  `nan_to_num`/`clip` identically here."""
+  return xp.clip(xp.nan_to_num(action, nan=0.0, posinf=1.0, neginf=-1.0), -1.0, 1.0)
+
+
 def frozen(module):
   """A view of `module` that neither trains nor updates: its parameters carry
   no gradient, and any batch-statistic normalization inside uses its running
@@ -256,6 +273,9 @@ class Policy(nnx.Module, ABC):
     self.obs_std  = Buffer(jnp.ones(observation_space.shape[-1]))
     self.obs_mean = Buffer(jnp.zeros(observation_space.shape[-1]))
 
+    # Gradient steps taken, for algorithms whose update cadence is `step % k`.
+    self.train_steps = Buffer(jnp.zeros((), jnp.int32))
+
   @property
   def env_stats(self) -> EnvStats:
     return self._env_stats.value
@@ -382,6 +402,7 @@ class Policy(nnx.Module, ABC):
       component.before_step()
 
   def after_step(self):
+    self.train_steps[...] += 1
     for component in self.components.values():
       component.after_step()
 
@@ -524,10 +545,14 @@ class Policy(nnx.Module, ABC):
   # the one-place affine remap, used only at env.step() call sites.
 
   def scale_action(self, raw_action):
-    """Canonical [-1, 1]-per-dimension actor output -> this env's actual action bounds."""
+    """Canonical [-1, 1]-per-dimension actor output -> this env's actual action bounds.
+
+    Sanitizes first, so the affine map cannot carry a NaN or an out-of-box value
+    into the env: outside [-1, 1] it would land outside the env's own bounds too,
+    which gymnasium does not check for MuJoCo."""
     if self.action_discrete:
       return raw_action
-    return raw_action * self.act_scale[...] + self.act_bias[...]
+    return sanitize_action(raw_action) * self.act_scale[...] + self.act_bias[...]
 
   def unscale_action(self, action):
     """Inverse of scale_action: real env-scale action -> canonical [-1, 1]."""

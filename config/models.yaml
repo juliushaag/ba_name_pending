@@ -90,15 +90,13 @@ SDAC:
 
     softmax_temp: 0.25
 
-    x0_data_frac: 0.5
-
     explore_init: 0.1
     explore_min: 1.0e-3
     explore_max: 1.0
 
   components:
     actor:   {class: VPDiffusionActor, latent_dim: 512, layers: 3, num_steps: 20, activation: Mish}
-    critic:  {class: C51Critic, pessimistic_target: true}
+    critic:  {class: C51Critic }
     squash:  {class: TanhSquash }
     entropy: {class: AutotuneRegulator }
 

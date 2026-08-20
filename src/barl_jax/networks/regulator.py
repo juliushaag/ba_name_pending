@@ -13,8 +13,10 @@ from barl_jax.policy import Component
 class AutotuneRegulator(Component, nnx.Module):
   """A Lagrange multiplier tuned to hold some measured quantity at `target`
   (SAC's entropy temperature, and the same machinery for any other dual). The
-  loss is `log_alpha * (value - target)`, so alpha rises while the measured
-  value sits above target and falls below it."""
+  loss is `log_alpha * (value - target)`, whose gradient wrt log_alpha is
+  `value - target`, so under descent alpha *falls* while the measured value sits
+  above target and rises while it sits below -- the sign canonical SAC needs, and
+  the opposite of what this docstring claimed before."""
 
   def __init__(self, env_stats=None, lr: float = 3e-4, alpha_init: float = 1e-2,
                max_alpha: float = 5.0, min_alpha: float = 1e-4, target: float = -1.0,

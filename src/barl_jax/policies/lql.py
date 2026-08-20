@@ -34,8 +34,8 @@ class NCLQLCritic(QCriticBase):
   Defaults follow the reference: no normalization, `mish`, `lr = 1e-4`."""
 
   def __init__(self, env_stats, latent_dim: int, layers: int, n_models: int = 2,
-               time_dim: int = 16, polyak_tau: float = 0.005,
-               activation: str = "mish", norm: str = "none",
+               time_dim: int = 16,
+               activation: str = "mish", norm: str = "none", time_embed="fourier",
                norm_input: bool = False, norm_stem: bool = False, norm_after_act: bool = True,
               norm_kwargs: dict | None = None, dtype: str = "float32",
                *, rngs: nnx.Rngs, **kwargs):
@@ -43,25 +43,26 @@ class NCLQLCritic(QCriticBase):
     self.time_dim = int(time_dim)
     
     self.time_embed = TimeEmbedding(
-      time_dim=int(time_dim),
-      kind="fourier",
+      time_dim=self.time_dim,
+      kind=time_embed,
       rngs=rngs,
     )
 
     q_function = ConcatQ(
-      env_stats["obs_dim"] + env_stats["act_dim"] + time_dim, 1, latent_dim, layers,
+      env_stats["obs_dim"] + env_stats["act_dim"] + self.time_dim, 1, latent_dim, layers,
       n_models=n_models, activation=activation, norm=norm,
       norm_input=norm_input, norm_stem=norm_stem,
       norm_after_act=norm_after_act, norm_kwargs=norm_kwargs, dtype=dtype, rngs=rngs
     )
 
-    super().__init__(env_stats, q_function, rngs=rngs, **kwargs)
+    super().__init__(env_stats, q_function, norm=norm, rngs=rngs, **kwargs)
 
-    self.n_models   = int(n_models)
-    self.polyak_tau = float(polyak_tau)
+    self.n_models = int(n_models)
 
-    self.time_embed_target = nnx.clone(self.time_embed)
-    self.q_target = nnx.clone(q_function)
+  def target_modules(self) -> dict:
+    """Also the level encoder: the bootstrap is conditioned on a noise level, so
+    a target value that used the live encoder would still track the live net."""
+    return {**super().target_modules(), "time_embed": self.time_embed}
 
   # ---- level conditioning -------------------------------------------------
 
@@ -78,25 +79,6 @@ class NCLQLCritic(QCriticBase):
     return jnp.concatenate([act, te], axis=-1)
     
 
-  def expectation_at(self, obs, act, level):
-    """E[Q] at a level, augmenting internally. The Langevin chain differentiates
-    this, so the encoder it uses must be the one on the module it was handed --
-    not one captured off `self` at another trace level."""
-    return self.reduce_expectation(self.raw(obs, self.augment(act, level)))
-
-  # ---- reductions ---------------------------------------------------------
-
-  def reduce_expectation(self, raw):
-    """E[Q] over the heads. NC-LQL's own, not part of the QCriticBase contract:
-    the Langevin chain differentiates the *unbounded* mean, because there the
-    gradient field is the policy and a pessimistic bound would change the
-    distribution being sampled. Everything else prices through `reduce_value`."""
-    return raw.astype(jnp.float32).mean(axis=0)
-
-  def reduce_value(self, raw):
-    """min over the heads -- the reference's `jnp.minimum(q1, q2)` bootstrap."""
-    return raw.astype(jnp.float32).min(axis=0)
-
   def loss_from_raw(self, raw, target, losses: dict) -> None:
     pred = raw.astype(jnp.float32)
     tgt  = jax.lax.stop_gradient(target).astype(jnp.float32)
@@ -112,24 +94,8 @@ class NCLQLCritic(QCriticBase):
     """`min` over the *target* heads, the reference's `q_backup` input. The
     chain that produced `next_act` ran on the live critic; only the value it is
     scored with comes from the target."""
-    raw = self.q_target(next_obs, self.augment(next_act, level, target=True))
-    return jax.lax.stop_gradient(self.reduce_value(raw))
-
-  def after_step(self):
-    """Polyak the target toward the live weights, once per gradient step."""
-
-    """Q-Function"""
-    live = nnx.state(self.q_function, nnx.Param)
-    tgt  = nnx.state(self.q_target, nnx.Param)
-
-    nnx.update(self.q_target,
-               jax.tree.map(lambda t, l: t + self.polyak_tau * (l - t), tgt, live))
-    """Time-Embedding"""
-    live = nnx.state(self.time_embed, nnx.Param)
-    tgt  = nnx.state(self.time_embed_target, nnx.Param)
-    
-    nnx.update(self.time_embed_target,
-               jax.tree.map(lambda t, l: t + self.polyak_tau * (l - t), tgt, live))
+    raw = self.q_target(next_obs, self.augment(next_act, level, target=True)).min(axis=0)
+    return jax.lax.stop_gradient(raw)
 
 
 @register_policy
@@ -189,7 +155,9 @@ class NCLQL(Policy):
 
   def critic_score(self, obs, act, level):
     def q(critic, a):
-      return critic.expectation_at(obs, a, level).sum()
+      pred = critic.raw(obs, critic.augment(a, level)).mean(axis=0)
+      return pred.sum()
+    
     return nnx.grad(q, argnums=1)(frozen(self.critic), act)
 
   def sample(self, obs, key):
@@ -249,7 +217,7 @@ class NCLQL(Policy):
 
     td_loss = losses.pop("q")
 
-    smoothing_target = jax.lax.stop_gradient(self.critic.reduce_expectation(pred_clean))
+    smoothing_target = jax.lax.stop_gradient(pred_clean.mean(axis=0))
 
     self.critic.loss_from_raw(pred_noisy, smoothing_target, losses)
     smoothing_loss = losses.pop("q")
