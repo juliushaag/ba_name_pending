@@ -49,7 +49,32 @@
 # None of them has a target network; a CrossQ-style critic is not a separate
 # class, just `norm: batchrenorm` (see config/components.yaml).
 
+# `training:` is the third block a policy may carry, alongside `params:` and
+# `components:`: the handful of run-config keys that are a property of the
+# *algorithm* rather than of the experiment -- rollout_steps, batch_size,
+# utd_ratio, epochs_per_rollout, random_steps, lr_warmup_steps (the whitelist
+# is model_config.TRAINING_KEYS; anything outside it is a validate() error, because
+# the rest of a run -- how long it trains, how many envs, how often it
+# evaluates -- belongs in config/online_learning.yaml and nowhere else).
+#
+# It resolves *between* that file's levels, lowest precedence first:
+#
+#   online_learning.yaml's `defaults:`
+#     < this file's `training:` for the model being run
+#     < the active profile's `training:`
+#     < online_learning.yaml's `env_defaults:` for that env
+#     < the `runs:` entry itself (and any run_sweep.py `run.` axis)
+#
+# so a model states what its algorithm wants and an explicit per-env or per-run
+# statement still overrides it. The five blocks below currently restate today's
+# global defaults, so nothing changes until one of them is edited to differ.
+
 SAC:
+  training:
+    rollout_steps: 5000
+    batch_size: 256
+    utd_ratio: 2.0
+
   params:
     entropy_scale: -1.0
 
@@ -59,6 +84,11 @@ SAC:
     entropy:  {class: AutotuneRegulator }
 
 DIME:
+  training:
+    rollout_steps: 5000
+    batch_size: 256
+    utd_ratio: 2.0
+
   params:
     entropy_scale: -4.0
 
@@ -69,6 +99,11 @@ DIME:
     entropy: {class: AutotuneRegulator }
 
 AMDP:
+  training:
+    rollout_steps: 5000
+    batch_size: 256
+    utd_ratio: 2.0
+
   params:
     entropy_scale: -1.0
 
@@ -82,11 +117,21 @@ AMDP:
     entropy: {class: AutotuneRegulator }
     
 SDAC:
+  training:
+    rollout_steps: 5000
+    batch_size: 256
+    utd_ratio: 2.0
+
   params:
     entropy_scale: -0.9
 
-    num_candidates: 32
-    num_bon: 8
+    # Both match the reference (mahaitongdae/diffusion_policy_online_rl):
+    # `reverse_mc_num`, hardcoded 64 in relax/algorithm/sdac.py, and
+    # `num_particles`, whose CLI default is 32 in scripts/train_mujoco.py (the
+    # dataclass default of 4 in relax/network/diffv2.py never applies -- the
+    # script always passes the flag).
+    num_candidates: 64   # K: softmax candidates in the soft denoising loss
+    num_bon: 32          # N: best-of-N, for the played action and the bootstrap
 
     softmax_temp: 0.25
 
@@ -95,12 +140,18 @@ SDAC:
     explore_max: 1.0
 
   components:
-    actor:   {class: VPDiffusionActor, latent_dim: 512, layers: 3, num_steps: 20, activation: Mish}
-    critic:  {class: C51Critic }
+    actor:   {class: VPDiffusionActor, latent_dim: 256, layers: 3, num_steps: 20, activation: Mish}
+    critic:  {class: C51Critic, latent_dim: 256, layers: 3, activation: Mish }
     squash:  {class: TanhSquash }
     entropy: {class: AutotuneRegulator }
 
 NCLQL:
+  training:
+    rollout_steps: 5000
+    batch_size: 256
+    utd_ratio: 0.2
+    random_steps: 30000
+
   params:
     noise_levels: 10
     steps_per_level: 2

@@ -6,8 +6,16 @@
 # merged onto `defaults` and run in series, so listing several algorithms
 # here trains them one after another in a single invocation.
 #
-# Merge order per run: `defaults` < `env_defaults[<that run's env>]` < the run
-# entry itself. A run entry (or either defaults level) may also carry
+# Merge order per run: `defaults` < the model's own `training:` block in
+# config/models.yaml < `env_defaults[<that run's env>]` < the run entry itself.
+#
+# That middle layer is where a knob belonging to the *algorithm* rather than to
+# the experiment lives -- `rollout_steps`, `batch_size`, `utd_ratio`,
+# `epochs_per_rollout`, `random_steps`, `lr_warmup_steps` (model_config.
+# TRAINING_KEYS). The values below stay the fallback for any model that
+# declares none of them, and anything set per-env or per-run here still wins
+# over the model. Every other key in this file is run-only: a model that tries
+# to set one is a validate() error, not a silent no-op. A run entry (or either defaults level) may also carry
 # `model_overrides:`, a dotted-path map layered over config/models.yaml on top
 # of any profile -- `{components.critic.rho: 1.0, params.entropy_scale: -2.0}`
 # -- which is how a tunable gets varied without editing the model config.
