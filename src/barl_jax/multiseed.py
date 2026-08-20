@@ -17,6 +17,8 @@ different graphdef, not a different array. Sweeping a hyperparameter is still
 scripts/jax/run_sweep.py's job; this axis is seeds.
 """
 
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -73,23 +75,25 @@ class StackedPolicy:
     return self._bounds
 
   def inference_fn(self):
-    graphdef, num_seeds, num_envs = self._graphdef, self.num_seeds, self.num_envs
+    return partial(_stacked_infer, self._graphdef, self.num_seeds, self.num_envs,
+                   self._state)
 
-    @jax.jit
-    def infer(state, observation, key):
-      obs = observation.reshape(num_seeds, num_envs, *observation.shape[1:])
-      keys = jax.random.split(key, num_seeds)
 
-      def one(state, obs, key):
-        policy, _ = nnx.merge(graphdef, state)
-        return policy.inference_step(obs, key=key)
+@partial(jax.jit, static_argnums=(0, 1, 2))
+def _stacked_infer(graphdef, num_seeds, num_envs, state, observation, key):
+  """The compiled body behind `StackedPolicy.inference_fn`. Module-level for the
+  same reason as `policy._jitted_infer`: built inside the method it was a fresh
+  closure per call, so every rollout recompiled the whole vmapped inference."""
+  obs = observation.reshape(num_seeds, num_envs, *observation.shape[1:])
+  keys = jax.random.split(key, num_seeds)
 
-      action, extras = jax.vmap(one)(state, obs, keys)
-      flat = lambda x: x.reshape(num_seeds * num_envs, *x.shape[2:])
-      return flat(action), jax.tree.map(flat, extras)
+  def one(state, obs, key):
+    policy, _ = nnx.merge(graphdef, state)
+    return policy.inference_step(obs, key=key)
 
-    state = self._state
-    return lambda observation, key: infer(state, observation, key)
+  action, extras = jax.vmap(one)(state, obs, keys)
+  flat = lambda x: x.reshape(num_seeds * num_envs, *x.shape[2:])
+  return flat(action), jax.tree.map(flat, extras)
 
 
 class MultiSeedReplay(ReplayBuffer):
@@ -137,12 +141,13 @@ class MultiSeedReplay(ReplayBuffer):
     is what keeps the seeds independent rather than merely differently
     initialized."""
     per_seed = [buffer.sample_numpy(batch_size) for buffer in self.seeds]
-    # Stacked on the host and transferred once per field: going through
-    # ReplayBuffer.sample() instead would cross the bus num_seeds x num_fields
-    # times every gradient step, which at these model sizes costs more than the
-    # step itself.
-    return {key: jnp.asarray(np.stack([s[key] for s in per_seed]))
-            for key in per_seed[0]}
+    # Stacked on the host and handed over in **one** device_put for the whole
+    # dict: going through ReplayBuffer.sample() instead would cross the bus
+    # num_seeds x num_fields times every gradient step, and even one jnp.asarray
+    # per field costs ~80 us of dispatch apiece regardless of the few KB it
+    # carries -- five of them were 455 us of host time per grad step.
+    return jax.device_put({key: np.stack([s[key] for s in per_seed])
+                           for key in per_seed[0]})
 
 
 def split_metrics(metrics: dict, num_seeds: int) -> tuple[dict, list[dict]]:

@@ -183,6 +183,15 @@ class Critic(Component, nnx.Module, ABC):
     ...
 
 
+@partial(jax.jit, static_argnums=(0,))
+def _jitted_infer(graphdef, state, observation, key):
+  """The compiled body behind `Policy.inference_fn`. Module-level so its jit
+  cache survives across calls: repeated `nnx.split` of the same policy yields an
+  equal-and-equally-hashing GraphDef, so a rollout or an eval wave rebinding its
+  weights hits the cache instead of recompiling."""
+  return nnx.merge(graphdef, state).inference_step(observation, key=key)
+
+
 class Policy(nnx.Module, ABC):
 
   _classes = dict()
@@ -610,11 +619,7 @@ class Policy(nnx.Module, ABC):
     graphdef, state = nnx.split(self)
     self.train()
 
-    @partial(jax.jit, static_argnums=(0,))
-    def infer(graphdef, state, observation, key):
-      return nnx.merge(graphdef, state).inference_step(observation, key=key)
-
-    return partial(infer, graphdef, state)
+    return partial(_jitted_infer, graphdef, state)
 
   def measure_latency(self, n: int = 10) -> float:
     """Rough per-epoch regression signal, not a rigorous benchmark."""

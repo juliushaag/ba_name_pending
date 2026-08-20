@@ -170,8 +170,13 @@ def train(run: Run):
   n_videos  = cfg["eval_runs"] if cfg.get("eval_videos") is None else min(cfg["eval_videos"], cfg["eval_runs"])
   # The rendering env must stay synchronous (a worker's render() comes back as
   # an EOFError); the unrendered one is parallel as before.
-  eval_envs = (run.environment.get_vector_env(cfg["eval_runs"] - n_videos)
-               if cfg["eval_runs"] > n_videos else None,
+  #
+  # Sized to the full `eval_runs`, not `eval_runs - n_videos`: only seed 0 ever
+  # renders, so every other seed asks this env for all `eval_runs` episodes at
+  # once. A smaller one served them in two waves, and a wave costs a full
+  # episode of stepping *every* sub-env to record the one slot still live.
+  needs_unrendered = cfg["eval_runs"] > n_videos or num_seeds > 1
+  eval_envs = (run.environment.get_vector_env(cfg["eval_runs"]) if needs_unrendered else None,
                run.environment.get_vector_env(n_videos, asynchronous=False) if n_videos else None)
 
   tags = [run.model_name, run.env_name, "online", "jax"]

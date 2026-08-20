@@ -183,7 +183,9 @@ class ReplayBuffer():
       starts  = np.concatenate([[0], np.cumsum(lengths + 1)[:-1]])
       obs_row = np.concatenate([s + np.arange(n) for s, n in zip(starts, lengths)])
 
-      term = np.zeros(int(lengths.sum()), dtype=bool)
+      # float32, not bool: sample_numpy's only consumer wants it that way, and
+      # casting here costs one pass per rollout instead of one per batch.
+      term = np.zeros(int(lengths.sum()), dtype=np.float32)
       term[np.cumsum(lengths) - 1] = [t.terminated for t in trajs]
 
       act_chunks = [t.actions for t in trajs]
@@ -206,7 +208,7 @@ class ReplayBuffer():
     """Draws `batch_size` i.i.d. random transition indices across the whole
     buffer, with replacement (standard SAC-style minibatch). Returns
     the same keys as the trainer expects, already on the device."""
-    return {k: jnp.asarray(v) for k, v in self.sample_numpy(batch_size).items()}
+    return jax.device_put(self.sample_numpy(batch_size))
 
   def sample_numpy(self, batch_size: int) -> dict:
     """`sample()` without the device transfer. A caller drawing several batches
@@ -222,7 +224,7 @@ class ReplayBuffer():
       next_obs= observations[rows + 1],
       act=      flat["act"][idx],
       rew=      flat["rew"][idx],
-      term=     flat["term"][idx].astype(np.float32),
+      term=     flat["term"][idx],
     )
     for key, values in flat["extras"].items():
       batch[key] = values[idx]
