@@ -198,6 +198,12 @@ def run_one(script: str, combo: dict, tag: str, defaults: dict, env_defaults: di
 
   status = "OK" if proc.returncode == 0 else f"FAILED (exit {proc.returncode})"
   print(f"[{tag}] {status}")
+
+  if proc.returncode != 0:
+    with open(log_path, "r") as logf:
+      print(logf.read(), flush=True)
+
+    
   return proc.returncode
 
 
