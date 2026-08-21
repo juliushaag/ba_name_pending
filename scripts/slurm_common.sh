@@ -38,6 +38,22 @@ RESULT_DIR="${SWEEPS_ROOT:-$PWD/sweeps}/$SWEEP_NAME"
 
 SWEEP_DIR="${TMPDIR:-/tmp}/sweep-${SLURM_JOB_ID:-$$}"
 
+# `mv`, not `cp`: slurmstepd keeps writing through its open descriptor, so a
+# rename within the same filesystem relocates the log *and* keeps collecting
+# what comes after this -- the footer, and whatever slurmstepd appends about a
+# cancellation. A copy would snapshot the file just short of the part that
+# explains why a job died. Falls back to cp if the two are on different mounts.
+save_slurm_log() {
+  local dest="$1" path
+  # scontrol, not the #SBATCH pattern above: sbatch's command line can override
+  # --output/--error, and scontrol reports where the file actually went.
+  for path in $(scontrol show job "${SLURM_JOB_ID:-}" 2>/dev/null \
+                | tr ' ' '\n' | grep -E '^Std(Out|Err)=' | cut -d= -f2- | sort -u); do
+    [ -f "$path" ] || continue
+    mv "$path" "$dest/" 2>/dev/null || cp "$path" "$dest/" 2>/dev/null || true
+  done
+}
+
 # Copied on *every* exit path, not just a clean one: a walltime kill or a
 # crashed run still leaves whatever the sweep had finished by then.
 save_results() {
@@ -46,18 +62,22 @@ save_results() {
 
   if [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
     cp -a "$SWEEP_DIR/." "$RESULT_DIR/" || true
+    # One job, several runs: no single run owns the job's log.
+    save_slurm_log "$RESULT_DIR"
     return 0
   fi
 
   # An array task ran a one-combo grid, so its sweep.yaml describes that single
   # run -- it goes inside the run's own directory rather than colliding at the
-  # shared root with every other task's. experiments.csv is the root index.
+  # shared root with every other task's, and so does the job's own stdout/stderr.
+  # experiments.csv is the root index.
   for run in "$SWEEP_DIR"/*/; do
     [ -d "$run" ] || continue
     cp -a "$run" "$RESULT_DIR/" || true
     if [ -f "$SWEEP_DIR/sweep.yaml" ]; then
       cp -a "$SWEEP_DIR/sweep.yaml" "$RESULT_DIR/$(basename "$run")/" || true
     fi
+    save_slurm_log "$RESULT_DIR/$(basename "$run")"
   done
 }
 trap save_results EXIT
