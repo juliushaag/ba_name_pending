@@ -263,13 +263,7 @@ if __name__ == "__main__":
   args.add_argument("--config", default=None,
                      help="Base config providing `defaults:`/`env_defaults:` for every run "
                           "(default: --grid's `base:`, else config/<script>.yaml)")
-  args.add_argument("--gpus", nargs="+", default="auto", metavar="INDEX",
-                     help="Run one sequential worker per GPU, each pinned via "
-                          "CUDA_VISIBLE_DEVICES: `--gpus 0 1 3` runs 3 runs at a time, one per "
-                          "GPU, each worker taking the next combo only when its own finishes. "
-                          "`--gpus auto` uses every GPU nvidia-smi reports. Default: one worker, "
-                          "CUDA_VISIBLE_DEVICES untouched, so a run sees whatever the environment "
-                          "already gives it.")
+  args.add_argument("--sweep_tag", default=None, help="Sweep tag")
   args.add_argument("--dry_run", action="store_true",
                      help="Print the runs the grid expands to and exit, without launching anything.")
   args.add_argument("--validate", action="store_true",
@@ -281,11 +275,7 @@ if __name__ == "__main__":
 
   kwargs = args.parse_args()
 
-  gpus = kwargs.gpus
-  if gpus == ["auto"]:
-    gpus = detect_gpus()
-  if gpus and len(set(gpus)) != len(gpus):
-    raise SystemExit(f"--gpus lists a GPU twice ({' '.join(gpus)}) -- that's two runs on one GPU")
+  gpus = detect_gpus()
 
   grid_base, axes, exclude = build_axes(kwargs)
 
@@ -309,11 +299,15 @@ if __name__ == "__main__":
   if kwargs.validate:
     defaults = {**defaults, "validate": True}
 
-  now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+  now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")  # noqa: DTZ005
   sweep_dir = os.path.join(SCRIPT_DIR, "..", "sweeps", now)
 
   # Threaded through `defaults` so every run in the grid can be filtered together in wandb.
-  sweep_tag = "sweep-" + datetime.datetime.now().strftime("%m-%d-%H-%M")
+  if args.sweep_tag is None:
+    sweep_tag = "sweep-" + datetime.datetime.now().strftime("%m-%d-%H-%M")  # noqa: DTZ005
+  else:
+    sweep_tag = args.sweep_tag
+
   defaults = {**defaults, "sweep_tag": sweep_tag}
 
   axis_desc = " x ".join(f"{len(v)} {k}" for k, v in axes.items() if len(v) > 1) or "1 run"

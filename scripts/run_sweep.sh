@@ -9,7 +9,7 @@
                                            #   gpu_mi300     -> AMD Instinct MI300A APU nodes
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:3                      # number of GPUs (nodes have 4x GPU each, request only what you need)
+#SBATCH --gres=gpu:2                      # number of GPUs (nodes have 4x GPU each, request only what you need)
 
 #SBATCH --output=logs/%x/%j/term.out           # stdout -> logs/ml_job_<jobid>.out
 #SBATCH --error=logs/%x/%j/term.err            # stderr
@@ -18,7 +18,7 @@
 #SBATCH --mail-user=ulqho@student.kit.edu
 #SBATCH --signal=B:USR1@300
 
-#SBATCH --time=6:00:00                   # HH:MM:SS, check current queue limits with `sinfo` / scontrol
+#SBATCH --time=4:00:00                   # HH:MM:SS, check current queue limits with `sinfo` / scontrol
 
 set -euo pipefail
 trap 'cp -r "$TMPDIR/results" ~/results/$SLURM_JOB_ID/ 2>/dev/null' EXIT
@@ -34,7 +34,7 @@ uv run python -c "import torch; print('CUDA available:', torch.cuda.is_available
 # --- Run your script -------------------------------------------------
 # Runs sequentially, algo by algo; --seeds N is N seeds vmapped inside each run.
 uv run python scripts/run_sweep.py \
-    --algos SAC SDAC NCLQL \
+    --algos NCLQL SDAC \
     --envs WalkerRun \
     --seeds 5
 
