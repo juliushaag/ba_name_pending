@@ -8,14 +8,15 @@
 #   RUN_ID      one id for the whole submission (see below)
 #   SWEEP_DIR   node-local scratch that run_sweep.py writes its per-run
 #               directories into -- config, log and checkpoints per run
-#   RESULT_DIR  sweeps/<RUN_ID>, where that tree is copied to on every exit path
+#   SWEEP_NAME  the sweep's folder name, one timestamp per submission
+#   RESULT_DIR  sweeps/<SWEEP_NAME>, where that tree is copied on every exit path
 #
 #   slurm_header / slurm_footer   the identical banner every job prints
 #
-# Every task of one submission copies into the *same* sweeps/<RUN_ID>, next to
-# the experiments.csv submit.py wrote there -- so a finished cluster submission
-# is one folder of per-combo run directories, exactly what `run_sweep.py` alone
-# leaves behind locally under sweeps/<timestamp>.
+# Every task of one submission copies into the *same* sweeps/<SWEEP_NAME>, next
+# to the experiments.csv submit.py wrote there -- so a finished cluster
+# submission is one folder of per-combo run directories, indistinguishable from
+# what `run_sweep.py` alone leaves behind locally.
 
 set -euo pipefail
 
@@ -27,7 +28,13 @@ export PYTHONUNBUFFERED=1
 # submitted without an array falls back to its own id.
 RUN_ID="${RUN_ID:-${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local-$$}}}"
 
-RESULT_DIR="${SWEEPS_ROOT:-$PWD/sweeps}/$RUN_ID"
+# Named the way run_sweep.py names a local sweep -- a timestamp, not a job id --
+# so a cluster sweep and a local one sit side by side in sweeps/ and read the
+# same. submit.py exports one name for a whole array (every task copies into it);
+# a single job takes its own clock reading.
+SWEEP_NAME="${SWEEP_NAME:-$(date +%Y-%m-%d_%H-%M-%S)}"
+
+RESULT_DIR="${SWEEPS_ROOT:-$PWD/sweeps}/$SWEEP_NAME"
 
 SWEEP_DIR="${TMPDIR:-/tmp}/sweep-${SLURM_JOB_ID:-$$}"
 
@@ -60,6 +67,7 @@ slurm_header() {
   echo "Job started: $(date)"
   echo "Hostname:    $(hostname)"
   echo "Run ID:      $RUN_ID"
+  echo "Sweep:       $SWEEP_NAME"
   echo "Job ID:      ${SLURM_JOB_ID:-n/a}"
   echo "Array task:  ${SLURM_ARRAY_TASK_ID:-n/a}"
   echo "Partition:   ${SLURM_JOB_PARTITION:-n/a}"

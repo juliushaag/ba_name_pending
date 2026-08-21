@@ -2,42 +2,19 @@
 
 import argparse
 import csv
-import json
+import datetime
 import os
 import subprocess
 from pathlib import Path
 from itertools import product
 
-# The same directory `run_sweep.py` writes a local sweep into, so a submission
-# ends up as one sweeps/<run id>/ folder: this manifest, plus the per-combo run
+# The same directory -- and the same timestamp naming -- `run_sweep.py` uses for
+# a local sweep, so a submission ends up as one sweeps/<timestamp>/ folder that
+# reads exactly like a local one: this manifest, plus the per-combo run
 # directories every array task copies back into it.
 SWEEPS_DIR = Path("sweeps")
 MANIFEST_NAME = "experiments.csv"
-
-# Run in a subprocess so this launcher stays import-free -- it is submitted from
-# a login node, and `import barl_jax` drags in jax and mujoco. Pure config
-# resolution: no env is built and no weights are allocated, so it costs the
-# import and nothing else.
-CONFIG_CHECK = """
-import json, sys
-import barl_jax
-from barl_jax import model_config
-from barl_jax.env import Environment
-
-algos, envs = json.loads(sys.argv[1]), json.loads(sys.argv[2])
-problems = []
-
-known_envs = set(Environment.available())
-problems += [f"{e!r} is not a registered environment" for e in envs if e not in known_envs]
-
-for algo in algos:
-    try:
-        problems += [f"{algo}: {p}" for p in model_config.validate(algo)]
-    except Exception as exc:                       # an unresolvable name raises rather than reports
-        problems.append(f"{algo}: {type(exc).__name__}: {exc}")
-
-print(json.dumps(problems))
-"""
+SWEEP_NAME_FORMAT = "%Y-%m-%d_%H-%M-%S"
 
 
 def check_config(algos: list[str], envs: list[str]) -> list[str]:
@@ -45,14 +22,32 @@ def check_config(algos: list[str], envs: list[str]) -> list[str]:
     point where it is still one error message: unregistered env or algo names,
     and anything `model_config.validate()` rejects (an override that lands on no
     slot, a kwarg no component accepts, a mistyped YAML value)."""
-    proc = subprocess.run(
-        ["uv", "run", "python", "-c", CONFIG_CHECK, json.dumps(algos), json.dumps(envs)],
-        capture_output=True, text=True, env={**os.environ, "MUJOCO_GL": "egl",
-                                             "JAX_PLATFORMS": "cpu"},
-    )
-    if proc.returncode != 0:
-        return [f"config check failed to run:\n{proc.stdout}{proc.stderr}"]
-    return json.loads(proc.stdout.strip().splitlines()[-1])
+    # Imported here rather than at module scope so `--help` and a --dry-run of a
+    # bad matrix don't pay for jax and mujoco, and pinned to CPU because this
+    # runs on a login node -- there is rarely a GPU to claim and never one to
+    # spend. Resolution only: no env is built and no weights are allocated.
+    os.environ["JAX_PLATFORMS"] = "cpu"
+    # mujoco binds its GL backend at import; without this it reaches for glfw and
+    # warns about a missing DISPLAY on every headless node. Nothing here renders,
+    # so egl is only ever declared, never used.
+    os.environ.setdefault("MUJOCO_GL", "egl")
+
+    import barl_jax  # noqa: F401  -- the import is what populates the registries
+    from barl_jax import model_config
+    from barl_jax.env import Environment
+
+    known_envs = set(Environment.available())
+    problems = [f"{env!r} is not a registered environment"
+                for env in envs if env not in known_envs]
+
+    for algo in algos:
+        try:
+            problems += [f"{algo}: {p}" for p in model_config.validate(algo)]
+        except Exception as exc:      # an unresolvable name raises rather than reporting
+            problems.append(f"{algo}: {type(exc).__name__}: {exc}")
+
+    return problems
+
 
 # --debug overrides for run_rl.slurm's own #SBATCH lines: sbatch's CLI wins over
 # them, so the job script stays the single description of a *real* run.
@@ -199,9 +194,14 @@ def main():
     # Slurm only hands out at submission -- is on disk before any task reads it.
     last_index = len(experiments) - 1
 
+    # Named here, not per task: every task of the array has to agree on which
+    # folder it copies its results into, and each would otherwise take its own
+    # clock reading.
+    sweep_name = datetime.datetime.now().strftime(SWEEP_NAME_FORMAT)  # noqa: DTZ005
+
     cmd = ["sbatch", "--parsable", "--hold",
            f"--array=0-{last_index}%{max_parallel}",
-           f"--export=ALL,SEEDS={args.seeds}"]
+           f"--export=ALL,SEEDS={args.seeds},SWEEP_NAME={sweep_name}"]
 
     if args.debug:
         cmd += [f"--partition={DEBUG_PARTITION}", f"--time={DEBUG_TIME}",
@@ -218,7 +218,7 @@ def main():
     run_id = submitted.stdout.strip().split(";")[0]
 
     try:
-        manifest = write_manifest(run_id, experiments)
+        manifest = write_manifest(sweep_name, run_id, experiments)
         subprocess.run(["scontrol", "release", run_id], check=True)
     except Exception:
         subprocess.run(["scancel", run_id], check=False)
@@ -226,19 +226,20 @@ def main():
 
     print(f"  Run ID:    {run_id}")
     print(f"  Sweep dir: {manifest.parent}")
-    print(f"  Manifest:  {manifest}")
     print(f"  Logs:      logs/{DEBUG_JOB_NAME if args.debug else 'rl'}/{run_id}_<task>/")
     print(f"  Sweep tag: {run_id}")
 
 
-def write_manifest(run_id: str, experiments: list[dict]) -> Path:
-    sweep_dir = SWEEPS_DIR / run_id
+def write_manifest(sweep_name: str, run_id: str, experiments: list[dict]) -> Path:
+    sweep_dir = SWEEPS_DIR / sweep_name
     sweep_dir.mkdir(parents=True, exist_ok=True)
 
     manifest = sweep_dir / MANIFEST_NAME
 
+    # `lineterminator`, not csv's "\r\n" default: run_rl.slurm reads these rows
+    # with `read`, which would carry the CR into the last field.
     with manifest.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["run_id", "algo", "env"])
+        writer = csv.DictWriter(f, fieldnames=["run_id", "algo", "env"], lineterminator="\n")
         writer.writeheader()
         writer.writerows({"run_id": run_id, **e} for e in experiments)
 

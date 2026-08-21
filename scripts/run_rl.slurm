@@ -38,7 +38,7 @@ slurm_header
 # +2: one for the header row, one because array indices start at 0.
 LINE=$(sed -n "$((SLURM_ARRAY_TASK_ID + 2))p" "$MANIFEST")
 
-IFS=',' read -r ROW_RUN_ID ALGO ENV <<< "$LINE"
+IFS=',' read -r ROW_RUN_ID ALGO ENV <<< "${LINE%$'\r'}"
 
 if [ "$ROW_RUN_ID" != "$RUN_ID" ]; then
     echo "WARNING: $MANIFEST row $SLURM_ARRAY_TASK_ID says run id $ROW_RUN_ID, job says $RUN_ID"

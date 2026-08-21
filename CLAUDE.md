@@ -403,17 +403,20 @@ shares the array job id as its **run id**: the manifest's `run_id` column, the `
 run carries into wandb, and the name of the folder they all write into. The id only exists once
 `sbatch` has accepted the job, so `submit.py` submits `--hold`, writes the manifest, then releases
 — held tasks cannot start before the file they read exists. Before any of that it resolves and
-validates every algorithm's model config in a subprocess (`--skip-check` opts out), since a config
-error would otherwise fail every task in the array identically.
+validates every algorithm's model config in-process — pinned to `JAX_PLATFORMS=cpu`, since a login
+node has no GPU to spend (`--skip-check` opts out) — because a config error would otherwise fail
+every task in the array identically.
 
-A submission lands in **`sweeps/<run id>/`** — the same directory a local `run_sweep.py` writes to,
-so a cluster sweep and a local one are the same shape. It holds `experiments.csv` (the manifest,
-one row per array task) plus one directory per `{algo, env}`, each with its `config.yaml`,
+A submission lands in **`sweeps/<timestamp>/`** — the same directory *and the same naming* a local
+`run_sweep.py` uses, so a cluster sweep and a local one are indistinguishable. `submit.py` picks
+that one timestamp and exports it as `SWEEP_NAME`, since every task of the array has to agree on
+which folder it copies into. It holds `experiments.csv` (the manifest, one row per array task,
+carrying the run id as a column) plus one directory per `{algo, env}`, each with its `config.yaml`,
 `run.log` and `checkpoints/`.
 
 All three job scripts (`run_rl.slurm`, `run_sweep.sh`, `debug.sh`) `source scripts/slurm_common.sh`,
 which establishes `RUN_ID`, a node-local `SWEEP_DIR` handed to `run_sweep.py --sweep_dir`, and
-`RESULT_DIR=sweeps/<RUN_ID>` (override the root with `SWEEPS_ROOT`), plus an EXIT trap that copies
+`RESULT_DIR=sweeps/$SWEEP_NAME` (override the root with `SWEEPS_ROOT`), plus an EXIT trap that copies
 the sweep tree back on *every* exit path — that is what makes `#SBATCH --signal=B:USR1@300`
 load-bearing: a walltime kill still saves whatever finished. Array tasks all copy into that one
 folder, so each task's own `sweep.yaml` (a one-combo grid) is filed inside the run directory it
