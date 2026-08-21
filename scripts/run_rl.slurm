@@ -21,10 +21,13 @@
 # that script, not with sbatch directly -- it is what names the manifest after
 # the array job id and fills in the `run_id` column.
 
-source scripts/slurm_common.sh
+source scripts/slurm_common.sh || {
+    echo "ERROR: scripts/slurm_common.sh not found -- sbatch this from the repo root." >&2
+    exit 1
+}
 
 SEEDS="${SEEDS:-5}"
-MANIFEST="${MANIFEST:-slurm_runs/$RUN_ID.csv}"
+MANIFEST="${MANIFEST:-$RESULT_DIR/experiments.csv}"
 
 slurm_header
 

@@ -26,7 +26,10 @@
 # array task (and its own GPU) per {algo, env}, use scripts/submit.py +
 # scripts/run_rl.slurm instead.
 
-source scripts/slurm_common.sh
+source scripts/slurm_common.sh || {
+    echo "ERROR: scripts/slurm_common.sh not found -- sbatch this from the repo root." >&2
+    exit 1
+}
 
 slurm_header
 

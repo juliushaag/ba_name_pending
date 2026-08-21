@@ -8,9 +8,14 @@
 #   RUN_ID      one id for the whole submission (see below)
 #   SWEEP_DIR   node-local scratch that run_sweep.py writes its per-run
 #               directories into -- config, log and checkpoints per run
-#   RESULT_DIR  where that tree is copied to on every exit path
+#   RESULT_DIR  sweeps/<RUN_ID>, where that tree is copied to on every exit path
 #
 #   slurm_header / slurm_footer   the identical banner every job prints
+#
+# Every task of one submission copies into the *same* sweeps/<RUN_ID>, next to
+# the experiments.csv submit.py wrote there -- so a finished cluster submission
+# is one folder of per-combo run directories, exactly what `run_sweep.py` alone
+# leaves behind locally under sweeps/<timestamp>.
 
 set -euo pipefail
 
@@ -22,17 +27,31 @@ export PYTHONUNBUFFERED=1
 # submitted without an array falls back to its own id.
 RUN_ID="${RUN_ID:-${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local-$$}}}"
 
-RESULT_DIR="$HOME/results/$RUN_ID${SLURM_ARRAY_TASK_ID:+/$SLURM_ARRAY_TASK_ID}"
+RESULT_DIR="${SWEEPS_ROOT:-$PWD/sweeps}/$RUN_ID"
 
 SWEEP_DIR="${TMPDIR:-/tmp}/sweep-${SLURM_JOB_ID:-$$}"
 
 # Copied on *every* exit path, not just a clean one: a walltime kill or a
 # crashed run still leaves whatever the sweep had finished by then.
 save_results() {
-  if [ -d "$SWEEP_DIR" ]; then
-    mkdir -p "$RESULT_DIR"
+  [ -d "$SWEEP_DIR" ] || return 0
+  mkdir -p "$RESULT_DIR"
+
+  if [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
     cp -a "$SWEEP_DIR/." "$RESULT_DIR/" || true
+    return 0
   fi
+
+  # An array task ran a one-combo grid, so its sweep.yaml describes that single
+  # run -- it goes inside the run's own directory rather than colliding at the
+  # shared root with every other task's. experiments.csv is the root index.
+  for run in "$SWEEP_DIR"/*/; do
+    [ -d "$run" ] || continue
+    cp -a "$run" "$RESULT_DIR/" || true
+    if [ -f "$SWEEP_DIR/sweep.yaml" ]; then
+      cp -a "$SWEEP_DIR/sweep.yaml" "$RESULT_DIR/$(basename "$run")/" || true
+    fi
+  done
 }
 trap save_results EXIT
 

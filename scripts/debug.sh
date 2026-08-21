@@ -20,7 +20,10 @@
 # allocation on it. Add --validate below for the cheapest possible check (one
 # rollout chunk + one train step per {algo, env}, no eval or checkpointing).
 
-source scripts/slurm_common.sh
+source scripts/slurm_common.sh || {
+    echo "ERROR: scripts/slurm_common.sh not found -- sbatch this from the repo root." >&2
+    exit 1
+}
 
 slurm_header
 

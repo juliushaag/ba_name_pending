@@ -2,11 +2,57 @@
 
 import argparse
 import csv
+import json
+import os
 import subprocess
 from pathlib import Path
 from itertools import product
 
-RUN_DIR = Path("slurm_runs")
+# The same directory `run_sweep.py` writes a local sweep into, so a submission
+# ends up as one sweeps/<run id>/ folder: this manifest, plus the per-combo run
+# directories every array task copies back into it.
+SWEEPS_DIR = Path("sweeps")
+MANIFEST_NAME = "experiments.csv"
+
+# Run in a subprocess so this launcher stays import-free -- it is submitted from
+# a login node, and `import barl_jax` drags in jax and mujoco. Pure config
+# resolution: no env is built and no weights are allocated, so it costs the
+# import and nothing else.
+CONFIG_CHECK = """
+import json, sys
+import barl_jax
+from barl_jax import model_config
+from barl_jax.env import Environment
+
+algos, envs = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+problems = []
+
+known_envs = set(Environment.available())
+problems += [f"{e!r} is not a registered environment" for e in envs if e not in known_envs]
+
+for algo in algos:
+    try:
+        problems += [f"{algo}: {p}" for p in model_config.validate(algo)]
+    except Exception as exc:                       # an unresolvable name raises rather than reports
+        problems.append(f"{algo}: {type(exc).__name__}: {exc}")
+
+print(json.dumps(problems))
+"""
+
+
+def check_config(algos: list[str], envs: list[str]) -> list[str]:
+    """Everything an array of 40 tasks would otherwise discover 40 times, at the
+    point where it is still one error message: unregistered env or algo names,
+    and anything `model_config.validate()` rejects (an override that lands on no
+    slot, a kwarg no component accepts, a mistyped YAML value)."""
+    proc = subprocess.run(
+        ["uv", "run", "python", "-c", CONFIG_CHECK, json.dumps(algos), json.dumps(envs)],
+        capture_output=True, text=True, env={**os.environ, "MUJOCO_GL": "egl",
+                                             "JAX_PLATFORMS": "cpu"},
+    )
+    if proc.returncode != 0:
+        return [f"config check failed to run:\n{proc.stdout}{proc.stderr}"]
+    return json.loads(proc.stdout.strip().splitlines()[-1])
 
 # --debug overrides for run_rl.slurm's own #SBATCH lines: sbatch's CLI wins over
 # them, so the job script stays the single description of a *real* run.
@@ -55,6 +101,13 @@ def main():
              f"{DEBUG_TIME} walltime cap and one task at a time (--max-parallel is "
              f"ignored). The runs are real ones, just cut short -- run_rl.slurm copies "
              f"whatever finished back to ~/results when the cap kills it.",
+    )
+
+    parser.add_argument(
+        "--skip-check",
+        action="store_true",
+        help="Don't resolve and validate every algorithm's model config first. Only worth it "
+             "if the check itself is in the way -- a bad config fails every array task.",
     )
 
     parser.add_argument(
@@ -111,6 +164,25 @@ def main():
         )
 
     # ------------------------------------------------------------
+    # Check the config before it costs queue time
+    # ------------------------------------------------------------
+
+    if args.skip_check:
+        print()
+        print("Skipping the config check (--skip-check).")
+    else:
+        print()
+        print("Checking model configs ...", flush=True)
+        problems = check_config(args.algos, args.envs)
+        if problems:
+            print()
+            print("Refusing to submit -- unusable config:")
+            for problem in problems:
+                print(f"  {problem}")
+            raise SystemExit(1)
+        print("  OK")
+
+    # ------------------------------------------------------------
     # Dry run
     # ------------------------------------------------------------
 
@@ -152,16 +224,18 @@ def main():
         subprocess.run(["scancel", run_id], check=False)
         raise
 
-    print(f"  Run ID:   {run_id}")
-    print(f"  Manifest: {manifest}")
-    print(f"  Logs:     logs/rl/{run_id}_<task>/")
+    print(f"  Run ID:    {run_id}")
+    print(f"  Sweep dir: {manifest.parent}")
+    print(f"  Manifest:  {manifest}")
+    print(f"  Logs:      logs/{DEBUG_JOB_NAME if args.debug else 'rl'}/{run_id}_<task>/")
     print(f"  Sweep tag: {run_id}")
 
 
 def write_manifest(run_id: str, experiments: list[dict]) -> Path:
-    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    sweep_dir = SWEEPS_DIR / run_id
+    sweep_dir.mkdir(parents=True, exist_ok=True)
 
-    manifest = RUN_DIR / f"{run_id}.csv"
+    manifest = sweep_dir / MANIFEST_NAME
 
     with manifest.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["run_id", "algo", "env"])

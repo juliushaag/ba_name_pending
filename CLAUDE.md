@@ -398,19 +398,29 @@ jobs put it on node-local scratch and copy it back (see below).
 
 ### Slurm (`scripts/*.slurm`, `scripts/submit.py`)
 
-`scripts/submit.py` submits an `{algo x env}` matrix as one job array: it writes
-`slurm_runs/<array job id>.csv`, one row per array task, and every task of that submission shares
-the array job id as its **run id** — the manifest's filename and `run_id` column, the `--sweep_tag`
-every run carries into wandb, and the name of its `~/results/<run id>/` directory. The id only
-exists once `sbatch` has accepted the job, so `submit.py` submits `--hold`, writes the manifest,
-then releases: held tasks cannot start before the file they read exists.
+`scripts/submit.py` submits an `{algo x env}` matrix as one job array. Every task of one submission
+shares the array job id as its **run id**: the manifest's `run_id` column, the `--sweep_tag` every
+run carries into wandb, and the name of the folder they all write into. The id only exists once
+`sbatch` has accepted the job, so `submit.py` submits `--hold`, writes the manifest, then releases
+— held tasks cannot start before the file they read exists. Before any of that it resolves and
+validates every algorithm's model config in a subprocess (`--skip-check` opts out), since a config
+error would otherwise fail every task in the array identically.
+
+A submission lands in **`sweeps/<run id>/`** — the same directory a local `run_sweep.py` writes to,
+so a cluster sweep and a local one are the same shape. It holds `experiments.csv` (the manifest,
+one row per array task) plus one directory per `{algo, env}`, each with its `config.yaml`,
+`run.log` and `checkpoints/`.
 
 All three job scripts (`run_rl.slurm`, `run_sweep.sh`, `debug.sh`) `source scripts/slurm_common.sh`,
-which establishes `RUN_ID`, a node-local `SWEEP_DIR` handed to `run_sweep.py --sweep_dir`, and a
-`RESULT_DIR` under `~/results/`, plus an EXIT trap that copies the sweep tree back on *every* exit
-path — that is what makes `#SBATCH --signal=B:USR1@300` load-bearing: a walltime kill still saves
-whatever finished. `run_rl.slurm` is the array task (one manifest row each);
-`run_sweep.sh`/`debug.sh` are single jobs with the grid written into them.
+which establishes `RUN_ID`, a node-local `SWEEP_DIR` handed to `run_sweep.py --sweep_dir`, and
+`RESULT_DIR=sweeps/<RUN_ID>` (override the root with `SWEEPS_ROOT`), plus an EXIT trap that copies
+the sweep tree back on *every* exit path — that is what makes `#SBATCH --signal=B:USR1@300`
+load-bearing: a walltime kill still saves whatever finished. Array tasks all copy into that one
+folder, so each task's own `sweep.yaml` (a one-combo grid) is filed inside the run directory it
+describes rather than colliding at the root; a single non-array job copies its tree wholesale,
+`sweep.yaml` and all. `run_rl.slurm` is the array task (one manifest row each);
+`run_sweep.sh`/`debug.sh` are single jobs with the grid written into them, and all three abort if
+sourced from outside the repo root.
 
 `submit.py --debug` is the array equivalent of `debug.sh`: same dev queue and 30-minute cap, but
 over a whole matrix, one task at a time. It overrides `run_rl.slurm`'s `#SBATCH` partition/time/
