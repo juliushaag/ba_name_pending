@@ -99,11 +99,16 @@ class SDAC(Policy):
   def _tile(obs, n: int):
     return jnp.broadcast_to(obs[None], (n, *obs.shape)).reshape(n * obs.shape[0], -1)
 
-  def pick_best(self, obs_rep, raw, n: int):
+  def score(self, obs_rep, raw):
+    return frozen(self.critic).value(obs_rep, self.squash(raw)).squeeze(-1)
+
+  def pick_best_from(self, qv, raw, n: int):
     B   = raw.shape[0] // n
-    qv  = frozen(self.critic).value(obs_rep, self.squash(raw)).reshape(n, B, -1).squeeze(-1)
-    idx = jnp.argmax(qv, axis=0)                                                 # (B,)
+    idx = jnp.argmax(qv.reshape(n, B), axis=0)                                   # (B,)
     return jnp.take_along_axis(raw.reshape(n, B, -1), idx[None, :, None], axis=0).squeeze(0)
+
+  def pick_best(self, obs_rep, raw, n: int):
+    return self.pick_best_from(self.score(obs_rep, raw), raw, n)
 
   def best_of_n(self, obs, n: int, key):
     obs_rep = self._tile(obs, n)
@@ -142,14 +147,17 @@ class SDAC(Policy):
     # underestimate that grows as the actor improves, and that the critic's
     # `pessimistic_target` then compounds. The reference selects its target
     # action with the same Q-scored best-of-N it acts with.
-    obs_rep  = self._tile(obs, self.num_bon)
-    next_rep = self._tile(next_obs, self.num_bon)
-    joint    = jax.lax.stop_gradient(
-      self.actor.sample(jnp.concatenate([next_rep, obs_rep], axis=0), keys[0]))
+    joint_obs = jnp.concatenate([self._tile(next_obs, self.num_bon),
+                                 self._tile(obs, self.num_bon)], axis=0)
+    joint     = jax.lax.stop_gradient(self.actor.sample(joint_obs, keys[0]))
 
+    # Scored in one critic pass for the same reason both halves are sampled in
+    # one actor pass: a frozen critic prices on running statistics, so the two
+    # halves cannot influence each other's normalization by sharing a batch.
     split     = self.num_bon * B
-    next_raw  = self.pick_best(next_rep, joint[:split], self.num_bon)
-    policy_x0 = self.pick_best(obs_rep, joint[split:], self.num_bon)
+    qv        = self.score(joint_obs, joint)
+    next_raw  = self.pick_best_from(qv[:split], joint[:split], self.num_bon)
+    policy_x0 = self.pick_best_from(qv[split:], joint[split:], self.num_bon)
 
     # ---- critic ------------------------------------------------------------
     next_action = jax.lax.stop_gradient(self.explore(self.squash(next_raw), keys[1]))

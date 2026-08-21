@@ -82,12 +82,13 @@ before committing to a full run:
 uv run python scripts/run_sweep.py --algos SAC NCLQL --envs HalfCheetah CheetahRun --validate
 ```
 
-Submit an `{algo x env}` matrix to Slurm as one job array (see the Slurm section below);
-`--debug` puts it on the dev queue with a 30-minute cap, one task at a time:
+Launch an `{algo x env}` matrix through the one interface that works in both places — a Slurm job
+array on the cluster, one tmux window per run on a workstation (see Execution backends below):
 
 ```bash
 uv run python scripts/submit.py --algos NCLQL SDAC --envs WalkerRun --seeds 5
-uv run python scripts/submit.py --algos NCLQL --envs WalkerRun --debug --dry-run
+uv run python scripts/submit.py --algos NCLQL --envs WalkerRun --executor tmux --dry-run
+uv run python scripts/submit.py --algos NCLQL --envs WalkerRun --debug     # 30-min smoke test
 ```
 
 No linter/formatter/type-checker is configured in `pyproject.toml`; there's no CI to match.
@@ -396,9 +397,35 @@ the axes, the resolved command, and one entry per run with its tag, directory an
 the grid finishes — its exit code. `--sweep_dir` relocates that whole tree, which is how the Slurm
 jobs put it on node-local scratch and copy it back (see below).
 
-### Slurm (`scripts/*.slurm`, `scripts/submit.py`)
+### Execution backends (`scripts/submit.py`)
 
-`scripts/submit.py` submits an `{algo x env}` matrix as one job array. Every task of one submission
+`scripts/submit.py` is the one interface for launching an `{algo x env}` matrix, on the cluster and
+on a workstation alike. It is only a CLI: it builds the matrix, validates it (`check_config`),
+and hands it to an `Executor`. `--executor auto` (the default) picks **slurm** when `sbatch` is on
+PATH and **tmux** otherwise; `--executor slurm|tmux` forces either.
+
+`scripts/executors.py` holds both backends behind one interface — `available()`,
+`default_parallelism`, `describe_debug()`, and `submit()`, which returns the lines `submit.py`
+prints, so a backend reports whatever is worth knowing about itself (a job id, a session to attach
+to) without the CLI knowing which is which. Each owns the whole of its own mechanism, because the
+parts that differ do not usefully generalise: Slurm's run id only exists once `sbatch` has accepted
+the job, so it submits held, writes the manifest, then releases; tmux has no scheduler to ask, so
+the sweep's name *is* the id and the manifest is written first. What they share lives in that
+module too — the `sweeps/<timestamp>/` layout and `write_manifest()`, which `tmux_pool.py` also
+reads its queue from. Both backends leave the same sweep folder behind.
+
+| | slurm | tmux |
+|---|---|---|
+| a task is | an array task (`run_rl.slurm`) | a window (`scripts/tmux_pool.py` opens it) |
+| the queue is | `--array=0-N%M` | the manager's GPU pool, `--max-parallel` slots |
+| default parallelism | 4 | one run per detected GPU |
+| scratch is | node-local `$TMPDIR` | `sweeps/<name>/.tasks/<k>/` |
+| results get there by | `cp` in the exit trap | `Path.replace` as each task finishes |
+| cancel with | `scancel <id>` | `tmux kill-session -t barl-<name>` |
+| status from | `sacct` | `sweeps/<name>/tasks.yaml`, and the live table |
+| the run id is | the array job id | the sweep's own timestamp |
+
+**Slurm** (`SlurmExecutor`). It submits the matrix as one job array. Every task of one submission
 shares the array job id as its **run id**: the manifest's `run_id` column, the `--sweep_tag` every
 run carries into wandb, and the name of the folder they all write into. The id only exists once
 `sbatch` has accepted the job, so `submit.py` submits `--hold`, writes the manifest, then releases
@@ -414,20 +441,33 @@ which folder it copies into. It holds `experiments.csv` (the manifest, one row p
 carrying the run id as a column) plus one directory per `{algo, env}`, each with its `config.yaml`,
 `run.log` and `checkpoints/`.
 
-All three job scripts (`run_rl.slurm`, `run_sweep.sh`, `debug.sh`) `source scripts/slurm_common.sh`,
-which establishes `RUN_ID`, a node-local `SWEEP_DIR` handed to `run_sweep.py --sweep_dir`, and
-`RESULT_DIR=sweeps/$SWEEP_NAME` (override the root with `SWEEPS_ROOT`), plus an EXIT trap that copies
-the sweep tree back on *every* exit path — that is what makes `#SBATCH --signal=B:USR1@300`
-load-bearing: a walltime kill still saves whatever finished. Array tasks all copy into that one
-folder, so each task's own `sweep.yaml` (a one-combo grid) is filed inside the run directory it
-describes rather than colliding at the root; a single non-array job copies its tree wholesale,
-`sweep.yaml` and all. `run_rl.slurm` is the array task (one manifest row each);
-`run_sweep.sh`/`debug.sh` are single jobs with the grid written into them, and all three abort if
-sourced from outside the repo root.
+`run_rl.slurm` is the only Slurm job script: one array task per manifest row, self-contained (no shared
+include), and it must be submitted through `submit.py` — `SWEEP_NAME` and `SEEDS` come from that
+script's `--export`. It works on node-local scratch and copies out on *every* exit path, which is
+what makes `#SBATCH --signal=B:USR1@300` load-bearing: a walltime kill still saves whatever
+finished. Each task's own `sweep.yaml` (a one-combo grid) is filed inside the run directory it
+describes rather than colliding at the shared root, and the job's `term.out`/`term.err` are
+**moved** (not copied) in beside it — a rename keeps slurmstepd's descriptor live, so the relocated
+file still collects the footer and any cancellation notice a copy would miss.
+`SWEEPS_ROOT` overrides where `sweeps/` itself lives.
 
-`submit.py --debug` is the array equivalent of `debug.sh`: same dev queue and 30-minute cap, but
-over a whole matrix, one task at a time. It overrides `run_rl.slurm`'s `#SBATCH` partition/time/
-job-name from sbatch's command line, so the job script stays the description of a real run.
+**tmux** (`TmuxExecutor`). It writes the manifest, then opens one detached session `barl-<timestamp>`:
+`scripts/tmux_pool.py` in window 0 owning the queue and a `rich` status table, and one window per
+run that it opens as a slot frees. Each window runs the *same command* a Slurm array task runs, so
+`run_sweep.py` is driven identically either way. Details that are load-bearing rather than
+incidental: each task gets its own scratch dir because two concurrent `run_sweep.py` processes
+sharing a `--sweep_dir` would both write `sweep.yaml` at its root; `PATH` is passed explicitly to
+the session and to every window (a window otherwise inherits the tmux *server's* environment, which
+need not have this venv's `uv`) — the tmux answer to `--export=ALL`; the exit code comes from
+`${PIPESTATUS[0]}` because it is piped through `tee`; `remain-on-exit` is set on every window and
+successes are killed explicitly, which is what leaves a failure on screen; and `tmux_pool.py` traps
+**SIGHUP** as well as SIGINT/SIGTERM, since `kill-session` hangs the pane up rather than terminating
+it — without that a cancel would strand whatever was in flight in `.tasks/`.
+
+`submit.py --debug` runs one task at a time with a 30-minute cap (`timeout` under tmux, `--time`
+under slurm, plus the dev queue there).
+It overrides `run_rl.slurm`'s `#SBATCH` partition/time/job-name from sbatch's command line, so the
+job script stays the description of a real run.
 
 ### Registered algorithms (`src/barl/policies/`)
 

@@ -140,7 +140,7 @@ SDAC:
     explore_max: 1.0
 
   components:
-    actor:   {class: VPDiffusionActor, latent_dim: 256, layers: 3, num_steps: 20, activation: Mish}
+    actor:   {class: VPDiffusionActor, latent_dim: 256, layers: 3, num_steps: 20, activation: Mish, dtype: bfloat16}
     critic:  {class: C51Critic, latent_dim: 256, layers: 3, activation: Mish }
     squash:  {class: TanhSquash }
     entropy: {class: AutotuneRegulator }
