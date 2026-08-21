@@ -26,11 +26,13 @@ export PYTHONUNBUFFERED=1
 # ------------------------------------------------------------
 
 SEEDS="${SEEDS:-5}"
-MANIFEST="${MANIFEST:-slurm_runs/experiments.csv}"
+RUN_ID="${RUN_ID:-$SLURM_ARRAY_JOB_ID}"
+MANIFEST="${MANIFEST:-slurm_runs/$RUN_ID.csv}"
 
 echo "=================================================="
 echo "Job started: $(date)"
 echo "Hostname:    $(hostname)"
+echo "Run ID:      $RUN_ID"
 echo "Job ID:      $SLURM_JOB_ID"
 echo "Array ID:    $SLURM_ARRAY_TASK_ID"
 echo "Partition:   $SLURM_JOB_PARTITION"
@@ -45,14 +47,14 @@ echo "=================================================="
 
 LINE=$(sed -n "$((SLURM_ARRAY_TASK_ID + 2))p" "$MANIFEST")
 
-IFS=',' read -r ALGO ENV CONFIG <<< "$LINE"
+IFS=',' read -r RUN_ID ALGO ENV <<< "$LINE"
 
 echo ""
 echo "Experiment:"
 echo "  Algo:   $ALGO"
 echo "  Env:    $ENV"
-echo "  Config: $CONFIG"
 echo "  Seeds:  $SEEDS"
+echo "  Tag:    $RUN_ID"
 echo ""
 
 # ------------------------------------------------------------
@@ -78,13 +80,14 @@ mkdir -p "$TMPDIR/results"
 uv run python scripts/run_sweep.py \
     --algos "$ALGO" \
     --envs "$ENV" \
-    --seeds "$SEEDS"
+    --seeds "$SEEDS" \
+    --sweep_tag "$RUN_ID"
 
 # ------------------------------------------------------------
-# Copy results to persistent storagex
+# Copy results to persistent storage
 # ------------------------------------------------------------
 
-RESULT_DIR="$HOME/results/$SLURM_ARRAY_JOB_ID/$SLURM_ARRAY_TASK_ID"
+RESULT_DIR="$HOME/results/$RUN_ID/$SLURM_ARRAY_TASK_ID"
 
 mkdir -p "$RESULT_DIR"
 

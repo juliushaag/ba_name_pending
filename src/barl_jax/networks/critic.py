@@ -177,7 +177,7 @@ class EnsembleCritic(QCriticBase):
   distributional critic's is the return's own.
 
   `rho` subsumes the usual reductions rather than needing a class each: 0.0 is
-  the plain mean, and at `n_models: 2` the population std is |q1 - q2|/2, so
+  the plain mean, and at `n_models: 2` the population std is |q1 - q2|/2, soy
   `rho: 1.0` is exactly the min-over-heads that C51EnsembleCritic takes."""
 
   def __init__(self, env_stats, latent_dim: int, layers: int, n_models: int, rho: float,
@@ -260,11 +260,6 @@ class CategoricalCriticBase(QCriticBase):
     return (self.probs(raw) * self.support[...]).sum(axis=-1, keepdims=True)
 
   def reduce_value(self, raw):
-    """min over the heads. The target averages them instead (see each
-    `bellman_target`, and C51Critic's `pessimistic_target` to put the min there
-    too), so both regress onto one well-posed target while the price a Policy
-    improves against stays pessimistic -- C51's reference behaviour, and the
-    same reduction EnsembleCritic's `rho: 1.0` gives."""
     return self.expectations(raw).min(axis=0)
 
   def loss_from_raw(self, raw, target, losses: dict) -> None:
@@ -342,9 +337,18 @@ class C51Critic(CategoricalCriticBase):
                norm_input: bool = False, norm_stem: bool = False, norm_after_act: bool = True,
                dropout: float = 0.0, final_activation: bool = False,
                residual: bool = False, norm_kwargs: dict = None, dtype: str = "float32",
+               v_min: float = None, v_max: float = None,
                *, rngs: nnx.Rngs, **kwargs):
 
-    v_min, v_max = env_stats["return_min"], env_stats["return_max"]
+    # Defaulted, not required: the support is a fact about the environment, so
+    # EnvStats supplies it -- but unlike a pure env fact it is also worth
+    # sweeping (the declared range is a bound, and a loose one wastes atoms:
+    # ~200 over 101 atoms is a 4.0-wide bin, while gamma=0.99 on a [0,1]-reward
+    # env caps |Q| at 100 and never uses the negative half at all). This is the
+    # kwarg-falling-back-to-EnvStats pattern, so `model.components.critic.v_min`
+    # is a sweep axis without EnvStats becoming tunable.
+    v_min = env_stats["return_min"] if v_min is None else float(v_min)
+    v_max = env_stats["return_max"] if v_max is None else float(v_max)
 
     q_function = ConcatQ(env_stats["obs_dim"] + env_stats["act_dim"], num_atoms,
                          latent_dim, layers, n_models=n_models,
@@ -397,9 +401,12 @@ class HLGaussCritic(CategoricalCriticBase):
                norm_input: bool = False, norm_stem: bool = False, norm_after_act: bool = True,
                dropout: float = 0.0, final_activation: bool = False,
                residual: bool = False, norm_kwargs: dict = None, dtype: str = "float32",
+               v_min: float = None, v_max: float = None,
                *, rngs: nnx.Rngs, **kwargs):
 
-    v_min, v_max = env_stats["return_min"], env_stats["return_max"]
+    # Same kwarg-over-EnvStats fallback as C51Critic -- see its __init__.
+    v_min = env_stats["return_min"] if v_min is None else float(v_min)
+    v_max = env_stats["return_max"] if v_max is None else float(v_max)
     edges = jnp.linspace(v_min, v_max, num_bins + 1, dtype=jnp.float32)
 
     q_function = ConcatQ(env_stats["obs_dim"] + env_stats["act_dim"], num_bins,

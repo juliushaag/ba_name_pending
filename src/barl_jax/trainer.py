@@ -208,7 +208,6 @@ def train(run: Run):
     run.env_stats["live"].update(
       run.buffer.random_fill(run.rollout_env, n_steps=cfg["random_steps"] // run.num_envs,
                              seed=run.base_seed))
-    log.advance({"env_steps": cfg["random_steps"]})
     log.message(f"Random-filled the buffer with {cfg['random_steps']} env steps before training")
 
   best = [float("-inf")] * num_seeds

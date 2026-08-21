@@ -303,10 +303,10 @@ if __name__ == "__main__":
   sweep_dir = os.path.join(SCRIPT_DIR, "..", "sweeps", now)
 
   # Threaded through `defaults` so every run in the grid can be filtered together in wandb.
-  if args.sweep_tag is None:
+  if kwargs.sweep_tag is None:
     sweep_tag = "sweep-" + datetime.datetime.now().strftime("%m-%d-%H-%M")  # noqa: DTZ005
   else:
-    sweep_tag = args.sweep_tag
+    sweep_tag = kwargs.sweep_tag
 
   defaults = {**defaults, "sweep_tag": sweep_tag}
 

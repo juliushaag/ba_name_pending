@@ -6,6 +6,8 @@ import subprocess
 from pathlib import Path
 from itertools import product
 
+RUN_DIR = Path("slurm_runs")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -43,7 +45,7 @@ def main():
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Generate the manifest but don't submit the jobs.",
+        help="Print the matrix but don't submit the jobs.",
     )
 
     args = parser.parse_args()
@@ -70,23 +72,6 @@ def main():
         raise RuntimeError("No experiments generated.")
 
     # ------------------------------------------------------------
-    # Write manifest
-    # ------------------------------------------------------------
-
-    run_dir = Path("slurm_runs")
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    manifest = run_dir / "experiments.csv"
-
-    with manifest.open("w", newline="") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["algo", "env"],
-        )
-        writer.writeheader()
-        writer.writerows(experiments)
-
-    # ------------------------------------------------------------
     # Print what we're about to do
     # ------------------------------------------------------------
 
@@ -97,7 +82,6 @@ def main():
     print(f"  Number of experiments: {len(experiments)}")
     print(f"  Seeds per experiment: {args.seeds}")
     print(f"  Max parallel jobs: {args.max_parallel}")
-    print(f"  Manifest: {manifest}")
     print()
 
     for i, experiment in enumerate(experiments):
@@ -120,12 +104,16 @@ def main():
     # Submit Slurm array
     # ------------------------------------------------------------
 
+    # Held so the manifest -- whose name and `run_id` column are the array job id
+    # Slurm only hands out at submission -- is on disk before any task reads it.
     last_index = len(experiments) - 1
 
     cmd = [
         "sbatch",
+        "--parsable",
+        "--hold",
         f"--array=0-{last_index}%{args.max_parallel}",
-        f"--export=ALL,SEEDS={args.seeds},MANIFEST={manifest}",
+        f"--export=ALL,SEEDS={args.seeds}",
         "scripts/run_rl.slurm",
     ]
 
@@ -134,7 +122,33 @@ def main():
     print(" ".join(cmd))
     print()
 
-    subprocess.run(cmd, check=True)
+    submitted = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    run_id = submitted.stdout.strip().split(";")[0]
+
+    try:
+        manifest = write_manifest(run_id, experiments)
+        subprocess.run(["scontrol", "release", run_id], check=True)
+    except Exception:
+        subprocess.run(["scancel", run_id], check=False)
+        raise
+
+    print(f"  Run ID:   {run_id}")
+    print(f"  Manifest: {manifest}")
+    print(f"  Logs:     logs/rl/{run_id}_<task>/")
+    print(f"  Sweep tag: {run_id}")
+
+
+def write_manifest(run_id: str, experiments: list[dict]) -> Path:
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+
+    manifest = RUN_DIR / f"{run_id}.csv"
+
+    with manifest.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["run_id", "algo", "env"])
+        writer.writeheader()
+        writer.writerows({"run_id": run_id, **e} for e in experiments)
+
+    return manifest
 
 
 if __name__ == "__main__":
