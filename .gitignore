@@ -9,6 +9,7 @@ __pycache__/
 output/
 wandb/
 logs/
+slurm_runs/
 
 checkpoints/
 sweeps/

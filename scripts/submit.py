@@ -68,7 +68,7 @@ def check_config(algos: list[str], envs: list[str]) -> list[str]:
 
 # --debug overrides for run_rl.slurm's own #SBATCH lines: sbatch's CLI wins over
 # them, so the job script stays the single description of a *real* run.
-DEBUG_PARTITION = "dev_gpu_a100_il"
+DEBUG_PARTITION = "gpu_a100_short"
 DEBUG_TIME      = "00:30:00"
 DEBUG_JOB_NAME  = "rl_dev"
 
