@@ -109,6 +109,18 @@ class QCriticBase(Critic):
   def value(self, s, a):
     return self.reduce_value(self.raw(s, a))
 
+  def expectation_from_raw(self, raw):
+    """E[Z] per head, `(n_models, B, 1)` -- the identity for a head that already
+    predicts a scalar, an integral over the support for one that does not."""
+    return raw
+
+  def expectation(self, s, a):
+    """E[Z] averaged over the heads, where `value()` is the pessimistic price.
+    A Policy whose improvement direction *is* the critic's action-gradient field
+    (NC-LQL's Langevin chain) differentiates this one: a spread term would move
+    the distribution it samples from, not merely bound the price."""
+    return self.expectation_from_raw(self.raw(s, a)).mean(axis=0)
+
   def create_optimizer(self) -> dict:
     return {"q": optax.adam(self.lr, b1=self.adam_b1)}
 
@@ -122,8 +134,27 @@ class QCriticBase(Critic):
     term   = term.reshape(-1, 1).astype(reward.dtype)
     return reward + (1.0 - term) * self.gamma * (bootstrap + shift)
 
-  def loss_from_raw(self, raw, target, losses: dict) -> None:
+  def target_from_raw(self, raw):
+    """One of this critic's own predictions lifted into a regression target --
+    head-averaged and detached, in whatever representation `loss()` regresses
+    against. What a Policy needs to pull one forward pass onto another (NC-LQL's
+    smoothing loss pulls the noisy levels onto the clean one) without knowing
+    whether that means a scalar or a distribution over atoms."""
+    return jax.lax.stop_gradient(raw.mean(axis=0))
+
+  def regression_loss(self, raw, target):
     raise NotImplementedError
+
+  def record(self, raw, target) -> None:
+    """The diagnostics half of `loss_from_raw`, separate so a Policy that fits
+    the same heads to two targets (NC-LQL) pays the `critic/q/*` keys once,
+    against whichever pass it means, instead of the second call overwriting the
+    first."""
+    raise NotImplementedError
+
+  def loss_from_raw(self, raw, target, losses: dict) -> None:
+    losses["q"] = self.regression_loss(raw, target)
+    self.record(raw, target)
 
   def td_loss(self, obs, action, next_obs, next_action, reward, term,
               losses: dict, shift=0.0) -> None:
@@ -206,13 +237,16 @@ class EnsembleCritic(QCriticBase):
     std = jnp.sqrt(jnp.maximum(raw.var(axis=0), 1e-8))
     return raw.mean(axis=0) - self.rho * std
 
-  def loss_from_raw(self, raw, target, losses: dict) -> None:
+  def regression_loss(self, raw, target):
     pred = raw.astype(jnp.float32)                             # (n_models, B, 1)
     tgt  = jax.lax.stop_gradient(target).astype(jnp.float32)   # (B, 1), shared by every head
-    losses["q"] = ((pred - tgt) ** 2).mean()
+    return ((pred - tgt) ** 2).mean()
+
+  def record(self, raw, target) -> None:
+    pred = raw.astype(jnp.float32)
 
     self.metrics.dist("q", pred.mean(axis=0))
-    self.metrics.dist("q_target", tgt)
+    self.metrics.dist("q_target", jax.lax.stop_gradient(target).astype(jnp.float32))
     self.metrics.ensemble("ensemble", pred, rho=self.rho)
 
 
@@ -255,14 +289,18 @@ class CategoricalCriticBase(QCriticBase):
   def probs(self, raw):
     return jax.nn.softmax(raw.astype(jnp.float32), axis=-1)
 
-  def expectations(self, raw):
-    """E[Z] **per head**, `(n_models, B, 1)`."""
+  def expectation_from_raw(self, raw):
     return (self.probs(raw) * self.support[...]).sum(axis=-1, keepdims=True)
 
   def reduce_value(self, raw):
-    return self.expectations(raw).min(axis=0)
+    return self.expectation_from_raw(raw).min(axis=0)
 
-  def loss_from_raw(self, raw, target, losses: dict) -> None:
+  def target_from_raw(self, raw):
+    """The heads' mean *distribution*, not their mean expectation -- the target
+    has to live on the support that `regression_loss` cross-entropies against."""
+    return jax.lax.stop_gradient(self.probs(raw).mean(axis=0))
+
+  def regression_loss(self, raw, target):
     logp = jax.nn.log_softmax(raw.astype(jnp.float32), axis=-1)
     tgt  = jax.lax.stop_gradient(target).astype(jnp.float32)
 
@@ -270,11 +308,14 @@ class CategoricalCriticBase(QCriticBase):
     # sum() adds up the heads -- a no-op on the scalar a single head leaves.
     reduce = lambda x: x.sum(axis=-1).mean(axis=-1).sum()
 
-    losses["q"] = reduce(-(tgt * logp))
+    loss = reduce(-(tgt * logp))
     if self.entropy_coef:
-      losses["q"] += self.entropy_coef * reduce(jnp.exp(logp) * logp)
+      loss += self.entropy_coef * reduce(jnp.exp(logp) * logp)
+    return loss
 
-    exp = self.expectations(raw)
+  def record(self, raw, target) -> None:
+    tgt = jax.lax.stop_gradient(target).astype(jnp.float32)
+    exp = self.expectation_from_raw(raw)
 
     self.metrics.dist("q", exp.mean(axis=0))
     self.metrics.dist("q_target", (tgt * self.support[...]).sum(axis=-1, keepdims=True))

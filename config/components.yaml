@@ -242,17 +242,33 @@ HLGaussCritic:
   norm_kwargs: {momentum: 0.01, warmup_steps: 100000}
 
 
-# NC-LQL's own critic (src/barl_jax/policies/lql.py), matching ku-dmlab/NCLQL:
-# two heads with a Polyak target network -- the one critic here that has one,
-# because NC-LQL has no actor to keep the bootstrap action on-distribution --
-# reduced by `min` for the bootstrap and by `mean` for the Langevin score.
-# Noise conditioning is inside it: `time_dim` sets the width of the sinusoidal
-# level encoding concatenated to (obs, act). Defaults are the reference's: no
-# normalization, mish, lr 1e-4, tau 0.005.
+# NC-LQL's critics (src/barl_jax/policies/lql.py). All three are the
+# NoiseConditionedCritic mixin over one of the generic critics above, so they
+# differ only in how the return is represented and are swapped by `class:`
+# alone: `--set model.components.critic.class=NCLQLC51Critic`. Shared across
+# them, and all the reference's (ku-dmlab/NCLQL): the 256x3 mish net with no
+# normalization, lr 1e-4, and a Polyak target at tau 0.005 -- the one target net
+# in this file, because NC-LQL has no actor to keep the bootstrap action
+# on-distribution. `time_dim` is the width of the level encoding concatenated to
+# the action; `norm` MUST stay off the running-statistic kinds, as for every
+# other target-net critic here.
+#
+# `smoothing_coef` weights the smoothing loss where it is summed with the TD
+# loss. The reference takes two *sequential* Adam steps (TD, then smoothing at
+# the already-updated params), which -- because Adam normalizes per coordinate
+# -- gives each loss a step of the same magnitude however large its gradient is.
+# Summing them into one step, as barl's one-backward contract requires, loses
+# that: the larger-gradient loss dominates, and after `reward_scale` that is the
+# TD term. 1.0 reproduces the plain sum; raise it to compensate.
+
+# The reference's: two scalar heads. `rho: 1.0` at `n_models: 2` is exactly its
+# `min(target_q1, target_q2)` -- see EnsembleCritic's docstring.
 NCLQLCritic:
   latent_dim: 256
   layers: 3
   n_models: 2
+  rho: 1.0
+  smoothing_coef: 1.0
   time_dim: 16
   polyak_tau: 0.005
   
@@ -260,6 +276,65 @@ NCLQLCritic:
 
   gamma: 0.99
   
+  time_embed: "fourier"
+
+  dtype: float32
+
+  activation: mish
+  norm: none
+  norm_stem: false
+  norm_input: false
+  norm_after_act: true
+
+# A categorical return distribution instead of a scalar. `pessimistic_target` is
+# on where C51Critic leaves it off: it is what puts the heads' `min` in the
+# Bellman target, which is where the reference's pessimism lives and NC-LQL has
+# no actor to provide another brake. The support defaults from the env's return
+# range *scaled by `reward_scale`* (NCLQL.__init__ does that), so it does not
+# need pinning per env.
+NCLQLC51Critic:
+  latent_dim: 256
+  layers: 3
+  n_models: 2
+  num_atoms: 101
+  entropy_coef: 0.005
+  pessimistic_target: true
+  smoothing_coef: 1.0
+  time_dim: 16
+  polyak_tau: 0.005
+
+  lr: 1.0e-4
+
+  gamma: 0.99
+
+  time_embed: "fourier"
+
+  dtype: float32
+
+  activation: mish
+  norm: none
+  norm_stem: false
+  norm_input: false
+  norm_after_act: true
+
+# The same scalar bootstrap as NCLQLCritic (`min` over the heads' expectations),
+# fitted as a Gaussian-smoothed histogram instead of by MSE -- so this is the
+# A/B that isolates classification-as-regression from the distributional
+# bootstrap NCLQLC51Critic also brings.
+NCLQLHLGaussCritic:
+  latent_dim: 256
+  layers: 3
+  n_models: 2
+  num_bins: 151
+  sigma_to_bin_ratio: 0.75
+  smoothing_coef: 1.0
+  time_dim: 16
+  polyak_tau: 0.005
+
+  lr: 1.0e-4
+
+  gamma: 0.99
+
   time_embed: "fourier"
 
   dtype: float32

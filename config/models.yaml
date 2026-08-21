@@ -171,16 +171,6 @@ NCLQL:
 
     reward_scale: 5.0
 
-    # Weight on the smoothing loss where it is summed with the TD loss. The
-    # reference takes two *sequential* Adam steps (TD, then smoothing at the
-    # already-updated params), which -- because Adam normalizes per coordinate
-    # -- gives each loss a step of the same magnitude however large its
-    # gradient is. Summing them into one step, as barl's one-backward contract
-    # requires, loses that: the larger-gradient loss dominates, and after
-    # reward_scale that is the TD term. 1.0 reproduces the plain sum; raise it
-    # to compensate. `nclql/grad_ratio` (debug tier) measures what it should be.
-    smoothing_coef: 1.0
-
     action_limit: 1.0
     init_scale: 1.0
 
@@ -188,4 +178,9 @@ NCLQL:
     # Spans the canonical [-1, 1] action range down to a scale where the
     # smoothed Q is effectively the clean one.
     sigmas:  { class: ExponentialSchedule, start: 0.1, end: 0.001, steps: 10 }
+
+    # The reference's scalar ensemble. NCLQLC51Critic / NCLQLHLGaussCritic are
+    # the same critic over a categorical / histogram return instead, and the
+    # algorithm reads none of that difference -- so the return representation is
+    # a one-word axis here, or `--set model.components.critic.class=...`.
     critic:  { class: NCLQLCritic }

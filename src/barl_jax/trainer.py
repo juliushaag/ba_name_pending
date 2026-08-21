@@ -195,8 +195,14 @@ def train(run: Run):
   for ns in [*run.reference.components, run.reference.algo_name(), "batch", "buffer"]:
     log.register(f"{ns}/*", "grad_steps")
 
-  ckpt_dir = os.path.abspath(os.path.join("checkpoints", name))
+  # A sweep hands every run its own directory (scripts/run_sweep.py) and its
+  # weights belong next to the config and log that produced them. A standalone
+  # run has no such directory, and keeps the global checkpoints/ tree keyed by
+  # the same <model>/<env>/<timestamp> the wandb run is named after.
+  ckpt_dir = os.path.abspath(os.path.join(cfg["run_dir"], "checkpoints") if cfg.get("run_dir")
+                             else os.path.join("checkpoints", name))
   os.makedirs(ckpt_dir, exist_ok=True)
+  log.message(f"Checkpoints: {ckpt_dir}")
   if num_seeds > 1:
     log.message(f"{num_seeds} seeds vmapped in one process "
                 f"({num_seeds * run.num_envs} rollout envs, "

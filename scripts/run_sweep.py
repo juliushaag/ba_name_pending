@@ -58,9 +58,9 @@ def detect_gpus() -> list[str]:
 
 
 def _resolve_model_snapshot(model_name: str, overrides: dict | None = None) -> dict:
-  """Self-contained mirror of barl.model_config.snapshot_for() -- duplicated
+  """Self-contained mirror of barl_jax.model_config.snapshot_for() -- duplicated
   (not imported) so this lightweight subprocess-launcher script never has to
-  import the `barl` package (and therefore torch/mujoco) just to read a YAML
+  import the `barl_jax` package (and therefore jax/mujoco) just to read a YAML
   file. Embedded into each run's per-run YAML under `models:` so the run
   stays exactly recreatable even if config/models.yaml or
   config/components.yaml changes later."""
@@ -176,6 +176,23 @@ def name_combos(combos: list[dict], axes: dict, num_seeds: int) -> list[str]:
   return tags
 
 
+def write_manifest(sweep_dir: str, path_args: dict, tags: list[str], combos: list[dict],
+                   results: dict[int, int] | None = None) -> None:
+  """`sweep.yaml`: what this sweep is, one entry per run, rewritten with each
+  run's exit code once the grid is done. The per-run `config.yaml` files are
+  each self-contained, so this is the index over them -- what varied, what it
+  was called, and where it went."""
+  manifest = dict(path_args)
+  manifest["runs"] = [
+    {"tag": tag, "dir": tag, "combo": combo,
+     **({} if results is None or i not in results
+        else {"exit_code": results[i], "status": "ok" if results[i] == 0 else "failed"})}
+    for i, (tag, combo) in enumerate(zip(tags, combos))
+  ]
+  with open(os.path.join(sweep_dir, "sweep.yaml"), "w") as f:
+    yaml.safe_dump(manifest, f, sort_keys=False)
+
+
 def run_one(script: str, combo: dict, tag: str, defaults: dict, env_defaults: dict, sweep_dir: str,
             num_seeds: int, gpu_id: str | None = None, stream: bool = False,
             progress: str = "") -> int:
@@ -190,17 +207,25 @@ def run_one(script: str, combo: dict, tag: str, defaults: dict, env_defaults: di
   if overrides:
     run_entry["model_overrides"] = overrides
 
+  # Everything this combo produces lands under one directory: the config it ran
+  # with, its log, and (via `run_dir`, which trainer.train() checkpoints into)
+  # its `best`/`latest`/`final` weights. A sweep is then self-contained -- no
+  # hunting through a global checkpoints/ tree for which run made which file.
+  run_dir = os.path.abspath(os.path.join(sweep_dir, tag))
+  os.makedirs(run_dir, exist_ok=True)
+  run_entry["run_dir"] = run_dir
+
   run_config = {"defaults": defaults, "runs": [run_entry],
                 "models": _resolve_model_snapshot(model, overrides)}
   if env_defaults:
     run_config["env_defaults"] = env_defaults
 
-  run_config_path = os.path.join(sweep_dir, f"{tag}.yaml")
+  run_config_path = os.path.join(run_dir, "config.yaml")
   with open(run_config_path, "w") as f:
     yaml.safe_dump(run_config, f)
 
   script_path = os.path.join(SCRIPT_DIR, f"{script}.py")
-  log_path = os.path.join(sweep_dir, f"{tag}.log")
+  log_path = os.path.join(run_dir, "run.log")
   cmd = [sys.executable, script_path, "--config", run_config_path]
 
   env_vars = os.environ.copy()
@@ -209,7 +234,7 @@ def run_one(script: str, combo: dict, tag: str, defaults: dict, env_defaults: di
     env_vars["CUDA_VISIBLE_DEVICES"] = gpu_id
     label = f"gpu{gpu_id}|{tag}"
 
-  emit(f"[{label}] starting {progress} -- log: {log_path}\n[{label}] $ {shlex.join(cmd)}")
+  emit(f"[{label}] starting {progress} -- dir: {run_dir}\n[{label}] $ {shlex.join(cmd)}")
   with open(log_path, "w") as logf:
     if stream:
       # --validate runs: tee each line (label-prefixed) to the terminal as well as the log file.
@@ -264,6 +289,10 @@ if __name__ == "__main__":
                      help="Base config providing `defaults:`/`env_defaults:` for every run "
                           "(default: --grid's `base:`, else config/<script>.yaml)")
   args.add_argument("--sweep_tag", default=None, help="Sweep tag")
+  args.add_argument("--sweep_dir", default=None,
+                     help="Where to write this sweep's per-run directories "
+                          "(default: sweeps/<timestamp>). A batch job points this at node-local "
+                          "scratch and copies the tree back when it finishes.")
   args.add_argument("--dry_run", action="store_true",
                      help="Print the runs the grid expands to and exit, without launching anything.")
   args.add_argument("--validate", action="store_true",
@@ -300,7 +329,8 @@ if __name__ == "__main__":
     defaults = {**defaults, "validate": True}
 
   now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")  # noqa: DTZ005
-  sweep_dir = os.path.join(SCRIPT_DIR, "..", "sweeps", now)
+  sweep_dir = os.path.abspath(kwargs.sweep_dir
+                              or os.path.join(SCRIPT_DIR, "..", "sweeps", now))
 
   # Threaded through `defaults` so every run in the grid can be filtered together in wandb.
   if kwargs.sweep_tag is None:
@@ -324,6 +354,20 @@ if __name__ == "__main__":
     raise SystemExit(0)
 
   os.makedirs(sweep_dir, exist_ok=True)
+
+  manifest_head = {
+    "sweep_tag": sweep_tag,
+    "created":   now,
+    "command":   shlex.join(sys.argv),
+    "script":    kwargs.script,
+    "base_config": os.path.abspath(base_config_path),
+    "seeds":     kwargs.seeds,
+    "gpus":      gpus or None,
+    "validate":  bool(kwargs.validate),
+    "axes":      {k: list(v) for k, v in axes.items()},
+    "exclude":   exclude or None,
+  }
+  write_manifest(sweep_dir, manifest_head, tags, combos)
 
   pending: queue.Queue = queue.Queue()
   for i, (combo, tag) in enumerate(zip(combos, tags)):
@@ -349,6 +393,8 @@ if __name__ == "__main__":
     t.start()
   for t in threads:
     t.join()
+
+  write_manifest(sweep_dir, manifest_head, tags, combos, results)
 
   failed = sum(1 for r in results.values() if r != 0)
   print(f"Done: {len(results) - failed}/{len(results)} succeeded"

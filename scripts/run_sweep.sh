@@ -1,6 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=ml_job                 # name shown in squeue
-#SBATCH --partition=gpu_a100_il              # bwUniCluster 3.0 GPU queues:
+
+#SBATCH --job-name=ml_job                  # name shown in squeue
+#SBATCH --partition=gpu_a100_il            # bwUniCluster 3.0 GPU queues:
                                            #   dev_gpu_h100  -> quick tests, short walltime, 4x H100 nodes
                                            #   gpu_h100      -> production runs, 4x H100 nodes (AMD EPYC 9454)
                                            #   gpu_h100_short-> shorter max walltime, higher priority
@@ -9,37 +10,33 @@
                                            #   gpu_mi300     -> AMD Instinct MI300A APU nodes
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:2                      # number of GPUs (nodes have 4x GPU each, request only what you need)
+#SBATCH --gres=gpu:2                       # number of GPUs (nodes have 4x GPU each, request only what you need)
 
-#SBATCH --output=logs/%x/%j/term.out           # stdout -> logs/ml_job_<jobid>.out
-#SBATCH --error=logs/%x/%j/term.err            # stderr
+#SBATCH --output=logs/%x/%j/term.out
+#SBATCH --error=logs/%x/%j/term.err
 
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=ulqho@student.kit.edu
+
 #SBATCH --signal=B:USR1@300
 
-#SBATCH --time=4:00:00                   # HH:MM:SS, check current queue limits with `sinfo` / scontrol
+#SBATCH --time=4:00:00                     # HH:MM:SS, check current queue limits with `sinfo` / scontrol
 
-set -euo pipefail
-trap 'cp -r "$TMPDIR/results" ~/results/$SLURM_JOB_ID/ 2>/dev/null' EXIT
+# One job, one grid edited in place below. For a matrix that wants its own
+# array task (and its own GPU) per {algo, env}, use scripts/submit.py +
+# scripts/run_rl.slurm instead.
 
-export PYTHONUNBUFFERED=1
+source scripts/slurm_common.sh
 
-echo "== Job started on $(hostname) at $(date) =="
-echo "Job ID: $SLURM_JOB_ID | Partition: $SLURM_JOB_PARTITION | GPUs: $CUDA_VISIBLE_DEVICES"
+slurm_header
 
-# --- Sanity checks -------------------------------------------------
-uv run python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
-
-# --- Run your script -------------------------------------------------
-# Runs sequentially, algo by algo; --seeds N is N seeds vmapped inside each run.
+# The grid runs sequentially, algo by algo, one GPU each (run_sweep.py detects
+# them); --seeds N is N seeds vmapped inside each run, not N processes.
 uv run python scripts/run_sweep.py \
     --algos NCLQL SDAC \
     --envs WalkerRun \
-    --seeds 5
+    --seeds 5 \
+    --sweep_tag "$RUN_ID" \
+    --sweep_dir "$SWEEP_DIR"
 
-# --- Copy results back to persistent storage --------------------------
-mkdir -p ~/results/$SLURM_JOB_ID
-cp -r "$TMPDIR/results" ~/results/$SLURM_JOB_ID/
-
-echo "== Job finished at $(date) =="
+slurm_footer

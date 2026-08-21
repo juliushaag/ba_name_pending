@@ -8,6 +8,12 @@ from itertools import product
 
 RUN_DIR = Path("slurm_runs")
 
+# --debug overrides for run_rl.slurm's own #SBATCH lines: sbatch's CLI wins over
+# them, so the job script stays the single description of a *real* run.
+DEBUG_PARTITION = "dev_gpu_a100_il"
+DEBUG_TIME      = "00:30:00"
+DEBUG_JOB_NAME  = "rl_dev"
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -43,6 +49,15 @@ def main():
     )
 
     parser.add_argument(
+        "--debug",
+        action="store_true",
+        help=f"Submit to the dev queue for a smoke test: {DEBUG_PARTITION}, a "
+             f"{DEBUG_TIME} walltime cap and one task at a time (--max-parallel is "
+             f"ignored). The runs are real ones, just cut short -- run_rl.slurm copies "
+             f"whatever finished back to ~/results when the cap kills it.",
+    )
+
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the matrix but don't submit the jobs.",
@@ -55,6 +70,8 @@ def main():
 
     if args.max_parallel < 1:
         parser.error("--max-parallel must be >= 1")
+
+    max_parallel = 1 if args.debug else args.max_parallel
 
     # ------------------------------------------------------------
     # Generate experiment matrix
@@ -81,7 +98,9 @@ def main():
     print(f"  Environments: {', '.join(args.envs)}")
     print(f"  Number of experiments: {len(experiments)}")
     print(f"  Seeds per experiment: {args.seeds}")
-    print(f"  Max parallel jobs: {args.max_parallel}")
+    print(f"  Max parallel jobs: {max_parallel}")
+    if args.debug:
+        print(f"  Debug: {DEBUG_PARTITION}, {DEBUG_TIME} cap, one task at a time")
     print()
 
     for i, experiment in enumerate(experiments):
@@ -108,14 +127,15 @@ def main():
     # Slurm only hands out at submission -- is on disk before any task reads it.
     last_index = len(experiments) - 1
 
-    cmd = [
-        "sbatch",
-        "--parsable",
-        "--hold",
-        f"--array=0-{last_index}%{args.max_parallel}",
-        f"--export=ALL,SEEDS={args.seeds}",
-        "scripts/run_rl.slurm",
-    ]
+    cmd = ["sbatch", "--parsable", "--hold",
+           f"--array=0-{last_index}%{max_parallel}",
+           f"--export=ALL,SEEDS={args.seeds}"]
+
+    if args.debug:
+        cmd += [f"--partition={DEBUG_PARTITION}", f"--time={DEBUG_TIME}",
+                f"--job-name={DEBUG_JOB_NAME}"]
+
+    cmd.append("scripts/run_rl.slurm")
 
     print()
     print("Submitting:")

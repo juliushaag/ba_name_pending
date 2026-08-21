@@ -4,14 +4,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`barl` is a research framework for online (off and on-Policy)
-deep-RL experiments across MuJoCo Gym and DeepMind Control Suite continuous-control benchmarks.
-It implements a range of actor-critic algorithms (SAC, PPO, IQL, DQN, FlowQL/FlowBC, AMDP, DIME)
-behind one shared `Policy`/`Environment` interface so any algorithm can be pointed at any
-registered environment through a single training script and YAML config.
+`barl_jax` is a research framework for online off-policy deep-RL experiments across MuJoCo Gym
+and DeepMind Control Suite continuous-control benchmarks. It implements a range of actor-critic
+algorithms (`SAC`, `AMDP`, `DIME`, `SDAC`, `NCLQL`) behind one shared `Policy`/`Environment`
+interface so any algorithm can be pointed at any registered environment through a single training
+script and YAML config.
 
-`main.py` at the repo root is a scratch/throwaway script (loading a Minari dataset), not part of
-the framework's entry points.
+**JAX only.** The framework is jax/flax-nnx/optax; there is no torch dependency, and the torch
+implementation this was ported from (`src/barl`) is gone. Comments that say "the torch version
+did X" are kept where they explain *why* the current code looks the way it does, not because that
+code is still around.
+
+> **Stale below this point.** Everything from "### Registries" down still describes the torch
+> implementation — its file paths (`src/barl/...`), its `DataLoader`/`retain_graph` training loop,
+> and policies that are not registered here (PPO, IQL, DQN, FlowQL/FlowBC, DirectPolicy). Read it
+> as background on the design, not as a description of this code.
 
 ## Code style
 
@@ -22,8 +29,8 @@ sentence max. Never write multi-line comment blocks or docstrings explaining wha
 
 ## Commands
 
-Dependency management is via `uv` (see `pyproject.toml` / `uv.lock`); the `barl` package itself is
-installed editable from `src/barl`.
+Dependency management is via `uv` (see `pyproject.toml` / `uv.lock`); the `barl_jax` package
+itself is installed editable from `src/barl_jax`.
 
 ```bash
 uv sync                                     # install/sync the environment
@@ -38,17 +45,16 @@ uv run python scripts/online_learning.py --config path/to/other.yaml
 ```
 
 Launch a grid of `{algo x env}` runs as separate OS processes (each with its own CUDA context),
-one sequential worker per GPU, logs under `sweeps/<timestamp>/`:
+one sequential worker per GPU, one directory per run under `sweeps/<timestamp>/`:
 
 ```bash
-uv run python scripts/run_sweep.py --algos SACPolicy PPOPolicy --envs HalfCheetah CheetahRun --seeds 3
-uv run python scripts/run_sweep.py --algos SACPolicy --envs HalfCheetah --gpus 0 1   # or --gpus auto
+uv run python scripts/run_sweep.py --algos SAC NCLQL --envs HalfCheetah CheetahRun --seeds 3
 ```
 
-Without `--gpus` the whole grid runs strictly one at a time with `CUDA_VISIBLE_DEVICES` untouched.
-With it, each listed GPU gets one worker that pins its subprocess to that GPU and only takes the
-next combo once its own finishes — so a run never shares a GPU. `--seeds N` is *not* a process
-axis: those N seeds are vmapped inside a single run.
+Every GPU `nvidia-smi` reports gets one worker, which pins its subprocess to that GPU with
+`CUDA_VISIBLE_DEVICES` and only takes the next combo once its own finishes — so a run never shares
+a GPU. `--seeds N` is *not* a process axis: those N seeds are vmapped inside a single run.
+`--sweep_dir` relocates the output tree (the Slurm jobs point it at node-local scratch).
 
 Anything in `config/models.yaml` is sweepable as a `model.<dotted path>` axis and anything in the
 run config as a `run.<key>` axis, either inline or via a `--grid` spec file (see
@@ -73,12 +79,16 @@ combination (no eval/checkpointing/wandb logging), to catch shape/dtype/algo-env
 before committing to a full run:
 
 ```bash
-uv run python scripts/run_sweep.py --algos SACPolicy PPOPolicy --envs HalfCheetah CheetahRun --validate
+uv run python scripts/run_sweep.py --algos SAC NCLQL --envs HalfCheetah CheetahRun --validate
 ```
 
-`scripts/run_sweep.py --script` also accepts `offline_learning`/`offline_to_online`, but those
-scripts and their configs (`config/offline_learning.yaml`, `config/offline_to_online.yaml`) are
-currently deleted on this branch — only `online_learning` is live.
+Submit an `{algo x env}` matrix to Slurm as one job array (see the Slurm section below);
+`--debug` puts it on the dev queue with a 30-minute cap, one task at a time:
+
+```bash
+uv run python scripts/submit.py --algos NCLQL SDAC --envs WalkerRun --seeds 5
+uv run python scripts/submit.py --algos NCLQL --envs WalkerRun --debug --dry-run
+```
 
 No linter/formatter/type-checker is configured in `pyproject.toml`; there's no CI to match.
 
@@ -320,8 +330,9 @@ must match a key in `model.create_optimizer()` — each is zero-grad'd, backward
 `Policy.grad_clip(key, cfg["grad_clip"])` (the owning component's own `grad_clip` from
 `config/components.yaml`, falling back to the run config for keys no component owns), and
 stepped independently, so no optimizer step invalidates another loss's graph mid-loop. Periodic
-eval (`evaluate_and_log`) checkpoints `latest.pt` every eval and `best.pt` on a new best avg reward,
-under `checkpoints/<model>/<env>/<timestamp>/`.
+eval (`evaluate_and_log`) checkpoints `latest` every eval and `best` on a new best avg reward,
+under the run's `run_dir/checkpoints/` inside a sweep, else `checkpoints/<model>/<env>/<timestamp>/`
+(with a `seed<i>/` level under either when a run vmaps more than one seed).
 
 ### Metrics (`src/barl/metrics.py`)
 
@@ -377,7 +388,33 @@ Combos go onto one shared queue (algo-major) and are drained by one worker threa
 entry; a worker sets `CUDA_VISIBLE_DEVICES` to its own GPU, blocks on the subprocess, then takes
 the next combo — so parallelism is exactly "one run per GPU at a time", never two on one device.
 Terminal output from concurrent workers is `gpu<id>|<tag>`-prefixed and emitted under a lock, and
-each run still gets its own `sweeps/<timestamp>/<tag>.log`.
+each run still gets its own directory, `sweeps/<timestamp>/<tag>/`, holding the `config.yaml` it
+ran with, its `run.log`, and its `checkpoints/` (the run entry's `run_dir` key is what points the
+trainer there — a run launched outside a sweep has no `run_dir` and keeps the global
+`checkpoints/<model>/<env>/<timestamp>/` tree). `sweeps/<timestamp>/sweep.yaml` indexes them:
+the axes, the resolved command, and one entry per run with its tag, directory and — rewritten once
+the grid finishes — its exit code. `--sweep_dir` relocates that whole tree, which is how the Slurm
+jobs put it on node-local scratch and copy it back (see below).
+
+### Slurm (`scripts/*.slurm`, `scripts/submit.py`)
+
+`scripts/submit.py` submits an `{algo x env}` matrix as one job array: it writes
+`slurm_runs/<array job id>.csv`, one row per array task, and every task of that submission shares
+the array job id as its **run id** — the manifest's filename and `run_id` column, the `--sweep_tag`
+every run carries into wandb, and the name of its `~/results/<run id>/` directory. The id only
+exists once `sbatch` has accepted the job, so `submit.py` submits `--hold`, writes the manifest,
+then releases: held tasks cannot start before the file they read exists.
+
+All three job scripts (`run_rl.slurm`, `run_sweep.sh`, `debug.sh`) `source scripts/slurm_common.sh`,
+which establishes `RUN_ID`, a node-local `SWEEP_DIR` handed to `run_sweep.py --sweep_dir`, and a
+`RESULT_DIR` under `~/results/`, plus an EXIT trap that copies the sweep tree back on *every* exit
+path — that is what makes `#SBATCH --signal=B:USR1@300` load-bearing: a walltime kill still saves
+whatever finished. `run_rl.slurm` is the array task (one manifest row each);
+`run_sweep.sh`/`debug.sh` are single jobs with the grid written into them.
+
+`submit.py --debug` is the array equivalent of `debug.sh`: same dev queue and 30-minute cap, but
+over a whole matrix, one task at a time. It overrides `run_rl.slurm`'s `#SBATCH` partition/time/
+job-name from sbatch's command line, so the job script stays the description of a real run.
 
 ### Registered algorithms (`src/barl/policies/`)
 
