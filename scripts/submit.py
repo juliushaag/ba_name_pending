@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import contextlib
 import csv
 import datetime
 import os
@@ -17,34 +18,50 @@ MANIFEST_NAME = "experiments.csv"
 SWEEP_NAME_FORMAT = "%Y-%m-%d_%H-%M-%S"
 
 
+@contextlib.contextmanager
+def _env(**overrides):
+    """Set env vars for the duration of a block and put the old values back."""
+    previous = {key: os.environ.get(key) for key in overrides}
+    os.environ.update(overrides)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def check_config(algos: list[str], envs: list[str]) -> list[str]:
     """Everything an array of 40 tasks would otherwise discover 40 times, at the
     point where it is still one error message: unregistered env or algo names,
     and anything `model_config.validate()` rejects (an override that lands on no
     slot, a kwarg no component accepts, a mistyped YAML value)."""
     # Imported here rather than at module scope so `--help` and a --dry-run of a
-    # bad matrix don't pay for jax and mujoco, and pinned to CPU because this
-    # runs on a login node -- there is rarely a GPU to claim and never one to
-    # spend. Resolution only: no env is built and no weights are allocated.
-    os.environ["JAX_PLATFORMS"] = "cpu"
-    # mujoco binds its GL backend at import; without this it reaches for glfw and
-    # warns about a missing DISPLAY on every headless node. Nothing here renders,
-    # so egl is only ever declared, never used.
-    os.environ.setdefault("MUJOCO_GL", "egl")
+    # bad matrix don't pay for jax and mujoco. Resolution only: no env is built
+    # and no weights are allocated.
+    #
+    # The two env vars are restored afterwards, and that is load-bearing rather
+    # than tidy: sbatch below inherits this process's environment and hands it
+    # to every array task via `--export=ALL`. Leaking JAX_PLATFORMS=cpu out of
+    # here puts the whole submission on CPU -- which does not fail, it just
+    # trains ~50x slower and looks like a hang.
+    with _env(JAX_PLATFORMS="cpu",           # a login node has no GPU to spend
+              MUJOCO_GL="egl"):              # else mujoco reaches for glfw and warns on DISPLAY
+        import barl_jax  # noqa: F401  -- the import is what populates the registries
+        from barl_jax import model_config
+        from barl_jax.env import Environment
 
-    import barl_jax  # noqa: F401  -- the import is what populates the registries
-    from barl_jax import model_config
-    from barl_jax.env import Environment
+        known_envs = set(Environment.available())
+        problems = [f"{env!r} is not a registered environment"
+                    for env in envs if env not in known_envs]
 
-    known_envs = set(Environment.available())
-    problems = [f"{env!r} is not a registered environment"
-                for env in envs if env not in known_envs]
-
-    for algo in algos:
-        try:
-            problems += [f"{algo}: {p}" for p in model_config.validate(algo)]
-        except Exception as exc:      # an unresolvable name raises rather than reporting
-            problems.append(f"{algo}: {type(exc).__name__}: {exc}")
+        for algo in algos:
+            try:
+                problems += [f"{algo}: {p}" for p in model_config.validate(algo)]
+            except Exception as exc:  # an unresolvable name raises rather than reporting
+                problems.append(f"{algo}: {type(exc).__name__}: {exc}")
 
     return problems
 

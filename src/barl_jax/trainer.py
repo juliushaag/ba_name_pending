@@ -30,6 +30,9 @@ from barl_jax.train import train_step
 seeded_step = jax.jit(jax.vmap(train_step, in_axes=(None, 0, 0, None)),
                       static_argnums=(0, 3), donate_argnums=(1,))
 
+# Longest the training loop stays silent before saying it is still alive.
+PROGRESS_INTERVAL_S = 300
+
 
 class Run:
   """Everything a run needs, built once: envs, buffer, stacked policies, logger.
@@ -239,8 +242,14 @@ def train(run: Run):
     log.log_per_seed([{"buffer/transitions": n} for n in run.buffer.transitions_per_seed()],
                      panel={"buffer/transitions": run.buffer.min_transitions()})
 
-    epoch_start = time.perf_counter()
-    for _ in range(grad_steps_this_iter):
+    # Same reason `evaluate()` announces itself: this is a phase that runs for
+    # hours with nothing on stdout between it and the next rollout, and after
+    # the fact a slow step is indistinguishable from a stall. `log_every` paces
+    # wandb, which at a few seconds per step can be a long way apart.
+    epoch_start = last_report = time.perf_counter()
+    progress_every = max(1, grad_steps_this_iter // 10)
+
+    for step in range(grad_steps_this_iter):
       gstep = log.get_step("grad_steps")
       tiers = (tuple([PRIMARY] if gstep % cfg["log_every"] == 0 else [])
                + tuple([DEBUG] if gstep % cfg["debug_every"] == 0 else []))
@@ -257,7 +266,26 @@ def train(run: Run):
 
       log.advance({"grad_steps": 1})
 
+      now, done = time.perf_counter(), step + 1
+      if step == 0:
+        # Reported on its own because it is not a step time: every distinct
+        # `tiers` value is a separate jit trace, so the first few steps each pay
+        # a compile the rest do not.
+        log.message(f"  first grad step (incl. compile): {now - epoch_start:.1f}s")
+        last_report = now
+      # Whichever comes first: a tenth of the iteration, or PROGRESS_INTERVAL_S
+      # of silence. The second is what a slow step needs -- a tenth of a
+      # 10k-step iteration at seconds per step is an hour apart.
+      elif done < grad_steps_this_iter and (done % progress_every == 0
+                                            or now - last_report > PROGRESS_INTERVAL_S):
+        rate = done / (now - epoch_start)
+        log.message(f"  {done}/{grad_steps_this_iter} grad steps, {rate:.2f}/s, "
+                    f"~{(grad_steps_this_iter - done) / rate / 60:.1f} min left this iter")
+        last_report = now
+
     epoch_time = time.perf_counter() - epoch_start
+    log.message(f"Trained {grad_steps_this_iter} grad steps in {epoch_time / 60:.1f} min "
+                f"({1000 * epoch_time / grad_steps_this_iter:.0f} ms/step)")
 
     eval_time = 0.0
     if log.get_step("env_steps") >= next_eval:

@@ -76,8 +76,15 @@ slurm_header() {
   echo "Results:     $RESULT_DIR"
   echo "=================================================="
   # The training stack is JAX, so whether *JAX* sees the GPU is the thing worth
-  # failing on here -- a job that silently falls back to CPU wastes its walltime.
-  uv run python -c "import jax; print('JAX devices:', jax.devices())"
+  # failing on here. Falling back to CPU does not error anywhere downstream --
+  # it just trains ~50x slower for the whole allocation and reads as a hang.
+  uv run python -c "
+import sys, jax
+print('JAX devices:', jax.devices())
+if jax.default_backend() == 'cpu':
+    sys.exit('ERROR: JAX sees no GPU. Refusing to train on CPU -- check '
+             'JAX_PLATFORMS and CUDA_VISIBLE_DEVICES in the job environment.')
+"
   echo ""
 }
 
