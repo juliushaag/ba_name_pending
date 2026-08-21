@@ -5,7 +5,10 @@
 
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16                 # one core per few subprocess envs -- rollouts are
+                                           # AsyncVectorEnv, num_seeds x num_envs processes deep
 #SBATCH --gres=gpu:1
+#SBATCH --mem=96gb                         # host RAM: the replay buffer is per seed, on the host
 
 #SBATCH --output=logs/%x/%A_%a/term.out
 #SBATCH --error=logs/%x/%A_%a/term.err

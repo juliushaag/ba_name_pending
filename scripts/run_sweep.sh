@@ -10,7 +10,10 @@
                                            #   gpu_mi300     -> AMD Instinct MI300A APU nodes
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16                 # one core per few subprocess envs -- rollouts are
+                                           # AsyncVectorEnv, num_seeds x num_envs processes deep
 #SBATCH --gres=gpu:2                       # number of GPUs (nodes have 4x GPU each, request only what you need)
+#SBATCH --mem=96gb                         # host RAM: the replay buffer is per seed, on the host
 
 #SBATCH --output=logs/%x/%j/term.out
 #SBATCH --error=logs/%x/%j/term.err

@@ -4,9 +4,10 @@
 #SBATCH --partition=dev_gpu_a100_il        # dev_* queues: short walltime, quick turnaround
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32                 # CPU cores for env stepping etc. (nodes have 96 cores total)
+#SBATCH --cpus-per-task=16                 # one core per few subprocess envs -- rollouts are
+                                           # AsyncVectorEnv, num_seeds x num_envs processes deep
 #SBATCH --gres=gpu:1                       # number of GPUs (nodes have 4x GPU each, request only what you need)
-#SBATCH --mem=64gb                         # host RAM (H100 nodes have up to 768 GiB total)
+#SBATCH --mem=96gb                         # host RAM: the replay buffer is per seed, on the host
 
 #SBATCH --output=logs/%x/%j/term.out
 #SBATCH --error=logs/%x/%j/term.err
