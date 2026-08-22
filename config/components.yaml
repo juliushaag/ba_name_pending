@@ -12,7 +12,7 @@ StochasticActor:
   dropout: 0.0
   final_activation: false
   residual: false
-  dtype: float32
+  dtype: bfloat16
 
 ScoreContinuousActor:
 
@@ -26,7 +26,7 @@ ScoreContinuousActor:
   dropout: 0.0
   final_activation: false
   residual: false
-  dtype: float32
+  dtype: bfloat16
 
   max_steps: 16
   time_dim: 8
@@ -37,16 +37,6 @@ ScoreContinuousActor:
   tau_min: 0.0
   tau_max: 1.0
 
-DistilledFlowActor:
-  latent_dim: 512
-  flow_steps: 16
-  time_dim: 8
-
-FlowBCActor:
-  latent_dim: 512
-  flow_steps: 16
-  time_dim: 8
-  hidden_layers: 4
 
 VPDiffusionActor:
   latent_dim: 512
@@ -63,7 +53,7 @@ VPDiffusionActor:
   dropout: 0.0
   final_activation: false
   residual: false
-  dtype: float32
+  dtype: bfloat16
 
   cosine_s: 0.008
   ab_start: 0.999
@@ -88,7 +78,7 @@ DDPMActor:
   dropout: 0.0
   final_activation: false
   residual: false
-  dtype: float32
+  dtype: bfloat16
 
   beta_schedule: linear
   beta_scale: 0.3
@@ -111,7 +101,7 @@ OUDiffusionActor:
   dropout: 0.0
   final_activation: false
   residual: false
-  dtype: float32
+  dtype: bfloat16
 
   beta_min: 0.12
   beta_max: 0.18
@@ -144,7 +134,7 @@ EnsembleCritic:
 
   activation: relu
   latent_dim: 2048
-  layers: 2
+  layers: 1
   n_models: 2
   rho: 1.0
   gamma: 0.99
@@ -171,7 +161,7 @@ TargetEnsembleCritic:
 
   activation: relu
   latent_dim: 2048
-  layers: 2
+  layers: 1
   n_models: 2
   rho: 1.0
   gamma: 0.99
@@ -192,17 +182,25 @@ TargetEnsembleCritic:
 C51Critic:
 
   lr: 3.0e-4
-  activation: gelu
+
+  # Structural parity with dime_am (models/critic.py `Critic.__call__`, sized by
+  # configs/alg/dime.yaml `hs: [2048, 2048]`, `activation: relu`). Its net is
+  # BN(concat) -> [Dense -> relu -> BN] x2 -> Dense(atoms); barl's MLP puts a
+  # stem ahead of `layers` blocks, so `layers: 1` is two blocks here, not one --
+  # the reference's depth. `layers: 2` would be a Linear deeper than it.
+  activation: relu
   latent_dim: 2048
-  layers: 2
+  layers: 1
   n_models: 2
   num_atoms: 101
   entropy_coef: 0.005
   gamma: 0.99
 
   # Put the heads' `min` in the Bellman target too, not just in the price a
-  # policy improves against. Off here because SAC/DIME/AMDP all learn this env
-  # with the averaging target; SDAC turns it on (see config/models.yaml).
+  # policy improves against. Off here, which is dime_am's behaviour -- it always
+  # averages the two projected distributions (diffusion/dime.py, `next_q_values
+  # = mean(stack([target_q1_projected, target_q2_projected]))`). Every policy
+  # resolving to this class -- SAC, DIME, AMDP, SDAC -- therefore averages.
   pessimistic_target: false
 
   dtype: bfloat16
@@ -220,10 +218,12 @@ C51Critic:
 HLGaussCritic:
 
   lr: 3.0e-4
-  
-  activation: gelu
+
+  # Same net as C51Critic and EnsembleCritic -- see the note there. Only the
+  # return representation differs, which is what makes the three a clean A/B.
+  activation: relu
   latent_dim: 2048
-  layers: 2
+  layers: 1
   n_models: 2
   num_bins: 151
   sigma_to_bin_ratio: 0.75
@@ -278,7 +278,7 @@ NCLQLCritic:
   
   time_embed: "fourier"
 
-  dtype: float32
+  dtype: bfloat16
 
   activation: mish
   norm: none
@@ -293,12 +293,12 @@ NCLQLCritic:
 # range *scaled by `reward_scale`* (NCLQL.__init__ does that), so it does not
 # need pinning per env.
 NCLQLC51Critic:
-  latent_dim: 256
-  layers: 3
+  latent_dim: 2048
+  layers: 1
   n_models: 2
   num_atoms: 101
   entropy_coef: 0.005
-  pessimistic_target: true
+  pessimistic_target: False
   smoothing_coef: 1.0
   time_dim: 16
   polyak_tau: 0.005
@@ -309,7 +309,7 @@ NCLQLC51Critic:
 
   time_embed: "fourier"
 
-  dtype: float32
+  dtype: bfloat16
 
   activation: mish
   norm: none
@@ -337,7 +337,7 @@ NCLQLHLGaussCritic:
 
   time_embed: "fourier"
 
-  dtype: float32
+  dtype: bfloat16
 
   activation: mish
   norm: none

@@ -114,6 +114,14 @@ class QCriticBase(Critic):
     predicts a scalar, an integral over the support for one that does not."""
     return raw
 
+  def pessimism_gap(self, raw):
+    """How far below E[Z] the price `value()` returns sits, whatever reduction
+    produced it -- `rho`*std for a scalar ensemble, mean-minus-min for a
+    categorical one. Defined as the difference rather than reconstructed from a
+    coefficient so it stays exact when a subclass changes how it reduces."""
+    exp = self.expectation_from_raw(raw).astype(jnp.float32).mean(axis=0)
+    return exp - self.reduce_value(raw).astype(jnp.float32)
+
   def expectation(self, s, a):
     """E[Z] averaged over the heads, where `value()` is the pessimistic price.
     A Policy whose improvement direction *is* the critic's action-gradient field
@@ -247,7 +255,7 @@ class EnsembleCritic(QCriticBase):
 
     self.metrics.dist("q", pred.mean(axis=0))
     self.metrics.dist("q_target", jax.lax.stop_gradient(target).astype(jnp.float32))
-    self.metrics.ensemble("ensemble", pred, rho=self.rho)
+    self.metrics.ensemble("ensemble", pred, gap=self.pessimism_gap(raw))
 
 
 @register_component
@@ -314,12 +322,24 @@ class CategoricalCriticBase(QCriticBase):
     return loss
 
   def record(self, raw, target) -> None:
-    tgt = jax.lax.stop_gradient(target).astype(jnp.float32)
-    exp = self.expectation_from_raw(raw)
+    tgt     = jax.lax.stop_gradient(target).astype(jnp.float32)
+    support = self.support[...]
+    probs   = self.probs(raw)                                    # (n_models, B, atoms)
+    exp     = (probs * support).sum(axis=-1, keepdims=True)      # expectation_from_raw
 
     self.metrics.dist("q", exp.mean(axis=0))
-    self.metrics.dist("q_target", (tgt * self.support[...]).sum(axis=-1, keepdims=True))
-    self.metrics.ensemble("ensemble", exp)
+    self.metrics.dist("q_target", (tgt * support).sum(axis=-1, keepdims=True))
+    self.metrics.ensemble("ensemble", exp, gap=self.pessimism_gap(raw))
+
+    # The spread of the predicted return distribution itself -- aleatoric, and
+    # the one quantity that distinguishes these critics from a scalar ensemble.
+    # Nothing logged it before, so a C51 run and an EnsembleCritic run produced
+    # identical metric families. Distinct from `ensemble/disagreement` (spread
+    # across heads) and from `q/std` (spread of E[Z] across the batch); the
+    # `return_std/std` this family emits is what shows whether the spread is
+    # state-dependent at all, which for HL-Gauss it should not be.
+    var = (probs * (support - exp) ** 2).sum(axis=-1)
+    self.metrics.dist("return_std", jnp.sqrt(var).mean(axis=0))
 
 
 def categorical_projection(next_probs, atoms, reward, term, gamma, shift, v_min, v_max):

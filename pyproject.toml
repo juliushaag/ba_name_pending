@@ -25,8 +25,22 @@ dependencies = [
     "rich>=15.0.0",
     "playground>=0.2.0",
     "warp-lang==1.13.0",
+    "cloc>=0.2.5",
 ]
 
 
 [tool.uv.sources]
 barl_jax = { path = "src/barl_jax", editable = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-xdist>=3.8.0",
+]
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# -n 4 is the sweet spot measured on this box: XLA's own compilation is already
+# multi-threaded, so more workers just duplicate imports. Use `-n 0` to debug.
+addopts = "-n 4"

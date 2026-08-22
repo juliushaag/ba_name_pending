@@ -172,15 +172,23 @@ class Recorder:
       self._put(f"{name}/frac_at_limit",
                 (jnp.abs(x) >= limit - 1e-4).astype(jnp.float32).mean())
 
-  def ensemble(self, name: str, raw, rho: float = 0.0):
+  def ensemble(self, name: str, raw, gap=None):
     """Epistemic disagreement across an ensemble critic's `(n_models, B, 1)`
     heads -- distinct from a distributional critic's return spread, which goes
-    through dist()."""
+    through `dist("return_std")`, and from `q/std`, which is the batch spread
+    of E[Z].
+
+    `gap` is how far below E[Z] the price a Policy improves against sits, passed
+    in rather than derived from a coefficient here: `mean - rho*std` is only one
+    of the reductions in this codebase, and a `min` over heads has no rho to
+    multiply -- deriving it that way logged a constant 0 for every categorical
+    critic. See QCriticBase.pessimism_gap."""
     if not _ACTIVE:
       return
     std = jnp.asarray(raw, dtype=jnp.float32).std(axis=0)
     self._put(f"{name}/disagreement", std.mean())
-    self._put(f"{name}/pessimism_gap", (rho * std).mean())
+    if gap is not None:
+      self._put(f"{name}/pessimism_gap", jnp.asarray(gap, dtype=jnp.float32).mean())
 
   def gap(self, name: str, online_state, target_state):
     """Target-net drift, ||online - target|| / ||online||, over two

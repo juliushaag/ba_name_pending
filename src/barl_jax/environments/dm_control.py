@@ -15,8 +15,20 @@ class DMControlEnvironment(Environment):
   # roughly break-even on cheetah/walker. Overridden to False per-env for those.
   use_async_vector_env = True
 
-  # Uniform across the whole suite: per-step reward in [0, 1] over a 1000-step
-  # horizon, so this one declaration covers every task below exactly.
+  # dime_am's tuned DMC value (configs/alg/dime.yaml: v_min -200, v_max 200 at
+  # n_atoms 101), which is a distributional critic's fixed support. It bounds the
+  # *discounted* value, not the undiscounted episode return -- reward is in
+  # [0, 1] over a 1000-step horizon, so at gamma 0.99 the value lives in
+  # [0, (1 - gamma^1000)/(1 - gamma)] = [0, 100] and this is twice that, both
+  # ways. The factor of two is headroom for transient over-estimation, which a
+  # support pinned at the true bound would clip and then be unable to correct;
+  # the symmetry keeps 0 -- where a near-uniform head prices and where
+  # `entropy_coef` pulls -- at the centre.
+  #
+  # The cost is resolution early: the bin is 4.0 wide and HumanoidRun's value is
+  # ~0.2 under a random policy, so almost the whole signal quantizes away until
+  # it climbs past ~5. dime_am reaches 448 on humanoid-run through exactly this,
+  # so it is a slow start, not a wall. See tests/test_env_supports.py.
   stats = {"return_min": -200.0, "return_max": 200.0}
 
   def domain_task(self) -> tuple[str, str]:

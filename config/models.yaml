@@ -80,7 +80,7 @@ SAC:
 
   components:
     actor:    {class: StochasticActor, latent_dim: 512, layers: 3}
-    critic:   {class: C51Critic }
+    critic:   {class: C51Critic, latent_dim: 512, layers: 1 }
     entropy:  {class: AutotuneRegulator }
 
 DIME:
@@ -94,7 +94,7 @@ DIME:
 
   components:
     actor:   {class: OUDiffusionActor, latent_dim: 512, layers : 3 }
-    critic:  {class: C51Critic }
+    critic:  {class: C51Critic, latent_dim: 512, layers: 1 }
     squash:  {class: TanhSquash }
     entropy: {class: AutotuneRegulator }
 
@@ -112,7 +112,7 @@ AMDP:
 
   components:
     actor:   {class: ScoreContinuousActor, latent_dim: 512, layers : 3 }
-    critic:  {class: C51Critic }
+    critic:  {class: C51Critic, latent_dim: 512, layers: 1 }
     squash:  {class: ErfSquash }
     entropy: {class: AutotuneRegulator }
     
@@ -125,11 +125,6 @@ SDAC:
   params:
     entropy_scale: -0.9
 
-    # Both match the reference (mahaitongdae/diffusion_policy_online_rl):
-    # `reverse_mc_num`, hardcoded 64 in relax/algorithm/sdac.py, and
-    # `num_particles`, whose CLI default is 32 in scripts/train_mujoco.py (the
-    # dataclass default of 4 in relax/network/diffv2.py never applies -- the
-    # script always passes the flag).
     num_candidates: 64   # K: softmax candidates in the soft denoising loss
     num_bon: 32          # N: best-of-N, for the played action and the bootstrap
 
@@ -140,8 +135,13 @@ SDAC:
     explore_max: 1.0
 
   components:
-    actor:   {class: VPDiffusionActor, latent_dim: 256, layers: 3, num_steps: 20, activation: Mish, dtype: bfloat16}
-    critic:  {class: C51Critic, latent_dim: 256, layers: 3, activation: Mish }
+    actor:   {class: VPDiffusionActor, latent_dim: 256, layers: 3, num_steps: 20, activation: Mish}
+    # Bare, so it is byte-for-byte the critic SAC/DIME/AMDP resolve -- the
+    # dime_am net. SDAC's own reference (mahaitongdae/diffusion_policy_online_rl)
+    # uses a 256x3 Mish critic; holding this fixed across the matrix is what
+    # makes an {algo x env} sweep an algorithm comparison rather than an
+    # algorithm-and-critic one. The actor below still follows SDAC's reference.
+    critic:  {class: C51Critic, latent_dim: 512, layers: 1 }
     squash:  {class: TanhSquash }
     entropy: {class: AutotuneRegulator }
 
@@ -183,4 +183,4 @@ NCLQL:
     # the same critic over a categorical / histogram return instead, and the
     # algorithm reads none of that difference -- so the return representation is
     # a one-word axis here, or `--set model.components.critic.class=...`.
-    critic:  { class: NCLQLCritic }
+    critic:  { class: NCLQLC51Critic, latent_dim: 512, layers: 1 }
