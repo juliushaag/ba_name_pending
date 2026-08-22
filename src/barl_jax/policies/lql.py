@@ -201,10 +201,14 @@ class NCLQL(Policy):
     """grad_a E[Z(s, a, level)], averaged over heads -- `expectation()` and not
     `value()`, since here the gradient field *is* the policy and a pessimism
     term would change the distribution the chain samples from."""
-    def q(critic, a):
-      return critic.expectation(obs, critic.augment(a, level)).sum()
+    critic = frozen(self.critic)
+    graphdef, params = nnx.split(critic)
 
-    return nnx.grad(q, argnums=1)(frozen(self.critic), act)
+    def q_fn(params, a):
+      critic_ = nnx.merge(graphdef, params)
+      return critic_.expectation(obs, critic_.augment(a, level)).sum()
+
+    return jax.grad(q_fn, argnums=1)(params, act)
 
   def sample(self, obs, key):
     key, init_key = jax.random.split(key)

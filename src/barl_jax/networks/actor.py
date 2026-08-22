@@ -11,6 +11,11 @@ from barl_jax.networks.mlp import MLP
 from barl_jax.networks.registry import get_component, register_component
 from barl_jax.policy import Actor, Buffer, Critic
 
+
+def safe_norm(x, axis=-1, keepdims=True, eps=1e-8):
+  """L2 norm with well-defined gradients at zero."""
+  return jnp.sqrt(jnp.sum(x**2, axis=axis, keepdims=keepdims) + eps)
+
 LOG_STD_MIN = -20.0
 LOG_STD_MAX = 2.0
 
@@ -172,8 +177,8 @@ class ScoreContinuousActor(Actor):
 
   def bound_control(self, u_tilde, X, sigma_i):
     """||u|| <= C(1 + ||X||) with u = sigma * u_tilde."""
-    max_norm = self.bound_c * (1.0 + jnp.linalg.norm(X, axis=-1, keepdims=True)) / sigma_i
-    n = jnp.maximum(jnp.linalg.norm(u_tilde, axis=-1, keepdims=True), 1e-8)
+    max_norm = self.bound_c * (1.0 + safe_norm(X)) / sigma_i
+    n = safe_norm(u_tilde)
     return u_tilde * jnp.minimum(max_norm / n, 1.0)
 
   def generate_action(self, obs, key=None):

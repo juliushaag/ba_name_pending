@@ -18,9 +18,10 @@ class RandomPolicy:
   buffer with broad, uncorrelated coverage before training starts (SAC/TD3-
   style `random_steps`); never registered/selectable like a real Policy."""
 
-  def __init__(self, action_space: gym.Space):
+  def __init__(self, action_space: gym.Space, seed: int = None):
     self.action_space = action_space
     self.action_discrete = isinstance(action_space, gym.spaces.Discrete)
+    self._rng = np.random.RandomState(seed)
     if not self.action_discrete:
       low  = np.asarray(action_space.low,  dtype=np.float32)
       high = np.asarray(action_space.high, dtype=np.float32)
@@ -30,10 +31,10 @@ class RandomPolicy:
   def inference_step(self, observation, step_info=None):
     batch = observation.shape[0]
     if self.action_discrete:
-      action = np.random.randint(0, self.action_space.n, (batch, 1))
+      action = self._rng.randint(0, self.action_space.n, (batch, 1))
     else:
       # canonical [-1, 1] per dimension -- same convention every real actor outputs.
-      action = np.random.uniform(-1.0, 1.0, (batch, *self.action_space.shape)).astype(np.float32)
+      action = self._rng.uniform(-1.0, 1.0, (batch, *self.action_space.shape)).astype(np.float32)
     return action, {}
 
   def action_bounds_numpy(self):
@@ -241,7 +242,7 @@ class ReplayBuffer():
     not for on-policy ones (PPO's compute_gae needs extras["value"]) -- callers
     should only use this for off-policy Policies (see Policy.on_policy)."""
     action_space = env.single_action_space if isinstance(env, gym.vector.VectorEnv) else env.action_space
-    return self.rollout(RandomPolicy(action_space), env, n_steps=n_steps, seed=seed)
+    return self.rollout(RandomPolicy(action_space, seed=seed), env, n_steps=n_steps, seed=seed)
 
   def rollout(self, policy : Policy, env : gym.Env | gym.vector.VectorEnv, n_steps = 10_000, seed : int = None):
     """A VectorEnv must use autoreset_mode=DISABLED -- finished sub-envs are

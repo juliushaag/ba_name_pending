@@ -378,6 +378,17 @@ def validate(name: str) -> list[str]:
       problems += [f"{policy_name}.{slot} [{cls.__name__}]: {k!r} is accepted by no __init__ in "
                    f"{cls.__name__}'s MRO -- it is silently swallowed by **kwargs" for k in unknown]
 
+    # Check for critical params that differ between slot config and components.yaml baseline
+    baseline = _components().get(cls.__name__, {})
+    for critical_key in ("n_models", "num_atoms", "num_bins"):
+      if critical_key in kwargs and critical_key in baseline:
+        if kwargs[critical_key] != baseline[critical_key]:
+          problems.append(
+            f"{policy_name}.{slot} [{cls.__name__}]: {critical_key}={kwargs[critical_key]} in models.yaml "
+            f"differs from components.yaml baseline {critical_key}={baseline[critical_key]} -- "
+            f"the slot value takes precedence but this may be unintentional"
+          )
+
     annotations = _annotations(cls)
     problems += [f"{policy_name}.{slot} [{cls.__name__}]: {p}"
                  for key, value in kwargs.items()

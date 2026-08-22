@@ -54,21 +54,27 @@ MLP_KWARGS = ("activation", "norm", "norm_input", "norm_stem", "norm_after_act",
 
 
 class ResidualBlock(nnx.Module):
-  """One pre-norm hidden layer: `x + Linear(ACT(LN(x)))`. The norm sits on the
-  branch rather than after its Linear, so the skip carries an unnormalized
-  identity and a branch whose activation has a one-sided range (ReLU, SiLU)
-  cannot walk the stream's mean upward once per layer."""
+  """One hidden layer with residual connection, matching the main MLP's
+  norm_after_act ordering: Linear -> act -> Norm (default) or Linear -> Norm -> act."""
 
   def __init__(self, latent_dim: int, act, norm: str, dropout: float = 0.0,
-               *, rngs: nnx.Rngs, dtype=jnp.float32, **norm_kwargs):
-    self.norm    = make_norm(norm, latent_dim, rngs=rngs, dtype=dtype, **norm_kwargs)
-    self.act     = act
-    self.lin     = Linear(latent_dim, latent_dim, rngs=rngs, dtype=dtype)
-    self.dropout = nnx.Dropout(dropout, rngs=rngs) if dropout > 0 else None
+               norm_after_act: bool = True, *, rngs: nnx.Rngs, dtype=jnp.float32, **norm_kwargs):
+    self.norm          = make_norm(norm, latent_dim, rngs=rngs, dtype=dtype, **norm_kwargs)
+    self.act           = act
+    self.lin           = Linear(latent_dim, latent_dim, rngs=rngs, dtype=dtype)
+    self.dropout       = nnx.Dropout(dropout, rngs=rngs) if dropout > 0 else None
+    self.norm_after_act = norm_after_act
 
   def __call__(self, x):
-    h = self.norm(x) if self.norm is not None else x
-    h = self.lin(self.act(h))
+    h = self.lin(x)
+    if self.norm_after_act:
+      h = self.act(h)
+      if self.norm is not None:
+        h = self.norm(h)
+    else:
+      if self.norm is not None:
+        h = self.norm(h)
+      h = self.act(h)
     if self.dropout is not None:
       h = self.dropout(h)
     return x + h
@@ -137,7 +143,8 @@ class MLP(nnx.Module):
       if residual:
         # One Linear per block, same as the plain path, so `residual` swaps the
         # wiring rather than the width -- the two differ only by the head norm.
-        blocks.append(ResidualBlock(latent_dim, act, norm, dropout, rngs=rngs,
+        blocks.append(ResidualBlock(latent_dim, act, norm, dropout,
+                                    norm_after_act=norm_after_act, rngs=rngs,
                                     dtype=dtype, **norm_kwargs))
       else:
         blocks.append(Linear(latent_dim, latent_dim, rngs=rngs, dtype=dtype))

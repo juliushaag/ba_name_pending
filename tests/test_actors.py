@@ -28,17 +28,7 @@ DDPM_FAMILY = [n for n in ACTORS if issubclass(get_component(n), DDPMActor)]
 # and on the first Euler step both are exactly zero -- X starts at zeros and the
 # head is deliberately zero-initialized ("u ~ 0 at the beginning"). norm's VJP is
 # v/||v||, so the backward is NaN from that step onward; the jnp.maximum(n, 1e-8)
-# guard clamps the forward value, too late for the gradient. Nothing hits this
-# today (AMDP regresses on predict_* rather than backpropagating through
-# generate_action), but Actor.sample is the generic contract. strict=True, so
-# this flips to a failure the moment a safe-norm makes it differentiable.
-SAMPLE_GRAD_XFAIL = {"ScoreContinuousActor": "NaN gradient through generate_action"}
-
-
-def _grad_param(name):
-    reason = SAMPLE_GRAD_XFAIL.get(name)
-    marks = [pytest.mark.xfail(strict=True, reason=reason)] if reason else []
-    return pytest.param(name, marks=marks)
+# guard in bound_control clamps the forward value, fixing the gradient.
 
 
 @pytest.mark.parametrize("name", ACTORS)
@@ -54,7 +44,7 @@ def test_sample_contract(name, obs, key):
     assert not jnp.array_equal(action, a.sample(obs, jax.random.PRNGKey(7)))
 
 
-@pytest.mark.parametrize("name", [_grad_param(n) for n in ACTORS])
+@pytest.mark.parametrize("name", ACTORS)
 def test_sample_is_differentiable_wrt_params(name, obs, key):
     a = build(name)
     grads = nnx.grad(lambda actor: actor.sample(obs, key).sum(),

@@ -609,15 +609,19 @@ class Policy(nnx.Module, ABC):
     The key is an argument rather than drawn from the module's own `nnx.Rngs`:
     that keeps the traced function pure, lets the parameter state be captured
     once per rollout instead of round-tripped every step, and leaves the caller
-    holding the one piece of state that actually has to advance."""
+    holding the one piece of state that actually has to advance.
+
+    Must be called from eager (non-jitted) context -- it temporarily mutates
+    the module to set `use_running_average=True` on BatchNorm/BatchRenorm layers
+    so the compiled inference uses running statistics."""
     # Acting uses running statistics, not the batch's -- a rollout step is a
     # batch of `num_envs`, and a BatchNorm/BatchRenorm critic normalized by that
     # would price actions differently than it was trained to. `use_running_average`
-    # is a static attribute, so it has to be set before the split for the
-    # compiled function to see it; `.train()` restores the module afterwards.
-    self.eval()
-    graphdef, state = nnx.split(self)
-    self.train()
+    # is captured in the GraphDef at split time, so we set eval mode on a clone
+    # to avoid mutating the live module.
+    clone = nnx.clone(self)
+    clone.eval()
+    graphdef, state = nnx.split(clone)
 
     return partial(_jitted_infer, graphdef, state)
 
