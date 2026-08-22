@@ -200,15 +200,16 @@ class NCLQL(Policy):
   def critic_score(self, obs, act, level):
     """grad_a E[Z(s, a, level)], averaged over heads -- `expectation()` and not
     `value()`, since here the gradient field *is* the policy and a pessimism
-    term would change the distribution the chain samples from."""
+    term would change the distribution the chain samples from.
+
+    Uses nnx.grad on the frozen critic to avoid trace-level issues when called
+    from within a vmapped context (multi-seed rollout)."""
     critic = frozen(self.critic)
-    graphdef, params = nnx.split(critic)
 
-    def q_fn(params, a):
-      critic_ = nnx.merge(graphdef, params)
-      return critic_.expectation(obs, critic_.augment(a, level)).sum()
+    def q_fn(critic, a):
+      return critic.expectation(obs, critic.augment(a, level)).sum()
 
-    return jax.grad(q_fn, argnums=1)(params, act)
+    return nnx.grad(q_fn, argnums=1)(critic, act)
 
   def sample(self, obs, key):
     key, init_key = jax.random.split(key)
