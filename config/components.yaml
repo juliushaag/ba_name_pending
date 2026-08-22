@@ -261,6 +261,16 @@ HLGaussCritic:
 # the action; `norm` MUST stay off the running-statistic kinds, as for every
 # other target-net critic here.
 #
+# `rho` and `pessimistic_target` are held equal to each critic's generic
+# counterpart above -- NCLQLCritic to EnsembleCritic, NCLQLC51Critic to
+# C51Critic, NCLQLHLGaussCritic to HLGaussCritic -- so that an {NCLQL vs
+# SAC/DIME/AMDP/SDAC} comparison varies the algorithm and not how pessimistically
+# its critic prices. Note what that costs on the two categorical ones: NC-LQL
+# selects its bootstrap action with the critic's own gradient field and has no
+# actor to keep it on-distribution, which is the setup where target pessimism
+# earns its keep most. If a run's `critic/q/mean` runs away from realized
+# returns, `pessimistic_target: true` is the first thing to put back.
+#
 # `smoothing_coef` weights the smoothing loss where it is summed with the TD
 # loss. The reference takes two *sequential* Adam steps (TD, then smoothing at
 # the already-updated params), which -- because Adam normalizes per coordinate
@@ -270,7 +280,8 @@ HLGaussCritic:
 # TD term. 1.0 reproduces the plain sum; raise it to compensate.
 
 # The reference's: two scalar heads. `rho: 1.0` at `n_models: 2` is exactly its
-# `min(target_q1, target_q2)` -- see EnsembleCritic's docstring.
+# `min(target_q1, target_q2)` -- see EnsembleCritic's docstring -- and is also
+# what EnsembleCritic ships, so this one needed no alignment.
 NCLQLCritic:
   latent_dim: 256
   layers: 3
@@ -295,19 +306,19 @@ NCLQLCritic:
   norm_input: false
   norm_after_act: true
 
-# A categorical return distribution instead of a scalar. `pessimistic_target` is
-# on where C51Critic leaves it off: it is what puts the heads' `min` in the
-# Bellman target, which is where the reference's pessimism lives and NC-LQL has
-# no actor to provide another brake. The support defaults from the env's return
-# range *scaled by `reward_scale`* (NCLQL.__init__ does that), so it does not
-# need pinning per env.
+# A categorical return distribution instead of a scalar, at C51Critic's own
+# `rho: 0.0` / `pessimistic_target: false` -- so this and C51Critic differ by
+# NC-LQL's noise conditioning and nothing else. The reference puts its pessimism
+# in the Bellman target instead; `pessimistic_target: true` restores that. The
+# support defaults from the env's return range *scaled by `reward_scale`*
+# (NCLQL.__init__ does that), so it does not need pinning per env.
 NCLQLC51Critic:
   latent_dim: 2048
   layers: 1
   n_models: 2
   num_atoms: 101
   entropy_coef: 0.005
-  rho: 1.0
+  rho: 0.0
   pessimistic_target: false
   smoothing_coef: 1.0
   time_dim: 16
@@ -327,18 +338,20 @@ NCLQLC51Critic:
   norm_input: false
   norm_after_act: true
 
-# The same scalar bootstrap as NCLQLCritic (`min` over the heads' expectations),
-# fitted as a Gaussian-smoothed histogram instead of by MSE -- so this is the
-# A/B that isolates classification-as-regression from the distributional
-# bootstrap NCLQLC51Critic also brings.
+# A scalar bootstrap fitted as a Gaussian-smoothed histogram instead of by MSE
+# -- the A/B that isolates classification-as-regression from the distributional
+# bootstrap NCLQLC51Critic also brings. Reduces like HLGaussCritic, which is the
+# plain mean in both places, so it bootstraps less pessimistically than
+# NCLQLCritic does; that difference is now the representation's, not a
+# pessimism setting's.
 NCLQLHLGaussCritic:
   latent_dim: 256
   layers: 3
   n_models: 2
   num_bins: 151
   sigma_to_bin_ratio: 0.75
-  rho: 1.0
-  pessimistic_target: true
+  rho: 0.0
+  pessimistic_target: false
   smoothing_coef: 1.0
   time_dim: 16
   polyak_tau: 0.005
