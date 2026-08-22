@@ -21,26 +21,27 @@ class BatchRenorm(nnx.Module):
   notoriously unstable in off-policy RL, where the same network is queried on a
   fresh single-transition batch every env step. BatchRenorm closes that gap: it
   still normalizes with the batch moments, then applies an affine correction
-  (r, d) that maps them onto the running ones, with r/d clipped to a window
-  that opens over `warmup_steps`. Training starts as BatchNorm and converges to
-  the eval-time normalization, so train and eval agree.
+  (r, d), clipped to +-`r_max`/`d_max`, that maps them onto the running ones.
+
+  The correction is gated off entirely until `warmup_steps`, so this is exactly
+  BatchNorm while the running statistics are still meaningless and full
+  BatchRenorm afterwards -- dime_am's hard switch, not a ramp into it.
 
   This is the normalization CrossQ (Bhatt et al., ICLR 2024) relies on to drop
   target networks entirely.
 
-  `momentum` is the weight given to the *batch* moment when updating the
-  running one (torch's `lerp` convention), so 0.01 means a slow running
-  average -- note flax's own BatchNorm takes the opposite convention, where
-  0.99 means the same thing."""
+  `momentum` is the weight given to the *running* average (standard PyTorch/Flax
+  convention), so 0.99 means a slow running average -- dime_am's `bn_momentum`,
+  whose own class default of 0.999 is dead code its configs always override."""
 
   # epsilon is dime_am's 1e-3, not flax's 1e-5: it enters the r/d ratios as well
   # as the denominator, so the two are not interchangeable here.
-  def __init__(self, num_features: int, *, momentum: float = 0.01, epsilon: float = 1e-3,
+  def __init__(self, num_features: int, *, momentum: float = 0.99, epsilon: float = 1e-3,
                r_max: float = 3.0, d_max: float = 5.0, warmup_steps: int = 100_000,
                use_running_average: bool = False, dtype=jnp.float32, rngs: nnx.Rngs = None):
     self.num_features = num_features
     self.dtype        = dtype
-    self.momentum     = float(momentum)
+    self.momentum     = float(momentum)  # weight on RUNNING average (standard convention)
     self.epsilon      = float(epsilon)
     self.r_max        = float(r_max)
     self.d_max        = float(d_max)
@@ -54,13 +55,6 @@ class BatchRenorm(nnx.Module):
     self.mean  = nnx.BatchStat(jnp.zeros((num_features,), jnp.float32))
     self.var   = nnx.BatchStat(jnp.ones((num_features,), jnp.float32))
     self.steps = nnx.BatchStat(jnp.zeros((), jnp.float32))
-
-  def _limits(self):
-    """r and d open linearly from (1, 0) -- i.e. exactly BatchNorm -- to
-    (r_max, d_max) over warmup_steps, so early training isn't corrected towards
-    running statistics that are still meaningless."""
-    t = jnp.minimum(self.steps[...] / self.warmup_steps, 1.0)
-    return 1.0 + t * (self.r_max - 1.0), t * self.d_max
 
   def _apply(self, x, a, b):
     """The whole normalization folded into one per-channel affine.
@@ -86,27 +80,32 @@ class BatchRenorm(nnx.Module):
     batch_std  = jnp.sqrt(batch_var + self.epsilon)
 
     running_std = jnp.sqrt(self.var[...] + self.epsilon)
-    r_max, d_max = self._limits()
     # stop_gradient: r and d are a correction *towards* the running statistics,
     # not a path the loss should push back through.
-    r = jax.lax.stop_gradient(jnp.clip(batch_std / running_std, 1.0 / r_max, r_max))
+    r = jax.lax.stop_gradient(jnp.clip(batch_std / running_std, 1.0 / self.r_max, self.r_max))
     d = jax.lax.stop_gradient(
-      jnp.clip((batch_mean - self.mean[...]) / running_std, -d_max, d_max))
+      jnp.clip((batch_mean - self.mean[...]) / running_std, -self.d_max, self.d_max))
+    # (r, d) = (1, 0) is exactly BatchNorm, so the gate is a plain interpolation.
+    warmed_up = (self.steps[...] >= self.warmup_steps).astype(jnp.float32)
+    r = 1.0 + warmed_up * (r - 1.0)
+    d = warmed_up * d
 
-    self.mean[...]  = self.mean[...] + self.momentum * (jax.lax.stop_gradient(batch_mean) - self.mean[...])
-    self.var[...]   = self.var[...] + self.momentum * (jax.lax.stop_gradient(batch_var) - self.var[...])
+    # momentum is weight on RUNNING average (standard convention):
+    # new_running = momentum * running + (1 - momentum) * batch
+    self.mean[...]  = self.momentum * self.mean[...] + (1.0 - self.momentum) * jax.lax.stop_gradient(batch_mean)
+    self.var[...]   = self.momentum * self.var[...] + (1.0 - self.momentum) * jax.lax.stop_gradient(batch_var)
     self.steps[...] = self.steps[...] + 1
 
     a = r * self.scale[...] / batch_std
     return self._apply(x, a, self.bias[...] + d * self.scale[...] - batch_mean * a)
 
 
-def BatchNorm(num_features: int, *, momentum: float = 0.01, epsilon: float = 1e-5,
+def BatchNorm(num_features: int, *, momentum: float = 0.99, epsilon: float = 1e-5,
               use_running_average: bool = False, dtype=jnp.float32,
               rngs: nnx.Rngs, **_) -> nnx.BatchNorm:
-  """flax's BatchNorm, with `momentum` in the same sense as BatchRenorm above
-  (weight on the batch moment) rather than flax's own decay convention."""
-  return nnx.BatchNorm(num_features, momentum=1.0 - momentum, epsilon=epsilon,
+  """flax's BatchNorm, with `momentum` in the standard convention
+  (weight on the running average)."""
+  return nnx.BatchNorm(num_features, momentum=momentum, epsilon=epsilon,
                        use_running_average=use_running_average,
                        dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
 

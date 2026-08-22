@@ -91,8 +91,9 @@ def test_c51_resolves_a_realistic_dm_control_value_gap(q_gap):
     stats = declared(Environment._classes["HumanoidRun"])
     env_stats = make_env_stats(return_min=stats["return_min"], return_max=stats["return_max"])
     c = get_component("C51Critic")(
-        env_stats, latent_dim=8, layers=1, n_models=2, num_atoms=101, entropy_coef=0.005,
-        pessimistic_target=False, gamma=GAMMA, lr=3e-4, rngs=nnx.Rngs(0))
+        env_stats, latent_dim=8, layers=1, n_models=2, rho=0.0, num_atoms=101,
+        entropy_coef=0.005, pessimistic_target=False, gamma=GAMMA, lr=3e-4,
+        rngs=nnx.Rngs(0))
 
     n = c.num_atoms
     bin_width = (c.v_max - c.v_min) / (n - 1)

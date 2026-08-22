@@ -22,13 +22,15 @@ class QCriticBase(Critic):
   both gives two half-cancelling mechanisms and a plausible-looking curve."""
 
   def __init__(self, env_stats, q_function, *, gamma: float, lr: float,
-               adam_b1: float = 0.5, polyak_tau: float = 0.0, target_delay: int = 1,
-               norm: str = None, **kwargs):
+               pessimistic_target: bool, adam_b1: float = 0.5, polyak_tau: float = 0.0,
+               target_delay: int = 1, norm: str = None, **kwargs):
     super().__init__(env_stats, **kwargs)
 
     self.gamma   = float(gamma)
     self.lr      = float(lr)
     self.adam_b1 = float(adam_b1)
+
+    self.pessimistic_target = bool(pessimistic_target)
 
     self.q_function = q_function
 
@@ -114,20 +116,23 @@ class QCriticBase(Critic):
     predicts a scalar, an integral over the support for one that does not."""
     return raw
 
+  def mean_expectation(self, raw):
+    """E[Z] averaged over the heads -- `reduce_value`'s risk-neutral
+    counterpart, and what the two differ by is `pessimism_gap`."""
+    return self.expectation_from_raw(raw).astype(jnp.float32).mean(axis=0)
+
   def pessimism_gap(self, raw):
     """How far below E[Z] the price `value()` returns sits, whatever reduction
-    produced it -- `rho`*std for a scalar ensemble, mean-minus-min for a
-    categorical one. Defined as the difference rather than reconstructed from a
+    produced it. Defined as the difference rather than reconstructed from a
     coefficient so it stays exact when a subclass changes how it reduces."""
-    exp = self.expectation_from_raw(raw).astype(jnp.float32).mean(axis=0)
-    return exp - self.reduce_value(raw).astype(jnp.float32)
+    return self.mean_expectation(raw) - self.reduce_value(raw).astype(jnp.float32)
 
   def expectation(self, s, a):
     """E[Z] averaged over the heads, where `value()` is the pessimistic price.
     A Policy whose improvement direction *is* the critic's action-gradient field
     (NC-LQL's Langevin chain) differentiates this one: a spread term would move
     the distribution it samples from, not merely bound the price."""
-    return self.expectation_from_raw(self.raw(s, a)).mean(axis=0)
+    return self.mean_expectation(self.raw(s, a))
 
   def create_optimizer(self) -> dict:
     return {"q": optax.adam(self.lr, b1=self.adam_b1)}
@@ -135,7 +140,14 @@ class QCriticBase(Critic):
   # ---- regression ----------------------------------------------------------
 
   def bootstrap_from_raw(self, next_raw):
-    return jax.lax.stop_gradient(self.reduce_value(next_raw))
+    """`rho` prices the heads' disagreement into `value()`; this decides whether
+    it is priced into the *target* as well. The two are independent because they
+    answer to different things -- dime_am puts pessimism in neither (both its
+    reductions are the plain mean), SAC-style clipped double-Q in both, and
+    NC-LQL needs it in the target because it has no actor to keep the bootstrap
+    action on-distribution."""
+    reduce = self.reduce_value if self.pessimistic_target else self.mean_expectation
+    return jax.lax.stop_gradient(reduce(next_raw))
 
   def bellman_target(self, reward, term, bootstrap, shift=0.0):
     reward = reward.reshape(-1, 1)
@@ -286,12 +298,13 @@ class CategoricalCriticBase(QCriticBase):
   -- so `bellman_target` is the entire difference, and everything about pricing
   and the loss is shared, including the `n_models` heads and their reduction."""
 
-  def __init__(self, env_stats, q_function, support, n_models: int,
+  def __init__(self, env_stats, q_function, support, n_models: int, rho: float,
                entropy_coef: float = 0.0, **kwargs):
     super().__init__(env_stats, q_function, **kwargs)
 
     self.support      = Buffer(support)
     self.n_models     = int(n_models)
+    self.rho          = float(rho)
     self.entropy_coef = float(entropy_coef)
 
   def probs(self, raw):
@@ -301,7 +314,13 @@ class CategoricalCriticBase(QCriticBase):
     return (self.probs(raw) * self.support[...]).sum(axis=-1, keepdims=True)
 
   def reduce_value(self, raw):
-    return self.expectation_from_raw(raw).min(axis=0)
+    """`rho` means what it means on EnsembleCritic -- the spread reduced with is
+    disagreement between heads, epistemic, whatever each head predicts. Sharing
+    the reduction is what makes swapping this family for that one an A/B over
+    the return representation alone."""
+    exp = self.expectation_from_raw(raw).astype(jnp.float32)
+    std = jnp.sqrt(jnp.maximum(exp.var(axis=0), 1e-8))
+    return exp.mean(axis=0) - self.rho * std
 
   def target_from_raw(self, raw):
     """The heads' mean *distribution*, not their mean expectation -- the target
@@ -376,24 +395,25 @@ class C51Critic(CategoricalCriticBase):
   distributional Bellman operator (Bellemare, Dabney & Munos, 2017).
 
   Genuinely distributional: it transports the whole next-state distribution
-  rather than a scalar, so its spread is the return's own. The two reductions
-  are deliberately different, following dime_am: the target averages the heads'
-  projected distributions so both regress onto one well-posed target, while the
-  price a Policy improves against is the `min` over their expectations.
-  `pessimistic_target` moves that `min` into the target as well, for an
-  algorithm whose bootstrap action is itself selected by the critic and so has
-  no other brake on over-estimation.
+  rather than a scalar, so its spread is the return's own. Both head reductions
+  follow dime_am, and both are the plain mean at the shipped `rho: 0.0`: the
+  target averages the heads' projected distributions so both regress onto one
+  well-posed target, and the price a Policy improves against averages their
+  expectations (`policy_q_reduce_fn = jnp.mean` there -- the `min_qf_pi` its
+  critic loss computes is a metric, not a learning signal). `rho` and
+  `pessimistic_target` are the two independent ways to put the heads'
+  disagreement back, in the price and in the target respectively; NC-LQL's
+  subclass turns the first on, having no actor to brake over-estimation.
 
   Deviations from dime_am worth knowing: its net emits post-softmax
   probabilities and takes log(p + 1e-15), where this keeps logits and uses
-  log_softmax -- identical in exact arithmetic, stable in float32. And barl's
-  MLP normalizes *before* the activation where the reference normalizes after,
-  and has a stem the reference lacks, so `layers` here is one Linear deeper
-  than the reference's `hs` of the same length; `norm_stem: true` is the
-  closest match."""
+  log_softmax -- identical in exact arithmetic, stable in float32; and this MLP
+  has a stem the reference lacks, so `layers` here is one Linear deeper than the
+  reference's `hs` of the same length (`layers: 1` + `norm_stem: true` is its
+  `hs: [w, w]`)."""
 
   def __init__(self, env_stats, latent_dim: int, layers: int, n_models: int,
-               num_atoms: int, entropy_coef: float, pessimistic_target: bool,
+               num_atoms: int, entropy_coef: float,
                activation: str = "silu", norm: str = None,
                norm_input: bool = False, norm_stem: bool = False, norm_after_act: bool = True,
                dropout: float = 0.0, final_activation: bool = False,
@@ -425,10 +445,11 @@ class C51Critic(CategoricalCriticBase):
 
     self.num_atoms = int(num_atoms)
     self.v_min, self.v_max = float(v_min), float(v_max)
-    self.pessimistic_target = bool(pessimistic_target)
 
   def bootstrap_from_raw(self, next_raw):
-    """The next-state *distribution*, per head -- not a scalar."""
+    """The next-state *distribution*, per head -- not a scalar, so the base's
+    `pessimistic_target` reduction cannot apply here; `bellman_target` below
+    applies the flag in the only form that keeps a distribution."""
     return jax.lax.stop_gradient(self.probs(next_raw))
 
   def bellman_target(self, reward, term, bootstrap, shift=0.0):

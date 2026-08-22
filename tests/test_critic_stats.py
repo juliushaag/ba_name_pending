@@ -18,7 +18,8 @@ from barl_jax.metrics import DEBUG, PRIMARY, DebugMetric, Metric, collect, recor
 from barl_jax.networks.registry import get_component
 from barl_jax.policies.lql import NoiseConditionedCritic
 
-from conftest import BATCH, CRITICS, build, built, critic_action, finite
+from conftest import (BATCH, CRITICS, build, built, critic_action, finite,
+                      target_expectation)
 
 _sub = lambda base: [n for n in CRITICS if issubclass(get_component(n), base)]
 
@@ -175,6 +176,38 @@ def _one_head(n, index):
     return jnp.zeros((1, 1, n)).at[0, 0, index].set(1.0)
 
 
+@pytest.mark.parametrize("name", CRITICS)
+def test_the_two_pessimism_axes_are_independent(name, obs, act):
+    """`rho` prices the heads' disagreement into `value()`; `pessimistic_target`
+    puts it in the Bellman target. They are separate because the references
+    disagree about them separately -- dime_am wants neither, NC-LQL's C51 critic
+    wants the first without the second -- and while they were one knob that
+    combination could not be expressed at all.
+
+    Independence is the pair of cross-terms: neither knob reaches the other's
+    quantity. (`pessimistic_target` is *not* inert at rho=0 for a distributional
+    critic -- it selects a head's whole categorical rather than reducing with a
+    spread, so it never routes through `reduce_value`.)"""
+    def priced(**over):
+        c = build(name, **over)
+        raw = c.raw(obs, critic_action(c, act))
+        return (c, c.reduce_value(raw), c.mean_expectation(raw),
+                c.bellman_target(jnp.zeros((BATCH,)), jnp.zeros((BATCH,)),
+                                 c.bootstrap_from_raw(raw)))
+
+    c, price, mean_exp, off = priced(rho=1.0, pessimistic_target=False)
+    _, price_on, _, on = priced(rho=1.0, pessimistic_target=True)
+    _, _, _, off_neutral = priced(rho=0.0, pessimistic_target=False)
+
+    lift = lambda t: target_expectation(c, t)
+    assert jnp.array_equal(price, price_on), "pessimistic_target moved the price"
+    assert jnp.array_equal(off, off_neutral), "rho moved a non-pessimistic target"
+
+    # ... and each knob does reach its own.
+    assert float(lift(on).mean()) < float(lift(off).mean()) - 1e-4
+    assert jnp.allclose(lift(off), c.gamma * mean_exp.squeeze(-1), atol=1e-3)
+
+
 def test_pessimistic_target_transports_the_lower_heads_distribution():
     """Not a pointwise min over probabilities -- that is not a distribution.
     It picks the head with the lower E[Z] and moves *that* head's whole
@@ -275,10 +308,15 @@ def test_pessimism_gap_tracks_the_reduction_that_produced_it():
 
 
 @pytest.mark.parametrize("name", CRITICS)
-def test_every_critic_prices_below_its_own_expectation(name, obs, act):
+def test_every_critic_prices_no_higher_than_its_own_expectation(name, obs, act):
+    """A gap is a configured choice, not a property of the class: dime_am's own
+    reduction is the plain mean (`policy_q_reduce_fn = jnp.mean`), which is what
+    the shipped `rho: 0.0` on the C51/HL-Gauss critics reproduces. So the
+    invariant is one-sided, and strictness is keyed off `rho`."""
     c = built(name)
-    raw = c.raw(obs, critic_action(c, act))
-    assert float(c.pessimism_gap(raw).mean()) > 1e-3
+    gap = float(c.pessimism_gap(c.raw(obs, critic_action(c, act))).mean())
+    assert gap >= -1e-4
+    assert (gap > 1e-3) == (c.rho > 0.0)
 
 
 def test_metric_families_separate_the_two_spreads(obs, act):
@@ -290,8 +328,13 @@ def test_metric_families_separate_the_two_spreads(obs, act):
     categorical = drain("C51Critic", obs, act)
 
     for m in (scalar, categorical):
-        assert m["ensemble/pessimism_gap"] > 1e-3
         assert m["ensemble/disagreement"] > 1e-3
+
+    # Disagreement is the heads' spread whatever the reduction does with it;
+    # the gap is what this critic's `rho` chooses to price in. EnsembleCritic
+    # ships rho: 1.0, C51Critic rho: 0.0 (dime_am's mean).
+    assert scalar["ensemble/pessimism_gap"] > 1e-3
+    assert categorical["ensemble/pessimism_gap"] == pytest.approx(0.0, abs=1e-4)
 
     assert categorical["return_std/mean"] > 0.0
     assert not any(k.startswith("return_std") for k in scalar), "a scalar critic has no return spread"

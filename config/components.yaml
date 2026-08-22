@@ -137,6 +137,7 @@ EnsembleCritic:
   layers: 1
   n_models: 2
   rho: 1.0
+  pessimistic_target: true
   gamma: 0.99
 
   dtype: bfloat16
@@ -149,7 +150,7 @@ EnsembleCritic:
   final_activation: false
   residual: false
 
-  norm_kwargs: {momentum: 0.01, warmup_steps: 100000}
+  norm_kwargs: {momentum: 0.99, warmup_steps: 100000}
 
 # EnsembleCritic + a Polyak target, for ported algorithms whose reference
 # bootstraps from one. `norm` MUST stay off the running-statistic kinds here:
@@ -164,6 +165,7 @@ TargetEnsembleCritic:
   layers: 1
   n_models: 2
   rho: 1.0
+  pessimistic_target: true
   gamma: 0.99
 
   polyak_tau: 0.005
@@ -194,13 +196,17 @@ C51Critic:
   n_models: 2
   num_atoms: 101
   entropy_coef: 0.005
+  rho: 0.0
   gamma: 0.99
 
-  # Put the heads' `min` in the Bellman target too, not just in the price a
-  # policy improves against. Off here, which is dime_am's behaviour -- it always
-  # averages the two projected distributions (diffusion/dime.py, `next_q_values
-  # = mean(stack([target_q1_projected, target_q2_projected]))`). Every policy
-  # resolving to this class -- SAC, DIME, AMDP, SDAC -- therefore averages.
+  # The two pessimism axes every critic here carries, both off because both are
+  # off in dime_am: `rho` prices the heads' disagreement into `value()`, which
+  # the reference reduces with `policy_q_reduce_fn = jnp.mean` (the `min_qf_pi`
+  # in its critic loss is a logged metric, not a learning signal), and
+  # `pessimistic_target` puts it in the Bellman target, which the reference
+  # likewise averages (`next_q_values = mean(stack([target_q1_projected,
+  # target_q2_projected]))`). Every policy resolving to this class -- SAC, DIME,
+  # AMDP, SDAC -- therefore averages in both places.
   pessimistic_target: false
 
   dtype: bfloat16
@@ -213,7 +219,7 @@ C51Critic:
   final_activation: false
   residual: false
 
-  norm_kwargs: {momentum: 0.01, warmup_steps: 100000}
+  norm_kwargs: {momentum: 0.99, warmup_steps: 100000}
 
 HLGaussCritic:
 
@@ -227,6 +233,8 @@ HLGaussCritic:
   n_models: 2
   num_bins: 151
   sigma_to_bin_ratio: 0.75
+  rho: 0.0
+  pessimistic_target: false
   gamma: 0.99
 
   dtype: bfloat16
@@ -239,7 +247,7 @@ HLGaussCritic:
   final_activation: false
   residual: false
 
-  norm_kwargs: {momentum: 0.01, warmup_steps: 100000}
+  norm_kwargs: {momentum: 0.99, warmup_steps: 100000}
 
 
 # NC-LQL's critics (src/barl_jax/policies/lql.py). All three are the
@@ -268,6 +276,7 @@ NCLQLCritic:
   layers: 3
   n_models: 2
   rho: 1.0
+  pessimistic_target: true
   smoothing_coef: 1.0
   time_dim: 16
   polyak_tau: 0.005
@@ -298,7 +307,8 @@ NCLQLC51Critic:
   n_models: 2
   num_atoms: 101
   entropy_coef: 0.005
-  pessimistic_target: False
+  rho: 1.0
+  pessimistic_target: false
   smoothing_coef: 1.0
   time_dim: 16
   polyak_tau: 0.005
@@ -327,6 +337,8 @@ NCLQLHLGaussCritic:
   n_models: 2
   num_bins: 151
   sigma_to_bin_ratio: 0.75
+  rho: 1.0
+  pessimistic_target: true
   smoothing_coef: 1.0
   time_dim: 16
   polyak_tau: 0.005
