@@ -2,9 +2,9 @@ import math
 
 import jax
 import jax.numpy as jnp
-import optax
 from flax import nnx
 
+from barl_jax.networks.optim import adam
 from barl_jax.networks.registry import register_component
 from barl_jax.policy import Component
 
@@ -18,20 +18,22 @@ class AutotuneRegulator(Component, nnx.Module):
   above target and rises while it sits below -- the sign canonical SAC needs, and
   the opposite of what this docstring claimed before."""
 
-  def __init__(self, env_stats=None, lr: float = 3e-4, alpha_init: float = 1e-2,
-               max_alpha: float = 5.0, min_alpha: float = 1e-4, target: float = -1.0,
-               *, rngs: nnx.Rngs = None, **kwargs):
+  def __init__(self, env_stats=None, *, lr: float, adam_b1: float,
+               grad_clip: float, grad_clip_mode: str, alpha_init: float,
+               max_alpha: float, min_alpha: float, target: float,
+               rngs: nnx.Rngs = None, **kwargs):
 
     super().__init__(env_stats, **kwargs)
 
-    self.lr = float(lr)
+    self.lr, self.adam_b1 = float(lr), float(adam_b1)
+    self.grad_clip, self.grad_clip_mode = float(grad_clip), str(grad_clip_mode)
     # 0-dim, not shape (1,): the torch original carried a singleton dimension
     # that made every product with alpha non-scalar, so a loss which did not
     # happen to end in .mean() came out shaped (1,) and jax.grad rejected it.
     self.log_alpha = nnx.Param(jnp.asarray(math.log(alpha_init), jnp.float32))
 
     self.target_value = float(target)
-    # max_alpha/min_alpha are accepted because config/components.yaml sets them,
+    # max_alpha/min_alpha are accepted because config/components/ sets them,
     # but value() does not clamp -- dime_am's dual is unbounded too, and pinning
     # alpha at a floor injects a constant entropy bonus into the Bellman target
     # that a near-zero-reward env cannot outvote. Kept as config, not as dead
@@ -55,4 +57,4 @@ class AutotuneRegulator(Component, nnx.Module):
   def create_optimizer(self) -> dict:
     # Keyed by slot, so a policy's two regulators stay distinct without a
     # `name` kwarg.
-    return {f"{self.slot}_alpha": optax.adam(self.lr)}
+    return {f"{self.slot}_alpha": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}

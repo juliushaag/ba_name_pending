@@ -34,12 +34,15 @@ class NoiseConditionedCritic:
   copies it too: the bootstrap is conditioned on a level, and an embedding that
   tracked the live weights would leak straight back into the target's value."""
 
-  def __init__(self, env_stats, *args, smoothing_coef: float, time_dim: int = 16,
-               time_embed: str = "fourier", rngs: nnx.Rngs, **kwargs):
+  def __init__(self, env_stats, *args, smoothing_coef: float, time_dim: int,
+               time_embed: str, time_kwargs: dict, rngs: nnx.Rngs, **kwargs):
 
     self.time_dim       = int(time_dim)
     self.smoothing_coef = float(smoothing_coef)
-    self.time_embed = TimeEmbedding(time_dim=self.time_dim, kind=time_embed, rngs=rngs)
+    # `time_kwargs` used to stop here: the embedding was built with none of them,
+    # so its frequency ladder sat at TimeEmbedding's own Python defaults.
+    self.time_embed = TimeEmbedding(time_dim=self.time_dim, kind=time_embed,
+                                    rngs=rngs, **time_kwargs)
 
     super().__init__(env_stats.derive(act_dim=env_stats["act_dim"] + self.time_dim),
                      *args, rngs=rngs, **kwargs)

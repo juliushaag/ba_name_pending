@@ -32,9 +32,9 @@ class TimeEmbedding(nnx.Module):
   The reference's time settings are `num_freqs 16`, `freq_range (0.1, 100.0)`,
   `hidden 32`, `time_dim 16`, `concat_input` on."""
 
-  def __init__(self, time_dim: int, kind: str = "sin", num_freqs: int = 16,
-               freq_min: float = 0.1, freq_max: float = 100.0, hidden: int = 32,
-               concat_input: bool = True, *, rngs: nnx.Rngs):
+  def __init__(self, time_dim: int, *, kind: str, num_freqs: int,
+               freq_min: float, freq_max: float, hidden: int,
+               concat_input: bool, rngs: nnx.Rngs):
 
     from barl_jax.networks.mlp import Linear   # circular at module import time
 

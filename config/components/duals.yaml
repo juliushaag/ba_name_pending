@@ -1,0 +1,24 @@
+# Regulators, squashes and schedules -- the components that are neither an actor
+# nor a critic, and so have no size ladder.
+#
+# `target` is deliberately absent from the regulators: they get theirs from the
+# owning Policy (action_dim * entropy_scale), so a baseline here would be dead
+# weight.
+
+AutotuneRegulator:
+  kind: dual
+  extends: [optim.dual]
+  alpha_init: 1.0
+  min_alpha: 1.0e-7
+  max_alpha: 500.0
+
+TanhSquash: {kind: squash}
+ErfSquash:  {kind: squash}   # `erf_k` is always derived at construction -- see AMDP.__init__
+
+ConstantSchedule:       {kind: schedule, warmup: 0}
+LinearSchedule:         {kind: schedule, warmup: 0}
+CosineSchedule:         {kind: schedule, warmup: 0}
+SineSchedule:           {kind: schedule, warmup: 0}
+ExponentialSchedule:    {kind: schedule, warmup: 0}
+PolynomialSchedule:     {kind: schedule, warmup: 0, power: 2.0}
+CosineAlphaBarSchedule: {kind: schedule, warmup: 0, s: 0.008}

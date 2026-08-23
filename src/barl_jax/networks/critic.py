@@ -2,11 +2,11 @@ import math
 
 import jax
 import jax.numpy as jnp
-import optax
 from flax import nnx
 
 from barl_jax.networks.ensemble import Ensemble
 from barl_jax.networks.mlp import MLP
+from barl_jax.networks.optim import adam
 from barl_jax.networks.registry import register_component
 from barl_jax.policy import TARGET_SUFFIX, Buffer, Critic, frozen
 
@@ -22,13 +22,15 @@ class QCriticBase(Critic):
   both gives two half-cancelling mechanisms and a plausible-looking curve."""
 
   def __init__(self, env_stats, q_function, *, gamma: float, lr: float,
-               pessimistic_target: bool, adam_b1: float = 0.5, polyak_tau: float = 0.0,
-               target_delay: int = 1, norm: str = None, **kwargs):
+               pessimistic_target: bool, adam_b1: float, grad_clip: float,
+               grad_clip_mode: str, polyak_tau: float,
+               target_delay: int, norm: str, **kwargs):
     super().__init__(env_stats, **kwargs)
 
     self.gamma   = float(gamma)
     self.lr      = float(lr)
     self.adam_b1 = float(adam_b1)
+    self.grad_clip, self.grad_clip_mode = float(grad_clip), str(grad_clip_mode)
 
     self.pessimistic_target = bool(pessimistic_target)
 
@@ -135,7 +137,7 @@ class QCriticBase(Critic):
     return self.mean_expectation(self.raw(s, a))
 
   def create_optimizer(self) -> dict:
-    return {"q": optax.adam(self.lr, b1=self.adam_b1)}
+    return {"q": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}
 
   # ---- regression ----------------------------------------------------------
 
@@ -194,12 +196,12 @@ class ConcatQ(nnx.Module):
   with a leading model axis. `n_models: 1` is the single-head case -- it keeps
   the axis, so every critic reduces over heads the same way."""
 
-  def __init__(self, in_dim: int, out_dim: int, latent_dim: int, layers: int, n_models: int,
-               activation: str = "silu", norm: str = None,
-               norm_input: bool = False, norm_stem: bool = False, norm_after_act: bool = True,
-               dropout: float = 0.0, final_activation: bool = False,
-               residual: bool = False, norm_kwargs: dict = None, dtype: str = "float32",
-               *, rngs: nnx.Rngs):
+  def __init__(self, in_dim: int, out_dim: int, latent_dim: int, layers: int, *, n_models: int,
+               activation: str, norm: str,
+               norm_input: bool, norm_stem: bool, norm_after_act: bool,
+               dropout: float, final_activation: bool,
+               residual: bool, norm_kwargs: dict, dtype: str,
+               rngs: nnx.Rngs):
     self.net = Ensemble(n_models, MLP, input_dim=in_dim, output_dim=out_dim,
                         latent_dim=latent_dim, hidden_layers=layers,
                         activation=activation, norm=norm, norm_input=norm_input,
@@ -231,12 +233,12 @@ class EnsembleCritic(QCriticBase):
   the plain mean, and at `n_models: 2` the population std is |q1 - q2|/2, soy
   `rho: 1.0` is exactly the min-over-heads that C51EnsembleCritic takes."""
 
-  def __init__(self, env_stats, latent_dim: int, layers: int, n_models: int, rho: float,
-               activation: str = "silu", norm: str = None,
-               norm_input: bool = False, norm_stem: bool = False, norm_after_act: bool = True,
-               dropout: float = 0.0, final_activation: bool = False,
-               residual: bool = False, norm_kwargs: dict = None, dtype: str = "float32",
-               *, rngs: nnx.Rngs, **kwargs):
+  def __init__(self, env_stats, *, latent_dim: int, layers: int, n_models: int, rho: float,
+               activation: str, norm: str,
+               norm_input: bool, norm_stem: bool, norm_after_act: bool,
+               dropout: float, final_activation: bool,
+               residual: bool, norm_kwargs: dict, dtype: str,
+               rngs: nnx.Rngs, **kwargs):
 
     q_function = ConcatQ(env_stats["obs_dim"] + env_stats["act_dim"], 1,
                          latent_dim, layers, n_models=n_models,
@@ -298,8 +300,8 @@ class CategoricalCriticBase(QCriticBase):
   -- so `bellman_target` is the entire difference, and everything about pricing
   and the loss is shared, including the `n_models` heads and their reduction."""
 
-  def __init__(self, env_stats, q_function, support, n_models: int, rho: float,
-               entropy_coef: float = 0.0, **kwargs):
+  def __init__(self, env_stats, q_function, support, *, n_models: int, rho: float,
+               entropy_coef: float, **kwargs):
     super().__init__(env_stats, q_function, **kwargs)
 
     self.support      = Buffer(support)
@@ -412,14 +414,14 @@ class C51Critic(CategoricalCriticBase):
   reference's `hs` of the same length (`layers: 1` + `norm_stem: true` is its
   `hs: [w, w]`)."""
 
-  def __init__(self, env_stats, latent_dim: int, layers: int, n_models: int,
+  def __init__(self, env_stats, *, latent_dim: int, layers: int, n_models: int,
                num_atoms: int, entropy_coef: float,
-               activation: str = "silu", norm: str = None,
-               norm_input: bool = False, norm_stem: bool = False, norm_after_act: bool = True,
-               dropout: float = 0.0, final_activation: bool = False,
-               residual: bool = False, norm_kwargs: dict = None, dtype: str = "float32",
+               activation: str, norm: str,
+               norm_input: bool, norm_stem: bool, norm_after_act: bool,
+               dropout: float, final_activation: bool,
+               residual: bool, norm_kwargs: dict, dtype: str,
                v_min: float = None, v_max: float = None,
-               *, rngs: nnx.Rngs, **kwargs):
+               rngs: nnx.Rngs, **kwargs):
 
     # Defaulted, not required: the support is a fact about the environment, so
     # EnvStats supplies it -- but unlike a pure env fact it is also worth
@@ -445,6 +447,12 @@ class C51Critic(CategoricalCriticBase):
 
     self.num_atoms = int(num_atoms)
     self.v_min, self.v_max = float(v_min), float(v_max)
+
+  def derived(self) -> dict:
+    """The support is the env's return range unless a kwarg pins it, so it is
+    not readable off this critic's own config."""
+    return {"v_min": self.v_min, "v_max": self.v_max,
+            "bin_width": (self.v_max - self.v_min) / (self.num_atoms - 1)}
 
   def bootstrap_from_raw(self, next_raw):
     """The next-state *distribution*, per head -- not a scalar, so the base's
@@ -477,14 +485,14 @@ class HLGaussCritic(CategoricalCriticBase):
   EnsembleCritic. The ensemble is this codebase's, not the paper's, and exists
   so all three critics differ only in the return representation."""
 
-  def __init__(self, env_stats, latent_dim: int, layers: int, n_models: int,
+  def __init__(self, env_stats, *, latent_dim: int, layers: int, n_models: int,
                num_bins: int, sigma_to_bin_ratio: float,
-               activation: str = "silu", norm: str = None,
-               norm_input: bool = False, norm_stem: bool = False, norm_after_act: bool = True,
-               dropout: float = 0.0, final_activation: bool = False,
-               residual: bool = False, norm_kwargs: dict = None, dtype: str = "float32",
+               activation: str, norm: str,
+               norm_input: bool, norm_stem: bool, norm_after_act: bool,
+               dropout: float, final_activation: bool,
+               residual: bool, norm_kwargs: dict, dtype: str,
                v_min: float = None, v_max: float = None,
-               *, rngs: nnx.Rngs, **kwargs):
+               rngs: nnx.Rngs, **kwargs):
 
     # Same kwarg-over-EnvStats fallback as C51Critic -- see its __init__.
     v_min = env_stats["return_min"] if v_min is None else float(v_min)
@@ -505,6 +513,13 @@ class HLGaussCritic(CategoricalCriticBase):
     self.num_bins = int(num_bins)
     self.sigma    = sigma_to_bin_ratio * (self.v_max - self.v_min) / num_bins
     self.edges    = Buffer(edges)
+
+  def derived(self) -> dict:
+    """`sigma` is the label smoothing in *return units*, derived from the support
+    and `num_bins` -- so changing either silently rescales it. Logged for exactly
+    that reason."""
+    return {"v_min": self.v_min, "v_max": self.v_max, "sigma": float(self.sigma),
+            "bin_width": (self.v_max - self.v_min) / self.num_bins}
 
   def _to_histogram(self, value):
     value = jnp.clip(value.reshape(-1, 1), self.v_min, self.v_max)

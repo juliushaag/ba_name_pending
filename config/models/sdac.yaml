@@ -1,0 +1,28 @@
+SDAC:
+  training:
+    batch_size: 256
+    utd_ratio: 2.0
+
+  params:
+    entropy_scale: -0.9
+
+    num_candidates: 64   # K: softmax candidates in the soft denoising loss
+    num_bon: 32          # N: best-of-N, for the played action and the bootstrap
+
+    softmax_temp: 0.25
+
+    explore_init: 0.1
+    explore_min: 1.0e-3
+    explore_max: 1.0
+    explore_raw_limit: 10.0   # clamp on the raw exploration-std parameter
+    explore_lr: 1.0e-2        # its own optimizer, separate from the actor's
+
+  components:
+    # SDAC's own reference (mahaitongdae/diffusion_policy_online_rl) sizes the
+    # actor 256x3 with Mish; the critic is deliberately left at the same `medium`
+    # every other policy here resolves, so an {algo x env} sweep is an algorithm
+    # comparison rather than an algorithm-and-critic one.
+    actor:   {class: VPDiffusionActor, size: small, num_steps: 20, activation: Mish}
+    critic:  {class: C51Critic,        size: medium}
+    squash:  {class: TanhSquash}
+    entropy: {class: AutotuneRegulator}

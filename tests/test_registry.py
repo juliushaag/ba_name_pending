@@ -46,9 +46,9 @@ def test_baseline_kwargs_are_all_accepted(name):
 
 
 def test_components_yaml_entries_are_registered():
-    """`_`-prefixed keys are YAML anchors, not components; everything else has
-    to name a class the registry can resolve."""
-    entries = {k for k in model_config._components() if not k.startswith("_")}
+    """Every entry in config/components/ has to name a class the registry can
+    resolve -- a typo's baseline kwargs would otherwise silently never apply."""
+    entries = set(model_config.tree().components)
     stale = sorted(entries - set(ALL) - KNOWN_UNREGISTERED)
     assert not stale, f"components.yaml entries with no registered class: {stale}"
 

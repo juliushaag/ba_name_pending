@@ -57,11 +57,14 @@ class ErfSquash(Squash):
   (not learned) function of the owning actor's noise schedule, chosen so
   this squash's log-Jacobian cancels out of AMDP's direct-score regression."""
 
-  def __init__(self, env_stats=None, erf_k: float = 1.0, **kwargs):
+  def __init__(self, env_stats=None, *, erf_k: float, **kwargs):
     super().__init__(env_stats, **kwargs)
     # A plain Python float, not a Variable: it is derived from the actor's
     # noise schedule at construction time and never trained or checkpointed.
     self.erf_k = float(erf_k)
+
+  def derived(self) -> dict:
+    return {"erf_k": self.erf_k}
 
   def __call__(self, x):
     return jnp.clip(jax.scipy.special.erf(self.erf_k * x), -1.0, 1.0)

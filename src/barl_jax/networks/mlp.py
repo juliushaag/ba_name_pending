@@ -39,11 +39,6 @@ def Linear(in_features: int, out_features: int, *, rngs: nnx.Rngs,
                     dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
 
 
-def _resolve_norm(norm: str | None) -> str:
-  """Unset means the framework default, LayerNorm."""
-  return "layer" if norm is None else norm
-
-
 # The full MLP surface, restated as named parameters by every component that
 # builds one (see e.g. StochasticActor). Named rather than passed through a
 # **kwargs catch-all on purpose: model_config.validate() reports a kwarg no
@@ -57,8 +52,8 @@ class ResidualBlock(nnx.Module):
   """One hidden layer with residual connection, matching the main MLP's
   norm_after_act ordering: Linear -> act -> Norm (default) or Linear -> Norm -> act."""
 
-  def __init__(self, latent_dim: int, act, norm: str, dropout: float = 0.0,
-               norm_after_act: bool = True, *, rngs: nnx.Rngs, dtype=jnp.float32, **norm_kwargs):
+  def __init__(self, latent_dim: int, act, norm: str, *, dropout: float,
+               norm_after_act: bool, rngs: nnx.Rngs, dtype=jnp.float32, **norm_kwargs):
     self.norm          = make_norm(norm, latent_dim, rngs=rngs, dtype=dtype, **norm_kwargs)
     self.act           = act
     self.lin           = Linear(latent_dim, latent_dim, rngs=rngs, dtype=dtype)
@@ -83,12 +78,12 @@ class ResidualBlock(nnx.Module):
 class MLP(nnx.Module):
 
   def __init__(self, input_dim: int, output_dim: int, latent_dim: int, hidden_layers: int,
-               activation: str = "silu", norm: str = None,
-               norm_input: bool = False, norm_stem: bool = False,
-               norm_after_act: bool = True, dropout: float = 0.0,
-               final_activation: bool = False, residual: bool = False,
-               dtype: str = "float32",
-               *, rngs: nnx.Rngs, **norm_kwargs):
+               *, activation: str, norm: str,
+               norm_input: bool, norm_stem: bool,
+               norm_after_act: bool, dropout: float,
+               final_activation: bool, residual: bool,
+               dtype: str,
+               rngs: nnx.Rngs, **norm_kwargs):
     """`norm` selects the normalization ("none" / "layer" / "batch" /
     "batchrenorm"); leaving it unset gives LayerNorm.
 
@@ -114,7 +109,6 @@ class MLP(nnx.Module):
     assert dtype in _DTYPES, f"{dtype} not in available dtypes {list(_DTYPES)}"
 
     act   = _ACTIVATIONS[activation]
-    norm  = _resolve_norm(norm)
     dtype = _DTYPES[dtype]
 
     self.input_dim        = input_dim

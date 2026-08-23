@@ -3,11 +3,11 @@ from abc import ABC, abstractmethod
 
 import jax
 import jax.numpy as jnp
-import optax
 from flax import nnx
 
 from barl_jax.networks.flow import TimeEmbedding
 from barl_jax.networks.mlp import MLP
+from barl_jax.networks.optim import adam
 from barl_jax.networks.registry import get_component, register_component
 from barl_jax.policy import Actor, Buffer, Critic
 
@@ -15,9 +15,6 @@ from barl_jax.policy import Actor, Buffer, Critic
 def safe_norm(x, axis=-1, keepdims=True, eps=1e-8):
   """L2 norm with well-defined gradients at zero."""
   return jnp.sqrt(jnp.sum(x**2, axis=axis, keepdims=keepdims) + eps)
-
-LOG_STD_MIN = -20.0
-LOG_STD_MAX = 2.0
 
 _LOG_SQRT_2PI = 0.5 * math.log(2 * math.pi)
 
@@ -38,16 +35,20 @@ class StochasticActor(Actor):
   `log_std` is a state-independent parameter rather than a network head --
   barl's deliberate deviation from canonical SAC, kept as-is."""
 
-  def __init__(self, env_stats, latent_dim: int, layers: int, squash_cls: str,
-               lr: float = 3e-4,
-               activation: str = "silu", norm: str = None,
-               norm_input: bool = False, norm_stem: bool = False, norm_after_act: bool = True,
-               dropout: float = 0.0, final_activation: bool = False,
-               residual: bool = False, norm_kwargs: dict = None, dtype: str = "float32",
-               *, rngs: nnx.Rngs, **kwargs):
+  def __init__(self, env_stats, *, latent_dim: int, layers: int, squash_cls: str,
+               lr: float, adam_b1: float, grad_clip: float, grad_clip_mode: str,
+               log_std_min: float, log_std_max: float, log_prob_clip: float,
+               activation: str, norm: str,
+               norm_input: bool, norm_stem: bool, norm_after_act: bool,
+               dropout: float, final_activation: bool,
+               residual: bool, norm_kwargs: dict, dtype: str,
+               rngs: nnx.Rngs, **kwargs):
     super().__init__(env_stats, **kwargs)
 
-    self.lr = float(lr)
+    self.lr, self.adam_b1 = float(lr), float(adam_b1)
+    self.grad_clip, self.grad_clip_mode = float(grad_clip), str(grad_clip_mode)
+    self.log_std_min, self.log_std_max = float(log_std_min), float(log_std_max)
+    self.log_prob_clip = float(log_prob_clip)
     self.log_std = nnx.Param(jnp.zeros((self.action_dim,), jnp.float32))
     self.squash  = get_component(squash_cls)(env_stats)
 
@@ -61,14 +62,14 @@ class StochasticActor(Actor):
   def dist(self, s):
     """(mean, std) of the pre-squash Normal."""
     mean = self.net(s).astype(jnp.float32)
-    std  = jnp.exp(jnp.clip(self.log_std[...], LOG_STD_MIN, LOG_STD_MAX))
+    std  = jnp.exp(jnp.clip(self.log_std[...], self.log_std_min, self.log_std_max))
     return mean, std
 
   def log_prob(self, dist, action):
     """`action` is the squashed (canonical [-1, 1]) value; inverts the squash
     and applies the change-of-variables correction."""
     mean, std = dist
-    x = self.squash.inverse(jnp.clip(action, -0.99, 0.99))
+    x = self.squash.inverse(jnp.clip(action, -self.log_prob_clip, self.log_prob_clip))
     lp = normal_log_prob(x, mean, std) - self.squash.log_abs_det_jacobian(x, action)
     return lp.sum(axis=-1)
 
@@ -89,7 +90,7 @@ class StochasticActor(Actor):
     return self.squash(mean)
 
   def create_optimizer(self) -> dict:
-    return {"actor": optax.adam(self.lr)}
+    return {"actor": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}
 
 
 @register_component
@@ -99,15 +100,16 @@ class ScoreContinuousActor(Actor):
   X += v_i * u_tilde + sqrt(v_i) * eps  with  v_i = int_{tau_i}^{tau_{i+1}} sigma^2.
   Raw, unsquashed output -- the owning Policy applies the erf squash."""
 
-  def __init__(self, env_stats, latent_dim: int, layers: int, max_steps: int,
+  def __init__(self, env_stats, *, latent_dim: int, layers: int, max_steps: int,
                sigma_min: float, sigma_max: float, tau_min: float, tau_max: float,
-               bound_c: float = 50.0, lr: float = 3e-4,
-               time_dim: int = 8, time_embed: str = "sin", time_kwargs: dict = None,
-               activation: str = "silu", norm: str = "none",
-               norm_input: bool = False, norm_stem: bool = False, norm_after_act: bool = True,
-               dropout: float = 0.0, final_activation: bool = False,
-               residual: bool = False, norm_kwargs: dict = None, dtype: str = "float32",
-               *, rngs: nnx.Rngs, **kwargs):
+               bound_c: float, lr: float, adam_b1: float,
+               grad_clip: float, grad_clip_mode: str,
+               time_dim: int, time_embed: str, time_kwargs: dict,
+               activation: str, norm: str,
+               norm_input: bool, norm_stem: bool, norm_after_act: bool,
+               dropout: float, final_activation: bool,
+               residual: bool, norm_kwargs: dict, dtype: str,
+               rngs: nnx.Rngs, **kwargs):
 
     super().__init__(env_stats, **kwargs)
 
@@ -116,10 +118,13 @@ class ScoreContinuousActor(Actor):
     self.max_steps, self.time_dim  = int(max_steps), int(time_dim)
     self.bound_c   = float(bound_c)
     self.lr        = float(lr)
+    self.adam_b1   = float(adam_b1)
+    self.grad_clip = float(grad_clip)
+    self.grad_clip_mode = str(grad_clip_mode)
     self._log_r    = math.log(sigma_max / sigma_min)
     self._int_base = float(self._raw_int(jnp.asarray(tau_min, jnp.float32)))
 
-    self.time_emb = TimeEmbedding(self.time_dim, time_embed, rngs=rngs, **(time_kwargs or {}))
+    self.time_emb = TimeEmbedding(self.time_dim, kind=time_embed, rngs=rngs, **time_kwargs)
 
     self.diffusion_act = MLP(self.obs_dim + self.action_dim + self.time_dim,
                              self.action_dim, latent_dim, layers,
@@ -209,7 +214,7 @@ class ScoreContinuousActor(Actor):
     return X
 
   def create_optimizer(self) -> dict:
-    return {"actor": optax.adam(self.lr)}
+    return {"actor": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}
 
 
 class DiscreteDiffusionActorBase(Actor, ABC):
@@ -226,21 +231,24 @@ class DiscreteDiffusionActorBase(Actor, ABC):
   differentiated through by DIME, so the draws have to be ordinary values in
   the graph rather than a side effect on the module."""
 
-  def __init__(self, env_stats, latent_dim: int, layers: int, num_steps: int,
-               time_dim: int = 8, time_embed: str = "sin", time_kwargs: dict = None,
-               lr: float = 3e-4,
-               activation: str = "silu", norm: str = "none",
-               norm_input: bool = False, norm_stem: bool = False, norm_after_act: bool = True,
-               dropout: float = 0.0, final_activation: bool = False,
-               residual: bool = False, norm_kwargs: dict = None, dtype: str = "float32",
-               *, rngs: nnx.Rngs, **kwargs):
+  def __init__(self, env_stats, *, latent_dim: int, layers: int, num_steps: int,
+               time_dim: int, time_embed: str, time_kwargs: dict,
+               lr: float, adam_b1: float, grad_clip: float, grad_clip_mode: str,
+               activation: str, norm: str,
+               norm_input: bool, norm_stem: bool, norm_after_act: bool,
+               dropout: float, final_activation: bool,
+               residual: bool, norm_kwargs: dict, dtype: str,
+               rngs: nnx.Rngs, **kwargs):
     super().__init__(env_stats, **kwargs)
 
     self.num_steps = int(num_steps)
     self.time_dim  = int(time_dim)
     self.lr        = float(lr)
+    self.adam_b1   = float(adam_b1)
+    self.grad_clip = float(grad_clip)
+    self.grad_clip_mode = str(grad_clip_mode)
 
-    self.time_emb = TimeEmbedding(self.time_dim, time_embed, rngs=rngs, **(time_kwargs or {}))
+    self.time_emb = TimeEmbedding(self.time_dim, kind=time_embed, rngs=rngs, **time_kwargs)
 
     self.diffusion_act = MLP(self.obs_dim + self.action_dim + time_dim, self.action_dim,
                              latent_dim, layers, activation=activation, norm=norm,
@@ -362,7 +370,7 @@ class DiscreteDiffusionActorBase(Actor, ABC):
     return self.generate(s, key=key)[0]
 
   def create_optimizer(self) -> dict:
-    return {"actor": optax.adam(self.lr)}
+    return {"actor": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}
 
 
 def _from_betas(betas):
@@ -420,12 +428,13 @@ class DDPMActor(DiscreteDiffusionActorBase):
 
   `VPDiffusionActor` below is this class with the settings SDAC was tuned on."""
 
-  def __init__(self, env_stats, latent_dim: int, layers: int, num_steps: int,
-               beta_schedule: str = "linear", beta_scale: float = 0.3,
-               cosine_s: float = 0.008, ab_start: float = 0.999, ab_end: float = 0.001,
-               clip_denoised: bool = True, prior_scale: float = 0.5,
-               *, rngs: nnx.Rngs, **kwargs):
-    super().__init__(env_stats, latent_dim, layers, num_steps, rngs=rngs, **kwargs)
+  def __init__(self, env_stats, *, latent_dim: int, layers: int, num_steps: int,
+               beta_schedule: str, beta_scale: float,
+               cosine_s: float, ab_start: float, ab_end: float,
+               clip_denoised: bool, prior_scale: float,
+               rngs: nnx.Rngs, **kwargs):
+    super().__init__(env_stats, latent_dim=latent_dim, layers=layers, num_steps=num_steps,
+                     rngs=rngs, **kwargs)
 
     self.alpha_bar = Buffer(alpha_bar_ladder(
       beta_schedule, num_steps,
@@ -478,10 +487,9 @@ class VPDiffusionActor(DDPMActor):
   x0 clip. Fixed schedule (Ma et al. Table 4); the settings SDAC was tuned on,
   named so that config and checkpoints keep referring to them by name."""
 
-  def __init__(self, env_stats, latent_dim: int, layers: int, num_steps: int,
-               cosine_s: float = 0.008, ab_start: float = 0.999, ab_end: float = 0.001,
-               *, rngs: nnx.Rngs, **kwargs):
-    super().__init__(env_stats, latent_dim, layers, num_steps,
-                     beta_schedule="vp_cosine", cosine_s=cosine_s,
-                     ab_start=ab_start, ab_end=ab_end,
-                     clip_denoised=False, prior_scale=1.0, rngs=rngs, **kwargs)
+  def __init__(self, env_stats, **kwargs):
+    # Purely a named alias for DDPMActor at the VP settings: what makes it that
+    # is its config/components/actors.yaml entry (beta_schedule: vp_cosine,
+    # clip_denoised: false, prior_scale: 1.0), not a hardcoded super() call --
+    # so a run's config shows the sampler it actually used.
+    super().__init__(env_stats, **kwargs)

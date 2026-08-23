@@ -63,6 +63,8 @@ class SDAC(Policy):
     self.explore_init   = params["explore_init"]
     self.explore_min    = float(params["explore_min"])
     self.explore_max    = float(params["explore_max"])
+    self.explore_raw_limit = float(params["explore_raw_limit"])
+    self.explore_lr        = float(params["explore_lr"])
     # Gated on the base, not VPDiffusionActor: everything SDAC calls
     # (diffuse/x0_from_eps/predict_eps/sample) is part of the shared skeleton,
     # so the noise process is swappable -- which is what makes "is the cosine
@@ -79,8 +81,6 @@ class SDAC(Policy):
     self.explore_raw = nnx.Param(jnp.full(
       (self.action_dim,), _inv_sigmoid((self.explore_init - lo) / (hi - lo)), jnp.float32))
 
-  EXPLORE_RAW_LIMIT = 10.0
-
   @property
   def explore_std(self):
     lo, hi = self.explore_min, self.explore_max
@@ -89,7 +89,7 @@ class SDAC(Policy):
   def after_step(self):
     super().after_step()
     self.explore_raw[...] = jnp.clip(self.explore_raw[...],
-                                     -self.EXPLORE_RAW_LIMIT, self.EXPLORE_RAW_LIMIT)
+                                     -self.explore_raw_limit, self.explore_raw_limit)
 
   def noise_entropy(self):
     """H of the additive exploration noise, the BoN output treated as deterministic."""
@@ -125,7 +125,7 @@ class SDAC(Policy):
     return self.explore(self.squash(self.best_of_n(obs, self.num_bon, k_bon)), k_explore)
 
   def create_optimizer(self) -> dict:
-    return {**super().create_optimizer(), "explore": optax.adam(1e-2)}
+    return {**super().create_optimizer(), "explore": optax.adam(self.explore_lr)}
 
   def train_step(self, batch):
     obs      = self.normalize_obs(batch["obs"])

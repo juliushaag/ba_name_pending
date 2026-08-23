@@ -36,8 +36,8 @@ class BatchRenorm(nnx.Module):
 
   # epsilon is dime_am's 1e-3, not flax's 1e-5: it enters the r/d ratios as well
   # as the denominator, so the two are not interchangeable here.
-  def __init__(self, num_features: int, *, momentum: float = 0.99, epsilon: float = 1e-3,
-               r_max: float = 3.0, d_max: float = 5.0, warmup_steps: int = 100_000,
+  def __init__(self, num_features: int, *, momentum: float, epsilon: float,
+               r_max: float, d_max: float, warmup_steps: int,
                use_running_average: bool = False, dtype=jnp.float32, rngs: nnx.Rngs = None):
     self.num_features = num_features
     self.dtype        = dtype
@@ -100,7 +100,7 @@ class BatchRenorm(nnx.Module):
     return self._apply(x, a, self.bias[...] + d * self.scale[...] - batch_mean * a)
 
 
-def BatchNorm(num_features: int, *, momentum: float = 0.99, epsilon: float = 1e-5,
+def BatchNorm(num_features: int, *, momentum: float, epsilon: float,
               use_running_average: bool = False, dtype=jnp.float32,
               rngs: nnx.Rngs, **_) -> nnx.BatchNorm:
   """flax's BatchNorm, with `momentum` in the standard convention
@@ -110,9 +110,10 @@ def BatchNorm(num_features: int, *, momentum: float = 0.99, epsilon: float = 1e-
                        dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
 
 
-def LayerNorm(num_features: int, *, epsilon: float = 1e-5, dtype=jnp.float32,
+def LayerNorm(num_features: int, *, epsilon: float, dtype=jnp.float32,
               rngs: nnx.Rngs, **_) -> nnx.LayerNorm:
-  # torch's LayerNorm eps default is 1e-5; flax's is 1e-6.
+  # torch's LayerNorm eps is 1e-5, flax's 1e-6; config/presets/net.yaml states
+  # which, rather than either library's default deciding silently.
   return nnx.LayerNorm(num_features, epsilon=epsilon,
                        dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
 

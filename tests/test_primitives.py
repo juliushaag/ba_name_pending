@@ -11,7 +11,7 @@ import optax
 import pytest
 
 from barl_jax.networks.critic import categorical_projection
-from barl_jax.networks.optim import every_k
+from barl_jax.networks.optim import CLIP_MODES, adam, every_k, grad_clip_transform
 
 from conftest import SCHEDULES, SQUASHES, build, built, finite
 
@@ -168,3 +168,49 @@ def test_every_k_drops_the_steps_it_skips():
 def test_every_k_is_a_no_op_at_k_of_one():
     inner = optax.sgd(1.0)
     assert every_k(inner, 1) is inner
+
+
+# ----------------------------------------------------------------------
+# Component optimizers
+# ----------------------------------------------------------------------
+
+CLIPPY = {"w": jnp.array([5.0, 0.1, -9.0])}
+ZEROS  = {"w": jnp.zeros((3,))}
+
+
+def _clipped(mode, grads=CLIPPY, tx=None):
+    """What the clip hands on: these transforms are stateless and scale-only, so
+    the update they emit *is* the clipped gradient."""
+    tx = tx or grad_clip_transform(1.0, mode)
+    updates, _ = tx.update(grads, tx.init(ZEROS), ZEROS)
+    return updates["w"]
+
+
+def test_global_norm_clip_preserves_direction_and_element_clip_does_not():
+    """The distinction the two modes exist for. A global-norm clip rescales, so
+    one outlier coordinate still dominates the update; the element-wise clip
+    bounds each coordinate, which is what actually attenuates it."""
+    g = CLIPPY["w"]
+    gn, el = _clipped("global_norm"), _clipped("element")
+
+    assert jnp.allclose(gn / jnp.linalg.norm(gn), g / jnp.linalg.norm(g), atol=1e-5)
+    assert jnp.isclose(jnp.linalg.norm(gn), 1.0, atol=1e-5)
+    assert jnp.allclose(el, jnp.array([1.0, 0.1, -1.0]), atol=1e-5)
+
+
+def test_no_clip_mode_passes_the_gradient_through():
+    assert jnp.allclose(_clipped("none"), CLIPPY["w"], atol=1e-5)
+
+
+def test_adam_zeroes_nans_ahead_of_its_clip():
+    """Order matters: a NaN reaching clip_by_global_norm makes the norm NaN and
+    scales every coordinate, not just the bad one."""
+    dirty = {"w": jnp.array([jnp.nan, 0.1, -9.0])}
+    for mode in CLIP_MODES:
+        u = _clipped(mode, dirty, tx=adam(1e-3, 0.9, 1.0, mode))
+        assert finite(u) and jnp.all(jnp.abs(u) <= 1e-3 + 1e-9)
+
+
+def test_unknown_clip_mode_is_rejected():
+    with pytest.raises(KeyError, match="grad_clip_mode"):
+        adam(1e-3, 0.9, 1.0, "sometimes")

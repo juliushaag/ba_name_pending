@@ -1,0 +1,55 @@
+# Per-environment facts and per-environment run overrides, in one place.
+#
+# `stats:` are env-derived values no gym space reports -- the return range a
+# categorical/histogram critic sizes its support from. They used to live in the
+# Environment class bodies (environments/mujoco_gym.py, dm_control.py), which put
+# a tunable in Python where no run could see it. A family base's entry applies to
+# every env under it, and one env's own entry overrides a single key.
+#
+# Every `return_min`/`return_max` below is a symmetric bound on the *discounted*
+# value a critic regresses, not on the undiscounted episode return -- at gamma
+# 0.99 over a 1000-step horizon the two differ by 10x. Following dime_am's
+# convention: twice the discounted bound `R*(1 - gamma^T)/(T*(1 - gamma))`,
+# symmetric. The factor of two is headroom for transient over-estimation, which a
+# support pinned at the true bound would clip and then be unable to correct; the
+# symmetry keeps 0 -- where a near-uniform head prices, and where `entropy_coef`
+# pulls -- at the centre.
+#
+# Humanoid and Ant are dime_am's own numbers (README: `alg.critic.v_min=-1600
+# alg.critic.v_max=1600`, "the same values for both gym environments"), and the
+# DMC +-200 is its configs/alg/dime.yaml. The rest follow the rule -- Reacher's
+# T=50 and Pusher's T=100 make their factor 0.790 and 0.634 rather than 0.100.
+#
+# The cost of that headroom is resolution early: on DMC the bin is 4.0 wide and
+# HumanoidRun's value is ~0.2 under a random policy, so almost the whole signal
+# quantizes away until it climbs past ~5. dime_am reaches 448 on humanoid-run
+# through exactly this, so it is a slow start, not a wall. A run's actual bin
+# width is logged as `model/derived.critic.bin_width`; see
+# tests/test_env_supports.py.
+#
+# `defaults:` are ordinary run keys applied to every run on that env, in this
+# file's runs and in every scripts/run_sweep.py grid alike -- so a sweep spanning
+# envs of very different cost/horizon needs no per-env run entry just to restate
+# the same handful of keys.
+
+environments:
+  # Family bases first: an entry here applies to every env deriving from it, and
+  # one env's own entry below overrides a single key.
+  DMControlEnvironment:    {stats: {return_min: -200.0, return_max: 200.0}}
+
+  HalfCheetah:            {stats: {return_min: -3200.0,  return_max: 3200.0}}
+  Hopper:                 {stats: {return_min: -900.0,   return_max: 900.0}}
+  Walker2d:               {stats: {return_min: -1400.0,  return_max: 1400.0}}
+  Ant:                    {stats: {return_min: -1600.0,  return_max: 1600.0}}
+  Humanoid:               {stats: {return_min: -1600.0,  return_max: 1600.0}}
+  HumanoidStandup:        {stats: {return_min: -80000.0, return_max: 80000.0}}
+  InvertedPendulum:       {stats: {return_min: -200.0,   return_max: 200.0}}
+  InvertedDoublePendulum: {stats: {return_min: -2000.0,  return_max: 2000.0}}
+  Reacher:                {stats: {return_min: -160.0,   return_max: 160.0}}
+  Swimmer:                {stats: {return_min: -80.0,    return_max: 80.0}}
+  Pusher:                 {stats: {return_min: -380.0,   return_max: 380.0}}
+
+  # Humanoid:
+  #   defaults: {total_env_steps: 5000000, num_envs: 64}
+  # InvertedPendulum:
+  #   defaults: {total_env_steps: 200000}

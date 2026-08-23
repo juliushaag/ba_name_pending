@@ -1,7 +1,8 @@
 """Shared scaffolding for the component suite.
 
-Every registered component is built from its real `config/components.yaml`
-entry, narrowed by `TINY` -- so a required kwarg that gets renamed or dropped
+Every registered component is built from its real `config/components/` entry
+-- presets expanded and at the smallest size, exactly as a run's first layers
+resolve it -- narrowed by `TINY` -- so a required kwarg that gets renamed or dropped
 from that file fails here, while the whole suite still runs in seconds. `TINY`
 only replaces keys the entry already has, so it never injects a kwarg a class
 does not declare (every component has a `**kwargs` catch-all that would swallow
@@ -48,12 +49,12 @@ RETURN_MIN, RETURN_MAX = -10.0, 10.0
 
 # Width is the only thing shrunk: everything that changes what a component
 # *means* -- the number of atoms or bins, the length of a reverse loop, the
-# compute dtype -- stays at whatever config/components.yaml ships, so these are
+# compute dtype -- stays at whatever config/components/ ships, so these are
 # the real models tested narrow rather than different models tested small.
 TINY = {"latent_dim": 8}
 
-# Schedules are the one family with no config/components.yaml entry -- they are
-# always spelled out in the slot that names them.
+# A schedule's ladder is always spelled out by the slot that names it, so a
+# standalone build has to supply one.
 SCHEDULE_KWARGS = {"start": 1.0, "end": 0.1, "steps": 4}
 
 def _members(base) -> list[str]:
@@ -81,18 +82,28 @@ def make_env_stats(**overrides) -> EnvStats:
     return EnvStats(**base)
 
 
+# Kwargs a Policy derives and passes explicitly at its build_component() call
+# site rather than reading from config (see e.g. AMDP.__init__'s erf_k). A
+# standalone build has to stand in for the Policy and supply them.
+POLICY_SUPPLIED = {
+    "AutotuneRegulator": {"target": -1.0},
+    "ErfSquash": {"erf_k": 1.0},
+}
+
+
 def tiny_kwargs(name: str, **extra) -> dict:
-    base = dict(model_config._components().get(name) or {})
-    if not base and issubclass(get_component(name), Schedule):
-        base = dict(SCHEDULE_KWARGS)
+    base = model_config.tree().component_kwargs(name)
+    if issubclass(get_component(name), Schedule):
+        base.update(SCHEDULE_KWARGS)
+    base.update(POLICY_SUPPLIED.get(name, {}))
     base.update({k: v for k, v in TINY.items() if k in base})
     base.update(extra)
     return base
 
 
-def build(name: str, *, seed: int = 0, **extra):
-    return get_component(name)(make_env_stats(), **tiny_kwargs(name, **extra),
-                               rngs=nnx.Rngs(seed))
+def build(name: str, *, seed: int = 0, env_stats: EnvStats = None, **extra):
+    stats = make_env_stats() if env_stats is None else env_stats
+    return get_component(name)(stats, **tiny_kwargs(name, **extra), rngs=nnx.Rngs(seed))
 
 
 @functools.lru_cache(maxsize=None)

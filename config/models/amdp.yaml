@@ -1,0 +1,20 @@
+AMDP:
+  training:
+    batch_size: 256
+    utd_ratio: 2.0
+
+  params:
+    entropy_scale: -1.0
+
+    # dime_am configs/alg/am.yaml + dime.yaml: policy_delay: 3. Gates the actor
+    # and the entropy dual together; the critic keeps stepping every grad step.
+    policy_delay: 3
+
+    q_score_max_norm: 5.0
+    q_score_max_percentile: 95.0
+
+  components:
+    actor:   {class: ScoreContinuousActor, size: medium}
+    critic:  {class: C51Critic,            size: medium}
+    squash:  {class: ErfSquash}
+    entropy: {class: AutotuneRegulator}

@@ -1,0 +1,17 @@
+DIME:
+  training:
+    batch_size: 256
+    utd_ratio: 2.0
+
+  params:
+    entropy_scale: -4.0
+
+    # dime_am configs/alg/am.yaml + dime.yaml: policy_delay: 3. Gates the actor
+    # and the entropy dual together; the critic keeps stepping every grad step.
+    policy_delay: 3
+
+  components:
+    actor:   {class: OUDiffusionActor,   size: medium}
+    critic:  {class: C51Critic,          size: medium}
+    squash:  {class: TanhSquash}
+    entropy: {class: AutotuneRegulator}

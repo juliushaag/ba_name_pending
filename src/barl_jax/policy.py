@@ -157,6 +157,15 @@ class Component:
     component's owning Policy returns from train_step."""
     return {}
 
+  def derived(self) -> dict:
+    """Values fixed at construction from something other than this component's
+    own config -- an EnvStats entry, or a quantity the owning Policy computed and
+    passed in (a critic's support, AMDP's erf_k). They are as load-bearing as any
+    resolved kwarg and are not recoverable from config/ alone, so a Policy
+    collects them into the run's logged config under `model/derived.*` rather
+    than leaving them to be inferred."""
+    return {}
+
 
 class Actor(Component, nnx.Module, ABC):
   """A network that can produce actions -- pure architecture; every
@@ -231,14 +240,16 @@ class Policy(nnx.Module, ABC):
 
   def __init__(self, env: gym.Env, profile: str = None, env_stats: EnvStats = None,
                rngs: nnx.Rngs = None, seed: int = 0, **kwargs):
-    from barl_jax.model_config import get_overrides
+    from barl_jax.model_config import get_overrides, snapshot_for
 
     self._profile  = profile
     # Held behind _Static for hashability (see _Static): these are dicts/lists,
     # and the GraphDef they end up in is a static jit argument.
     self._raw_kwargs_s = _Static(dict(kwargs))
-    # Captured so a checkpoint reconstructs under the same overrides too.
+    # Captured so a checkpoint reconstructs under the same config it was built
+    # from -- see save()/load().
     self._overrides_s  = _Static(get_overrides())
+    self._snapshot_s   = _Static(snapshot_for(type(self).__name__, profile))
 
     # Every module that needs randomness draws from this; nnx threads and
     # advances the key state across the jit boundary, so no call signature has
@@ -307,6 +318,10 @@ class Policy(nnx.Module, ABC):
   def _overrides(self) -> dict:
     return self._overrides_s.value
 
+  @property
+  def _snapshot(self) -> dict:
+    return self._snapshot_s.value
+
 
 
   def resolve_component(self, slot: str, **explicit_kwargs) -> tuple[type, dict]:
@@ -345,6 +360,14 @@ class Policy(nnx.Module, ABC):
     component = cls(stats, *args, **kwargs)
     component.slot = slot
     return component
+
+  def derived_config(self) -> dict:
+    """Every slot's construction-derived values, keyed `<slot>.<name>` -- the
+    part of what a run actually built that config/ alone does not state. Merged
+    into the run's wandb config next to the resolved kwargs."""
+    return {f"{slot}.{key}": value
+            for slot, component in self.components.items()
+            for key, value in component.derived().items()}
 
   # ------------------------------------------------------------------
   # Metrics
@@ -441,6 +464,16 @@ class Policy(nnx.Module, ABC):
       out.update(component.create_optimizer())
     return out
 
+  def optimizer_cadence(self) -> dict:
+    """Optimizer key -> grad steps between its updates; absent means every step.
+
+    TD3's delayed policy update, which dime_am carries as `policy_delay: 3`
+    (`am_diff.py`: the critic steps every gradient step, `update_actor` and
+    `update_temperature` only when `(n_updates + i + 1) % policy_delay == 0`).
+    The point is to let the critic settle before the actor chases it, so it is a
+    property of the algorithm and belongs to the Policy rather than to a slot."""
+    return {}
+
   def optimizer_labels(self) -> dict:
     """The `param path -> optimizer key` tree optax.multi_transform partitions
     on. A slot's name *is* its attribute name (see `components`), so a
@@ -477,18 +510,31 @@ class Policy(nnx.Module, ABC):
       f"build_component(), or declare it in `policy_params`."
     )
 
-  def build_optimizer(self, lr_schedule=None, max_grad_norm: float = 1.0):
+  def build_optimizer(self, *, lr_schedule):
     """One optax.multi_transform over the whole param tree. multi_transform
-    applies each transform to its own partition, so clip_by_global_norm is
-    computed *per optimizer key* -- exactly what the torch loop's
-    clip_grad_norm_(params_of_key_k, 1.0) did, in one backward pass instead of
-    one per key."""
+    applies each transform to its own partition, so each component's own clip
+    and Adam see only that component's gradients -- exactly what the torch
+    loop's clip_grad_norm_(params_of_key_k, ...) did, in one backward pass
+    instead of one per key.
+
+    The clip itself lives in the component (networks/optim.adam, spent from
+    config/presets/optim.yaml), not here: `global_norm` and `element` are
+    different operations rather than two strengths of one, and which of them a
+    net wants is a property of that net's gradients."""
+    cadence = self.optimizer_cadence()
+
     transforms = {}
     for key, tx in self.create_optimizer().items():
-      chain = [optax.clip_by_global_norm(max_grad_norm), tx]
-      if lr_schedule is not None:
-        chain.append(optax.scale_by_schedule(lr_schedule))
-      transforms[key] = optax.chain(*chain)
+      every = int(cadence.get(key, 1))
+      if every > 1:
+        # Masks the *update* and leaves the inner state alone, so a skipped step
+        # does not decay Adam's moments -- which zeroing the gradient instead
+        # would not give: Adam with g=0 still moves on accumulated momentum.
+        # Wrapped around `tx` alone rather than the whole chain, so the LR
+        # schedule outside it still advances once per grad step.
+        tx = optax.conditionally_mask(tx, lambda step, k=every: (step + 1) % k == 0)
+      transforms[key] = (tx if lr_schedule is None else
+                         optax.chain(tx, optax.scale_by_schedule(lr_schedule)))
     return optax.multi_transform(transforms, self.optimizer_labels())
 
   # ------------------------------------------------------------------
@@ -504,6 +550,11 @@ class Policy(nnx.Module, ABC):
       "policy_class": type(self).__name__,
       "profile":      self._profile,
       "overrides":    self._overrides,
+      # The whole config this policy was built from, frozen. Without it a
+      # checkpoint silently reconstructs a *different* architecture the moment
+      # config/ is edited underneath it -- the weights would still load, since
+      # only the shapes have to agree.
+      "snapshot":     self._snapshot,
     }
     with ocp.StandardCheckpointer() as ckpt:
       ckpt.save(os.path.join(path, "state"), nnx.state(self), force=True)
@@ -512,17 +563,27 @@ class Policy(nnx.Module, ABC):
 
   @staticmethod
   def load(type_name: str, path: str, env: gym.Env, env_stats: EnvStats = None) -> "Policy":
-    from barl_jax.model_config import set_overrides
+    from barl_jax import model_config
     path = os.path.abspath(path)
     with open(os.path.join(path, "meta.json")) as f:
       meta = json.load(f)
-    # The run's dotted overrides are part of the architecture, so they have to
-    # be back in place before the components are constructed -- and they beat
-    # the resuming run's own, which the weights would not match.
-    if meta.get("overrides"):
-      set_overrides(meta["overrides"])
-    # env_stats is a function of the env, so it is rebuilt rather than persisted.
-    policy = Policy._classes[type_name](env, profile=meta.get("profile"), env_stats=env_stats)
+
+    # The architecture has to be back in place before the components are
+    # constructed, and it has to be *this checkpoint's*, not whatever config/
+    # says now -- the weights match one and not the other. Both the frozen
+    # snapshot and the run's dotted overrides are restored, and both are undone
+    # afterwards so loading a checkpoint does not silently redefine the config
+    # for the rest of the process (which it used to).
+    previous = (model_config.get_snapshot(), model_config.get_overrides())
+    try:
+      model_config.set_snapshot(meta.get("snapshot"))
+      model_config.set_overrides(meta.get("overrides"))
+      # env_stats is a function of the env, so it is rebuilt rather than persisted.
+      policy = Policy._classes[type_name](env, profile=meta.get("profile"), env_stats=env_stats)
+    finally:
+      model_config.set_snapshot(previous[0])
+      model_config.set_overrides(previous[1])
+
     with ocp.StandardCheckpointer() as ckpt:
       restored = ckpt.restore(os.path.join(path, "state"), nnx.state(policy))
     nnx.update(policy, restored)
@@ -641,17 +702,31 @@ class Policy(nnx.Module, ABC):
 
     return 1000 * elapsed / n
 
+  DECAYS = {
+    # Quarter-sine 1 -> 0: flat for the first part of the run, steepest at the end.
+    "sine":     lambda progress: jnp.sin((1.0 - progress) * jnp.pi / 2),
+    "linear":   lambda progress: 1.0 - progress,
+    "cosine":   lambda progress: 0.5 * (1.0 + jnp.cos(progress * jnp.pi)),
+    "constant": lambda progress: jnp.ones_like(progress),
+  }
+
   @staticmethod
-  def lr_schedule(warmup_steps: int, total_steps: int):
-    """Multiplicative LR factor: linear 0 -> 1 ramp over `warmup_steps`, then a
-    quarter-sine decay 1 -> 0 to `total_steps` (flat at 0 past that, in case
-    `total_steps` -- an estimate -- undershoots the run's actual grad-step count)."""
+  def lr_schedule(warmup_steps: int, total_steps: int, decay: str):
+    """Multiplicative LR factor: linear 0 -> 1 ramp over `warmup_steps`, then
+    `decay` from 1 -> 0 by `total_steps` (flat past that, in case `total_steps` --
+    an estimate -- undershoots the run's actual grad-step count). `decay` is the
+    run config's `lr_decay`; it used to be hardcoded to "sine" here, which meant
+    the schedule's shape was the one part of the optimizer no run recorded."""
+    if decay not in Policy.DECAYS:
+      raise KeyError(f"lr_decay {decay!r} is not one of {', '.join(Policy.DECAYS)}")
+    decay_fn = Policy.DECAYS[decay]
+
     def schedule(step):
       step = jnp.asarray(step, jnp.float32)
       warm = step / max(1, warmup_steps)
       progress = jnp.clip((step - warmup_steps) / max(1, total_steps - warmup_steps), 0.0, 1.0)
-      decay = jnp.sin((1.0 - progress) * jnp.pi / 2)
-      return jnp.where(step < warmup_steps, warm, decay) if warmup_steps > 0 else decay
+      decayed = decay_fn(progress)
+      return jnp.where(step < warmup_steps, warm, decayed) if warmup_steps > 0 else decayed
     return schedule
 
   # ------------------------------------------------------------------

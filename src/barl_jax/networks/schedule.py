@@ -32,8 +32,8 @@ class Schedule(Component, nnx.Module, ABC):
   runs `start` -> `end` over the remaining `steps - warmup`, then stays flat at
   `end` (so a `steps` estimate that undershoots the real run is harmless)."""
 
-  def __init__(self, env_stats=None, start: float = 1.0, end: float | None = None,
-               steps: int = 1, warmup: int = 0, **kw):
+  def __init__(self, env_stats=None, *, start: float, end: float | None,
+               steps: int, warmup: int, **kw):
 
     super().__init__(env_stats, **kw)
 
@@ -104,7 +104,7 @@ class SineSchedule(Schedule):
 @register_component
 class PolynomialSchedule(Schedule):
 
-  def __init__(self, env_stats=None, power: float = 2.0, **kw):
+  def __init__(self, env_stats=None, *, power: float, **kw):
     super().__init__(env_stats, **kw)
     self.power = float(power)
 
@@ -131,7 +131,7 @@ class CosineAlphaBarSchedule(Schedule):
   """Nichol & Dhariwal's cosine alpha-bar ladder, rescaled to run
   `start` -> `end`; `s` is their small offset keeping beta_0 away from 0."""
 
-  def __init__(self, env_stats=None, s: float = 0.008, **kw):
+  def __init__(self, env_stats=None, *, s: float, **kw):
     super().__init__(env_stats, **kw)
     self.s = float(s)
 

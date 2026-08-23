@@ -1,6 +1,6 @@
 """Train one or more {model, env} combinations, optionally several seeds at once.
 
-    uv run python scripts/online_learning.py --config config/online_learning.yaml
+    uv run python scripts/online_learning.py --config config/experiments/online_learning.yaml
     uv run python scripts/online_learning.py --seeds 10
 
 `--seeds N` (or `num_seeds:` in the config) runs N independently-initialized
@@ -26,13 +26,14 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"wandb\..
 from barl_jax.config import load_config
 from barl_jax.trainer import setup, train, validate
 
-DEFAULT_CONFIG = os.path.join(os.path.dirname(__file__), "..", "config", "online_learning.yaml")
+DEFAULT_CONFIG = os.path.join(os.path.dirname(__file__), "..", "config", "experiments",
+                              "online_learning.yaml")
 
 
 if __name__ == "__main__":
   args = argparse.ArgumentParser()
   args.add_argument("--config", default=DEFAULT_CONFIG,
-                    help="Path to a YAML config (see config/online_learning.yaml). "
+                    help="Path to a YAML experiment config (see config/experiments/online_learning.yaml). "
                          "Lists one or more {model, env, ...} runs, executed in series.")
   args.add_argument("--seeds", type=int, default=None,
                     help="How many seeds to run vmapped in this process. "
@@ -41,10 +42,10 @@ if __name__ == "__main__":
 
   runs = load_config(kwargs.config)
   for i, cfg in enumerate(runs):
-    num_seeds = kwargs.seeds or cfg.get("num_seeds") or 1
+    num_seeds = kwargs.seeds or cfg["num_seeds"]
     seeds = f", {num_seeds} seeds vmapped" if num_seeds > 1 else ""
     print(f"=== Run {i + 1}/{len(runs)}: {cfg['model']} on {cfg['env']}{seeds} ===")
 
-    only_validate = bool(cfg.get("validate"))
+    only_validate = bool(cfg["validate"])
     run = setup(cfg, num_seeds, validate_only=only_validate)
     (validate if only_validate else train)(run)

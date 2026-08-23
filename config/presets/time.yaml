@@ -1,0 +1,17 @@
+# Time/level embedding bundles. `time_dim` is the width of the encoding
+# concatenated to the action; `time_kwargs` configures the frequency ladder.
+
+sin_16:
+  time_dim: 8
+  time_embed: sin
+  time_kwargs: {num_freqs: 16, freq_min: 0.1, freq_max: 100.0, hidden: 32, concat_input: true}
+
+sin_20:
+  extends: [time.sin_16]
+  time_kwargs: {num_freqs: 20}
+
+# NC-LQL conditions on a noise *level* rather than a diffusion time.
+fourier:
+  extends: [time.sin_16]
+  time_dim: 16
+  time_embed: fourier

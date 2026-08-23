@@ -1,41 +1,43 @@
 # Example sweep spec for scripts/run_sweep.py:
 #
-#   uv run python scripts/run_sweep.py --grid config/sweep_grid.yaml --dry_run
-#   uv run python scripts/run_sweep.py --grid config/sweep_grid.yaml
+#   uv run python scripts/run_sweep.py --grid config/experiments/sweep_grid.yaml --dry_run
+#   uv run python scripts/run_sweep.py --grid config/experiments/sweep_grid.yaml
 #
 # Every run is one point of the cross product of `axes`, minus anything
 # `exclude` matches, launched as its own OS process. Four kinds of axis:
 #
-#   algo / env / seed   the run's model, environment, and seed
-#   model.<dotted>      a model override -- layered over config/models.yaml
-#                       (and any profile) for that run only, so sweeping a
-#                       tunable never means editing the model config
-#   run.<key>           a key of the run config (config/online_learning.yaml's
-#                       `defaults:`), e.g. run.batch_size, run.utd_ratio
+#   algo / env / seed   the run's model, environment, and base seed
+#   model.<dotted>      a model override -- layered over config/models/ (and any
+#                       profile) for that run only, so sweeping a tunable never
+#                       means editing the model config
+#   run.<key>           a key of the run config (config/run/defaults.yaml),
+#                       e.g. run.batch_size, run.utd_ratio
 #
 # `uv run python scripts/print_config.py <model>` lists the dotted paths a
-# `model.` axis can name; a path that resolves to nothing aborts the run
-# before any training starts rather than silently sweeping a no-op axis.
+# `model.` axis can name; a path that resolves to nothing aborts the run before
+# any training starts rather than silently sweeping a no-op axis.
 #
-# --algos/--envs/--seeds/--set on the command line override the axis of the
-# same name here, so this file can also serve as the base for one-off runs.
+# --algos/--envs/--seeds/--set on the command line override the axis of the same
+# name here, so this file can also serve as the base for one-off runs.
 
-base: config/online_learning.yaml
+base: config/experiments/online_learning.yaml
 
 axes:
-  algo: [AMDP, SACPolicy]
+  algo: [SAC, AMDP]
   env:  [HalfCheetah, Walker2d]
   seed: [0, 1, 2]
 
-  # Both algos below run MeanStdEnsembleCritic, the one critic that takes `rho`
-  # (the distributional pair calls its spread coefficient `risk_aversion`, and
-  # Mean/MinEnsembleCritic take neither -- so an axis has to match the class).
-  model.components.critic.rho: [0.0, 2.0]
-  # model.components.critic.class: [MeanStdEnsembleCritic, QRDistributionalCritic]
+  # The capacity axis: one word per run, and `large` means the same net for
+  # every critic class, so this stays a capacity comparison rather than an
+  # incidental-architecture one. See config/presets/sizes.yaml.
+  model.components.critic.size: [small, medium, large]
+
+  # model.components.actor.size: [small, medium, large]
+  # model.components.critic.class: [C51Critic, HLGaussCritic, EnsembleCritic]
   # model.params.entropy_scale: [-1.0, -2.0]
   # run.utd_ratio: [0.5, 1.0]
 
 exclude: []
-  # Prune combinations out of the full product, e.g. a value that would be a
-  # duplicate run for one algo:
-  # - {algo: SACPolicy, model.components.critic.rho: 0.0}
+  # Prune combinations out of the full product, e.g. a size that is only
+  # interesting for one algorithm:
+  # - {algo: SAC, model.components.critic.size: small}

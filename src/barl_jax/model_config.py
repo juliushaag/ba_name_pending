@@ -1,283 +1,130 @@
-"""YAML-driven configuration: component classes + kwargs (resolve_slot) and
-each Policy's own top-level tunables (resolve_params), with exactly two files
-behind them and no Python-level defaults -- config/components.yaml (per
-component *class* baseline kwargs) under config/models.yaml (per *policy*
-slots/params/profiles). See resolve_slot/resolve_component/resolve_params for
-the override precedence, explain() for per-key provenance, and
-set_models_override()/snapshot_for() for how a sweep run's embedded `models:`
-snapshot reproduces its exact resolved config later."""
+"""Registry-aware facade over config_tree.ConfigTree.
+
+config_tree.py owns the tree and the whole precedence chain and imports nothing
+but yaml, so scripts/run_sweep.py can use it without dragging in jax. This module
+adds the parts that need the component registry -- turning a `class:` string into
+a class, checking resolved kwargs against that class's __init__ signature, and
+the lint that keeps tunables out of Python -- plus a process-wide default tree
+for the callers that want one rather than passing an instance around.
+
+See config_tree.ConfigTree for the layering; see validate() for what is checked
+before a run is allowed to start."""
 
 import inspect
-import os
 
-import yaml
-
+from barl_jax.config_tree import (CONFIG_DIR, SIZES, TRAINING_KEYS, ConfigTree,  # noqa: F401
+                                  merge)
 from barl_jax.networks.registry import get_component
 
-_CONFIG_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "config")
-_MODELS_PATH = os.path.join(_CONFIG_DIR, "models.yaml")
-_COMPONENTS_PATH = os.path.join(_CONFIG_DIR, "components.yaml")
+# __init__ parameters that are plumbing rather than tunables: injected by the
+# framework, not resolved from config. Everything else a component takes must be
+# keyword-only and defaultless, which is what no_default_problems() enforces.
+PLUMBING_PARAMS = frozenset({"self", "env_stats", "rngs", "q_function", "support",
+                             "cls", "args", "kwargs", "in_dim", "out_dim",
+                             "input_dim", "output_dim", "num_features", "n"})
 
-# Reserved key under which a snapshot carries the config/components.yaml
-# entries it resolved against, so replaying it never depends on the current
-# contents of that file.
-COMPONENT_DEFAULTS_KEY = "component_defaults"
+# Params whose default is not a hidden constant but "take it from EnvStats" --
+# a critic's support follows the env unless a kwarg pins it. They are exempt from
+# the no-defaults rule *because* the value they end up with is reported by the
+# component's derived() and logged under `model/derived.*`, so it is still
+# visible in the run. Adding a name here without a matching derived() entry
+# would reintroduce exactly what this module exists to prevent.
+ENV_BACKED_PARAMS = frozenset({"v_min", "v_max"})
 
-# The run-config keys a policy is allowed to set from its own `training:` block in
-# config/models.yaml -- the ones that are a property of the *algorithm* rather
-# than of the experiment. Everything else about a run (how long it trains, how
-# many envs, how often it evaluates, what it logs) stays in
-# config/online_learning.yaml, which is the whole point of the whitelist: a key
-# outside it in a model's `training:` block is a typo or a misplaced knob, and
-# validate() says so rather than letting it silently do nothing.
-TRAINING_KEYS = frozenset({
-  "rollout_steps",       # env steps per outer iteration
-  "batch_size",
-  "utd_ratio",           # grad steps per env step (off-policy)
-  "epochs_per_rollout",  # on-policy passes over the buffer
-  "random_steps",        # uniform-action buffer fill before training
-  "lr_warmup_steps",
-})
-
-_models_cache: dict = None
-_components_cache: dict = None
-_models_override: dict | None = None
-_components_override: dict | None = None
+_tree: ConfigTree | None = None
 _overrides: dict = {}
+_snapshot: dict | None = None
 
 
-def _load_yaml(path: str) -> dict:
-  if not os.path.exists(path):
-    return {}
-  with open(path) as f:
-    return yaml.safe_load(f) or {}
+def tree() -> ConfigTree:
+  """The process-wide tree, rebuilt whenever the overrides or the frozen
+  snapshot change."""
+  global _tree
+  if _tree is None:
+    _tree = ConfigTree(overrides=_overrides, snapshot=_snapshot)
+  return _tree
 
 
-def _models() -> dict:
-  global _models_cache
-  if _models_cache is None:
-    _models_cache = _load_yaml(_MODELS_PATH)
-  return {**_models_cache, **_models_override} if _models_override else _models_cache
+def _invalidate():
+  global _tree
+  _tree = None
 
 
-def _components() -> dict:
-  global _components_cache
-  if _components_cache is None:
-    _components_cache = _load_yaml(_COMPONENTS_PATH)
-  return {**_components_cache, **_components_override} if _components_override else _components_cache
-
-
-def set_models_override(override: dict | None):
-  """Layers `override` on top of config/models.yaml for the rest of the
-  process -- lets a saved per-run YAML's embedded `models:` snapshot (see
-  scripts/jax/run_sweep.py / snapshot_for()) reproduce its exact resolved
-  architecture/params even if config/models.yaml has since changed. Its
-  reserved `component_defaults:` key is split off the same way over
-  config/components.yaml. Called once per run by
-  scripts/jax/online_learning.py's main()."""
-  global _models_override, _components_override
-  if override is None:
-    _models_override = _components_override = None
-    return
-  override = dict(override)
-  _components_override = override.pop(COMPONENT_DEFAULTS_KEY, None)
-  _models_override = override
+def set_snapshot(snapshot: dict | None):
+  """Freezes the tree to a run's embedded snapshot (see
+  ConfigTree.snapshot_for), so a saved run or checkpoint resolves exactly what it
+  resolved originally even if config/ has since changed. Called once per run by
+  trainer.setup()."""
+  global _snapshot
+  _snapshot = snapshot
+  _invalidate()
 
 
 def set_overrides(overrides: dict | None):
-  """Per-run dotted-path overrides -- `{"components.critic.rho": 1.0,
-  "params.entropy_scale": -2.0}` -- sitting above both YAML files and any
-  profile, below only the kwargs a Policy passes itself. This is the layer a
-  sweep varies (config/online_learning.yaml's `model_overrides:`, fed by
-  scripts/jax/run_sweep.py's `model.*` grid axes), so nothing has to be edited
-  in-place to sweep a tunable. Called once per run by
-  scripts/jax/online_learning.py's main(); validate() checks the keys actually
-  land somewhere."""
+  """Per-run dotted-path overrides -- `{"components.critic.size": "large",
+  "params.entropy_scale": -2.0}` -- sitting above the whole tree and below only
+  the kwargs a Policy passes itself. This is the layer a sweep varies, so nothing
+  has to be edited in place to sweep a tunable."""
   global _overrides
   _overrides = dict(overrides or {})
+  _invalidate()
 
 
 def get_overrides() -> dict:
   return dict(_overrides)
 
 
-def _override_layer(prefix: str) -> dict:
-  return {key.rpartition(".")[2]: value
-          for key, value in _overrides.items() if key.rpartition(".")[0] == prefix}
-
-
 def resolve_model_name(name: str) -> tuple[str, str | None]:
-  """Resolves a `model:` string to (policy_class_name, profile) via
-  models.yaml's `aliases:` map; anything not listed there is assumed to
-  already be a literal registered Policy class name."""
-  alias = _models().get("aliases", {}).get(name)
-  if alias:
-    return alias["policy"], alias.get("profile")
-  return name, None
-
-
-def _profile_cfg(policy_name: str, profile: str) -> dict:
-  profile_cfg = (_models().get(policy_name) or {}).get("profiles", {}).get(profile)
-  if profile_cfg is None:
-    raise KeyError(f"{policy_name!r} has no profile {profile!r} in {_MODELS_PATH}")
-  return profile_cfg
-
-
-def _slot_layers(policy_name: str, slot: str, profile: str | None) -> tuple[type, list[tuple[str, dict]]]:
-  """The resolved class plus every kwarg layer feeding that slot, ordered
-  lowest-precedence first and each tagged with where it came from -- the
-  single place the precedence chain is defined. `class:` is required in the
-  policy's own slot dict; only an override may change it, never a profile."""
-  policy_cfg = _models().get(policy_name) or {}
-
-  slot_cfg = dict(policy_cfg.get("components", {}).get(slot, {}))
-  cls_name = slot_cfg.pop("class", None)
-  if cls_name is None:
-    raise KeyError(
-      f"{policy_name!r} has no `class:` for its {slot!r} slot in {_MODELS_PATH} -- "
-      f"every component must be named explicitly, there is no Python-level default."
-    )
-  # An override may swap the class itself (the point of a
-  # `model.components.<slot>.class` sweep axis); the baseline layer below then
-  # comes from the class actually used, and any now-stale kwarg the policy's
-  # own slot dict carried for the old class is reported by validate().
-  cls_name = _overrides.get(f"components.{slot}.class", cls_name)
-  cls = get_component(cls_name)
-
-  layers = [
-    (f"components.yaml: {cls_name}", dict(_components().get(cls_name) or {})),
-    (f"models.yaml: {policy_name}.components.{slot}", slot_cfg),
-  ]
-
-  if profile is not None:
-    profile_slot_cfg = dict(_profile_cfg(policy_name, profile).get(slot, {}))
-    profile_slot_cfg.pop("class", None)  # profiles override kwargs only, not the component class
-    layers.append((f"models.yaml: {policy_name}.profiles.{profile}.{slot}", profile_slot_cfg))
-
-  override_kwargs = _override_layer(f"components.{slot}")
-  override_kwargs.pop("class", None)  # consumed above, not a constructor kwarg
-  layers.append((f"override: components.{slot}", override_kwargs))
-
-  return cls, layers
-
-
-def _params_layers(policy_name: str, profile: str | None) -> list[tuple[str, dict]]:
-  policy_cfg = _models().get(policy_name) or {}
-  layers = [(f"models.yaml: {policy_name}.params", dict(policy_cfg.get("params", {})))]
-  if profile is not None:
-    layers.append((f"models.yaml: {policy_name}.profiles.{profile}.params",
-                   dict(_profile_cfg(policy_name, profile).get("params", {}))))
-  layers.append(("override: params", _override_layer("params")))
-  return layers
-
-
-def _training_layers(policy_name: str, profile: str | None) -> list[tuple[str, dict]]:
-  policy_cfg = _models().get(policy_name) or {}
-  layers = [(f"models.yaml: {policy_name}.training", dict(policy_cfg.get("training", {})))]
-  if profile is not None:
-    layers.append((f"models.yaml: {policy_name}.profiles.{profile}.training",
-                   dict(_profile_cfg(policy_name, profile).get("training", {}))))
-  return layers
+  return tree().resolve_model_name(name)
 
 
 def resolve_training(name: str) -> dict:
-  """The run-config keys `name` sets for itself (models.yaml's `training:` block,
-  profile-overridable), as one flat dict -- restricted to TRAINING_KEYS.
-
-  Unlike resolve_slot/resolve_params this takes a *model* string rather than a
-  policy class name, because its caller is barl_jax.config.load_config, which
-  only ever has the `model:` a run entry named. It deliberately sits *below*
-  the run config's own levels: a model states what its algorithm needs, and
-  config/online_learning.yaml's env_defaults/run entry (and therefore any
-  scripts/run_sweep.py `run.` axis) still wins over it."""
-  policy_name, profile = resolve_model_name(name)
-  return {k: v for k, v in _merge(_training_layers(policy_name, profile)).items() if k in TRAINING_KEYS}
-
-
-def _merge(layers: list[tuple[str, dict]]) -> dict:
-  merged: dict = {}
-  for _, kwargs in layers:
-    merged.update(kwargs)
-  return merged
+  return tree().resolve_training(name)
 
 
 def resolve_slot(policy_name: str, slot: str, profile: str | None) -> tuple[type, dict]:
-  """See _slot_layers for the precedence. `class:` is required -- no
-  Python-level fallback -- every other key in the slot's dict is a kwarg,
-  layered on top of config/components.yaml's baseline for that class."""
-  cls, layers = _slot_layers(policy_name, slot, profile)
-  return cls, _merge(layers)
+  """The resolved component *class* plus its merged kwargs. `class:` is
+  required -- there is no Python-level default."""
+  cls_name, kwargs = tree().resolve_slot(policy_name, slot, profile)
+  return get_component(cls_name), kwargs
 
 
 def resolve_params(policy_name: str, profile: str | None) -> dict:
-  """Like resolve_slot but for a Policy's own top-level tunables
-  (models.yaml's `params:` block) rather than a named actor/critic/squash/...
-  slot -- no `class:` and no components.yaml layer involved, just a flat
-  kwargs dict, profile-overridable the same way."""
-  return _merge(_params_layers(policy_name, profile))
+  return tree().resolve_params(policy_name, profile)
 
 
 def explain(name: str) -> dict:
-  """Every resolved value for `name` (a policy class name or an alias)
-  annotated with the layer it came from and what the layers below it said --
-  the readable form of the precedence chain, printed by
-  scripts/print_config.py so no default is ever unattributable."""
-  policy_name, profile = resolve_model_name(name)
-  policy_cfg = _models().get(policy_name)
-  if policy_cfg is None:
-    raise KeyError(f"{policy_name!r} has no block in {_MODELS_PATH}")
-
-  def annotate(layers):
-    keys = {k for _, kwargs in layers for k in kwargs}
-    out = {}
-    for key in sorted(keys):
-      hits = [(source, kwargs[key]) for source, kwargs in layers if key in kwargs]
-      source, value = hits[-1]
-      out[key] = {"value": value, "source": source,
-                  "overrides": [{"value": v, "source": s} for s, v in hits[:-1]]}
-    return out
-
-  components = {}
-  for slot in policy_cfg.get("components", {}):
-    cls, layers = _slot_layers(policy_name, slot, profile)
-    components[slot] = {"class": cls.__name__, "kwargs": annotate(layers)}
-
-  return {
-    "model": name,
-    "policy": policy_name,
-    "profile": profile,
-    "params": annotate(_params_layers(policy_name, profile)),
-    "training": annotate(_training_layers(policy_name, profile)),
-    "components": components,
-  }
+  return tree().explain(name)
 
 
 def available_models() -> list[str]:
-  """Every `model:` string config/models.yaml understands -- its policy blocks
-  plus its aliases."""
-  models = _models()
-  return [k for k in models if k not in ("aliases", COMPONENT_DEFAULTS_KEY)] + list(models.get("aliases", {}))
+  return tree().available_models()
 
 
-def resolved_flat(name: str) -> dict:
-  """Every effective value for `name` as a flat `params.x` /
-  `components.<slot>.<x>` map, whichever layer set it -- what a sweep run
-  logs to wandb so runs stay comparable by their actual hyperparameters
-  rather than by which layer happened to define them."""
-  policy_name, profile = resolve_model_name(name)
-  out = {f"params.{k}": v for k, v in resolve_params(policy_name, profile).items()}
-  out.update({f"training.{k}": v for k, v in resolve_training(name).items()})
-  for slot in (_models().get(policy_name) or {}).get("components", {}):
-    cls, kwargs = resolve_slot(policy_name, slot, profile)
-    out[f"components.{slot}.class"] = cls.__name__
-    out.update({f"components.{slot}.{k}": v for k, v in kwargs.items()})
-  return out
+def resolved_flat(name: str, profile: str | None = None) -> dict:
+  return tree().resolved(name, profile)
 
+
+def snapshot_for(name: str, profile: str | None = None) -> dict:
+  return tree().snapshot_for(name, profile)
+
+
+def get_snapshot() -> dict | None:
+  return _snapshot
+
+
+def env_stats(env_name: str) -> dict:
+  return tree().env_stats(env_name)
+
+
+# ---------------------------------------------------------------------------
+# signature introspection
+# ---------------------------------------------------------------------------
 
 def _accepted_kwargs(cls: type) -> tuple[set[str], bool]:
-  """Named __init__ parameters across `cls`'s whole MRO (a subclass routes
-  e.g. QCriticBase's `gamma` through its own **kwargs), plus whether anything
-  in that chain has a **kwargs catch-all at all."""
+  """Named __init__ parameters across `cls`'s whole MRO (a subclass routes e.g.
+  QCriticBase's `gamma` through its own **kwargs), plus whether anything in that
+  chain has a **kwargs catch-all at all."""
   names, catchall = set(), False
   for klass in cls.__mro__:
     init = klass.__dict__.get("__init__")
@@ -320,48 +167,137 @@ def _type_problem(key: str, value, annotation: type) -> str | None:
   return None
 
 
-def validate(name: str) -> list[str]:
-  """Everything about `name`'s resolved config that is wrong in a way YAML
-  alone can't catch: overrides that land nowhere, kwargs no component accepts
-  (every component has a **kwargs catch-all, so these are silently swallowed
-  otherwise -- the expensive failure mode in a sweep), and values whose YAML
-  type doesn't match the annotation. Returns problem strings; empty means
-  clean. Called by scripts/jax/online_learning.py's main() before any training
-  starts."""
-  policy_name, profile = resolve_model_name(name)
+def no_default_problems(cls: type) -> list[str]:
+  """Every __init__ parameter of `cls` that is a tunable yet carries a Python
+  default or is positional -- i.e. a value that could differ from what config/
+  says and would never appear in the run's wandb config. This is the check that
+  makes "no defaults in the code" an enforced invariant rather than a convention;
+  PLUMBING_PARAMS is the whitelist of framework-injected arguments."""
+  problems = []
+  for klass in cls.__mro__:
+    init = klass.__dict__.get("__init__")
+    if init is None:
+      continue
+    for param in inspect.signature(init).parameters.values():
+      if (param.name in PLUMBING_PARAMS or param.name in ENV_BACKED_PARAMS
+          or param.kind in (param.VAR_KEYWORD, param.VAR_POSITIONAL)):
+        continue
+      where = f"{klass.__name__}.__init__"
+      if param.default is not param.empty:
+        problems.append(f"{where}: {param.name!r} has a Python default "
+                        f"({param.default!r}) -- move it into config/")
+      elif param.kind is not param.KEYWORD_ONLY:
+        problems.append(f"{where}: {param.name!r} is positional -- every tunable must be "
+                        f"keyword-only so a missing config value is a TypeError")
+  return problems
 
-  # Only the classes *this* model resolves to. The torch version flagged every
-  # unregistered components.yaml key, which is the right global lint but the
-  # wrong gate for a run: barl_jax implements a subset of the policies, so
-  # every baseline belonging to an unported component (PPOCritic,
-  # OUDiffusionActor, ...) would otherwise abort a perfectly valid SAC run.
-  # See unknown_component_defaults() for the whole-file view.
-  problems = [f"config/components.yaml: {key!r} names no registered component, "
+
+# ---------------------------------------------------------------------------
+# validation
+# ---------------------------------------------------------------------------
+
+def unknown_component_defaults(policy_name: str = None) -> list[str]:
+  """config/components/ entries that don't name a registered component -- typos
+  whose baseline kwargs would silently never apply. Only meaningful once
+  `barl_jax` is fully imported (that's what populates the registry).
+
+  With `policy_name`, narrowed to the classes that policy's slots actually name
+  (plus any an override swaps in), which is what validate() gates a run on;
+  without it, the whole-tree lint."""
+  from barl_jax.networks.registry import available_components
+  known = set(available_components())
+  candidates = dict(tree().components)
+  if policy_name is not None:
+    named = {tree().slot_class(policy_name, slot) for slot in tree().slots(policy_name)}
+    candidates = {k: v for k, v in candidates.items() if k in named}
+  return sorted(k for k in candidates if k not in known)
+
+
+def structure_problems() -> list[str]:
+  """Whole-tree checks that don't depend on which model is being run: sizes own
+  their keys exclusively, every `extends:` resolves, every component declares a
+  `kind:`. These are what keep `size: large` meaning one thing everywhere."""
+  t = tree()
+  if t.replaying:
+    # A replay serves one past run's resolved values; the tree it came from was
+    # checked when the snapshot was made, and the files here are not what ran.
+    return []
+  problems = []
+
+  for kind, table in (t.presets.get(SIZES) or {}).items():
+    key_sets = {name: set(entry) for name, entry in table.items()}
+    if len(set(map(frozenset, key_sets.values()))) > 1:
+      shape = ", ".join(f"{n}={sorted(k)}" for n, k in key_sets.items())
+      problems.append(f"config/presets/sizes.yaml: {kind!r} entries declare different keys "
+                      f"({shape}) -- every size of a kind must set the same ones, or a size "
+                      f"comparison silently varies which keys are set")
+
+  for cls_name, entry in t.components.items():
+    if not isinstance(entry, dict):
+      continue
+    if "kind" not in entry:
+      problems.append(f"config/components/: {cls_name!r} declares no `kind:`")
+      continue
+    owned = t.size_keys(entry["kind"])
+    for key in sorted(owned & set(entry)):
+      problems.append(f"config/components/: {cls_name!r} sets {key!r}, which the "
+                      f"{entry['kind']!r} size ladder owns -- state a `size:` on the slot instead")
+    for ref in entry.get("extends") or []:
+      try:
+        t.preset(ref)
+      except (KeyError, ValueError) as e:
+        problems.append(f"config/components/: {cls_name}: {e}")
+
+  return problems
+
+
+def validate(name: str) -> list[str]:
+  """Everything about `name`'s resolved config that is wrong in a way YAML alone
+  can't catch: unregistered classes, a slot missing its `size:`, overrides that
+  land nowhere, kwargs no component accepts (every component has a **kwargs
+  catch-all, so these are silently swallowed otherwise -- the expensive failure
+  mode in a sweep), tunables still defaulting in Python, and values whose YAML
+  type doesn't match the annotation. Returns problem strings; empty means clean.
+  Called by trainer.setup() before any training starts."""
+  t = tree()
+  policy_name, profile = t.resolve_model_name(name)
+
+  # Only the classes *this* model resolves to: barl_jax implements a subset of
+  # the policies, so a baseline belonging to an unported component would
+  # otherwise abort a perfectly valid SAC run. structure_problems() is the
+  # whole-tree view.
+  problems = [f"config/components/: {key!r} names no registered component, "
               f"so its baseline kwargs never apply"
               for key in unknown_component_defaults(policy_name)]
-  policy_cfg = _models().get(policy_name)
-  if policy_cfg is None:
-    return problems + [f"config/models.yaml has no block for {policy_name!r}"]
+  problems += structure_problems()
 
-  slots = policy_cfg.get("components", {})
+  if not t.policy_cfg(policy_name):
+    return problems + [f"config/models/ has no block for {policy_name!r}"]
 
-  # A `training:` key outside TRAINING_KEYS lands in no run config and changes nothing --
-  # the same silent no-op a typo'd sweep axis would be.
-  for source, block in _training_layers(policy_name, profile):
+  slots = t.slots(policy_name)
+
+  # A `training:` key outside TRAINING_KEYS lands in no run config and changes
+  # nothing -- the same silent no-op a typo'd sweep axis would be.
+  for source, block in t.training_layers(policy_name, profile):
     problems += [f"{source}: {key!r} is not a training key a model may set "
                  f"({', '.join(sorted(TRAINING_KEYS))}) -- run-level knobs outside that set "
-                 f"belong in config/online_learning.yaml"
+                 f"belong in config/run/defaults.yaml"
                  for key in sorted(set(block) - TRAINING_KEYS)]
 
   for key in _overrides:
     parts = key.split(".")
     if parts[:1] == ["params"] and len(parts) == 2:
       # against the layers *below* the override, which is itself the last one
-      if parts[1] not in _merge(_params_layers(policy_name, profile)[:-1]):
+      if parts[1] not in merge(t.params_layers(policy_name, profile)[:-1]):
         problems.append(f"override {key!r} sets a param {policy_name} doesn't have")
     elif parts[:1] == ["components"] and len(parts) == 3:
       if parts[1] not in slots:
         problems.append(f"override {key!r} names no slot of {policy_name} ({', '.join(slots)})")
+      elif parts[2] == "size":
+        kind = t.component_kind(t.slot_class(policy_name, parts[1]))
+        if _overrides[key] not in t.size_table(kind):
+          problems.append(f"override {key!r}={_overrides[key]!r} is not a {kind} size "
+                          f"({', '.join(sorted(t.size_table(kind)))})")
     else:
       problems.append(f"override {key!r} must be 'params.<name>' or 'components.<slot>.<name>'")
 
@@ -372,22 +308,18 @@ def validate(name: str) -> list[str]:
       problems.append(str(e))
       continue
 
+    kind = t.component_kind(t.slot_class(policy_name, slot))
+    if t.size_table(kind) and t.slot_size(policy_name, slot, profile) is None:
+      problems.append(f"{policy_name}.{slot} [{cls.__name__}]: no `size:` -- every {kind} slot "
+                      f"must name one of {', '.join(sorted(t.size_table(kind)))}")
+
     accepted, catchall = _accepted_kwargs(cls)
     unknown = sorted(set(kwargs) - accepted)
     if unknown and catchall:
       problems += [f"{policy_name}.{slot} [{cls.__name__}]: {k!r} is accepted by no __init__ in "
                    f"{cls.__name__}'s MRO -- it is silently swallowed by **kwargs" for k in unknown]
 
-    # Check for critical params that differ between slot config and components.yaml baseline
-    baseline = _components().get(cls.__name__, {})
-    for critical_key in ("n_models", "num_atoms", "num_bins"):
-      if critical_key in kwargs and critical_key in baseline:
-        if kwargs[critical_key] != baseline[critical_key]:
-          problems.append(
-            f"{policy_name}.{slot} [{cls.__name__}]: {critical_key}={kwargs[critical_key]} in models.yaml "
-            f"differs from components.yaml baseline {critical_key}={baseline[critical_key]} -- "
-            f"the slot value takes precedence but this may be unintentional"
-          )
+    problems += [f"{policy_name}.{slot} [{cls.__name__}]: {p}" for p in no_default_problems(cls)]
 
     annotations = _annotations(cls)
     problems += [f"{policy_name}.{slot} [{cls.__name__}]: {p}"
@@ -395,52 +327,3 @@ def validate(name: str) -> list[str]:
                  if key in annotations and (p := _type_problem(key, value, annotations[key]))]
 
   return problems
-
-
-def unknown_component_defaults(policy_name: str = None) -> list[str]:
-  """config/components.yaml keys that don't name a registered component --
-  i.e. typos whose baseline kwargs would silently never apply. Only meaningful
-  once `barl_jax` is fully imported (that's what populates the registry).
-
-  With `policy_name`, narrowed to the classes that policy's slots actually name
-  (plus any an override swaps in), which is what validate() gates a run on;
-  without it, the whole-file lint."""
-  from barl_jax.networks.registry import available_components
-  known = set(available_components())
-  candidates = dict(_components())
-  if policy_name is not None:
-    named = {slot_cfg.get("class")
-             for slot_cfg in (_models().get(policy_name) or {}).get("components", {}).values()}
-    named |= {v for k, v in _overrides.items() if k.endswith(".class")}
-    candidates = {k: v for k, v in candidates.items() if k in named}
-  return sorted(k for k in candidates if k not in known)
-
-
-def snapshot_for(name: str) -> dict:
-  """Minimal config sub-dict needed to reproduce resolving `name` later,
-  regardless of subsequent edits to config/models.yaml or
-  config/components.yaml: the aliases: entry (if `name` names one), the
-  resolved policy's full block, and the components.yaml entry for every class
-  that policy's slots name. Embedded verbatim by scripts/jax/run_sweep.py into
-  each run's per-run YAML, and logged to wandb by
-  scripts/jax/online_learning.py."""
-  models = _models()
-  out: dict = {}
-  alias = models.get("aliases", {}).get(name)
-  if alias:
-    out["aliases"] = {name: alias}
-  policy_name, _ = resolve_model_name(name)
-  if policy_name in models:
-    out[policy_name] = models[policy_name]
-
-  components = _components()
-  named = [slot_cfg.get("class")
-           for slot_cfg in (models.get(policy_name) or {}).get("components", {}).values()]
-  # An override may name a class no slot mentions (a `components.<slot>.class`
-  # sweep axis), whose baseline the snapshot needs just as much.
-  named += [v for k, v in _overrides.items() if k.endswith(".class")]
-  used = {cls_name: components[cls_name] for cls_name in named if cls_name in components}
-  if used:
-    out[COMPONENT_DEFAULTS_KEY] = used
-
-  return out

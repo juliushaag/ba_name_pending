@@ -30,20 +30,26 @@ def print_model(name: str) -> None:
   print_block("training", cfg["training"])
   print_block("params", cfg["params"])
   for slot, slot_cfg in cfg["components"].items():
-    print_block(f"components.{slot}  [{slot_cfg['class']}]", slot_cfg["kwargs"])
+    title = f"components.{slot}  [{slot_cfg['class']}]"
+    if slot_cfg.get("size"):
+      title += f"  size: {slot_cfg['size']}"
+    print_block(title, slot_cfg["kwargs"])
 
 
 if __name__ == "__main__":
   args = argparse.ArgumentParser(
-    description="Print a model's fully resolved config (config/components.yaml baselines "
-                "< config/models.yaml slots/params < profile < run overrides), annotating "
-                "every value with the layer it came from.")
+    description="Print a model's fully resolved config -- presets < component baseline "
+                "< slot size < slot kwargs < profile < run overrides -- annotating every "
+                "value with the layer it came from and what it shadows.")
   args.add_argument("models", nargs="*",
-                    help="Policy class names and/or models.yaml aliases (default: all of them)")
+                    help="Policy class names and/or config/models/ aliases (default: all of them)")
   args.add_argument("--set", action="append", metavar="PATH=VALUE",
                     help="Preview under a dotted override, exactly as a run's model_overrides: "
                          "or a scripts/run_sweep.py `model.` axis would apply it, e.g. "
-                         "--set components.critic.rho=0.0. Repeatable.")
+                         "--set components.critic.size=large. Repeatable.")
+  args.add_argument("--json", action="store_true",
+                    help="Print the flat resolved config as JSON instead -- exactly what a run "
+                         "snapshots and logs to wandb.")
   kwargs = args.parse_args()
 
   overrides = {}
@@ -55,6 +61,12 @@ if __name__ == "__main__":
   model_config.set_overrides(overrides)
 
   names = kwargs.models or model_config.available_models()
+
+  if kwargs.json:
+    import json
+    print(json.dumps({name: model_config.resolved_flat(name) for name in names},
+                     indent=2, sort_keys=True, default=str))
+    raise SystemExit(0)
 
   problems = []
   for name in names:

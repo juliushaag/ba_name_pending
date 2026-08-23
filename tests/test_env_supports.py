@@ -21,18 +21,19 @@ from barl_jax.env import Environment
 from barl_jax.environments.dm_control import DMControlEnvironment
 from barl_jax.networks.registry import get_component
 
-from conftest import make_env_stats
+from conftest import build, make_env_stats
 
-GAMMA = model_config._components()["C51Critic"]["gamma"]
+GAMMA = model_config.tree().component_kwargs("C51Critic")["gamma"]
 DM_HORIZON = 1000                      # every suite task; see DMControlEnvironment's docstring
 
 
 def declared(cls) -> dict:
-    """`stats` merged down the MRO, as Environment.get_env_stats does it --
-    replicated rather than called so this stays free of a real gym env."""
+    """config/run/envs.yaml's stats merged down the MRO, as
+    Environment.get_env_stats does it -- replicated rather than called so this
+    stays free of a real gym env."""
     out = {}
     for klass in reversed(cls.__mro__):
-        out.update(klass.__dict__.get("stats") or {})
+        out.update(model_config.tree().env_stats(klass.__name__))
     return out
 
 
@@ -90,10 +91,7 @@ def test_c51_resolves_a_realistic_dm_control_value_gap(q_gap):
     atom's mass."""
     stats = declared(Environment._classes["HumanoidRun"])
     env_stats = make_env_stats(return_min=stats["return_min"], return_max=stats["return_max"])
-    c = get_component("C51Critic")(
-        env_stats, latent_dim=8, layers=1, n_models=2, rho=0.0, num_atoms=101,
-        entropy_coef=0.005, pessimistic_target=False, gamma=GAMMA, lr=3e-4,
-        rngs=nnx.Rngs(0))
+    c = build("C51Critic", env_stats=env_stats)
 
     n = c.num_atoms
     bin_width = (c.v_max - c.v_min) / (n - 1)

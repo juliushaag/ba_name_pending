@@ -23,17 +23,20 @@ class OUDiffusionActor(DiscreteDiffusionActorBase):
   N(0, eta^2 I) (Table 2), and a per-dimension learnable scaling of the beta
   ladder."""
 
-  EULER_MAX_STEP  = 0.35
-  MIN_TOTAL_NOISE = 2.0
+  def __init__(self, env_stats, *, latent_dim: int, layers: int, num_steps: int,
+               beta_min: float, beta_max: float, beta_scale_min: float,
+               beta_scale_max: float, learn_beta_scale: bool,
+               prior_var: float, anchor_score: bool,
+               euler_max_step: float, min_total_noise: float,
+               rngs: nnx.Rngs, **kwargs):
 
-  def __init__(self, env_stats, latent_dim: int, layers: int, num_steps: int,
-               beta_min: float, beta_max: float, beta_scale_min: float = 0.7,
-               beta_scale_max: float = 1.8, learn_beta_scale: bool = True,
-               prior_var: float = 2.5, anchor_score: bool = True,
-               *, rngs: nnx.Rngs, **kwargs):
+    super().__init__(env_stats, latent_dim=latent_dim, layers=layers, num_steps=num_steps,
+                     rngs=rngs, **kwargs)
 
-    super().__init__(env_stats, latent_dim, layers, num_steps, rngs=rngs, **kwargs)
-
+    # Used to be module constants, which meant the bound that silently clamps
+    # beta_scale_max below was invisible to every run that hit it.
+    self.euler_max_step  = float(euler_max_step)
+    self.min_total_noise = float(min_total_noise)
     self.anchor_score = bool(anchor_score)
     self.eta2 = float(prior_var)
     self.eta  = math.sqrt(prior_var)
@@ -46,7 +49,7 @@ class OUDiffusionActor(DiscreteDiffusionActorBase):
 
     lo = self.beta_scale_min = float(beta_scale_min)
     hi = self.beta_scale_max = min(float(beta_scale_max),
-                                   self.EULER_MAX_STEP / float(beta[1:].max()))
+                                   self.euler_max_step / float(beta[1:].max()))
     raw = jnp.full((self.action_dim,), _inv_sigmoid((1.0 - lo) / (hi - lo)), jnp.float32)
     # Trainable only when it is meant to be: a frozen Buffer keeps it out of
     # every optimizer, which is what `requires_grad=False` did in torch.
@@ -62,11 +65,11 @@ class OUDiffusionActor(DiscreteDiffusionActorBase):
     used  = self.beta[...][1:, None] * self.beta_scale
     total = float(used.sum(axis=0).min())
     peak  = float(used.max())
-    assert peak <= self.EULER_MAX_STEP, (
-      f"beta*scale peaks at {peak:.3f} > EULER_MAX_STEP {self.EULER_MAX_STEP} "
+    assert peak <= self.euler_max_step, (
+      f"beta*scale peaks at {peak:.3f} > euler_max_step {self.euler_max_step} "
       f"-- lower beta_max or beta_scale_max")
-    assert total >= self.MIN_TOTAL_NOISE, (
-      f"total forward noise {total:.3f} < MIN_TOTAL_NOISE {self.MIN_TOTAL_NOISE} "
+    assert total >= self.min_total_noise, (
+      f"total forward noise {total:.3f} < min_total_noise {self.min_total_noise} "
       f"(signal at step N still {math.exp(-total):.3f}) -- raise num_steps or beta_min/beta_max")
 
   @property
@@ -128,6 +131,7 @@ class DIME(Policy):
 
     params = self.resolve_params()
     self.entropy_scale = params["entropy_scale"]
+    self.policy_delay           = params["policy_delay"]
 
     self.critic: QCriticBase = self.build_component("critic", QCriticBase)
     self.actor: OUDiffusionActor = self.build_component("actor", OUDiffusionActor)
@@ -146,6 +150,13 @@ class DIME(Policy):
     constant +-7.25, so most of the batch contributed no gradient and a wrong
     value."""
     return self.squash.log_abs_det_jacobian(X).sum(axis=-1, keepdims=True)
+
+
+  def optimizer_cadence(self) -> dict:
+    """dime_am's `policy_delay`: the critic steps every gradient step, the actor
+    and the entropy dual only every `policy_delay`-th -- both gated by the same
+    branch there, so both are gated by the same key here."""
+    return {"actor": self.policy_delay, "entropy_alpha": self.policy_delay}
 
   def train_step(self, batch):
     obs      = self.normalize_obs(batch["obs"])

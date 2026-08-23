@@ -37,10 +37,10 @@ uv sync                                     # install/sync the environment
 ```
 
 Train one or more algorithm/env combinations in series (defined by a YAML config, see
-`config/online_learning.yaml`):
+`config/experiments/online_learning.yaml`):
 
 ```bash
-uv run python scripts/online_learning.py                              # uses config/online_learning.yaml
+uv run python scripts/online_learning.py                        # config/experiments/online_learning.yaml
 uv run python scripts/online_learning.py --config path/to/other.yaml
 ```
 
@@ -56,24 +56,36 @@ Every GPU `nvidia-smi` reports gets one worker, which pins its subprocess to tha
 a GPU. `--seeds N` is *not* a process axis: those N seeds are vmapped inside a single run.
 `--sweep_dir` relocates the output tree (the Slurm jobs point it at node-local scratch).
 
-Anything in `config/models.yaml` is sweepable as a `model.<dotted path>` axis and anything in the
+Anything under `config/models/` or `config/components/` is sweepable as a `model.<dotted path>` axis
+(including `.class` and `.size`), and anything in the
 run config as a `run.<key>` axis, either inline or via a `--grid` spec file (see
-`config/sweep_grid.yaml`); `--dry_run` prints the expansion instead of launching it:
+`config/experiments/sweep_grid.yaml`); `--dry_run` prints the expansion instead of launching it:
 
 ```bash
 uv run python scripts/run_sweep.py --algos AMDP --envs HalfCheetah --seeds 3 \
-    --set model.components.critic.rho=0.0 --set run.utd_ratio=0.5
-uv run python scripts/run_sweep.py --grid config/sweep_grid.yaml --dry_run
+    --set model.components.critic.size=large --set run.utd_ratio=0.5
+uv run python scripts/run_sweep.py --grid config/experiments/sweep_grid.yaml --dry_run
 ```
 
 To see what a `model:` string actually resolves to, with every value attributed to the layer that
 set it:
 
 ```bash
-uv run python scripts/print_config.py AMDP    # no args: every model in config/models.yaml
+uv run python scripts/print_config.py AMDP    # no args: every model in config/models/
+uv run python scripts/print_config.py AMDP --json                          # the flat resolved form
+uv run python scripts/print_config.py SAC --set components.critic.size=large   # preview an override
 ```
 
-There is no unit test suite. The closest thing to "run the tests" is `--validate`: a cheap smoke
+And to check the tree itself -- no Python defaults, no unreferenced presets, no slot missing its
+`size:`, no run key read but undeclared:
+
+```bash
+uv run python scripts/lint_config.py
+```
+
+There is a pytest suite (`uv run pytest tests/ -q`, ~400 tests in about ten seconds; every
+registered component is built from its real `config/components/` entry, and `tests/test_config_tree.py`
+holds the tree's guarantees). The complement to it is `--validate`: a cheap smoke
 test that runs one rollout chunk + one `train_step` + one optimizer step per `{algo, env}`
 combination (no eval/checkpointing/wandb logging), to catch shape/dtype/algo-env mismatches
 before committing to a full run:
@@ -130,7 +142,7 @@ default and one subclass override a single key. That is where `return_min`/`retu
 `C51Critic`'s fixed categorical support defaults from them, since no gym space reports a return
 range. A `live` sub-dict is refreshed from each rollout's stats and, because every component holds
 a reference to the same object, one update reaches all of them. `EnvStats` is *not* part of the
-models.yaml layering: it is a function of the environment, not a tunable, so a component that wants
+config/models/ layering: it is a function of the environment, not a tunable, so a component that wants
 one of its values tunable takes a normal kwarg that falls back to the `EnvStats` entry.
 
 ### `Policy` / `Actor` / `Critic` split
@@ -141,7 +153,7 @@ The load-bearing convention throughout the codebase:
 
 - **Actor/Critic = pure architecture** (plus whatever tunables are intrinsic to that architecture's
   own process — e.g. a diffusion actor's noise schedule, a critic's ensemble pessimism — supplied
-  as required kwargs from `config/models.yaml`, no Python-level defaults). No algorithm logic
+  as required kwargs from `config/`, no Python-level defaults). No algorithm logic
   lives here.
 - **Policy = the whole algorithm**: Bellman targets, advantage weighting, clipped surrogates,
   entropy/trust-region duals, adjoint matching — everything algorithm-specific lives in that
@@ -174,7 +186,7 @@ Policy makes on top (e.g. AMDP's `ErfSquash`), not something the actor architect
 
 Concrete critics in `networks/critic.py`, all subclassing `QCriticBase` (shared Polyak-averaged
 target net: `polyak_tau`/`polyak_tau_init`/`target_warmup_steps`/`gamma`, all
-`config/components.yaml`-supplied, see below) via one of two head-building bases — `MLPCriticBase`
+`config/components/critics.yaml`-supplied, see below) via one of two head-building bases — `MLPCriticBase`
 (one MLP over `[s, a]`, `output_dim` wide) or `EnsembleCriticBase` (`n_models` vmapped MLP heads).
 Both own the head's shape kwargs (`hidden_dim`/`layers`/`activation`/`layernorm`/`residual`), so a
 concrete critic declares only what its own representation needs. Only a critic that actually
@@ -226,79 +238,98 @@ Only two call sites ever need it: `ReplayBuffer.rollout()` (immediately before `
 canonical — a Policy re-invoking its own actor mid-`train_step` (e.g. for a Bellman bootstrap
 action) can feed the result straight to its critic with no further conversion.
 
-### Tunables all live in YAML -- there is no Python-level HParam system
+### Tunables all live in `config/` -- there are no Python-level defaults
 
-Every tunable value -- architecture kwargs (`hidden_dim`, `layers`, `activation`, `layernorm`,
-`residual`), optimizer kwargs (`lr`, `weight_decay`, `adam_beta1`, `adam_beta2`, `grad_clip`), and
-algorithm tunables that used to be a separate `HParam`-declared axis (`rho`, `gamma`,
-`tr_lambda_init`, PPO's `clip_eps`, ...) -- is a required, no-default **keyword-only** argument
-supplied from YAML, across exactly two files: `config/components.yaml` (baseline kwargs per
-component *class*) under `config/models.yaml` (per *policy* slots/params/profiles). There is no
-Python-level fallback anywhere in this chain; a value listed in neither file is a
-`KeyError`/`TypeError` at construction time, and `model_config.validate()` reports it before a run
-starts (keyword-only-and-defaultless is exactly the marker that check keys off).
-`config/components.yaml`'s `_`-prefixed top-level keys are YAML anchors the class entries
-`<<:`-merge, not components; nothing resolves against them.
+Every value that affects a run -- architecture kwargs, optimizer kwargs, algorithm tunables, the
+run loop's own knobs -- is a required, no-default **keyword-only** argument supplied from the
+config tree. This is enforced, not conventional: `model_config.no_default_problems()` fails any
+registered component whose `__init__` carries a Python default or a positional tunable, and
+`scripts/lint_config.py` runs that over every component (`validate()` runs it per slot before
+every training run). The point is that a run's wandb config is a *complete* account of what ran.
 
-- **Component-level tunables** (everything an `Actor`/`Critic` itself needs — its architecture,
-  its process's own constants, its target net's update law, and its optimizer's `lr`/
-  `weight_decay`/`adam_beta1`/`adam_beta2`/`grad_clip` via the `Optimized` mixin in
-  `networks/optim.py`, which every component owning an optimizer mixes in *before* `Component`)
-  resolve through `Policy.build_component()`/`resolve_component()` → `model_config.resolve_slot()`,
-  which layers, lowest precedence first: `config/components.yaml`'s entry for the slot's `class:` <
-  the slot dict in `config/models.yaml` < the active profile's override for that slot < the
-  Policy's own explicit kwargs. `config/components.yaml` is the *only* defaults layer in the
-  codebase; a policy slot names its `class:` and then lists only its deltas, so swapping a slot's
-  class (`MeanStdEnsembleCritic` → `QRDistributionalCritic`) is a one-word edit as long as the new
-  class has an entry there. Classes without one must have every kwarg spelled out in the slot.
-  `uv run python scripts/print_config.py <model>` prints a model's fully resolved config with every
-  value annotated by the layer it came from (and what it shadows), so no default is unattributable.
-- **Per-run overrides** (`model_config.set_overrides()`) sit above both YAML files and any profile,
-  below only the Policy's own explicit kwargs: a flat dotted-path map,
-  `{"components.critic.rho": 1.0, "params.entropy_scale": -2.0}`, coming from a run config's
-  `model_overrides:` key (which `scripts/run_sweep.py`'s `model.*` grid axes write). This is the
-  layer a sweep varies, so **sweeping a tunable never means editing a config file in place**.
-  `components.<slot>.class` is overridable too and re-bases the slot on the new class's
-  `config/components.yaml` entry, which is what makes an architecture axis
-  (`MeanStdEnsembleCritic` vs `QRDistributionalCritic`) sweepable. The active overrides are
-  captured into every checkpoint (`Policy.save`) and reapplied by `Policy.load`, since they are
-  part of the architecture.
+```
+config/
+  presets/      sizes.yaml  net.yaml  optim.yaml  time.yaml   named reusable fragments
+  components/   actors.yaml  critics.yaml  duals.yaml         per component *class* baselines
+  models/       sac.yaml  dime.yaml  ...  aliases.yaml        per *policy* slots/params/training
+  run/          defaults.yaml  envs.yaml                      every run key; per-env facts
+  experiments/  online_learning.yaml  sweep_grid.yaml         run lists and sweep specs
+```
 
-`model_config.validate(name)` is run by `scripts/online_learning.py`'s `main()` before anything is
-constructed, and raises rather than starting a doomed run: overrides that land on no slot/param,
-kwargs no `__init__` in the resolved class's MRO accepts (every component has a `**kwargs`
-catch-all, so a typo'd kwarg is otherwise silently swallowed and a mistyped sweep axis silently
-becomes a no-op), and values whose YAML type contradicts the annotation (a bare `3e-4` or a stray
-`true,` parses as a `str`). `scripts/print_config.py` reports the same problems non-fatally.
-- **Policy-level tunables** (things a Policy reads directly off `self` in `train_step`, not part of
-  any actor/critic slot -- AMDP's `tr_lambda_init`/`tr_epsilon`, PPO's `gamma`/`lam`/`clip_eps`/
-  `entropy_coef`, IQL's `tau`/`beta`, FlowQL's `alpha`) live in a `params:` block alongside that
-  policy's `components:` block in `config/models.yaml`, resolved via `Policy.resolve_params()` →
-  `model_config.resolve_params()` (same `models.yaml` < profile-override < `_raw_kwargs` <
-  explicit-kwargs precedence as `resolve_component()`, minus the `components.yaml` layer -- a
-  `params:` block has no `class:`), called once early in the Policy's `__init__` and assigned by
-  required dict key.
+Each directory merges into one map; a key defined in two files of the same directory is a load
+error, so which file an entry lives in is organizational, never semantic.
 
-Because those two YAML files are the *only* place tunables live, a checkpoint's reconstruction
-(`Policy.save`/`Policy.load`) only needs to persist which `profile` was used, not a `hparams` dict
--- both architecture and former-HParams come back from YAML at load time, so keeping those files
-(or a run's own frozen snapshot of them, see below) stable is what makes a checkpoint reproducible.
+**Composition is `extends:` and `size:`.** A block names preset fragments by dotted path
+(`extends: [net.crossq, optim.critic]`, recursively -- a preset may extend another), which is what
+keeps `config/components/` free of the ten-line MLP block that used to be copy-pasted into all
+thirteen entries. Nested dicts (`norm_kwargs`, `time_kwargs`) deep-merge, so a fragment can add one
+key to an inherited dict.
 
-`model_config.snapshot_for(name)` returns the minimal config sub-dict needed to reproduce resolving
-`name` later: the `aliases:` entry if `name` is one, the resolved policy's full `models.yaml` block,
-and -- under the reserved `component_defaults:` key -- the `components.yaml` entry for every class
-that policy's slots name, so replay never depends on either file's current contents.
-`scripts/run_sweep.py` embeds this into every per-run YAML it writes under a `models:`
-key (via a small dependency-free local mirror of `snapshot_for()`, so the lightweight
-subprocess-launcher script never has to import `barl` itself); `config.py`'s `load_config()` threads
-that key through to `cfg["models"]`, and `scripts/online_learning.py`'s `main()` applies it via
-`model_config.set_models_override()` before constructing the Policy -- so a saved sweep run stays
-exactly recreatable even if `config/models.yaml` changes afterward. The same resolved-config dict
-(embedded snapshot, or freshly computed via `snapshot_for()` for a non-sweep run) is logged to
-wandb under `"resolved_model"` in every run's `config=` dict, alongside `resolved/*` — every
-*effective* value flattened to `resolved/components.critic.rho`-style keys via
-`model_config.resolved_flat()`, which is what makes runs in a sweep groupable/comparable by
-hyperparameter rather than by which layer happened to define it.
+`size: large` is sugar for `extends: [sizes.<kind>.large]`, where `<kind>` is the component's
+declared `kind:`. **The size tables own their keys exclusively**: no component entry may set
+`latent_dim`/`layers`/`n_models`, every slot of a sized kind must name a `size:`, and all sizes of
+a kind must declare the same keys -- all three checked by the lint. That is what makes `large`
+mean one net for every critic class, so `--set model.components.critic.size=large` is a capacity
+comparison rather than an incidental-architecture one. Ladders are width at fixed depth; a net
+needing a different depth states `layers:` inline and `print_config.py` reports it as shadowing.
+
+Precedence for a component kwarg, lowest first:
+
+| # | layer |
+|---|---|
+| 1 | the component entry's `extends:` presets, in list order |
+| 2 | the component entry's own keys (`config/components/critics.yaml`) |
+| 3 | the slot's `size:` |
+| 4 | the slot's `extends:` presets |
+| 5 | the slot's own keys (`config/models/<policy>.yaml`) |
+| 6 | the active profile's block for that slot |
+| 7 | the run's dotted overrides (`model_overrides:`, i.e. a `model.*` sweep axis) |
+| 8 | the Policy's leftover `**kwargs` |
+| 9 | the explicit kwargs at its own `build_component()` call site |
+
+1-7 live in `config_tree.py`; 8-9 in `policy.py`. `params:` and `training:` use the same chain
+minus the component layers. `components.<slot>.class` and `.size` are overridable too, which is
+what makes an architecture axis and a capacity axis sweepable without editing a file.
+
+```bash
+uv run python scripts/print_config.py AMDP          # resolved, every value attributed to its layer
+uv run python scripts/print_config.py AMDP --json   # the flat form a run snapshots and logs
+uv run python scripts/lint_config.py                # the whole-tree gate
+```
+
+**`src/barl_jax/config_tree.py` is the only resolver**, and it imports nothing but `yaml` --
+which is what lets `scripts/run_sweep.py` use it directly instead of carrying the hand-maintained
+copy of `snapshot_for()` it used to. `model_config.py` is a thin registry-aware facade over it
+(class lookup, `__init__` signature checks, the no-defaults lint) plus a process-wide default tree.
+
+**A run's snapshot is fully resolved.** `ConfigTree.snapshot_for()` returns the complete flat
+resolved config under `resolved:`, and a tree constructed with that snapshot *serves those values
+directly* rather than re-running the layering -- so a saved sweep run and a checkpoint replay
+exactly, whatever `config/` says later. `Policy.save` writes the same snapshot into `meta.json`,
+which is what closes the old gap where a checkpoint silently reconstructed a different
+architecture. `Policy.load` restores it and the run's overrides, then puts both back, so loading a
+checkpoint no longer redefines the config for the rest of the process.
+
+**What is not resolvable from `config/` alone is reported by the component.** A critic's support
+follows the env (`v_min`/`v_max` from `EnvStats`), `HLGaussCritic`'s `sigma` is derived from it and
+`num_bins`, and AMDP's `erf_k` from its actor's noise schedule. Each such component overrides
+`Component.derived()`, the Policy collects them, and the trainer logs them under
+`model/derived.*` -- the exemption in the no-defaults lint (`ENV_BACKED_PARAMS`) exists only
+because of that reporting path.
+
+**Run keys** are declared in `config/run/defaults.yaml` and nowhere else. `config.load_config()`
+rejects a resolved run carrying a key that file doesn't declare, `trainer.py` indexes `cfg[...]`
+with no `cfg.get(key, default)` anywhere, and the lint checks the two directions agree. Six of them
+(`config_tree.TRAINING_KEYS`) may also be set by a model's own `training:` block, for knobs that
+belong to the *algorithm* rather than the experiment; per-env facts and per-env run overrides live
+in `config/run/envs.yaml`, including the `return_min`/`return_max` that used to sit in the
+`Environment` class bodies.
+
+**What every run logs to wandb** (`trainer.wandb_config`): `run/*` every run key, `model/*` every
+resolved component kwarg plus its `class` and `size`, `model/derived.*` the values above,
+`env/*` the full `EnvStats` including the array bounds, `meta/git_sha` and `meta/config_hash` (a
+digest of everything but the seed, so "same config, different seed" is one group), and `snapshot`
+for exact replay.
 
 ### Rollout / replay / dataset pipeline
 
@@ -329,7 +360,7 @@ Outer loop, per iteration: `buffer.rollout()` collects `rollout_steps` env steps
 must match a key in `model.create_optimizer()` — each is zero-grad'd, backward'd
 (`retain_graph=True`, since e.g. an actor loss reads the critic's forward pass), grad-clipped to
 `Policy.grad_clip(key, cfg["grad_clip"])` (the owning component's own `grad_clip` from
-`config/components.yaml`, falling back to the run config for keys no component owns), and
+`config/components/`, falling back to the run config for keys no component owns), and
 stepped independently, so no optimizer step invalidates another loss's graph mid-loop. Periodic
 eval (`evaluate_and_log`) checkpoints `latest` every eval and `best` on a new best avg reward,
 under the run's `run_dir/checkpoints/` inside a sweep, else `checkpoints/<model>/<env>/<timestamp>/`
@@ -366,22 +397,25 @@ the panel. `wandb.define_metric(step_metric=...)` alignment means step counters 
 `grad_steps`) must be logged in the *same* `wandb.log()` call as the data they index, not a
 separate `increment()` call before/after.
 
-### Config resolution (`src/barl/config.py`)
+### Run-config resolution (`src/barl_jax/config.py`)
 
-A YAML config has a `defaults:` dict, an optional `env_defaults:` map (keyed by env name) and a
-`runs:` list; each run entry is merged onto `env_defaults[<its env>]` onto `defaults` (later wins)
-and `load_config()` returns the resolved list — `scripts/online_learning.py` iterates it and runs
-each `{model, env, ...}` combination in series in one process. `model_overrides:` is the one key
-merged key-wise across those three levels rather than replaced wholesale, since a per-env and a
-per-run override normally mean to stack.
+An experiment file (`config/experiments/*.yaml`) carries a `defaults:` dict and a `runs:` list.
+`load_config()` merges each run entry over, lowest first: `config/run/defaults.yaml` < this file's
+`defaults:` < the model's own `training:` block < `config/run/envs.yaml`'s `defaults:` for that
+env < the run entry — and returns the resolved list, which `scripts/online_learning.py` iterates,
+running each `{model, env, ...}` combination in series in one process. A resolved run carrying a
+key `config/run/defaults.yaml` does not declare is an error, not a silent no-op.
+`model_overrides:` is the one key merged key-wise across the levels rather than replaced
+wholesale, since a per-env and a per-run override normally mean to stack.
 
 `scripts/run_sweep.py` instead fans a grid out across **separate processes** (own interpreter, own
-CUDA context each), writing one throwaway per-run YAML (same `defaults`/`env_defaults` +
-single-entry `runs`) per subprocess so it can reuse the exact same script/config-loading path. The
+CUDA context each), writing one throwaway per-run YAML (this file's `defaults:` + a single-entry
+`runs:` + the fully resolved `snapshot:`) per subprocess so it can reuse the exact same
+script/config-loading path. The
 grid is a cross product over named axes — `algo`/`env`/`seed`, plus any number of
 `model.<dotted path>` axes (written into that run's `model_overrides:`) and `run.<key>` axes
 (written into its run entry) — declared either on the CLI or in a `--grid` spec file
-(`config/sweep_grid.yaml` is a documented example), with an `exclude:` list for pruning
+(`config/experiments/sweep_grid.yaml` is a documented example), with an `exclude:` list for pruning
 combinations out of the full product. `--dry_run` prints the expansion without launching anything.
 Because the axes are just overrides, **no config file is ever edited to run a sweep**.
 
@@ -491,7 +525,7 @@ are online-only (`get_dataset()` raises) and set `use_async_vector_env = True`.
 mujoco` — mujoco picks its GL backend at import time, so this must happen before any
 `barl`/`dm_control` import or headless `env.render()` calls hard-crash looking for an X11 display.
 
-### EMA vs. Shadow (`src/barl/networks/ema.py`)
+### EMA vs. Shadow (`src/barl/networks/ema.py`) -- **stale: no such module exists**
 
 Two different "frozen reference copy" wrappers, not interchangeable: `EMA` exponentially blends
 toward the source every `step()` call (used for Q target nets — call once per train step) and is

@@ -12,7 +12,10 @@ an enclosing jit the step is dispatched op-by-op and costs ~4x more at N=1 and
 """
 
 import datetime
+import hashlib
+import json
 import os
+import subprocess
 import time
 
 import jax
@@ -44,7 +47,7 @@ class Run:
     self.cfg = cfg
     self.num_seeds = num_seeds
     self.model_name, self.env_name = cfg["model"], cfg["env"]
-    self.base_seed = cfg.get("seed") or 0
+    self.base_seed = cfg["seed"]
     self.num_envs = cfg["num_envs"]
 
 
@@ -54,7 +57,7 @@ def setup(cfg: dict, num_seeds: int, *, validate_only: bool = False) -> Run:
 
   # Unconditional: also resets anything left over from a previous run in this
   # process's `runs:` series when the current run doesn't carry one.
-  model_config.set_models_override(cfg.get("models"))
+  model_config.set_snapshot(cfg.get("snapshot"))
   model_config.set_overrides(cfg.get("model_overrides"))
 
   problems = model_config.validate(run.model_name)
@@ -72,7 +75,7 @@ def setup(cfg: dict, num_seeds: int, *, validate_only: bool = False) -> Run:
   run.buffer = MultiSeedReplay(num_seeds, num_envs, cfg["buffer_size"],
                                traj_len=run.environment.get_max_traj_length(run.env))
 
-  checkpoint = cfg.get("checkpoint")
+  checkpoint = cfg["checkpoint"]
   if checkpoint is not None and os.path.exists(checkpoint) and num_seeds == 1:
     policies = [Policy.load(run.model_name, checkpoint, run.env, run.env_stats)]
   else:
@@ -85,7 +88,7 @@ def setup(cfg: dict, num_seeds: int, *, validate_only: bool = False) -> Run:
       f"currently implements the off-policy loop only.")
 
   total_grad_steps = max(1, round(cfg["total_env_steps"] * cfg["utd_ratio"]))
-  schedule = Policy.lr_schedule(cfg["lr_warmup_steps"], total_grad_steps)
+  schedule = Policy.lr_schedule(cfg["lr_warmup_steps"], total_grad_steps, cfg["lr_decay"])
   optimizers = [nnx.Optimizer(p, p.build_optimizer(lr_schedule=schedule), wrt=TRAINABLE)
                 for p in policies]
 
@@ -122,7 +125,7 @@ def evaluate(run: Run, envs, log, ckpt_dir, best):
     # Only seed 0's video is ever logged, so only seed 0 renders one. Every seed
     # rendering a full episode and discarding all but the first cost a whole
     # extra rendered episode per seed per eval -- ~5 s each at 1000 frames.
-    videos = cfg.get("eval_videos", 2) if i == 0 else 0
+    videos = cfg["eval_videos"] if i == 0 else 0
     runs = policy.evaluate(eval_env, runs=cfg["eval_runs"],
                            videos=videos, render_env=render_env)
     reward = float(np.mean([np.sum(r["rewards"]) for r in runs]))
@@ -162,6 +165,62 @@ def evaluate(run: Run, envs, log, ckpt_dir, best):
 # ----------------------------------------------------------------------
 
 
+def wandb_config(run: Run) -> dict:
+  """Everything that determines this run, flattened for the wandb config panel.
+
+  Assembled from the resolved config rather than from any YAML layer, so what the
+  panel shows *is* what ran: `model/*` carries every component kwarg including the
+  ones that used to sit at a Python default, and `run/*` every run key -- there is
+  no `cfg.get(key, default)` left anywhere for a value to hide behind. `snapshot`
+  is the same thing nested, kept so a finished run can be replayed exactly."""
+  cfg = run.cfg
+  snapshot = cfg.get("snapshot") or model_config.snapshot_for(run.model_name)
+  resolved = snapshot["resolved"]
+
+  env_stats = {}
+  for key, value in run.env_stats.static().items():
+    env_stats[key] = value.tolist() if isinstance(value, np.ndarray) else value
+
+  config = {f"run/{k}": v for k, v in cfg.items() if k not in ("snapshot", "model_overrides")}
+  config.update({f"model/{k}": v for k, v in resolved.items()})
+  config.update({f"model/derived.{k}": v for k, v in run.reference.derived_config().items()})
+  config.update({f"env/{k}": v for k, v in env_stats.items()})
+  config.update({
+    "model": run.model_name, "env": run.env_name, "backend": "jax",
+    "num_seeds": run.num_seeds, "base_seed": run.base_seed,
+    "env/obs_space": str(run.env.observation_space),
+    "env/act_space": str(run.env.action_space),
+    "env/async_vector_env": run.environment.use_async_vector_env,
+    "meta/git_sha": _git_sha(), "meta/config_hash": _config_hash(resolved, cfg),
+    "snapshot": snapshot,
+  })
+  return config
+
+
+def _git_sha() -> str:
+  """The commit a run was launched from, plus a `-dirty` marker -- the other half
+  of reproducibility that the config itself cannot carry."""
+  try:
+    sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True,
+                         text=True, timeout=5, cwd=os.path.dirname(__file__))
+    dirty = subprocess.run(["git", "status", "--porcelain"], capture_output=True,
+                           text=True, timeout=5, cwd=os.path.dirname(__file__))
+    if sha.returncode:
+      return "unknown"
+    return sha.stdout.strip() + ("-dirty" if dirty.stdout.strip() else "")
+  except Exception:
+    return "unknown"
+
+
+def _config_hash(resolved: dict, cfg: dict) -> str:
+  """Stable digest of everything that defines this run except the seed, so
+  "same config, different seed" is one group in wandb."""
+  payload = {**{f"model.{k}": v for k, v in resolved.items()},
+             **{f"run.{k}": v for k, v in cfg.items()
+                if k not in ("seed", "num_seeds", "run_dir", "sweep_tag", "snapshot", "checkpoint")}}
+  return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:12]
+
+
 def train(run: Run):
   cfg, num_seeds = run.cfg, run.num_seeds
   now  = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -169,7 +228,7 @@ def train(run: Run):
   if num_seeds > 1:
     name += f"_x{num_seeds}"
 
-  n_videos  = cfg["eval_runs"] if cfg.get("eval_videos") is None else min(cfg["eval_videos"], cfg["eval_runs"])
+  n_videos  = cfg["eval_runs"] if cfg["eval_videos"] is None else min(cfg["eval_videos"], cfg["eval_runs"])
   
   needs_unrendered = cfg["eval_runs"] > n_videos or num_seeds > 1
   eval_envs = (run.environment.get_vector_env(cfg["eval_runs"]) if needs_unrendered else None,
@@ -178,18 +237,13 @@ def train(run: Run):
   tags = [run.model_name, run.env_name, "online", "jax"]
   if num_seeds > 1:
     tags.append("multiseed")
-  if cfg.get("sweep_tag"):
+  if cfg["sweep_tag"]:
     tags.append(cfg["sweep_tag"])
 
   log = Logger(
     "BA-RL", run_name=name, step_keys={"env_steps", "grad_steps"}, tags=tags,
-    config={**cfg, "backend": "jax", "num_seeds": num_seeds, "base_seed": run.base_seed,
-            "resolved_model": cfg.get("models") or model_config.snapshot_for(run.model_name),
-            **{f"resolved/{k}": v for k, v in model_config.resolved_flat(run.model_name).items()},
-            **{f"env_stats/{k}": v for k, v in run.env_stats.static().items()
-               if not isinstance(v, np.ndarray)},
-            "env_obs": str(run.env.observation_space), "env_act": str(run.env.action_space)},
-    group=name, seeds=[run.base_seed + i for i in range(num_seeds)]
+    config=wandb_config(run), group=name,
+    seeds=[run.base_seed + i for i in range(num_seeds)]
   )
 
   log.register("eval/*", "env_steps")
@@ -202,7 +256,7 @@ def train(run: Run):
   # weights belong next to the config and log that produced them. A standalone
   # run has no such directory, and keeps the global checkpoints/ tree keyed by
   # the same <model>/<env>/<timestamp> the wandb run is named after.
-  ckpt_dir = os.path.abspath(os.path.join(cfg["run_dir"], "checkpoints") if cfg.get("run_dir")
+  ckpt_dir = os.path.abspath(os.path.join(cfg["run_dir"], "checkpoints") if cfg["run_dir"]
                              else os.path.join("checkpoints", name))
   os.makedirs(ckpt_dir, exist_ok=True)
   log.message(f"Checkpoints: {ckpt_dir}")
@@ -213,7 +267,7 @@ def train(run: Run):
 
   steps_per_iter = cfg["rollout_steps"] // run.num_envs
 
-  if cfg.get("random_steps", 0) > 0:
+  if cfg["random_steps"] > 0:
     run.env_stats["live"].update(
       run.buffer.random_fill(run.rollout_env, n_steps=cfg["random_steps"] // run.num_envs,
                              seed=run.base_seed))

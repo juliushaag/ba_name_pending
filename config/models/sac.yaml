@@ -1,0 +1,12 @@
+SAC:
+  training:
+    batch_size: 256
+    utd_ratio: 2.0
+
+  params:
+    entropy_scale: -1.0
+
+  components:
+    actor:   {class: StochasticActor,    size: medium}
+    critic:  {class: C51Critic,          size: medium}
+    entropy: {class: AutotuneRegulator}

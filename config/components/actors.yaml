@@ -1,0 +1,74 @@
+# Baseline kwargs per actor class. `kind: actor` makes `size:` on a slot resolve
+# against presets/sizes.yaml's actor ladder, and makes it required there -- which
+# is why no entry below sets latent_dim/layers.
+#
+# Score-based actors deliberately return a raw, unsquashed terminal state; the
+# squash is the owning Policy's decision (its own `squash` slot), not the
+# architecture's.
+
+StochasticActor:
+  kind: actor
+  extends: [net.layer_silu, optim.actor]
+  squash_cls: TanhSquash
+  log_std_min: -20.0
+  log_std_max: 2.0
+  log_prob_clip: 0.99   # tanh atanh guard in log_prob
+
+ScoreContinuousActor:
+  kind: actor
+  extends: [net.silu, optim.actor, time.sin_16]
+  max_steps: 16
+  sigma_min: 0.01
+  sigma_max: 2.0
+  tau_min: 0.0
+  tau_max: 1.0
+  bound_c: 50.0
+
+# The diffusion-policy online-RL references' sampler: a scaled *linear* ladder, a
+# shrunk prior and the predicted x0 clipped every reverse step. Distinct from
+# VPDiffusionActor below (cosine, unit prior, no clip), which SDAC's numbers
+# depend on -- these are two samplers, not two spellings of one.
+DDPMActor:
+  kind: actor
+  extends: [net.gelu, optim.actor, time.sin_20]
+  num_steps: 20
+  beta_schedule: linear
+  beta_scale: 0.3
+  cosine_s: 0.008
+  ab_start: 0.999
+  ab_end: 0.001
+  clip_denoised: true
+  prior_scale: 0.5
+
+# DDPMActor at the fixed VP-cosine settings SDAC was tuned on (Ma et al. Table 4),
+# named so config and checkpoints keep referring to them by name. The three
+# values that make it "VP" used to be hardcoded into its super() call, where no
+# run could see them.
+VPDiffusionActor:
+  kind: actor
+  extends: [net.gelu, optim.actor, time.sin_20]
+  num_steps: 16
+  beta_schedule: vp_cosine
+  beta_scale: 0.3
+  cosine_s: 0.008
+  ab_start: 0.999
+  ab_end: 0.001
+  clip_denoised: false
+  prior_scale: 1.0
+
+OUDiffusionActor:
+  kind: actor
+  extends: [net.gelu, optim.actor, time.sin_20]
+  num_steps: 16
+  beta_min: 0.12
+  beta_max: 0.18
+  beta_scale_min: 0.7
+  beta_scale_max: 1.8
+  learn_beta_scale: true
+  prior_var: 2.5
+  anchor_score: true
+  # The Euler discretization's stability bound and the total-noise floor the
+  # ladder must clear. Both used to be module constants that silently clamped
+  # beta_scale_max (policies/dime.py).
+  euler_max_step: 0.35
+  min_total_noise: 2.0

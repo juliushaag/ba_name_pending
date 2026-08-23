@@ -34,6 +34,12 @@ import yaml
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(SCRIPT_DIR, "..", "config")
 
+# barl_jax.config_tree imports nothing but yaml, so this launcher still never
+# pulls in jax/mujoco -- and the snapshot it writes is produced by the same code
+# that resolves it at run time, rather than by a copy of it that drifts.
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "src"))
+from barl_jax.config_tree import ConfigTree  # noqa: E402
+
 RESERVED_AXES = ("algo", "env", "seed")
 
 # Workers write to the same terminal, so multi-line output is emitted under this.
@@ -55,40 +61,6 @@ def detect_gpus() -> list[str]:
   if not gpus:
     raise SystemExit("--gpus auto: nvidia-smi reported no GPUs")
   return gpus
-
-
-def _resolve_model_snapshot(model_name: str, overrides: dict | None = None) -> dict:
-  """Self-contained mirror of barl_jax.model_config.snapshot_for() -- duplicated
-  (not imported) so this lightweight subprocess-launcher script never has to
-  import the `barl_jax` package (and therefore jax/mujoco) just to read a YAML
-  file. Embedded into each run's per-run YAML under `models:` so the run
-  stays exactly recreatable even if config/models.yaml or
-  config/components.yaml changes later."""
-  with open(os.path.join(CONFIG_DIR, "models.yaml")) as f:
-    models = yaml.safe_load(f) or {}
-  with open(os.path.join(CONFIG_DIR, "components.yaml")) as f:
-    components = yaml.safe_load(f) or {}
-
-  out: dict = {}
-  alias = models.get("aliases", {}).get(model_name)
-  policy_name = alias["policy"] if alias else model_name
-  if alias:
-    out["aliases"] = {model_name: alias}
-  if policy_name in models:
-    out[policy_name] = models[policy_name]
-
-  # Baselines for exactly the component classes this run uses -- the ones this
-  # policy's slots name, plus any an override swaps in. Without them the
-  # snapshot would resolve against whatever components.yaml says at replay
-  # time (see model_config.COMPONENT_DEFAULTS_KEY).
-  named = [slot.get("class")
-           for slot in (models.get(policy_name) or {}).get("components", {}).values()]
-  named += [v for k, v in (overrides or {}).items() if k.endswith(".class")]
-  used = {cls_name: components[cls_name] for cls_name in named if cls_name in components}
-  if used:
-    out["component_defaults"] = used
-
-  return out
 
 
 def build_axes(kwargs) -> tuple[str | None, dict, list[dict]]:
@@ -193,7 +165,7 @@ def write_manifest(sweep_dir: str, path_args: dict, tags: list[str], combos: lis
     yaml.safe_dump(manifest, f, sort_keys=False)
 
 
-def run_one(script: str, combo: dict, tag: str, defaults: dict, env_defaults: dict, sweep_dir: str,
+def run_one(script: str, combo: dict, tag: str, defaults: dict, sweep_dir: str,
             num_seeds: int, gpu_id: str | None = None, stream: bool = False,
             progress: str = "") -> int:
   model, env = combo["algo"], combo["env"]
@@ -215,10 +187,11 @@ def run_one(script: str, combo: dict, tag: str, defaults: dict, env_defaults: di
   os.makedirs(run_dir, exist_ok=True)
   run_entry["run_dir"] = run_dir
 
+  # The snapshot is fully resolved *under this combo's overrides*, so replaying
+  # this config re-runs no layering and cannot drift with config/.
+  snapshot = ConfigTree(CONFIG_DIR, overrides=overrides).snapshot_for(model)
   run_config = {"defaults": defaults, "runs": [run_entry],
-                "models": _resolve_model_snapshot(model, overrides)}
-  if env_defaults:
-    run_config["env_defaults"] = env_defaults
+                "snapshot": snapshot}
 
   run_config_path = os.path.join(run_dir, "config.yaml")
   with open(run_config_path, "w") as f:
@@ -286,8 +259,11 @@ if __name__ == "__main__":
                      choices=["online_learning"],
                      help="Which training script to launch each run with")
   args.add_argument("--config", default=None,
-                     help="Base config providing `defaults:`/`env_defaults:` for every run "
-                          "(default: --grid's `base:`, else config/<script>.yaml)")
+                     help="Base experiment config providing `defaults:` for every run "
+                          "(default: --grid's `base:`, else config/experiments/<script>.yaml). "
+                          "Run keys themselves are declared in config/run/defaults.yaml and "
+                          "per-env overrides in config/run/envs.yaml; this only carries what is "
+                          "specific to these runs.")
   args.add_argument("--sweep_tag", default=None, help="Sweep tag")
   args.add_argument("--sweep_dir", default=None,
                      help="Where to write this sweep's per-run directories "
@@ -319,11 +295,10 @@ if __name__ == "__main__":
     raise SystemExit("grid is empty -- every combination was excluded")
   tags = name_combos(combos, axes, kwargs.seeds)
 
-  base_config_path = kwargs.config or grid_base or os.path.join(CONFIG_DIR, f"{kwargs.script}.yaml")
+  base_config_path = kwargs.config or grid_base or os.path.join(CONFIG_DIR, "experiments", f"{kwargs.script}.yaml")
   with open(base_config_path) as f:
     base_config = yaml.safe_load(f) or {}
   defaults = base_config.get("defaults", {})
-  env_defaults = base_config.get("env_defaults") or {}
 
   if kwargs.validate:
     defaults = {**defaults, "validate": True}
@@ -381,7 +356,7 @@ if __name__ == "__main__":
         i, combo, tag = pending.get_nowait()
       except queue.Empty:
         return
-      results[i] = run_one(kwargs.script, combo, tag, defaults, env_defaults, sweep_dir,
+      results[i] = run_one(kwargs.script, combo, tag, defaults, sweep_dir,
                            num_seeds=kwargs.seeds, gpu_id=gpu_id, stream=kwargs.validate,
                            progress=f"{i + 1}/{len(combos)}")
 

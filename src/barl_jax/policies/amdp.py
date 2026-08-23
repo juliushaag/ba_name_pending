@@ -44,6 +44,7 @@ class AMDP(Policy):
     self.entropy_scale          = params["entropy_scale"]
     self.q_score_max_norm       = params["q_score_max_norm"]
     self.q_score_max_percentile = params["q_score_max_percentile"]
+    self.policy_delay           = params["policy_delay"]
 
     self.critic: QCriticBase = self.build_component("critic", QCriticBase)
     self.actor: ScoreContinuousActor = self.build_component("actor", ScoreContinuousActor)
@@ -55,6 +56,13 @@ class AMDP(Policy):
     # log-Jacobian is chosen to cancel out of the score regression below.
     self.squash = self.build_component("squash", Squash,
                                        erf_k=(2 * self.actor.terminal_var) ** -0.5)
+
+
+  def optimizer_cadence(self) -> dict:
+    """dime_am's `policy_delay`: the critic steps every gradient step, the actor
+    and the entropy dual only every `policy_delay`-th -- both gated by the same
+    branch there, so both are gated by the same key here."""
+    return {"actor": self.policy_delay, "entropy_alpha": self.policy_delay}
 
   def train_step(self, batch):
     obs      = batch["obs"]
