@@ -1,7 +1,7 @@
 # Named capacity ladders -- the one knob a size comparison varies.
 #
 #   components: {critic: {class: C51Critic, size: large}}
-#   scripts/run_sweep.py ... --set model.components.critic.size=small
+#   scripts/submit.py ... --set model.components.critic.size=small
 #
 # Every slot whose component declares a `kind:` listed here must name a `size:`,
 # and nothing else may set the keys these tables own (scripts/lint_config.py

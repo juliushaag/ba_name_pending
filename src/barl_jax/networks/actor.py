@@ -217,7 +217,21 @@ class ScoreContinuousActor(Actor):
     return {"actor": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}
 
 
-class DiscreteDiffusionActorBase(Actor, ABC):
+class PathEntropyActor(Actor, ABC):
+  """An actor whose sampling *path* carries its own entropy estimate.
+
+  `generate(obs) -> (raw terminal state, aux)`, where `aux` is (B, 1) and is the
+  policy entropy up to the squash's log-det, which the owning Policy adds. That
+  is the whole of what DIME needs from its actor slot, and it is deliberately
+  narrower than "a diffusion actor": the DDPM-style denoisers here and the DIS
+  sampler compute it in completely different ways and are both valid there."""
+
+  @abstractmethod
+  def generate(self, obs, key=None):
+    ...
+
+
+class DiscreteDiffusionActorBase(PathEntropyActor, ABC):
   """Shared skeleton for fixed-step (DDPM-style) diffusion actors.
 
   Subclasses supply the noise process -- its marginal coefficients, how a raw
@@ -493,3 +507,153 @@ class VPDiffusionActor(DDPMActor):
     # clip_denoised: false, prior_scale: 1.0), not a hardcoded super() call --
     # so a run's config shows the sampler it actually used.
     super().__init__(env_stats, **kwargs)
+
+
+def _inv_softplus(x: float) -> float:
+  """dime_am's `inverse_softplus`, so a raw parameter initialized with this
+  passes through softplus back to the value the config states."""
+  return float(x) if x > 20.0 else float(math.log(math.expm1(x)))
+
+
+@register_component
+class DISActor(PathEntropyActor):
+  """The time-reversed diffusion sampler (DIS) DIME actually uses --
+  `dime_am/diffusion/od/dis.py` plus `od_integrators.py`.
+
+  Not a denoiser, and not a reparameterization of one. The chain starts at a
+  sample from a **fixed** Gaussian prior and is integrated *forward* under a
+  learned control, accumulating the log-ratio between the controlled forward
+  kernel and an uncontrolled backward kernel. That log-ratio is the path's KL,
+  which is what DIME's entropy term is -- so here the entropy falls out of the
+  integration rather than being read off a closed-form density, and the step
+  size and diffusion coefficient are themselves learned.
+
+  One Euler-Maruyama step at index i, with `f` the control net:
+
+      dt    = softplus(dt_raw) * cosine_schedule(i)
+      s2    = 1 / softplus(friction_raw)          # per action dim
+      eta   = dt * s2 ;  scale = sqrt(2 * eta)
+      drift = grad log p_prior(x) = -x / prior_std^2
+      x'    ~ N(x + eta * (drift + f(i, x, obs)), scale^2)
+      log_w += log N(x | x' + eta * grad log p_prior(x'), scale)
+             - log N(x' | x  + eta * (drift + f), scale)
+
+  Raw, unsquashed output: the owning Policy applies the tanh. `aux` therefore
+  stops one term short of the reference's `running_cost - terminal_cost`, since
+  DIME adds the tanh log-det itself (`_squash_correction`) -- add it here too
+  and it would be counted twice."""
+
+  def __init__(self, env_stats, *, latent_dim: int, layers: int, num_steps: int,
+               prior_std: float, dt_init: float, dt_min: float, dt_s: float, dt_pow: float,
+               friction_init: float, per_dim_friction: bool,
+               learn_dt: bool, learn_friction: bool, out_clip: float,
+               time_dim: int, time_embed: str, time_kwargs: dict,
+               lr: float, adam_b1: float, grad_clip: float, grad_clip_mode: str,
+               activation: str, norm: str,
+               norm_input: bool, norm_stem: bool, norm_after_act: bool,
+               dropout: float, final_activation: bool,
+               residual: bool, norm_kwargs: dict, dtype: str,
+               rngs: nnx.Rngs, **kwargs):
+    super().__init__(env_stats, **kwargs)
+
+    self.num_steps = int(num_steps)
+    self.time_dim  = int(time_dim)
+    self.prior_std = float(prior_std)
+    self.out_clip  = float(out_clip)
+    self.lr        = float(lr)
+    self.adam_b1   = float(adam_b1)
+    self.grad_clip, self.grad_clip_mode = float(grad_clip), str(grad_clip_mode)
+
+    # Both are stored through softplus, the reference's parameterization, so the
+    # positivity a step size and a friction need is structural rather than a
+    # clamp. `learn_*` picks Param vs Buffer -- the reference spells the same
+    # choice as a stop_gradient on the read.
+    hold = (lambda v: nnx.Param(v)) if learn_dt else (lambda v: Buffer(v))
+    self.dt_raw = hold(jnp.full((1,), _inv_softplus(dt_init), jnp.float32))
+    hold = (lambda v: nnx.Param(v)) if learn_friction else (lambda v: Buffer(v))
+    friction_shape = (self.action_dim,) if per_dim_friction else (1,)
+    self.friction_raw = hold(jnp.full(friction_shape, _inv_softplus(friction_init), jnp.float32))
+
+    # dime_am's `get_cosine_schedule`, tabulated once: `per_step_dt` is False
+    # there, so the learned dt is a single scalar the schedule shapes.
+    i = jnp.arange(self.num_steps, dtype=jnp.float32)
+    t = (self.num_steps - i) / self.num_steps
+    offset = 1.0 + dt_s
+    self.dt_scale = Buffer((1.0 - dt_min) * jnp.cos(0.5 * jnp.pi * (offset - t) / offset) ** dt_pow + dt_min)
+
+    self.time_emb = TimeEmbedding(self.time_dim, kind=time_embed, rngs=rngs, **time_kwargs)
+    self.control  = MLP(self.obs_dim + self.action_dim + self.time_dim, self.action_dim,
+                        latent_dim, layers, activation=activation, norm=norm,
+                        norm_input=norm_input, norm_stem=norm_stem,
+                        norm_after_act=norm_after_act, dropout=dropout,
+                        final_activation=final_activation, residual=residual,
+                        dtype=dtype, rngs=rngs, **norm_kwargs)
+
+    # PISGRADNet initializes this head at a constant 1e-8 -- an uncontrolled
+    # chain at step 0, so the sampler starts as the prior it is anchored to.
+    self.control.head.kernel[...] = jnp.zeros_like(self.control.head.kernel[...])
+    self.control.head.bias[...]   = jnp.zeros_like(self.control.head.bias[...])
+
+    self.rngs = rngs
+
+  # ---- the process ---------------------------------------------------------
+
+  def step_coef(self, i: int):
+    """(eta, scale) at step `i`; both broadcast over the action dimension."""
+    dt    = jax.nn.softplus(self.dt_raw[...]) * self.dt_scale[...][i]
+    eta   = dt / jax.nn.softplus(self.friction_raw[...])
+    return eta, jnp.sqrt(2.0 * eta)
+
+  def prior_score(self, x):
+    """grad_x log N(x; 0, prior_std^2 I), the reference's uncontrolled drift."""
+    return -x / self.prior_std**2
+
+  def prior_log_prob(self, x):
+    return (-0.5 * (x / self.prior_std) ** 2
+            - math.log(self.prior_std) - _LOG_SQRT_2PI).sum(axis=-1, keepdims=True)
+
+  @staticmethod
+  def _log_kernel(x, mean, scale):
+    return (-0.5 * ((x - mean) / scale) ** 2
+            - jnp.log(scale) - _LOG_SQRT_2PI).sum(axis=-1, keepdims=True)
+
+  def control_at(self, obs, x, i: int):
+    t = jnp.full((x.shape[0], 1), float(i), jnp.float32)
+    u = self.control(obs, x, self.time_emb(t)).astype(jnp.float32)
+    return jnp.clip(u, -self.out_clip, self.out_clip)
+
+  def generate(self, obs, key=None):
+    """-> (raw terminal state, `log_ratio - log p_prior(x_0)`) with aux (B, 1).
+
+    The integration is float32 whatever the control net's compute dtype: the
+    log-ratio is a sum of 16 differences of large, nearly-equal log-densities,
+    which is exactly the accumulation bfloat16 cannot carry."""
+    key = self.rngs.noise() if key is None else key
+    key, prior_key = jax.random.split(key)
+
+    x = self.prior_std * jax.random.normal(prior_key, (obs.shape[0], self.action_dim), jnp.float32)
+    aux = -self.prior_log_prob(x)
+    keys = jax.random.split(key, self.num_steps)
+
+    for i in range(self.num_steps):
+      eta, scale = self.step_coef(i)
+      fwd_mean = x + eta * (self.prior_score(x) + self.control_at(obs, x, i))
+      x_new    = fwd_mean + scale * jax.random.normal(keys[i], x.shape, jnp.float32)
+      # The backward kernel carries no control -- `backward_model` returns zeros
+      # there -- so this is the prior's own drift and nothing else.
+      bwd_mean = x_new + eta * self.prior_score(x_new)
+      aux = aux + self._log_kernel(x, bwd_mean, scale) - self._log_kernel(x_new, fwd_mean, scale)
+      x = x_new
+
+    return x, aux
+
+  def sample(self, s, key=None, critic: Critic = None):
+    return self.generate(s, key=key)[0]
+
+  def create_optimizer(self) -> dict:
+    return {"actor": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}
+
+  def derived(self) -> dict:
+    return {"dt_0": float(jax.nn.softplus(self.dt_raw[...])[0] * self.dt_scale[...][0]),
+            "dt_last": float(jax.nn.softplus(self.dt_raw[...])[0] * self.dt_scale[...][-1]),
+            "prior_var": self.prior_std**2}

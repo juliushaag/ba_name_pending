@@ -39,12 +39,12 @@ def load_config(path: str, root=CONFIG_DIR) -> list[dict]:
   *algorithm* (batch_size, utd_ratio, rollout_steps -- config_tree.TRAINING_KEYS)
   live next to that policy instead of being restated per run. It sits above this
   file's `defaults:` so a model that declares one gets it, and below the env/run
-  levels so an explicit statement -- including any scripts/run_sweep.py `run.`
+  levels so an explicit statement -- including any scripts/submit.py `run.`
   axis, which writes into the run entry -- still wins.
 
   `model_overrides:` is the one key merged key-wise across the levels instead of
   replaced wholesale, since a per-env and a per-run override normally mean to
-  stack. A top-level `snapshot:` key (see scripts/run_sweep.py) rides along on
+  stack. A top-level `snapshot:` key (see scripts/grid.py) rides along on
   every resolved run and is applied by model_config.set_snapshot()."""
   with open(path) as f:
     raw = yaml.safe_load(f) or {}

@@ -252,7 +252,7 @@ def train(run: Run):
   for ns in [*run.reference.components, run.reference.algo_name(), "batch", "buffer"]:
     log.register(f"{ns}/*", "grad_steps")
 
-  # A sweep hands every run its own directory (scripts/run_sweep.py) and its
+  # A sweep hands every run its own directory (scripts/grid.py) and its
   # weights belong next to the config and log that produced them. A standalone
   # run has no such directory, and keeps the global checkpoints/ tree keyed by
   # the same <model>/<env>/<timestamp> the wandb run is named after.

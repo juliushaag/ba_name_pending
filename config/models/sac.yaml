@@ -8,5 +8,5 @@ SAC:
 
   components:
     actor:   {class: StochasticActor,    size: medium}
-    critic:  {class: C51Critic,          size: medium}
+    critic:  {class: C51Critic,          size: xlarge}
     entropy: {class: AutotuneRegulator}

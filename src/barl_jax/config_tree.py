@@ -2,7 +2,7 @@
 config/ becomes a kwarg.
 
 Deliberately dependency-free: this module imports `os`/`pathlib`/`yaml` and
-nothing else, so scripts/run_sweep.py can resolve and snapshot a model config
+nothing else, so scripts/submit.py can resolve and snapshot a model config
 without importing barl_jax (and therefore jax/mujoco). model_config.py wraps it
 with the parts that do need the component registry -- class lookup, __init__
 signature checks, the no-defaults lint.

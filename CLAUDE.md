@@ -36,36 +36,51 @@ itself is installed editable from `src/barl_jax`.
 uv sync                                     # install/sync the environment
 ```
 
-Train one or more algorithm/env combinations in series (defined by a YAML config, see
-`config/experiments/online_learning.yaml`):
+**`scripts/submit.py` is the entry point for running anything** -- one run or a thousand, on a
+workstation or on the cluster. It expands the sweep, writes each run's self-contained config, and
+hands the list to an executor:
 
 ```bash
-uv run python scripts/online_learning.py                        # config/experiments/online_learning.yaml
-uv run python scripts/online_learning.py --config path/to/other.yaml
+uv run python scripts/submit.py --algos SAC NCLQL --envs HalfCheetah CheetahRun --seeds 3
+uv run python scripts/submit.py --algos NCLQL --envs WalkerRun --debug        # 30-min smoke test
+uv run python scripts/submit.py --algos SAC --envs HalfCheetah --executor local --validate
 ```
 
-Launch a grid of `{algo x env}` runs as separate OS processes (each with its own CUDA context),
-one sequential worker per GPU, one directory per run under `sweeps/<timestamp>/`:
+`--executor auto` (the default) picks **slurm** where `sbatch` is on PATH, **tmux** where only tmux
+is, and **local** otherwise, so the same command works everywhere. `local` runs the sweep in this
+terminal -- one worker per GPU, each pinning its subprocess with `CUDA_VISIBLE_DEVICES` and taking
+the next run only once its own finishes, so a run never shares a GPU -- and is the only one that
+blocks. `--max-parallel` is the runs in flight (Slurm's `--array %N`); setting it above the GPU
+count is how you deliberately oversubscribe a device. `--seeds N` is *not* a process axis: those N
+seeds are vmapped inside a single run, and the default comes from `config/run/defaults.yaml`'s
+`num_seeds` -- the one place the seed count is declared.
+
+The grid is a cross product over named axes: `algo`/`env`/`seed`, plus **any** `model.<dotted path>`
+axis (anything under `config/models/` or `config/components/`, `.class` and `.size` included) and
+any `run.<key>` axis. Declare them inline or in a `--grid` spec file
+(`config/experiments/sweep_grid.yaml` is a documented example, with an `exclude:` list for pruning);
+`--dry-run` prints the expansion instead of running it. Because the axes are just overrides, **no
+config file is ever edited to run a sweep**, and because the grid is expanded *before* submission,
+a model axis reaches the cluster exactly as it reaches this machine:
 
 ```bash
-uv run python scripts/run_sweep.py --algos SAC NCLQL --envs HalfCheetah CheetahRun --seeds 3
-```
-
-Every GPU `nvidia-smi` reports gets one worker, which pins its subprocess to that GPU with
-`CUDA_VISIBLE_DEVICES` and only takes the next combo once its own finishes — so a run never shares
-a GPU. `--seeds N` is *not* a process axis: those N seeds are vmapped inside a single run.
-`--sweep_dir` relocates the output tree (the Slurm jobs point it at node-local scratch).
-
-Anything under `config/models/` or `config/components/` is sweepable as a `model.<dotted path>` axis
-(including `.class` and `.size`), and anything in the
-run config as a `run.<key>` axis, either inline or via a `--grid` spec file (see
-`config/experiments/sweep_grid.yaml`); `--dry_run` prints the expansion instead of launching it:
-
-```bash
-uv run python scripts/run_sweep.py --algos AMDP --envs HalfCheetah --seeds 3 \
+uv run python scripts/submit.py --algos AMDP --envs HalfCheetah --seeds 3 \
     --set model.components.critic.size=large --set run.utd_ratio=0.5
-uv run python scripts/run_sweep.py --grid config/experiments/sweep_grid.yaml --dry_run
+uv run python scripts/submit.py --grid config/experiments/sweep_grid.yaml --dry-run
 ```
+
+Every submission leaves one `sweeps/<timestamp>/` folder, the same shape whichever backend produced
+it: `experiments.csv` (the manifest, one row per run), `sweep.yaml` (what the grid was, one entry
+per run), and one directory per run holding its `config.yaml`, its log and its `checkpoints/`.
+
+`scripts/online_learning.py` is what an executor invokes per task -- it takes one config and runs
+it. It is not the entry point, but it stays the way to re-run a single finished run from the config
+it left behind:
+
+```bash
+uv run python scripts/online_learning.py --config sweeps/<ts>/<tag>/config.yaml
+```
+
 
 To see what a `model:` string actually resolves to, with every value attributed to the layer that
 set it:
@@ -85,13 +100,14 @@ uv run python scripts/lint_config.py
 
 There is a pytest suite (`uv run pytest tests/ -q`, ~400 tests in about ten seconds; every
 registered component is built from its real `config/components/` entry, and `tests/test_config_tree.py`
-holds the tree's guarantees). The complement to it is `--validate`: a cheap smoke
-test that runs one rollout chunk + one `train_step` + one optimizer step per `{algo, env}`
-combination (no eval/checkpointing/wandb logging), to catch shape/dtype/algo-env mismatches
-before committing to a full run:
+holds the tree's guarantees). The complement to it is `--validate`: a cheap smoke test that runs one
+rollout chunk + one `train_step` + one optimizer step per `{algo, env}` combination (no
+eval/checkpointing/wandb logging), to catch shape/dtype/algo-env mismatches before committing to a
+full run. It collapses every axis but algo/env to its first value and streams each run's output:
 
 ```bash
-uv run python scripts/run_sweep.py --algos SAC NCLQL --envs HalfCheetah CheetahRun --validate
+uv run python scripts/submit.py --algos SAC NCLQL --envs HalfCheetah CheetahRun \
+    --executor local --validate
 ```
 
 Launch an `{algo x env}` matrix through the one interface that works in both places — a Slurm job
@@ -298,9 +314,10 @@ uv run python scripts/lint_config.py                # the whole-tree gate
 ```
 
 **`src/barl_jax/config_tree.py` is the only resolver**, and it imports nothing but `yaml` --
-which is what lets `scripts/run_sweep.py` use it directly instead of carrying the hand-maintained
-copy of `snapshot_for()` it used to. `model_config.py` is a thin registry-aware facade over it
-(class lookup, `__init__` signature checks, the no-defaults lint) plus a process-wide default tree.
+which is what lets `scripts/submit.py` and `scripts/grid.py` resolve and snapshot a model config on
+a login node without pulling in jax — and what removed the hand-maintained copy of `snapshot_for()`
+the launcher used to carry. `model_config.py` is a thin registry-aware facade over it (class lookup,
+`__init__` signature checks, the no-defaults lint) plus a process-wide default tree.
 
 **A run's snapshot is fully resolved.** `ConfigTree.snapshot_for()` returns the complete flat
 resolved config under `resolved:`, and a tree constructed with that snapshot *serves those values
@@ -408,100 +425,91 @@ key `config/run/defaults.yaml` does not declare is an error, not a silent no-op.
 `model_overrides:` is the one key merged key-wise across the levels rather than replaced
 wholesale, since a per-env and a per-run override normally mean to stack.
 
-`scripts/run_sweep.py` instead fans a grid out across **separate processes** (own interpreter, own
-CUDA context each), writing one throwaway per-run YAML (this file's `defaults:` + a single-entry
-`runs:` + the fully resolved `snapshot:`) per subprocess so it can reuse the exact same
-script/config-loading path. The
-grid is a cross product over named axes — `algo`/`env`/`seed`, plus any number of
-`model.<dotted path>` axes (written into that run's `model_overrides:`) and `run.<key>` axes
-(written into its run entry) — declared either on the CLI or in a `--grid` spec file
-(`config/experiments/sweep_grid.yaml` is a documented example), with an `exclude:` list for pruning
-combinations out of the full product. `--dry_run` prints the expansion without launching anything.
-Because the axes are just overrides, **no config file is ever edited to run a sweep**.
+### Launching: one CLI, three executors
 
-Combos go onto one shared queue (algo-major) and are drained by one worker thread per `--gpus`
-entry; a worker sets `CUDA_VISIBLE_DEVICES` to its own GPU, blocks on the subprocess, then takes
-the next combo — so parallelism is exactly "one run per GPU at a time", never two on one device.
-Terminal output from concurrent workers is `gpu<id>|<tag>`-prefixed and emitted under a lock, and
-each run still gets its own directory, `sweeps/<timestamp>/<tag>/`, holding the `config.yaml` it
-ran with, its `run.log`, and its `checkpoints/` (the run entry's `run_dir` key is what points the
-trainer there — a run launched outside a sweep has no `run_dir` and keeps the global
-`checkpoints/<model>/<env>/<timestamp>/` tree). `sweeps/<timestamp>/sweep.yaml` indexes them:
-the axes, the resolved command, and one entry per run with its tag, directory and — rewritten once
-the grid finishes — its exit code. `--sweep_dir` relocates that whole tree, which is how the Slurm
-jobs put it on node-local scratch and copy it back (see below).
+`scripts/submit.py` is the only entry point, and it is only a CLI. The pipeline is three stages
+with one direction of travel:
 
-### Execution backends (`scripts/submit.py`)
+```
+submit.py          expand the grid → write every run's config → hand the list over
+  grid.py          axes / combos / exclude / naming / materialization  (pure, executes nothing)
+  executors.py     LocalExecutor | SlurmExecutor | TmuxExecutor
+       └─ per task: online_learning.py --config sweeps/<ts>/<tag>/config.yaml
+```
 
-`scripts/submit.py` is the one interface for launching an `{algo x env}` matrix, on the cluster and
-on a workstation alike. It is only a CLI: it builds the matrix, validates it (`check_config`),
-and hands it to an `Executor`. `--executor auto` (the default) picks **slurm** when `sbatch` is on
-PATH and **tmux** otherwise; `--executor slurm|tmux` forces either.
+**The grid is fully expanded before anything is submitted.** That is the load-bearing decision:
+after `grid.materialize()`, a run *is* a path to a self-contained config, so an executor's whole job
+is "run these N commands, at most M at a time". None of the three — nor `run_rl.slurm`, nor
+`tmux_pool.py`, nor the manifest format — knows what an algorithm, an environment or an axis is,
+which is why an arbitrary `model.*` axis reaches the cluster without any of them learning anything.
+The manifest (`experiments.csv`) is four columns, `index,run_id,tag,config`, and only the last is
+load-bearing.
 
-`scripts/executors.py` holds both backends behind one interface — `available()`,
-`default_parallelism`, `describe_debug()`, and `submit()`, which returns the lines `submit.py`
-prints, so a backend reports whatever is worth knowing about itself (a job id, a session to attach
-to) without the CLI knowing which is which. Each owns the whole of its own mechanism, because the
-parts that differ do not usefully generalise: Slurm's run id only exists once `sbatch` has accepted
-the job, so it submits held, writes the manifest, then releases; tmux has no scheduler to ask, so
-the sweep's name *is* the id and the manifest is written first. What they share lives in that
-module too — the `sweeps/<timestamp>/` layout and `write_manifest()`, which `tmux_pool.py` also
-reads its queue from. Both backends leave the same sweep folder behind.
+Each run's `config.yaml` carries a fully resolved `snapshot:` taken *under that run's own
+overrides*, so a run replays exactly regardless of what `config/` says later (see the snapshot
+section above).
 
-| | slurm | tmux |
-|---|---|---|
-| a task is | an array task (`run_rl.slurm`) | a window (`scripts/tmux_pool.py` opens it) |
-| the queue is | `--array=0-N%M` | the manager's GPU pool, `--max-parallel` slots |
-| default parallelism | 4 | one run per detected GPU |
-| scratch is | node-local `$TMPDIR` | `sweeps/<name>/.tasks/<k>/` |
-| results get there by | `cp` in the exit trap | `Path.replace` as each task finishes |
-| cancel with | `scancel <id>` | `tmux kill-session -t barl-<name>` |
-| status from | `sacct` | `sweeps/<name>/tasks.yaml`, and the live table |
-| the run id is | the array job id | the sweep's own timestamp |
+| | local | slurm | tmux |
+|---|---|---|---|
+| a task is | a subprocess | an array task (`run_rl.slurm`) | a window (`tmux_pool.py` opens it) |
+| the queue is | one worker thread per GPU | `--array=0-N%M` | the manager's GPU pool |
+| default parallelism | one per detected GPU | 4 | one per detected GPU |
+| scratch is | none — writes in place | node-local `$TMPDIR` | none — writes in place |
+| results get there by | already there | `cp` in the exit trap | already there |
+| blocks until done | yes | no | no |
+| cancel with | ctrl-C | `scancel <id>` | `tmux kill-session -t barl-<name>` |
+| status from | the terminal, then `sweep.yaml` | `sacct` | `sweeps/<name>/tasks.yaml`, and the live table |
+| the run id is | the sweep's timestamp | the array job id | the sweep's timestamp |
 
-**Slurm** (`SlurmExecutor`). It submits the matrix as one job array. Every task of one submission
-shares the array job id as its **run id**: the manifest's `run_id` column, the `--sweep_tag` every
-run carries into wandb, and the name of the folder they all write into. The id only exists once
-`sbatch` has accepted the job, so `submit.py` submits `--hold`, writes the manifest, then releases
-— held tasks cannot start before the file they read exists. Before any of that it resolves and
-validates every algorithm's model config in-process — pinned to `JAX_PLATFORMS=cpu`, since a login
-node has no GPU to spend (`--skip-check` opts out) — because a config error would otherwise fail
-every task in the array identically.
+Every submission lands in **`sweeps/<timestamp>/`**, the same shape whichever backend produced it:
+`experiments.csv`, `sweep.yaml` (the grid, one entry per run, with exit codes once a blocking
+executor finishes), and one directory per run holding its `config.yaml`, its log and its
+`checkpoints/`. `--sweep-dir` relocates the tree.
 
-A submission lands in **`sweeps/<timestamp>/`** — the same directory *and the same naming* a local
-`run_sweep.py` uses, so a cluster sweep and a local one are indistinguishable. `submit.py` picks
-that one timestamp and exports it as `SWEEP_NAME`, since every task of the array has to agree on
-which folder it copies into. It holds `experiments.csv` (the manifest, one row per array task,
-carrying the run id as a column) plus one directory per `{algo, env}`, each with its `config.yaml`,
-`run.log` and `checkpoints/`.
+**Slurm** (`SlurmExecutor`). One array task per *run* — per grid point, not per `{algo, env}` — so a
+grid that varies a model axis submits that many more tasks, each one GPU's work, queued
+independently. Every task of one submission shares the array job id as its **run id**: the
+manifest's `run_id` column, the wandb sweep tag, and the folder they all write into. The id only
+exists once `sbatch` has accepted the job, so `submit.py` submits `--hold`, writes the manifest,
+then releases — held tasks cannot start before the file they read exists. Before any of that it
+resolves and validates every algorithm's model config in-process, pinned to `JAX_PLATFORMS=cpu`
+since a login node has no GPU to spend (`--skip-check` opts out), because a config error would
+otherwise fail every task in the array identically.
 
-`run_rl.slurm` is the only Slurm job script: one array task per manifest row, self-contained (no shared
-include), and it must be submitted through `submit.py` — `SWEEP_NAME` and `SEEDS` come from that
-script's `--export`. It works on node-local scratch and copies out on *every* exit path, which is
-what makes `#SBATCH --signal=B:USR1@300` load-bearing: a walltime kill still saves whatever
-finished. Each task's own `sweep.yaml` (a one-combo grid) is filed inside the run directory it
-describes rather than colliding at the shared root, and the job's `term.out`/`term.err` are
-**moved** (not copied) in beside it — a rename keeps slurmstepd's descriptor live, so the relocated
-file still collects the footer and any cancellation notice a copy would miss.
-`SWEEPS_ROOT` overrides where `sweeps/` itself lives.
+`run_rl.slurm` is the only Slurm job script: one array task per manifest row, self-contained, and it
+must be submitted through `submit.py` — `SWEEP_NAME` comes from that script's `--export`. It reads
+its row, runs that config with `--run-dir` pointed at node-local scratch, and copies out on *every*
+exit path, which is what makes `#SBATCH --signal=B:USR1@300` load-bearing: a walltime kill still
+saves whatever finished. The run's directory under the sweep folder already exists — it is where
+`submit.py` put the config — so the copy-back merges into it. The job's `term.out`/`term.err` are
+**moved** (not copied) in beside it: a rename keeps slurmstepd's descriptor live, so the relocated
+file still collects the footer and any cancellation notice a copy would miss. `SWEEPS_ROOT`
+overrides where `sweeps/` itself lives.
 
 **tmux** (`TmuxExecutor`). It writes the manifest, then opens one detached session `barl-<timestamp>`:
 `scripts/tmux_pool.py` in window 0 owning the queue and a `rich` status table, and one window per
-run that it opens as a slot frees. Each window runs the *same command* a Slurm array task runs, so
-`run_sweep.py` is driven identically either way. Details that are load-bearing rather than
-incidental: each task gets its own scratch dir because two concurrent `run_sweep.py` processes
-sharing a `--sweep_dir` would both write `sweep.yaml` at its root; `PATH` is passed explicitly to
-the session and to every window (a window otherwise inherits the tmux *server's* environment, which
-need not have this venv's `uv`) — the tmux answer to `--export=ALL`; the exit code comes from
-`${PIPESTATUS[0]}` because it is piped through `tee`; `remain-on-exit` is set on every window and
-successes are killed explicitly, which is what leaves a failure on screen; and `tmux_pool.py` traps
-**SIGHUP** as well as SIGINT/SIGTERM, since `kill-session` hangs the pane up rather than terminating
-it — without that a cancel would strand whatever was in flight in `.tasks/`.
+run that it opens as a slot frees. Each window runs the *same command* a Slurm array task runs.
+Unlike a Slurm task there is no node-local scratch to copy back — it is the same filesystem, and
+each run writes only into its own directory, so it writes there directly. Details that are
+load-bearing rather than incidental: `PATH` is passed explicitly to the session and to every window
+(a window otherwise inherits the tmux *server's* environment, which need not have this venv's `uv`)
+— the tmux answer to `--export=ALL`; the exit code comes from `${PIPESTATUS[0]}` because it is piped
+through `tee`; `remain-on-exit` is set on every window and successes are killed explicitly, which is
+what leaves a failure on screen; `tmux_pool.py` traps **SIGHUP** as well as SIGINT/SIGTERM, since
+`kill-session` hangs the pane up rather than terminating it; and `submit.py` checks the session is
+still alive a second after opening it, because `tmux new-session` succeeds even when the manager it
+was handed dies on the spot.
 
-`submit.py --debug` runs one task at a time with a 30-minute cap (`timeout` under tmux, `--time`
-under slurm, plus the dev queue there).
-It overrides `run_rl.slurm`'s `#SBATCH` partition/time/job-name from sbatch's command line, so the
-job script stays the description of a real run.
+**local** (`LocalExecutor`). The foreground option, and the only blocking one: one worker thread per
+GPU, each pinning its subprocess with `CUDA_VISIBLE_DEVICES` and blocking on it before taking the
+next run. It is never chosen by `auto` — running a sweep in your terminal is something you ask for.
+`--validate` streams each run's output through it, label-prefixed.
+
+`submit.py --debug` runs one task at a time with a 30-minute cap (`timeout` under tmux and local,
+`--time` under slurm, plus the dev queue there). It overrides `run_rl.slurm`'s `#SBATCH`
+partition/time/job-name from sbatch's command line, so the job script stays the description of a
+real run.
+
 
 ### Registered algorithms (`src/barl/policies/`)
 

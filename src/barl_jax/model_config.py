@@ -1,7 +1,7 @@
 """Registry-aware facade over config_tree.ConfigTree.
 
 config_tree.py owns the tree and the whole precedence chain and imports nothing
-but yaml, so scripts/run_sweep.py can use it without dragging in jax. This module
+but yaml, so scripts/submit.py can use it without dragging in jax. This module
 adds the parts that need the component registry -- turning a `class:` string into
 a class, checking resolved kwargs against that class's __init__ signature, and
 the lint that keeps tunables out of Python -- plus a process-wide default tree

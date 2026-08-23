@@ -1,5 +1,5 @@
 # The run list for scripts/online_learning.py, and the base config every
-# scripts/run_sweep.py grid expands from.
+# scripts/submit.py grid expands from.
 #
 #   uv run python scripts/online_learning.py [--config path/to/this.yaml]
 #
@@ -11,12 +11,12 @@
 #     < this file's `defaults:`
 #     < the model's own `training:` block (config/models/<policy>.yaml)
 #     < config/run/envs.yaml's `defaults:` for that env
-#     < the `runs:` entry itself (and any run_sweep.py `run.` axis)
+#     < the `runs:` entry itself (and any submit.py `run.` axis)
 #
 # A run entry (or `defaults:`) may also carry `model_overrides:`, a dotted-path
 # map layered over the model config -- `{components.critic.size: large,
 # params.entropy_scale: -2.0}`. Unlike every other key those merge key-wise
-# across the levels instead of replacing wholesale. run_sweep.py's `model.*` and
+# across the levels instead of replacing wholesale. submit.py's `model.*` and
 # `run.*` grid axes write exactly these.
 
 defaults: {}

@@ -1,7 +1,7 @@
-# Example sweep spec for scripts/run_sweep.py:
+# Example sweep spec for scripts/submit.py:
 #
-#   uv run python scripts/run_sweep.py --grid config/experiments/sweep_grid.yaml --dry_run
-#   uv run python scripts/run_sweep.py --grid config/experiments/sweep_grid.yaml
+#   uv run python scripts/submit.py --grid config/experiments/sweep_grid.yaml --dry-run
+#   uv run python scripts/submit.py --grid config/experiments/sweep_grid.yaml
 #
 # Every run is one point of the cross product of `axes`, minus anything
 # `exclude` matches, launched as its own OS process. Four kinds of axis:

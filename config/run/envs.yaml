@@ -28,7 +28,7 @@
 # tests/test_env_supports.py.
 #
 # `defaults:` are ordinary run keys applied to every run on that env, in this
-# file's runs and in every scripts/run_sweep.py grid alike -- so a sweep spanning
+# file's runs and in every scripts/submit.py grid alike -- so a sweep spanning
 # envs of very different cost/horizon needs no per-env run entry just to restate
 # the same handful of keys.
 

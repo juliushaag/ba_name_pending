@@ -5,7 +5,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from barl_jax.networks.actor import DiscreteDiffusionActorBase
+from barl_jax.networks.actor import DiscreteDiffusionActorBase, PathEntropyActor
 from barl_jax.networks.critic import QCriticBase
 from barl_jax.networks.registry import register_component
 from barl_jax.networks.regulator import AutotuneRegulator
@@ -134,7 +134,7 @@ class DIME(Policy):
     self.policy_delay           = params["policy_delay"]
 
     self.critic: QCriticBase = self.build_component("critic", QCriticBase)
-    self.actor: OUDiffusionActor = self.build_component("actor", OUDiffusionActor)
+    self.actor: PathEntropyActor = self.build_component("actor", PathEntropyActor)
     self.squash: Squash = self.build_component("squash", Squash)
     self.entropy: AutotuneRegulator = self.build_component(
       "entropy", AutotuneRegulator, target=self.action_dim * self.entropy_scale)

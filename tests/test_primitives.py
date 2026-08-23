@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import optax
 import pytest
+from flax import nnx
 
 from barl_jax.networks.critic import categorical_projection
 from barl_jax.networks.optim import CLIP_MODES, adam, every_k, grad_clip_transform
@@ -100,7 +101,7 @@ def test_schedule_warmup_ramps_to_start(name):
 # ----------------------------------------------------------------------
 
 def test_regulator_dual_has_the_sign_sac_needs():
-    """d(loss)/d(log_alpha) is exactly `value - target`, so under descent alpha
+    """d(loss)/d(log_alpha) is `alpha * (value - target)`, so under descent alpha
     falls while the measured quantity sits above target and rises below it."""
     r = build("AutotuneRegulator", alpha_init=0.5, target=-1.0)
     assert float(r.value()) == pytest.approx(0.5, abs=1e-6)
@@ -112,12 +113,31 @@ def test_regulator_dual_has_the_sign_sac_needs():
     (key,) = losses
     assert key in r.create_optimizer(), "dual's loss key has no optimizer"
 
-    # loss = log_alpha * (value - target).mean(), so d/d(log_alpha) is that mean:
-    # positive while the measured quantity sits above target, which is exactly
-    # what makes gradient *descent* lower alpha there.
     gap = float((above - r.target_value).mean())
     assert gap == pytest.approx(1.0, abs=1e-6)
-    assert float(losses[key]) == pytest.approx(float(r.log_alpha[...]) * gap, abs=1e-6)
+    assert float(losses[key]) == pytest.approx(0.5 * gap, abs=1e-6)
+
+
+def test_regulator_dual_gradient_scales_with_alpha():
+    """dime_am's form: d(loss)/d(log_alpha) is `alpha * (value - target)`, not the
+    flat `value - target` a log_alpha coefficient would give. Same sign at every
+    alpha -- the magnitude is what differs, and it is what sets how far alpha
+    travels before the measured value pulls it back."""
+    gap = jnp.array([2.0])
+
+    def grad_at(alpha_init):
+        r = build("AutotuneRegulator", alpha_init=alpha_init, target=0.0)
+
+        def dual_loss(reg):
+            losses = {}
+            reg.loss(gap, losses)
+            return next(iter(losses.values()))
+
+        grads = nnx.grad(dual_loss)(r)
+        return float(grads["log_alpha"][...])
+
+    assert grad_at(1.0) == pytest.approx(2.0, rel=1e-5)
+    assert grad_at(0.01) == pytest.approx(0.02, rel=1e-5)
 
 
 # ----------------------------------------------------------------------

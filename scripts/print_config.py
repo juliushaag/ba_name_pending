@@ -45,7 +45,7 @@ if __name__ == "__main__":
                     help="Policy class names and/or config/models/ aliases (default: all of them)")
   args.add_argument("--set", action="append", metavar="PATH=VALUE",
                     help="Preview under a dotted override, exactly as a run's model_overrides: "
-                         "or a scripts/run_sweep.py `model.` axis would apply it, e.g. "
+                         "or a scripts/submit.py `model.` axis would apply it, e.g. "
                          "--set components.critic.size=large. Repeatable.")
   args.add_argument("--json", action="store_true",
                     help="Print the flat resolved config as JSON instead -- exactly what a run "

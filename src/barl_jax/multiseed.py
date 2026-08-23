@@ -14,7 +14,7 @@ What this does **not** do is vary the configuration across the axis. Everything
 stacked here shares one graphdef, and barl's tunables are Python scalars living
 in that graphdef rather than in state -- `rho` differing per seed would be a
 different graphdef, not a different array. Sweeping a hyperparameter is still
-scripts/jax/run_sweep.py's job; this axis is seeds.
+scripts/submit.py's job; this axis is seeds.
 """
 
 from functools import partial

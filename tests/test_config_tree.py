@@ -131,9 +131,13 @@ def test_a_snapshot_replays_through_an_edit_to_the_tree(tmp_path):
     backup = tmp_path / "sizes.yaml"
     shutil.copy(sizes, backup)
     try:
+        # Edit whichever rung SAC's critic actually names, so changing a slot's
+        # `size:` cannot quietly turn this into a test of nothing.
+        rung = ConfigTree().policy_cfg("SAC")["components"]["critic"]["size"]
+        line = next(ln for ln in backup.read_text().splitlines()
+                    if ln.strip().startswith(f"{rung}:") and "latent_dim" in ln)
         sizes.write_text(backup.read_text().replace(
-            "medium: {latent_dim: 512,  layers: 1, n_models: 2}",
-            "medium: {latent_dim: 99,   layers: 7, n_models: 5}"))
+            line, f"  {rung}: {{latent_dim: 99, layers: 7, n_models: 5}}"))
         assert ConfigTree().resolved("SAC")["components.critic.latent_dim"] == 99, \
             "the edit changed nothing, so this proves nothing"
         assert ConfigTree(snapshot=snapshot).resolved("SAC") == original

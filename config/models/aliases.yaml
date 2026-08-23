@@ -1,5 +1,5 @@
 # `model:` shortcuts resolving to a (policy, profile) pair. An alias is usable
-# anywhere a policy name is -- including as a scripts/run_sweep.py `--algos`
+# anywhere a policy name is -- including as a scripts/submit.py `--algos`
 # value, which a `--set` override is not. That is what it is for: a named variant
 # you want to run as its own arm of a sweep, rather than one you dial in per run.
 #
@@ -20,7 +20,7 @@
 #   aliases:
 #     sac_big: {policy: SAC, profile: big}
 #
-#   uv run python scripts/run_sweep.py --algos SAC sac_big --envs HalfCheetah
+#   uv run python scripts/submit.py --algos SAC sac_big --envs HalfCheetah
 #
 # Note that for a plain capacity comparison a `size:` axis is the simpler tool --
 # `--set model.components.critic.size=large` needs no alias at all. Reach for a

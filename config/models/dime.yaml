@@ -11,7 +11,17 @@ DIME:
     policy_delay: 3
 
   components:
-    actor:   {class: OUDiffusionActor,   size: medium}
-    critic:  {class: C51Critic,          size: medium}
+    # dime_am's score net is 3 hidden Dense(256) + head (PISGRADNet:
+    # num_hid 256, num_layers 3). barl's MLP is stem + `layers` blocks +
+    # head, so that depth is `layers: 2` -- stated inline because the size
+    # ladder is width-at-fixed-depth by design.
+    #
+    # DISActor, not OUDiffusionActor: the reference's actor is a time-reversed
+    # diffusion *sampler* with a learned step size and per-dimension friction,
+    # not a DDPM denoiser, and its entropy term is the path KL the integration
+    # accumulates. OUDiffusionActor stays registered so the two are comparable
+    # as a `--set model.components.actor.class=` axis.
+    actor:   {class: DISActor,           size: small, layers: 2}
+    critic:  {class: C51Critic,          size: xlarge}
     squash:  {class: TanhSquash}
     entropy: {class: AutotuneRegulator}

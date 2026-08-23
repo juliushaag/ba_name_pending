@@ -30,11 +30,13 @@ class TimeEmbedding(nnx.Module):
     two differ: which of `freqs`/`phase` carries gradient.
 
   The reference's time settings are `num_freqs 16`, `freq_range (0.1, 100.0)`,
-  `hidden 32`, `time_dim 16`, `concat_input` on."""
+  `hidden 32`, `time_dim 16`, `concat_input` on, geometric spacing; PISGRADNet's
+  (see `spacing`) are 256 linearly spaced frequencies into a 256-wide coder with
+  no raw `t` concatenated."""
 
   def __init__(self, time_dim: int, *, kind: str, num_freqs: int,
                freq_min: float, freq_max: float, hidden: int,
-               concat_input: bool, rngs: nnx.Rngs):
+               concat_input: bool, spacing: str, rngs: nnx.Rngs):
 
     from barl_jax.networks.mlp import Linear   # circular at module import time
 
@@ -48,7 +50,16 @@ class TimeEmbedding(nnx.Module):
     if kind == "sin":
       return
 
-    freqs = jnp.geomspace(freq_min, freq_max, num_freqs, dtype=jnp.float32)
+    assert spacing in ("geometric", "linear"), \
+      f"{spacing} not in available frequency spacings ('geometric', 'linear')"
+
+    # dime_am's two time coders disagree here and the difference is not
+    # cosmetic: ctrl_net.FeatureProjector puts its frequencies on a geometric
+    # grid, PISGRADNet's `timestep_coeff` on a linear one (jnp.linspace(0.1,
+    # 100, num_hid)), so a linear grid spends most of its ladder on the high
+    # frequencies a 16-step index needs.
+    space = jnp.geomspace if spacing == "geometric" else jnp.linspace
+    freqs = space(freq_min, freq_max, num_freqs, dtype=jnp.float32)
     self.freqs = nnx.Param(freqs) if kind == "learned" else Buffer(freqs)
     self.phase = nnx.Param(jnp.zeros((num_freqs,), jnp.float32))
 

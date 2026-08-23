@@ -72,3 +72,25 @@ OUDiffusionActor:
   # beta_scale_max (policies/dime.py).
   euler_max_step: 0.35
   min_total_noise: 2.0
+
+# The sampler DIME's reference actually runs (dime_am/diffusion/od/dis.py), as
+# opposed to the DDPM-style denoisers above: a fixed Gaussian prior integrated
+# forward under a learned control, with a learned step size and a learned
+# per-dimension friction. `prior_std` is a standard deviation, not a variance --
+# the reference's `sampler.init_std: 2.5` is passed straight to
+# MultivariateNormalDiag's scale.
+DISActor:
+  kind: actor
+  extends: [net.gelu, optim.actor, time.pisgrad]
+  num_steps: 16
+  prior_std: 2.5
+  dt_init: 0.1          # configs/base.yaml `dt`, shaped by the cosine schedule below
+  dt_min: 0.001         # configs/sampler/dt_schedule/cosine.yaml
+  dt_s: 0.008
+  dt_pow: 2.0
+  friction_init: 1.0    # configs/sampler/dis.yaml `friction`
+  per_dim_friction: true
+  learn_dt: true
+  learn_friction: true
+  out_clip: 10000.0     # PISGRADNet's `outer_clip`
+  dtype: float32        # the reference is fp32, and the log-ratio accumulates

@@ -34,4 +34,4 @@ NCLQL:
     # NCLQLCritic / NCLQLHLGaussCritic are the same critic over a scalar /
     # histogram return instead, and the algorithm reads none of that difference --
     # so the return representation is a one-word axis here.
-    critic: {class: NCLQLC51Critic, size: medium}
+    critic: {class: NCLQLC51Critic, size: xlarge}

@@ -57,8 +57,13 @@ utd_ratio: 2.0             # off-policy: grad steps per outer iteration =
                            # round(rollout_steps * utd_ratio)
 epochs_per_rollout: 32     # on-policy only -- currently unread, the on-policy
                            # path is unported (trainer.train raises)
-lr_warmup_steps: 1000      # grad steps of linear 0 -> base_lr ramp before the
-                           # post-warmup decay kicks in
+lr_warmup_steps: 0         # grad steps of linear 0 -> base_lr ramp before the
+                           # post-warmup decay kicks in; 0 disables the ramp and
+                           # starts at the base rate. Off because dime_am has no
+                           # warmup either (configs/base.yaml: `warmup: const`
+                           # with use_step_size_scheduler False) -- with the
+                           # decay already flat, a ramp was the only thing left
+                           # making the effective rate depend on the step count.
 lr_decay: constant         # shape of the post-warmup decay (Policy.DECAYS).
                            # `constant` because every reference here holds its
                            # rate flat (dime_am configs/base.yaml:
