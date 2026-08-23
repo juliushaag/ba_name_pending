@@ -42,28 +42,37 @@ def check_config(algos: list[str], envs: list[str]) -> list[str]:
     # bad matrix don't pay for jax and mujoco. Resolution only: no env is built,
     # no weights are allocated, and nothing here touches a device.
     #
-    # Nothing may be left in os.environ that wasn't already there: the executors
-    # pass this process's environment on to the runs (sbatch's `--export=ALL`,
-    # tmux's `-e PATH`). MUJOCO_GL is the one exception, and only because egl is
-    # what the training scripts set for themselves anyway.
+    # Restored on the way out, without exception: every executor hands this
+    # process's environment to the runs (LocalExecutor's `env=`, sbatch's
+    # `--export=ALL`, tmux's `-e`), so a JAX_PLATFORMS=cpu left behind here does
+    # not just slow the check down -- it trains every run of the sweep on the
+    # CPU, ~100x slower per gradient step and indistinguishable from a hang.
+    saved = {key: os.environ.get(key) for key in ("MUJOCO_GL", "JAX_PLATFORMS")}
     os.environ.setdefault("MUJOCO_GL", "egl")
     os.environ.setdefault("JAX_PLATFORMS", "cpu")   # a login node has no GPU to spend
 
-    import barl_jax  # noqa: F401  -- the import is what populates the registries
-    from barl_jax import model_config
-    from barl_jax.env import Environment
+    try:
+        import barl_jax  # noqa: F401  -- the import is what populates the registries
+        from barl_jax import model_config
+        from barl_jax.env import Environment
 
-    known_envs = set(Environment.available())
-    problems = [f"{env!r} is not a registered environment"
-                for env in envs if env not in known_envs]
+        known_envs = set(Environment.available())
+        problems = [f"{env!r} is not a registered environment"
+                    for env in envs if env not in known_envs]
 
-    for algo in algos:
-        try:
-            problems += [f"{algo}: {p}" for p in model_config.validate(algo)]
-        except Exception as exc:  # an unresolvable name raises rather than reporting
-            problems.append(f"{algo}: {type(exc).__name__}: {exc}")
+        for algo in algos:
+            try:
+                problems += [f"{algo}: {p}" for p in model_config.validate(algo)]
+            except Exception as exc:  # an unresolvable name raises rather than reporting
+                problems.append(f"{algo}: {type(exc).__name__}: {exc}")
 
-    return problems
+        return problems
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def parse_args():
