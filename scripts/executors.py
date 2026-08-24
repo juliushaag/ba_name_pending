@@ -48,6 +48,23 @@ SWEEP_NAME_FORMAT = "%Y-%m-%d_%H-%M-%S"
 DEBUG_TIME_LABEL = "00:30:00"
 DEBUG_SECONDS = 30 * 60
 
+#: Variables that decide *where* jax runs, and which therefore never travel from
+#: a launcher to a run. A JAX_PLATFORMS=cpu picked up from the submitting shell
+#: is silent: the run trains, logs and checkpoints normally, ~160x slower per
+#: gradient step. run_rl.slurm and tmux_pool.py unset the same list at their end,
+#: since `--export=ALL` and a tmux server's environment are not this process's to
+#: filter.
+DEVICE_VARS = ("JAX_PLATFORMS", "JAX_PLATFORM_NAME")
+
+
+def child_env(**extra: str) -> dict:
+    """This process's environment as a run should see it: device choice left to
+    the machine, plus whatever the caller pins itself."""
+    env = {k: v for k, v in os.environ.items() if k not in DEVICE_VARS}
+    env.update(extra)
+    return env
+
+
 #: The manifest's columns. `config` is relative to the sweep dir, so the tree
 #: stays relocatable -- a Slurm task copies it to node-local scratch and back.
 MANIFEST_FIELDS = ["index", "run_id", "tag", "config"]
@@ -159,7 +176,7 @@ class LocalExecutor(Executor):
         if timeout:
             cmd = ["timeout", str(timeout), *cmd]
 
-        env_vars = os.environ.copy()
+        env_vars = child_env()
         label = run.tag
         if gpu_id is not None:
             env_vars["CUDA_VISIBLE_DEVICES"] = gpu_id

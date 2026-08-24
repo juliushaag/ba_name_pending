@@ -88,3 +88,10 @@ eval_videos: 1             # of those runs, how many render frames (they run on
 log_every: 250             # grad steps between primary-tier logs
 debug_every: 1000          # grad steps between debug-tier logs (min/max/std/
                            # quantiles, gradient health)
+wandb_finish_timeout: 300  # seconds run.finish() may spend uploading before it
+                           # gives up. wandb's own default is 0 = block forever,
+                           # which is how a finished run was seen to sit for 17
+                           # minutes with wandb-core idle and the network fine --
+                           # on a batch job that is walltime burned after the
+                           # science is done. Whatever it could not send stays
+                           # in wandb/ and `wandb sync <dir>` pushes it later.

@@ -505,6 +505,24 @@ GPU, each pinning its subprocess with `CUDA_VISIBLE_DEVICES` and blocking on it 
 next run. It is never chosen by `auto` — running a sweep in your terminal is something you ask for.
 `--validate` streams each run's output through it, label-prefixed.
 
+**Where jax runs is decided by the task, never by whoever launched it.** A run that
+lands on the CPU is silent -- it trains, logs and checkpoints normally, ~160x slower per
+gradient step -- so nothing downstream can tell it from a slow algorithm, and one sweep
+spent 10 GPU-hours reaching 2% of a run before anyone could. Four things keep that from
+recurring, and a change to any of them should keep the others in mind: `check_config()`
+runs in a **child process** (its `JAX_PLATFORMS=cpu` cannot reach a run, since sbatch's
+`--export=ALL`, tmux's `-e` and `LocalExecutor`'s `env=` all hand a run the launcher's
+environment); `executors.child_env()` strips `DEVICE_VARS` from what it passes;
+`run_rl.slurm` and `tmux_pool.py` `unset` the same list at their end, which is the only
+side that can, since neither `--export=ALL` nor a tmux server's environment is the
+launcher's to filter; and `online_learning.require_accelerator()` refuses to start a run
+with no GPU/TPU backend whatever the cause -- a leaked variable, a venv without the CUDA
+plugin, a bad node -- unless `BARL_ALLOW_CPU=1`. `tests/test_launcher_devices.py` holds
+all four. It is also why `grid.py` loads `config_tree.py` **by path** rather than as
+`barl_jax.config_tree`: the package's `__init__` imports every policy and environment,
+so importing it is what put jax in the launcher and made a device variable look
+necessary there at all.
+
 `submit.py --debug` runs one task at a time with a 30-minute cap (`timeout` under tmux and local,
 `--time` under slurm, plus the dev queue there). It overrides `run_rl.slurm`'s `#SBATCH`
 partition/time/job-name from sbatch's command line, so the job script stays the description of a

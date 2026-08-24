@@ -12,6 +12,7 @@ its run entry). Since the axes are just overrides, no config file is ever edited
 to run a sweep.
 """
 
+import importlib.util
 import itertools
 import os
 import re
@@ -28,11 +29,16 @@ REPO_ROOT  = os.path.dirname(SCRIPT_DIR)
 CONFIG_DIR = os.path.join(REPO_ROOT, "config")
 DEFAULT_BASE_CONFIG = os.path.join(CONFIG_DIR, "experiments", "online_learning.yaml")
 
-# barl_jax.config_tree imports nothing but yaml, so reading the tree here costs
-# no jax/mujoco import -- which is what keeps submit.py cheap enough to run on a
-# login node.
-sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
-from barl_jax.config_tree import ConfigTree  # noqa: E402
+# config_tree.py imports nothing but yaml, and it is loaded from its path rather
+# than as `barl_jax.config_tree` so it stays that way: the package's __init__
+# imports every policy and environment to populate the registries, i.e. jax and
+# mujoco, which is exactly what a launcher on a login node must not pay for --
+# and what made a device-forcing env var look necessary here in the first place.
+_CONFIG_TREE = os.path.join(REPO_ROOT, "src", "barl_jax", "config_tree.py")
+_spec = importlib.util.spec_from_file_location("barl_jax_config_tree", _CONFIG_TREE)
+_config_tree = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_config_tree)
+ConfigTree = _config_tree.ConfigTree
 
 RESERVED_AXES = ("algo", "env", "seed")
 

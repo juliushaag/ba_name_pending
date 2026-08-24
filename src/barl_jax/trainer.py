@@ -243,6 +243,7 @@ def train(run: Run):
   log = Logger(
     "BA-RL", run_name=name, step_keys={"env_steps", "grad_steps"}, tags=tags,
     config=wandb_config(run), group=name,
+    finish_timeout=cfg["wandb_finish_timeout"],
     seeds=[run.base_seed + i for i in range(num_seeds)]
   )
 

@@ -34,6 +34,13 @@ set -euo pipefail
 
 export PYTHONUNBUFFERED=1
 
+# `--export=ALL` hands this task whatever the submitting shell happened to hold,
+# so where jax runs is decided here rather than there: a JAX_PLATFORMS=cpu left
+# over from a config check or exported by hand trains the run on the CPU, ~160x
+# slower per gradient step and looking exactly like a hang. The job asked for a
+# GPU; it uses it. online_learning.py refuses to start without one.
+unset JAX_PLATFORMS JAX_PLATFORM_NAME
+
 # The array job id: shared by every task of one submission, so it is also the
 # manifest's `run_id` column and the sweep tag wandb filters on.
 RUN_ID="$SLURM_ARRAY_JOB_ID"

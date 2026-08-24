@@ -24,7 +24,11 @@ on the cluster as it does here.
 
 import argparse
 import datetime
+import json
 import os
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 import yaml
@@ -33,46 +37,64 @@ import grid
 from executors import EXECUTORS, SWEEP_NAME_FORMAT, SWEEPS_DIR, resolve
 
 
+#: The check itself, run as a program in a child process. Everything it needs
+#: is on stdin; what it found comes back through the file named by argv[1],
+#: which import chatter on stdout cannot corrupt.
+CHECK_PROGRAM = """
+import json, sys
+
+algos, envs = json.load(sys.stdin)
+
+import barl_jax  # noqa: F401  -- the import is what populates the registries
+from barl_jax import model_config
+from barl_jax.env import Environment
+
+known_envs = set(Environment.available())
+problems = [f"{env!r} is not a registered environment"
+            for env in envs if env not in known_envs]
+
+for algo in algos:
+    try:
+        problems += [f"{algo}: {p}" for p in model_config.validate(algo)]
+    except Exception as exc:  # an unresolvable name raises rather than reporting
+        problems.append(f"{algo}: {type(exc).__name__}: {exc}")
+
+with open(sys.argv[1], "w") as out:
+    json.dump(problems, out)
+"""
+
+
 def check_config(algos: list[str], envs: list[str]) -> list[str]:
     """Everything an array of 40 tasks would otherwise discover 40 times, at the
     point where it is still one error message: unregistered env or algo names,
     and anything `model_config.validate()` rejects (an override that lands on no
-    slot, a kwarg no component accepts, a slot missing its `size:`)."""
-    # Imported here rather than at module scope so `--help` and a --dry-run of a
-    # bad matrix don't pay for jax and mujoco. Resolution only: no env is built,
-    # no weights are allocated, and nothing here touches a device.
-    #
-    # Restored on the way out, without exception: every executor hands this
-    # process's environment to the runs (LocalExecutor's `env=`, sbatch's
-    # `--export=ALL`, tmux's `-e`), so a JAX_PLATFORMS=cpu left behind here does
-    # not just slow the check down -- it trains every run of the sweep on the
-    # CPU, ~100x slower per gradient step and indistinguishable from a hang.
-    saved = {key: os.environ.get(key) for key in ("MUJOCO_GL", "JAX_PLATFORMS")}
-    os.environ.setdefault("MUJOCO_GL", "egl")
-    os.environ.setdefault("JAX_PLATFORMS", "cpu")   # a login node has no GPU to spend
+    slot, a kwarg no component accepts, a slot missing its `size:`).
 
-    try:
-        import barl_jax  # noqa: F401  -- the import is what populates the registries
-        from barl_jax import model_config
-        from barl_jax.env import Environment
+    Resolution only: no env is built, no weights are allocated, nothing touches
+    a device."""
+    # In a child process, and that is the whole point. The check wants
+    # JAX_PLATFORMS=cpu -- a login node has no GPU to spend -- while every
+    # executor hands *this* process's environment to the runs (LocalExecutor's
+    # `env=`, sbatch's `--export=ALL`, tmux's `-e`). A JAX_PLATFORMS=cpu left in
+    # os.environ here does not just slow the check down: it trains every run of
+    # the sweep on the CPU, ~160x slower per gradient step and indistinguishable
+    # from a hang. Setting it only in the child is what makes that unleakable,
+    # for this variable and any other the check ever needs -- and it keeps jax
+    # and mujoco out of the launcher process entirely.
+    env = {**os.environ, "MUJOCO_GL": "egl", "JAX_PLATFORMS": "cpu"}
 
-        known_envs = set(Environment.available())
-        problems = [f"{env!r} is not a registered environment"
-                    for env in envs if env not in known_envs]
+    with tempfile.TemporaryDirectory() as tmp:
+        found = os.path.join(tmp, "problems.json")
+        proc = subprocess.run([sys.executable, "-c", CHECK_PROGRAM, found],
+                              input=json.dumps([list(algos), list(envs)]),
+                              text=True, capture_output=True, env=env)
 
-        for algo in algos:
-            try:
-                problems += [f"{algo}: {p}" for p in model_config.validate(algo)]
-            except Exception as exc:  # an unresolvable name raises rather than reporting
-                problems.append(f"{algo}: {type(exc).__name__}: {exc}")
+        if proc.returncode != 0 or not os.path.exists(found):
+            tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-5:]
+            return ["the config check could not run:", *(f"  {line}" for line in tail)]
 
-        return problems
-    finally:
-        for key, value in saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
+        with open(found) as f:
+            return json.load(f)
 
 
 def parse_args():

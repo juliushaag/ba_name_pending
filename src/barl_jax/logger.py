@@ -43,22 +43,32 @@ class Logger():
 
   REFRESH_INTERVAL = 0.5   # seconds between terminal redraws, regardless of log() call frequency
 
-  def __init__(self, log_name : str, step_keys : set, run_name : str = None, tags : list[str] = None,
+  def __init__(self, log_name : str, step_keys : set, *, finish_timeout : float,
+               run_name : str = None, tags : list[str] = None,
                config : dict = None, group=None, seeds : list[int] = (0,)):
     """One wandb run **per seed**, all sharing `group` so wandb's group view
     draws them as one experiment with a mean/spread band -- rather than one run
     carrying `seed0/`-prefixed copies of every key, which no wandb aggregation
     understands. `reinit="create_new"` is what lets them coexist in a process;
     note it leaves `wandb.run` as None, so nothing here may use the global
-    `wandb.log`/`wandb.run` -- every call goes through an explicit run."""
+    `wandb.log`/`wandb.run` -- every call goes through an explicit run.
+
+    Only the first run captures the console. Every run here shares one process,
+    hence one stdout, so the others would each store an identical copy of it --
+    and wandb installs a *separate* stream wrapper (and flush thread) per run,
+    so N of them stack on the same stream and the first run's finish() has to
+    unwind from under the rest. That is where a finished run was observed to
+    wedge for 17 minutes with wandb-core idle and the network fine."""
 
     self._seeds = list(seeds)
     self._runs  = [
       wandb.init(project=log_name, group=group or run_name,
                  name=f"{run_name}/s{seed}" if len(self._seeds) > 1 else run_name,
                  config={**(config or {}), "seed": seed}, tags=tags,
-                 reinit="create_new")
-      for seed in self._seeds
+                 reinit="create_new",
+                 settings=wandb.Settings(finish_timeout=finish_timeout,
+                                         console="auto" if i == 0 else "off"))
+      for i, seed in enumerate(self._seeds)
     ]
 
     self._steps = {k: 0 for k in step_keys}
@@ -207,6 +217,9 @@ class Logger():
     self._runs[seed_index].log({key: wandb.Video(video, fps=30, format="mp4")})
 
   def finish(self):
+    # Bounded by the `finish_timeout` passed at init: wandb gives up on the
+    # upload rather than blocking the process forever, and what it could not
+    # send stays in wandb/ for `wandb sync` to push later.
     self._live.update(self._render())
     self._live.stop()
     for run in self._runs:

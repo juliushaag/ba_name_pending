@@ -112,9 +112,13 @@ class Pool:
     if self.time_limit:
       inner = ["timeout", str(self.time_limit), *inner]
 
-    # PIPESTATUS, not $?: `tee` would otherwise be the exit code that gets
-    # recorded, and it succeeds even when the run under it dies.
-    script = (f"{shlex.join(inner)} 2>&1 | tee {shlex.quote(str(task.dir / 'term.out'))}\n"
+    # A window inherits the tmux *server's* environment, which nothing here
+    # filtered, so where jax runs is decided in the window rather than wherever
+    # that server was started from (see executors.DEVICE_VARS). PIPESTATUS, not
+    # $?: `tee` would otherwise be the exit code that gets recorded, and it
+    # succeeds even when the run under it dies.
+    script = ("unset JAX_PLATFORMS JAX_PLATFORM_NAME\n"
+              f"{shlex.join(inner)} 2>&1 | tee {shlex.quote(str(task.dir / 'term.out'))}\n"
               f"echo ${{PIPESTATUS[0]}} > {shlex.quote(str(task.dir / 'exit_code'))}\n")
 
     # PATH for the same reason submit.py sets it on the session: a new window

@@ -32,11 +32,38 @@ warnings.filterwarnings("ignore", module="glfw")  # dm_control still probes GLFW
 # wandb API at login, once per process -- nothing here can act on them.
 warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"wandb\..*")
 
+import jax
+
 from barl_jax.config import load_config
 from barl_jax.trainer import setup, train, validate
 
 DEFAULT_CONFIG = os.path.join(os.path.dirname(__file__), "..", "config", "experiments",
                               "online_learning.yaml")
+
+
+def require_accelerator() -> None:
+  """The last gate before a run costs anything, and the only one that holds
+  whatever the cause -- a leaked JAX_PLATFORMS, a venv without the CUDA plugin,
+  a node whose driver came back wrong. A run that lands on the CPU trains, logs
+  and checkpoints exactly as it should, ~160x slower per gradient step, so
+  nothing downstream can tell it from a slow algorithm: sweep 2026-08-23_17-54-53
+  spent 10 GPU-hours reaching 2% of one run's steps. Better to fail in the first
+  second than to be told 10 hours later."""
+  if os.environ.get("BARL_ALLOW_CPU"):
+    return
+
+  devices = jax.devices()
+  if any(device.platform in ("gpu", "tpu") for device in devices):
+    return
+
+  forced = {key: os.environ[key] for key in ("JAX_PLATFORMS", "JAX_PLATFORM_NAME")
+            if key in os.environ}
+  raise SystemExit(
+    f"Refusing to start: jax has no GPU/TPU backend, only {devices}.\n"
+    + (f"  {forced} is forcing it -- unset it and resubmit.\n" if forced else
+       f"  CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')!r}; "
+       "check the driver on this node and that jax[cuda13] is installed in this venv.\n")
+    + "  BARL_ALLOW_CPU=1 runs on the CPU anyway.")
 
 
 if __name__ == "__main__":
@@ -52,6 +79,8 @@ if __name__ == "__main__":
                          "`run_dir`. A batch task points it at node-local scratch and copies "
                          "the tree back on exit, so the config itself stays the shared one.")
   kwargs = args.parse_args()
+
+  require_accelerator()
 
   runs = load_config(kwargs.config)
   for i, cfg in enumerate(runs):
