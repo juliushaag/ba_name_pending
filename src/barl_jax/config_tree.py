@@ -153,12 +153,6 @@ class ConfigTree:
   def replaying(self) -> bool:
     return bool((self.snapshot or {}).get("resolved"))
 
-  def with_overrides(self, overrides: dict | None) -> "ConfigTree":
-    clone = object.__new__(ConfigTree)
-    clone.__dict__ = dict(self.__dict__)
-    clone.overrides = dict(overrides or {})
-    return clone
-
   # -- presets --------------------------------------------------------------
 
   def preset(self, path: str) -> dict:

@@ -24,12 +24,6 @@ DIFFUSION = [n for n in ACTORS if issubclass(get_component(n), DiscreteDiffusion
 # so `predict_raw` is not eps_theta there and the base's eps helpers do not apply.
 DDPM_FAMILY = [n for n in ACTORS if issubclass(get_component(n), DDPMActor)]
 
-# ScoreContinuousActor.bound_control takes jnp.linalg.norm of both X and u_tilde,
-# and on the first Euler step both are exactly zero -- X starts at zeros and the
-# head is deliberately zero-initialized ("u ~ 0 at the beginning"). norm's VJP is
-# v/||v||, so the backward is NaN from that step onward; the jnp.maximum(n, 1e-8)
-# guard in bound_control clamps the forward value, fixing the gradient.
-
 
 @pytest.mark.parametrize("name", ACTORS)
 def test_sample_contract(name, obs, key):

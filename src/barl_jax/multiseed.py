@@ -64,6 +64,7 @@ class StackedPolicy:
   straight onto the seed axis and the vmapped inference needs no gather."""
 
   def __init__(self, graphdef, state, num_seeds: int, num_envs: int, reference):
+    # The split of the stacked (policy, optimizer) pair -- see stack().
     self._graphdef = graphdef
     self._state    = state
     self.num_seeds = num_seeds
@@ -75,7 +76,19 @@ class StackedPolicy:
     return self._bounds
 
   def inference_fn(self):
-    return partial(_stacked_infer, self._graphdef, self.num_seeds, self.num_envs,
+    """A pure, jitted `(observation, key) -> (action, extras)` over all seeds,
+    pinned to the stacked weights and to **eval mode** -- the same clone/eval/
+    split `Policy.inference_fn` does for the single-seed path. Without it a
+    rollout would act through BatchNorm/BatchRenorm on batch moments and with
+    dropout live, i.e. differently than `evaluate()` prices the same policy.
+    Eval-mode flags are plain Python fields, so they live in the GraphDef and
+    not in state: one seed's module is enough to flip them for every seed."""
+    policy, opt = nnx.merge(self._graphdef,
+                            jax.tree.map(lambda x: x[0], self._state))
+    clone = nnx.clone(policy)
+    clone.eval()
+    graphdef, _ = nnx.split((clone, opt))
+    return partial(_stacked_infer, graphdef, self.num_seeds, self.num_envs,
                    self._state)
 
 

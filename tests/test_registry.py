@@ -64,10 +64,8 @@ def test_optimizer_keys_are_named(name):
 
 @pytest.mark.parametrize("name", ALL)
 def test_lifecycle_hooks_are_callable(name):
-    """The four hooks a Policy fans out over its slots, on a component that has
+    """The two hooks a Policy fans out over its slots, on a component that has
     never been stepped -- they run before the first train_step in a real run."""
     c = built(name)
     c.before_step()
     c.after_step()
-    c.on_epoch_start()
-    c.on_epoch_end()

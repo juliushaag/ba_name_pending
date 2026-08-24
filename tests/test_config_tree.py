@@ -85,7 +85,7 @@ def test_the_ladder_is_monotone_in_width(tree, kind):
 def test_a_size_override_moves_exactly_the_ladder_keys(tree):
     """What `--set model.components.critic.size=large` has to do, and no more."""
     base  = tree.resolved("SAC")
-    large = tree.with_overrides({"components.critic.size": "large"}).resolved("SAC")
+    large = ConfigTree(overrides={"components.critic.size": "large"}).resolved("SAC")
 
     moved = {k for k in base if base[k] != large.get(k)}
     expected = {f"components.critic.{k}" for k in tree.size_keys("critic")

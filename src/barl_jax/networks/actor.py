@@ -12,10 +12,6 @@ from barl_jax.networks.registry import get_component, register_component
 from barl_jax.policy import Actor, Buffer, Critic
 
 
-def safe_norm(x, axis=-1, keepdims=True, eps=1e-8):
-  """L2 norm with well-defined gradients at zero."""
-  return jnp.sqrt(jnp.sum(x**2, axis=axis, keepdims=keepdims) + eps)
-
 _LOG_SQRT_2PI = 0.5 * math.log(2 * math.pi)
 
 
@@ -98,11 +94,13 @@ class ScoreContinuousActor(Actor):
   """AMDP continuous-time control (Thilges et al. 2026). The network predicts
   u_tilde with u = sigma(tau) * u_tilde, so each Euler step reduces to
   X += v_i * u_tilde + sqrt(v_i) * eps  with  v_i = int_{tau_i}^{tau_{i+1}} sigma^2.
-  Raw, unsquashed output -- the owning Policy applies the erf squash."""
+  Raw, unsquashed output -- the owning Policy applies the erf squash. Sampling
+  starts from the Dirac prior X_0 = 0 and returns the Girsanov path weight as
+  the entropy estimate, up to the owning Policy's squash correction."""
 
   def __init__(self, env_stats, *, latent_dim: int, layers: int, max_steps: int,
                sigma_min: float, sigma_max: float, tau_min: float, tau_max: float,
-               bound_c: float, lr: float, adam_b1: float,
+               lr: float, adam_b1: float,
                grad_clip: float, grad_clip_mode: str,
                time_dim: int, time_embed: str, time_kwargs: dict,
                activation: str, norm: str,
@@ -116,7 +114,6 @@ class ScoreContinuousActor(Actor):
     self.sigma_min, self.sigma_max = float(sigma_min), float(sigma_max)
     self.tau_min,   self.tau_max   = float(tau_min),   float(tau_max)
     self.max_steps, self.time_dim  = int(max_steps), int(time_dim)
-    self.bound_c   = float(bound_c)
     self.lr        = float(lr)
     self.adam_b1   = float(adam_b1)
     self.grad_clip = float(grad_clip)
@@ -141,7 +138,6 @@ class ScoreContinuousActor(Actor):
     sig_sq = self.sigma_sq_int_fn(taus)                        # exact, rebased to tau_min
     self.taus     = Buffer(taus)
     self.step_var = Buffer(jnp.maximum(sig_sq[1:] - sig_sq[:-1], 0.0))
-    self.sigma    = Buffer(self.sigma_fn(taus[:-1]))
     self.rngs     = rngs
 
   def sigma_fn(self, tau):
@@ -180,32 +176,40 @@ class ScoreContinuousActor(Actor):
     """Var(X_1) at zero control. erf_k MUST be derived from this."""
     return float(self.step_var[...].sum())
 
-  def bound_control(self, u_tilde, X, sigma_i):
-    """||u|| <= C(1 + ||X||) with u = sigma * u_tilde."""
-    max_norm = self.bound_c * (1.0 + safe_norm(X)) / sigma_i
-    n = safe_norm(u_tilde)
-    return u_tilde * jnp.minimum(max_norm / n, 1.0)
+  def embed_time(self, tau):
+    """The level embedding the control net conditions on. The reference scales
+    the level into [-1, 1] before its fourier coder (ctrl_net.py), so the fixed
+    frequency ladder reads the same span whatever tau_min/tau_max say."""
+    return self.time_emb(2.0 * tau - 1.0)
 
   def generate_action(self, obs, key=None):
-    """Euler-Maruyama over the forward SDE. Left as an unrolled Python loop
-    rather than a lax.scan: max_steps is 16, the unrolled graph compiles fine,
-    and it keeps the step algebra readable and identical to the torch version."""
+    """Euler-Maruyama over the forward SDE from the Dirac start X_0 = 0,
+    accumulating the Girsanov path weight of the controlled process against the
+    uncontrolled one -- running cost plus stochastic term, the two integrands
+    of log dQ/dP (diffusion_AM/diffusion_utils.integrator). The squash's
+    log-Jacobian is deliberately absent: the owning Policy adds its own squash's
+    correction, which is what prices the *action* density however the squash
+    slot is configured. Left as an unrolled Python loop rather than a lax.scan:
+    max_steps is 16, the unrolled graph compiles fine, and it keeps the step
+    algebra readable."""
     B = obs.shape[0]
     key = self.rngs.noise() if key is None else key
     keys = jax.random.split(key, self.max_steps)
 
-    X        = jnp.zeros((B, self.action_dim), jnp.float32)
-    path_int = jnp.zeros((B, 1), jnp.float32)
+    X     = jnp.zeros((B, self.action_dim), jnp.float32)
+    log_w = jnp.zeros((B, 1), jnp.float32)
 
     for i in range(self.max_steps):
-      emb     = self.time_emb(jnp.broadcast_to(self.taus[...][i], (B, 1)))
-      u_tilde = self.bound_control(self.diffusion_act(obs, X, emb), X, self.sigma[...][i])
+      emb     = self.embed_time(jnp.broadcast_to(self.taus[...][i], (B, 1)))
+      u_tilde = self.diffusion_act(obs, X, emb)
       v       = self.step_var[...][i]
+      eps     = jax.random.normal(keys[i], u_tilde.shape, u_tilde.dtype)
 
-      X        = X + v * u_tilde + jnp.sqrt(v) * jax.random.normal(keys[i], u_tilde.shape, u_tilde.dtype)
-      path_int = path_int + (v * (u_tilde ** 2).sum(axis=-1))[:, None]
+      X     = X + v * u_tilde + jnp.sqrt(v) * eps
+      log_w = log_w - 0.5 * v * (u_tilde ** 2).sum(axis=-1, keepdims=True) \
+                   - jnp.sqrt(v) * (eps * u_tilde).sum(axis=-1, keepdims=True)
 
-    return X, math.log(2) * self.action_dim - 0.5 * path_int
+    return X, log_w
 
   def sample(self, s, key=None, critic: Critic = None):
     """Raw, unsquashed -- not a valid action on its own; exists to satisfy the

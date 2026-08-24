@@ -76,11 +76,20 @@ def setup(cfg: dict, num_seeds: int, *, validate_only: bool = False) -> Run:
                                traj_len=run.environment.get_max_traj_length(run.env))
 
   checkpoint = cfg["checkpoint"]
-  if checkpoint is not None and os.path.exists(checkpoint) and num_seeds == 1:
-    policies = [Policy.load(run.model_name, checkpoint, run.env, run.env_stats)]
-  else:
+  if checkpoint is None:
     policies = [Policy.make(run.model_name, run.env, env_stats=run.env_stats,
                             seed=run.base_seed + i) for i in range(num_seeds)]
+  elif num_seeds > 1:
+    raise NotImplementedError(
+      f"checkpoint={checkpoint!r}: a checkpoint holds one seed's state, so it cannot "
+      f"resume a {num_seeds}-seed vmapped run -- restart with num_seeds: 1.")
+  elif not os.path.exists(checkpoint):
+    raise FileNotFoundError(f"checkpoint={checkpoint!r}: no such directory")
+  else:
+    # load_any, not Policy.load(run.model_name, ...): the meta sidecar carries the
+    # registered class name, so resuming under a `model:` alias resolves to the
+    # policy class that was saved instead of missing from the registry.
+    policies = [Policy.load_any(checkpoint, run.env, run.env_stats)]
 
   if policies[0].on_policy:
     raise NotImplementedError(

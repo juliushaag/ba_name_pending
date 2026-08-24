@@ -64,6 +64,12 @@ class AMDP(Policy):
     branch there, so both are gated by the same key here."""
     return {"actor": self.policy_delay, "entropy_alpha": self.policy_delay}
 
+  def _squash_correction(self, X):
+    """H(action) = H(X) + E[log|dy/dx|]: the slot's own squash lifts the path
+    weight onto the action's density, whatever squash it names -- the same
+    division of labor as DIME's."""
+    return self.squash.log_abs_det_jacobian(X).sum(axis=-1, keepdims=True)
+
   def train_step(self, batch):
     obs      = batch["obs"]
     next_obs = batch["next_obs"]
@@ -76,10 +82,11 @@ class AMDP(Policy):
 
     # Both terminal samples are targets: the SDE rollout is never
     # differentiated through, only the single-step vector field below is.
-    next_X, entropy_penalty = jax.lax.stop_gradient(self.actor.generate_action(next_obs))
+    next_X, path_weight = jax.lax.stop_gradient(self.actor.generate_action(next_obs))
     X, _ = jax.lax.stop_gradient(self.actor.generate_action(obs))
 
-    entropy_bonus = jax.lax.stop_gradient(alpha * entropy_penalty)
+    entropy = path_weight + self._squash_correction(next_X)
+    entropy_bonus = jax.lax.stop_gradient(alpha * entropy)
     next_action   = self.squash(next_X)
 
     self.critic.td_loss(obs, action, next_obs, next_action, reward, term,
@@ -87,10 +94,9 @@ class AMDP(Policy):
 
     # --- actor: regress the SDE's vector field onto the critic's action score
     X_t, tau = self.actor.sample_noised(X)
-    # The actor's own module, not a fresh sinusoidal_emb: a `fourier`/`learned`
-    # embedding carries parameters, and a second copy would not be the one the
-    # sampler used.
-    time_embed = self.actor.time_emb(tau.reshape(X.shape[0], 1))
+    # The actor's own embedding, scaling included: a second copy of the coder
+    # would not be the one the sampler used, and its phase is trainable.
+    time_embed = self.actor.embed_time(tau.reshape(X.shape[0], 1))
     u_tilde = self.actor.diffusion_act(obs, X_t, time_embed)
 
     # The score is a gradient w.r.t. the *action*; the critic must not be
@@ -114,7 +120,7 @@ class AMDP(Policy):
     target = jax.lax.stop_gradient(sigma_tau * (x_score / alpha))
     amdp_loss = (0.5 * ((u - target) ** 2).sum(axis=-1) / sigma_tau.squeeze(-1)).mean()
 
-    self.entropy.loss(entropy_penalty, losses)
+    self.entropy.loss(entropy, losses)
 
     losses["actor"] = amdp_loss
 
@@ -124,7 +130,7 @@ class AMDP(Policy):
     self.metrics.dist("score_target", target)
     self.actor.metrics.vec("u", u)
     self.actor.metrics.vec("action", next_action, limit=1.0)
-    self.actor.metrics.dist("entropy", entropy_penalty)
+    self.actor.metrics.dist("entropy", entropy)
     self.critic.metrics.vec("score", x_score)
     self.metrics.scalar("score_clipped_frac", clipped_frac)
 

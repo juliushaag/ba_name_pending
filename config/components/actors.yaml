@@ -16,13 +16,12 @@ StochasticActor:
 
 ScoreContinuousActor:
   kind: actor
-  extends: [net.silu, optim.actor, time.sin_16]
+  extends: [net.silu, optim.actor, time.ctrl]
   max_steps: 16
   sigma_min: 0.01
   sigma_max: 2.0
   tau_min: 0.0
   tau_max: 1.0
-  bound_c: 50.0
 
 # The diffusion-policy online-RL references' sampler: a scaled *linear* ladder, a
 # shrunk prior and the predicted x0 clipped every reverse step. Distinct from
@@ -82,6 +81,9 @@ OUDiffusionActor:
 DISActor:
   kind: actor
   extends: [net.gelu, optim.actor, time.pisgrad]
+  # dime_am trains the sampler's nets with the critic's b1 (init_model shares
+  # alg.optimizer.b1), not optax's actor default of 0.9.
+  adam_b1: 0.5
   num_steps: 16
   prior_std: 2.5
   dt_init: 0.1          # configs/base.yaml `dt`, shaped by the cosine schedule below

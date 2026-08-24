@@ -374,11 +374,13 @@ class ReplayBuffer():
         slot["actions"][t] = action_np[i]
         slot["rewards"][t] = reward[i]
 
-        for key, value in step_extras.items():
+        # `name`, never `key`: that identifier is the PRNG key split at the top
+        # of this step, and shadowing it here crashed the next iteration.
+        for name, value in step_extras.items():
           value_i = value[i]
-          if key not in slot["extras"]:
-            slot["extras"][key] = np.empty((cap, *np.shape(value_i)), dtype=np.asarray(value_i).dtype)
-          slot["extras"][key][t] = value_i
+          if name not in slot["extras"]:
+            slot["extras"][name] = np.empty((cap, *np.shape(value_i)), dtype=np.asarray(value_i).dtype)
+          slot["extras"][name][t] = value_i
 
         slot["t"] = t + 1
 

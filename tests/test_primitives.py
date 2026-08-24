@@ -12,7 +12,7 @@ import pytest
 from flax import nnx
 
 from barl_jax.networks.critic import categorical_projection
-from barl_jax.networks.optim import CLIP_MODES, adam, every_k, grad_clip_transform
+from barl_jax.networks.optim import CLIP_MODES, adam, grad_clip_transform
 
 from conftest import SCHEDULES, SQUASHES, build, built, finite
 
@@ -167,27 +167,6 @@ def test_categorical_projection_is_terminal_at_term_one():
 
     proj = categorical_projection(probs, atoms, reward, jnp.ones((3,)), 0.99, 0.0, -1.0, 1.0)
     assert jnp.allclose((proj * atoms).sum(axis=-1), reward, atol=1e-5)
-
-
-def test_every_k_drops_the_steps_it_skips():
-    """Not optax.MultiSteps: the skipped gradients are discarded rather than
-    accumulated, and the inner state is frozen so momentum cannot leak through."""
-    tx = every_k(optax.sgd(1.0), 3)
-    params = {"w": jnp.zeros((2,))}
-    state = tx.init(params)
-    grads = {"w": jnp.ones((2,))}
-
-    moved = []
-    for _ in range(6):
-        updates, state = tx.update(grads, state, params)
-        moved.append(bool(jnp.any(updates["w"] != 0)))
-
-    assert moved == [False, False, True, False, False, True]
-
-
-def test_every_k_is_a_no_op_at_k_of_one():
-    inner = optax.sgd(1.0)
-    assert every_k(inner, 1) is inner
 
 
 # ----------------------------------------------------------------------

@@ -108,7 +108,7 @@ class Component:
   """Mixin for anything Policy.build_component() constructs. Three jobs: consume
   the run's EnvStats, which every component takes as its first positional
   argument; give the owning Policy a uniform lifecycle to fan out to -- it
-  registers each slot it builds and forwards all four hooks below, so no Policy
+  registers each slot it builds and forwards both hooks below, so no Policy
   has to hand-roll a critic's Polyak update from its own train_step; and hold a
   `metrics` sink already namespaced to this component's slot, so writing
   `self.metrics.dist("q", pred)` lands at `critic/q/*` without the component
@@ -144,12 +144,6 @@ class Component:
 
   def after_step(self):
     """Called once per gradient step, after every optimizer has stepped."""
-    ...
-
-  def on_epoch_start(self):
-    ...
-
-  def on_epoch_end(self):
     ...
 
   def create_optimizer(self) -> dict:
@@ -438,19 +432,6 @@ class Policy(nnx.Module, ABC):
     for component in self.components.values():
       component.after_step()
 
-  def on_epoch_start(self):
-    self._epoch_start_time = time.perf_counter()
-    for component in self.components.values():
-      component.on_epoch_start()
-
-  def on_epoch_end(self):
-    for component in self.components.values():
-      component.on_epoch_end()
-
-  def epoch_time(self) -> float:
-    """Wall-clock seconds since the last on_epoch_start() call."""
-    return time.perf_counter() - self._epoch_start_time
-
   # ------------------------------------------------------------------
   # Optimizers
   # ------------------------------------------------------------------
@@ -598,10 +579,6 @@ class Policy(nnx.Module, ABC):
   # ------------------------------------------------------------------
   # Observation normalisation
   # ------------------------------------------------------------------
-
-  def set_obs_normalization(self, mean, std):
-    self.obs_mean[...] = jnp.asarray(mean, dtype=jnp.float32)
-    self.obs_std[...]  = jnp.asarray(std,  dtype=jnp.float32)
 
   def normalize_obs(self, obs):
     return (obs - self.obs_mean[...]) / self.obs_std[...]

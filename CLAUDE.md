@@ -183,9 +183,9 @@ architectural (belongs there) or algorithmic (belongs on the owning Policy) befo
 Everything `build_component()` constructs inherits the `Component` mixin (`policy.py`), which
 supplies four things: the run's `EnvStats` (**first positional argument** of every component —
 `self.obs_dim`/`self.action_dim` come from it, so dims are never passed separately), the slot name,
-a slot-namespaced `metrics` sink, and the `before_step`/`after_step`/`on_epoch_start`/
-`on_epoch_end` lifecycle. The Policy registers each slot in `self.components` and fans all four
-hooks out over it, which is why a critic's Polyak update lives in `QCriticBase.before_step()`
+a slot-namespaced `metrics` sink, and the `before_step`/`after_step` lifecycle. The Policy
+registers each slot in `self.components` and fans both hooks out over it, which is why a critic's
+Polyak update lives in `QCriticBase.after_step()`
 rather than being hand-driven from each `train_step`.
 
 Concrete actors in `networks/actor.py`:
