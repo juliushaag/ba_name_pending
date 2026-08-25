@@ -140,6 +140,11 @@ class ScoreContinuousActor(Actor):
     self.step_var = Buffer(jnp.maximum(sig_sq[1:] - sig_sq[:-1], 0.0))
     self.rngs     = rngs
 
+    # Plain Python floats: `prior_surprisal` runs inside the vmapped train/
+    # inference step, where reading them back off the Buffer is a tracer.
+    self._terminal_var = float(self.step_var[...].sum())
+    self.prior_logZ    = 0.5 * self.action_dim * math.log(2 * math.pi * self._terminal_var)
+
   def sigma_fn(self, tau):
     """dime_am's `get_geometric_scheduler`: sigma(t) = sigma_min * r^(1-t) *
     sqrt(2 log r), which *decreases* over the path. barl previously used the
@@ -174,7 +179,15 @@ class ScoreContinuousActor(Actor):
   @property
   def terminal_var(self) -> float:
     """Var(X_1) at zero control. erf_k MUST be derived from this."""
-    return float(self.step_var[...].sum())
+    return self._terminal_var
+
+  def prior_surprisal(self, X):
+    """-log p_1(X) under the *uncontrolled* terminal marginal N(0, terminal_var),
+    the constant of integration the Girsanov weight is missing: log_w alone is
+    -KL(Q||P) between path measures, and H(q_1) >= E[log_w] - E[log p_1(X_1)].
+    DIME's `init_aux` is the same term for a process whose prior is an ordinary
+    Gaussian rather than this one's Dirac at X_0 = 0."""
+    return self.prior_logZ + 0.5 * (X ** 2).sum(axis=-1, keepdims=True) / self._terminal_var
 
   def embed_time(self, tau):
     """The level embedding the control net conditions on. The reference scales
@@ -186,7 +199,9 @@ class ScoreContinuousActor(Actor):
     """Euler-Maruyama over the forward SDE from the Dirac start X_0 = 0,
     accumulating the Girsanov path weight of the controlled process against the
     uncontrolled one -- running cost plus stochastic term, the two integrands
-    of log dQ/dP (diffusion_AM/diffusion_utils.integrator). The squash's
+    of log dQ/dP (diffusion_AM/diffusion_utils.integrator) -- plus
+    `prior_surprisal`, without which the returned quantity is an entropy only up
+    to an unknown additive constant. The squash's
     log-Jacobian is deliberately absent: the owning Policy adds its own squash's
     correction, which is what prices the *action* density however the squash
     slot is configured. Left as an unrolled Python loop rather than a lax.scan:
@@ -209,7 +224,7 @@ class ScoreContinuousActor(Actor):
       log_w = log_w - 0.5 * v * (u_tilde ** 2).sum(axis=-1, keepdims=True) \
                    - jnp.sqrt(v) * (eps * u_tilde).sum(axis=-1, keepdims=True)
 
-    return X, log_w
+    return X, log_w + self.prior_surprisal(X)
 
   def sample(self, s, key=None, critic: Critic = None):
     """Raw, unsquashed -- not a valid action on its own; exists to satisfy the

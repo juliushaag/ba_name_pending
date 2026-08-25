@@ -65,11 +65,7 @@ class SDAC(Policy):
     self.explore_max    = float(params["explore_max"])
     self.explore_raw_limit = float(params["explore_raw_limit"])
     self.explore_lr        = float(params["explore_lr"])
-    # Gated on the base, not VPDiffusionActor: everything SDAC calls
-    # (diffuse/x0_from_eps/predict_eps/sample) is part of the shared skeleton,
-    # so the noise process is swappable -- which is what makes "is the cosine
-    # ladder or the reference's linear one responsible" testable as a `class:`
-    # override rather than an edit.
+   
     self.actor: DiscreteDiffusionActorBase = self.build_component(
       "actor", DiscreteDiffusionActorBase)
     self.critic: QCriticBase     = self.build_component("critic", QCriticBase)

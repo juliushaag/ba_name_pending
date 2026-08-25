@@ -52,8 +52,7 @@ class AMDP(Policy):
     self.entropy: AutotuneRegulator = self.build_component(
       "entropy", AutotuneRegulator, target=self.action_dim * self.entropy_scale)
 
-    # erf_k is fixed by the actor's terminal variance -- the squash's
-    # log-Jacobian is chosen to cancel out of the score regression below.
+    
     self.squash = self.build_component("squash", Squash,
                                        erf_k=(2 * self.actor.terminal_var) ** -0.5)
 
@@ -92,21 +91,11 @@ class AMDP(Policy):
     self.critic.td_loss(obs, action, next_obs, next_action, reward, term,
                         losses, shift=entropy_bonus)
 
-    # --- actor: regress the SDE's vector field onto the critic's action score
     X_t, tau = self.actor.sample_noised(X)
-    # The actor's own embedding, scaling included: a second copy of the coder
-    # would not be the one the sampler used, and its phase is trainable.
+
     time_embed = self.actor.embed_time(tau.reshape(X.shape[0], 1))
     u_tilde = self.actor.diffusion_act(obs, X_t, time_embed)
 
-    # The score is a gradient w.r.t. the *action*; the critic must not be
-    # trained through the actor loss.
-    #
-    # nnx.value_and_grad rather than jax's, and the critic passed explicitly
-    # rather than captured: an ensemble critic runs nnx.vmap internally, and a
-    # raw jax.value_and_grad over a closure holding the module makes that vmap
-    # re-extract it at a different trace level ("Cannot extract graph node from
-    # different trace level"). Same reason as NCLQL.critic_score.
     def q_values(critic, x):
       return critic.value(obs, self.squash(x)).sum()
 
