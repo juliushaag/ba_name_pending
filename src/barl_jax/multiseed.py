@@ -80,16 +80,32 @@ class StackedPolicy:
     pinned to the stacked weights and to **eval mode** -- the same clone/eval/
     split `Policy.inference_fn` does for the single-seed path. Without it a
     rollout would act through BatchNorm/BatchRenorm on batch moments and with
-    dropout live, i.e. differently than `evaluate()` prices the same policy.
-    Eval-mode flags are plain Python fields, so they live in the GraphDef and
-    not in state: one seed's module is enough to flip them for every seed."""
-    policy, opt = nnx.merge(self._graphdef,
-                            jax.tree.map(lambda x: x[0], self._state))
+    dropout live, i.e. differently than `evaluate()` prices the same policy."""
+    return partial(_stacked_infer, _eval_graphdef(self._graphdef, self._state),
+                   self.num_seeds, self.num_envs, self._state)
+
+
+_EVAL_GRAPHDEF: dict = {}
+
+
+def _eval_graphdef(graphdef, state):
+  """The eval-mode GraphDef derived from `graphdef`, memoized on it.
+
+  Eval-mode flags are plain Python fields, so they live in the GraphDef and not
+  in state: one seed's module is enough to flip them for every seed, and the
+  result is a pure function of the GraphDef -- `state` is needed only because
+  `nnx.merge` wants a module to clone. A run holds one GraphDef for its whole
+  life, so this is computed once instead of once per rollout, where the
+  merge/clone/split (and the per-leaf device slice feeding it) cost 22.8 ms --
+  fine amortized over a 1024-step rollout, the dominant cost of a short one."""
+  cached = _EVAL_GRAPHDEF.get(graphdef)
+  if cached is None:
+    policy, opt = nnx.merge(graphdef, jax.tree.map(lambda x: x[0], state))
     clone = nnx.clone(policy)
     clone.eval()
-    graphdef, _ = nnx.split((clone, opt))
-    return partial(_stacked_infer, graphdef, self.num_seeds, self.num_envs,
-                   self._state)
+    cached, _ = nnx.split((clone, opt))
+    _EVAL_GRAPHDEF[graphdef] = cached
+  return cached
 
 
 @partial(jax.jit, static_argnums=(0, 1, 2))
@@ -112,19 +128,21 @@ def _stacked_infer(graphdef, num_seeds, num_envs, state, observation, key):
 class MultiSeedReplay(ReplayBuffer):
   """One ReplayBuffer per seed behind a single rollout loop.
 
-  `ReplayBuffer.rollout()` already tags each chunk with the sub-env slot it came
-  from (`Trajectory.id`), so routing is a one-line override of
-  `save_trajectory()` and the loop itself -- chunking, episode continuation
+  `ReplayBuffer.rollout()` hands every sub-env slot's transition to `add()` in
+  slot order, and slot `j` belongs to seed `j // num_envs` (see StackedPolicy),
+  so routing is a one-line override and the loop itself -- episode continuation
   across calls, per-slot resets -- is reused unchanged."""
 
-  def __init__(self, num_seeds: int, num_envs: int, max_transitions: int, traj_len: int):
-    super().__init__(max_transitions, traj_len)
+  def __init__(self, num_seeds: int, num_envs: int, max_transitions: int):
+    super().__init__(max_transitions)
     self.num_seeds = num_seeds
     self.num_envs  = num_envs
-    self.seeds = [ReplayBuffer(max_transitions, traj_len) for _ in range(num_seeds)]
+    self.seeds = [ReplayBuffer(max_transitions) for _ in range(num_seeds)]
 
-  def save_trajectory(self, traj):
-    self.seeds[traj.id // self.num_envs].save_trajectory(traj)
+  def add(self, **row) -> None:
+    for i, buffer in enumerate(self.seeds):
+      block = slice(i * self.num_envs, (i + 1) * self.num_envs)
+      buffer.add(**{name: value[block] for name, value in row.items()})
 
   def last_rollout_per_seed(self) -> list[dict]:
     """The statistics of the most recent rollout(), split per seed: seed i's
@@ -145,9 +163,6 @@ class MultiSeedReplay(ReplayBuffer):
 
   def transitions_per_seed(self) -> list[int]:
     return [buffer.n_transitions for buffer in self.seeds]
-
-  def n_chunks(self) -> int:
-    return sum(len(buffer.buffer) for buffer in self.seeds)
 
   def sample(self, batch_size: int) -> dict:
     """`(num_seeds, batch_size, ...)` -- each seed draws from its own data, which

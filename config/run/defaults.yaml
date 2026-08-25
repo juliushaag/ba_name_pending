@@ -31,25 +31,39 @@ random_steps: 5000         # random-action buffer fill before training starts.
                            # it exists to avoid.
 
 # --- rollout ---------------------------------------------------------------
-rollout_steps: 1024        # env steps collected per outer iteration (across all
-                           # num_envs), i.e. how stale the behaviour policy is
-                           # allowed to get. dime_am refreshes it every single env
-                           # step (SB3 train_freq=(1, "step")); a vectorized
-                           # rollout cannot go below num_envs, and below ~1024 the
-                           # per-iteration cost stops being free -- every rollout
-                           # flushes a partial chunk per env, so halving this
-                           # doubles the chunk count and the O(buffer) flat-cache
-                           # rebuild grows superlinearly (85ms -> 244ms -> 431ms
-                           # at 1024/512/256 on a full 1M buffer). Keep it a
-                           # multiple of num_envs: steps_per_iter rounds down while
-                           # the env_steps counter advances by the full value, so a
-                           # remainder makes the two drift apart.
+rollout_steps: 32          # env steps collected per outer iteration (across all
+                           # num_envs) before the next batch of gradient steps,
+                           # i.e. how stale the behaviour policy is allowed to
+                           # get. Set to `num_envs`: one step per env slot per
+                           # iteration, the freshest a vectorized rollout can be.
+                           # dime_am refreshes every single env step (one env,
+                           # SB3 train_freq=(1, "step")), so its behaviour policy
+                           # is at most `utd_ratio` grad steps stale; at 32 here
+                           # ours is at most 64, where 1024 made it 2048.
+                           # This was 1024 because two per-call costs were paid
+                           # per iteration and had to be amortized: the replay
+                           # buffer's O(buffer) flat-cache rebuild (superlinear
+                           # in the chunk count too, and chunk length followed
+                           # rollout_steps -- 120 ms at a 1M buffer of 32-step
+                           # chunks, 3.8 s once every chunk held one transition)
+                           # and StackedPolicy's 22.8 ms merge/clone/split per
+                           # rollout. The buffer is now a flat ring appended in
+                           # O(rows) and that GraphDef is memoized, so an
+                           # iteration costs 4.71 ms/env-step at 32 against 4.73
+                           # at 1024 -- 32x less staleness for free. Keep it
+                           # *equal* to num_envs: steps_per_iter floors while the
+                           # env_steps counter advances by the full value, so a
+                           # remainder makes the two drift apart, and anything
+                           # above num_envs only buys back staleness.
+
 num_envs: 32               # parallel rollout envs (policy inference is flat in
                            # batch size out to ~512, so the whole batch costs what
                            # one env would; episodes persist across rollouts, so
                            # this no longer shortens the horizon)
-buffer_size: 1000000       # max transitions kept (whole trajectory chunks are
-                           # evicted/kept, never split, so this is a budget)
+buffer_size: 1000000       # max transitions kept, per seed. A flat ring: this
+                           # many rows are preallocated per field and overwritten
+                           # oldest-first, so it is an exact capacity rather than
+                           # the budget the old whole-chunk eviction made it.
 
 # --- optimization ----------------------------------------------------------
 batch_size: 256

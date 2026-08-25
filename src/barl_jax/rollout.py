@@ -1,4 +1,3 @@
-from dataclasses import dataclass, field
 import math
 
 import jax
@@ -43,20 +42,6 @@ class RandomPolicy:
     return self.act_scale, self.act_bias
 
 
-@dataclass
-class Trajectory:
-  id: int
-  observations : np.ndarray
-  actions : np.ndarray
-  rewards : np.ndarray
-  terminated : bool
-  truncated : bool
-  extras : dict[str, np.ndarray] = field(default_factory=dict)
-
-  def __len__(self):
-    return len(self.actions)
-
-
 def summarize_rollout(acc: dict, slots: slice = slice(None)) -> dict:
   """Per-sub-env-slot sums -> the reported rollout statistics, over `slots`.
 
@@ -90,16 +75,32 @@ def summarize_rollout(acc: dict, slots: slice = slice(None)) -> dict:
 
 
 class ReplayBuffer():
+  """A flat ring buffer of single transitions: one preallocated array per field,
+  written at a rolling index, evicted oldest-first.
 
-  def __init__(self, max_transitions : int, traj_len : int):
+  Replaces the list-of-chunks this used to be, whose `sample()` read from a
+  full re-concatenation of every chunk rebuilt whenever the buffer changed.
+  That is O(buffer) per rollout and superlinear in the *chunk count*, and the
+  chunk length was `min(traj_len, n_steps)` -- so shortening a rollout shortened
+  the chunks too and the rebuild went 120 ms (1M transitions, 32-step chunks) to
+  3.8 s (1M one-transition chunks). Appending here is O(rows added), which is
+  what lets `rollout_steps` drop to `num_envs` without the rebuild dominating.
 
-    self.max_transitions = max_transitions
-    self.traj_len = traj_len
-    self._buffer = list()
-    self._n_transitions = 0
-    self._length_cumsum_cache = None
-    self._flat_cache = None
-    self._dest_cache = dict()
+  `next_obs` is stored per transition rather than reconstructed from the next
+  row. It costs a second observation array -- the same memory the chunk list and
+  its flattened copy already used between them -- and in exchange there are no
+  seams: the observation the env returned *before* its reset is the one stored,
+  so a truncation boundary needs no special handling, and oldest-first eviction
+  can cut anywhere.
+
+  `term` is termination only, never truncation: a time-limit cut is not a
+  terminal state and must keep its bootstrap."""
+
+  def __init__(self, max_transitions : int):
+    self.max_transitions = int(max_transitions)
+    self._fields = None
+    self._write  = 0
+    self._size   = 0
     # Live env/episode state carried across rollout() calls -- see rollout().
     self._rollout_state = None
     # Per-sub-env-slot sums from the last rollout(), for a caller that owns a
@@ -107,103 +108,39 @@ class ReplayBuffer():
     self._rollout_per_env = None
 
   @property
-  def buffer(self) -> list[Trajectory]:
-    return self._buffer
-
-  @buffer.setter
-  def buffer(self, trajectories: list[Trajectory]):
-    # A property purely so the on-policy `buffer.buffer = []` reset invalidates
-    # the derived caches below instead of silently desyncing them.
-    self._buffer = trajectories
-    self._n_transitions = sum(len(t) for t in trajectories)
-    self._invalidate()
-
-  @property
   def n_transitions(self) -> int:
-    return self._n_transitions
+    return self._size
 
-  def _invalidate(self):
-    self._length_cumsum_cache = None
-    self._flat_cache = None
+  def _allocate(self, row: dict) -> None:
+    self._fields = {
+      name: np.empty((self.max_transitions, *value.shape[1:]), dtype=value.dtype)
+      for name, value in row.items()
+    }
 
-  def save_trajectory(self, traj : Trajectory):
-    """Evicts random whole chunks (never splits one) until `traj` fits under
-    the transition budget. The running `_n_transitions` is what keeps this O(1)
-    in the common case -- re-summing the whole buffer here cost ~5 ms per call
-    once it holds a 1M-transition rollout's worth of chunks, and a rollout ends
-    with one call per env."""
-    while self._buffer and self._n_transitions + len(traj) > self.max_transitions:
-      idx = np.random.randint(0, len(self._buffer))
-      self._n_transitions -= len(self._buffer[idx])
-      del self._buffer[idx]
+  def add(self, **row) -> None:
+    """Append a batch of transitions, one row per sub-env slot. Every array must
+    have the same leading length; each is stored under its keyword name and
+    comes back out of `sample_numpy()` under that same name."""
+    if self._fields is None:
+      self._allocate(row)
+    elif row.keys() != self._fields.keys():
+      raise KeyError(
+        f"transition fields changed mid-run: buffer holds {sorted(self._fields)}, "
+        f"got {sorted(row)} -- a ring buffer cannot backfill the rows already written")
 
-    self._buffer.append(traj)
-    self._n_transitions += len(traj)
-    self._invalidate()
+    n = len(next(iter(row.values())))
+    if n > self.max_transitions:
+      raise ValueError(f"{n} rows at once exceeds the buffer's {self.max_transitions}")
 
-  def _length_cumsum(self):
-    """Cached across sample() calls within the same outer iteration --
-    invalidated whenever the buffer gains, loses or is reassigned a chunk."""
-    if self._length_cumsum_cache is None:
-      self._length_cumsum_cache = np.cumsum([len(t) for t in self._buffer])
-    return self._length_cumsum_cache
+    # One wrapped index array rather than two slice assignments: n is num_envs
+    # per step, so this is a handful of rows and the fancy index costs less than
+    # the branch would.
+    idx = (self._write + np.arange(n)) % self.max_transitions
+    for name, value in row.items():
+      self._fields[name][idx] = value
 
-  def _cat(self, key: str, arrays: list[np.ndarray], dtype) -> np.ndarray:
-    """np.concatenate into a destination reused across rebuilds. Letting it
-    allocate a fresh one each time cost 4x the copy itself at a full buffer
-    (438 ms vs 108 ms for a 1M-transition DogRun observation array) -- faulting
-    in ~900 MB of new pages, then freeing them again one rollout later."""
-    rows = sum(len(a) for a in arrays)
-    tail = arrays[0].shape[1:]
-
-    buf = self._dest_cache.get(key)
-    if buf is None or buf.shape[1:] != tail or buf.dtype != dtype or len(buf) < rows:
-      buf = np.empty((rows, *tail), dtype=dtype)
-      self._dest_cache[key] = buf
-
-    return np.concatenate(arrays, out=buf[:rows])
-
-  def _flat(self) -> dict:
-    """The whole buffer flattened into contiguous per-field arrays, so sample()
-    is one fancy-index per field instead of a Python loop building `batch_size`
-    dicts. Rebuilt once per rollout (whenever a chunk is added/evicted), which
-    amortizes over the thousands of grad steps that follow.
-
-    Observations are stored once, not twice: `obs_row` indexes a transition's
-    observation in the concatenated (traj_len + 1)-row array, and that row + 1
-    is its next_obs. Floats are narrowed to float32 here -- MuJoCo hands back
-    float64, which would otherwise double this array and be cast per batch
-    anyway."""
-    if self._flat_cache is None:
-      trajs = self._buffer
-      lengths = np.array([len(t) for t in trajs])
-
-      observations = self._cat("obs", [t.observations for t in trajs], np.float32)
-      # Each chunk contributes len(t) + 1 rows; a transition's row is its chunk's
-      # start offset plus its within-chunk index.
-      starts  = np.concatenate([[0], np.cumsum(lengths + 1)[:-1]])
-      obs_row = np.concatenate([s + np.arange(n) for s, n in zip(starts, lengths)])
-
-      # float32, not bool: sample_numpy's only consumer wants it that way, and
-      # casting here costs one pass per rollout instead of one per batch.
-      term = np.zeros(int(lengths.sum()), dtype=np.float32)
-      term[np.cumsum(lengths) - 1] = [t.terminated for t in trajs]
-
-      act_chunks = [t.actions for t in trajs]
-      act_dtype  = act_chunks[0].dtype if np.issubdtype(act_chunks[0].dtype, np.integer) else np.float32
-
-      self._flat_cache = dict(
-        observations=observations,
-        obs_row=obs_row,
-        act=self._cat("act", act_chunks, act_dtype),
-        rew=self._cat("rew", [t.rewards for t in trajs], np.float32),
-        term=term,
-        # Intersected, not just the first chunk's: a random_fill() prefix stores
-        # no extras at all, and a field only some chunks carry can't be batched.
-        extras={k: self._cat(f"extras/{k}", [t.extras[k] for t in trajs], np.float32)
-                for k in set.intersection(*(set(t.extras) for t in trajs))},
-      )
-    return self._flat_cache
+    self._write = int((self._write + n) % self.max_transitions)
+    self._size  = int(min(self._size + n, self.max_transitions))
 
   def sample(self, batch_size : int) -> dict:
     """Draws `batch_size` i.i.d. random transition indices across the whole
@@ -215,32 +152,17 @@ class ReplayBuffer():
     """`sample()` without the device transfer. A caller drawing several batches
     at once (the multi-seed trainer, one per seed) stacks them on the host and
     crosses once, rather than once per seed per field."""
-    flat = self._flat()
-    idx  = np.random.randint(0, len(flat["obs_row"]), size=batch_size)
-    rows = flat["obs_row"][idx]
-
-    observations = flat["observations"]
-    batch = dict(
-      obs=      observations[rows],
-      next_obs= observations[rows + 1],
-      act=      flat["act"][idx],
-      rew=      flat["rew"][idx],
-      term=     flat["term"][idx],
-    )
-    for key, values in flat["extras"].items():
-      batch[key] = values[idx]
-
-    return batch
+    if self._size == 0:
+      raise ValueError("sample() from an empty buffer")
+    idx = np.random.randint(0, self._size, size=batch_size)
+    return {name: value[idx] for name, value in self._fields.items()}
 
   def random_fill(self, env : gym.Env | gym.vector.VectorEnv, n_steps : int, seed : int = None):
     """Seeds the buffer with `n_steps` of uniformly-random actions before
     training starts -- broader, less-correlated coverage than an untrained
     (but already-biased) policy's own actions would give. Just rollout()
-    under a RandomPolicy stand-in, so every chunking/truncation rule there
-    applies unchanged; the resulting Trajectory extras are empty, which is
-    fine for off-policy algorithms (they read obs/act/rew/next_obs only) but
-    not for on-policy ones (PPO's compute_gae needs extras["value"]) -- callers
-    should only use this for off-policy Policies (see Policy.on_policy)."""
+    under a RandomPolicy stand-in, so every truncation rule there applies
+    unchanged."""
     action_space = env.single_action_space if isinstance(env, gym.vector.VectorEnv) else env.action_space
     return self.rollout(RandomPolicy(action_space, seed=seed), env, n_steps=n_steps, seed=seed)
 
@@ -258,23 +180,6 @@ class ReplayBuffer():
     is_vec = isinstance(env, gym.vector.VectorEnv)
     n_envs = env.num_envs if is_vec else 1
 
-    # A slot can't outlive this call -- the tail flush below cuts every open
-    # chunk -- so sizing to n_steps avoids handing the buffer `traj_len`-row
-    # allocations that a short rollout only fills a fraction of (the saved
-    # Trajectory slices are views, and would keep the whole thing alive).
-    cap = min(self.traj_len, n_steps)
-
-    def fresh_slot(o):
-      slot = dict(
-        observations=np.empty((cap + 1, *o.shape), dtype=o.dtype),
-        actions=None,
-        rewards=np.empty(cap, dtype=np.float32),
-        extras=dict(),
-        t=0,
-      )
-      slot["observations"][0] = o
-      return slot
-
     state = self._rollout_state
     if state is None or state["env"] is not env or seed is not None:
       obs, _ = env.reset(seed=seed)
@@ -283,9 +188,8 @@ class ReplayBuffer():
     else:
       obs = state["obs"]
 
-    # Only `obs` is carried between calls -- every open chunk was cut and
-    # flushed at the end of the last one, so the slots start empty regardless.
-    slots = [fresh_slot(obs[i]) for i in range(n_envs)]
+    # Only `obs` is carried between calls: a transition is stored whole, the
+    # step it completes, so there is never an open chunk to flush.
 
     # JAX transfers are already async and it has no pinned-host-buffer API, so
     # the torch version's staging buffer has no counterpart -- jnp.asarray is
@@ -361,47 +265,20 @@ class ReplayBuffer():
       acc["n_rew"]      += 1
 
       done = term | trunc
-      finished_idx = []
 
-      for i in range(n_envs):
-        slot = slots[i]
+      # The whole transition is stored the step it completes. `next_obs` is the
+      # observation the env returned *before* any reset below, which is what
+      # makes a truncated step bootstrap from where it actually left off.
+      self.add(obs=obs.reshape(n_envs, -1).astype(np.float32),
+               next_obs=next_obs.reshape(n_envs, -1).astype(np.float32),
+               act=action_np,
+               rew=reward.astype(np.float32).reshape(n_envs),
+               # Termination only: a time-limit truncation is not a terminal
+               # state and must keep its bootstrap.
+               term=term.astype(np.float32).reshape(n_envs),
+               **{name: value for name, value in step_extras.items()})
 
-        if slot["actions"] is None:
-          slot["actions"] = np.empty((cap, *action_np[i].shape), dtype=action_np.dtype)
-
-        t = slot["t"]
-        slot["observations"][t + 1] = next_obs[i]
-        slot["actions"][t] = action_np[i]
-        slot["rewards"][t] = reward[i]
-
-        # `name`, never `key`: that identifier is the PRNG key split at the top
-        # of this step, and shadowing it here crashed the next iteration.
-        for name, value in step_extras.items():
-          value_i = value[i]
-          if name not in slot["extras"]:
-            slot["extras"][name] = np.empty((cap, *np.shape(value_i)), dtype=np.asarray(value_i).dtype)
-          slot["extras"][name][t] = value_i
-
-        slot["t"] = t + 1
-
-        if done[i] or slot["t"] >= cap:
-          self.save_trajectory(Trajectory(
-            id=i,  # originating sub-env slot index
-            observations=slot["observations"][:slot["t"] + 1],
-            actions=slot["actions"][:slot["t"]],
-            rewards=slot["rewards"][:slot["t"]],
-            terminated=bool(term[i]),
-            # A chunk-size cut mid-episode (done[i] False here) is truncated too,
-            # same as a real env-reported one -- either way this chunk doesn't
-            # represent an actual episode end.
-            truncated=bool(trunc[i]) if done[i] else True,
-            extras={k: v[:slot["t"]] for k, v in slot["extras"].items()},
-          ))
-          if done[i]:
-            finished_idx.append(i)
-          else:
-            # chunk boundary mid-episode: continue the same episode in a fresh chunk
-            slots[i] = fresh_slot(next_obs[i])
+      finished_idx = np.flatnonzero(done).tolist()
 
       obs = next_obs
 
@@ -412,26 +289,6 @@ class ReplayBuffer():
           obs, _ = env.reset(options={"reset_mask": mask})
         else:
           obs[0], _ = env.reset()
-
-        for i in finished_idx:
-          slots[i] = fresh_slot(obs[i])
-
-    # n_steps ran out mid-chunk -- flush whatever each slot collected instead of
-    # silently discarding it when `slots` goes out of scope; the episode itself
-    # isn't over, so terminated=False, truncated=True, same as a chunk-size cut.
-    # The episode continues in the next call, from `obs` below.
-    for i in range(n_envs):
-      slot = slots[i]
-      if slot["t"] > 0:
-        self.save_trajectory(Trajectory(
-          id=i,
-          observations=slot["observations"][:slot["t"] + 1],
-          actions=slot["actions"][:slot["t"]],
-          rewards=slot["rewards"][:slot["t"]],
-          terminated=False,
-          truncated=True,
-          extras={k: v[:slot["t"]] for k, v in slot["extras"].items()},
-        ))
 
     self._rollout_state = dict(env=env, obs=obs)
 

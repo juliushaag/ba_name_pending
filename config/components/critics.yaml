@@ -93,7 +93,7 @@ HLGaussCritic:
 
 NCLQLCritic:
   kind: critic
-  extends: [net.mish, optim.critic_slow, time.fourier]
+  extends: [net.mish, optim.critic, time.fourier]
   rho: 1.0
   pessimistic_target: true
   smoothing_coef: 1.0
@@ -108,7 +108,7 @@ NCLQLCritic:
 # pinning.
 NCLQLC51Critic:
   kind: critic
-  extends: [net.mish, optim.critic_slow, time.fourier]
+  extends: [net.mish, optim.critic, time.fourier]
   num_atoms: 101
   entropy_coef: 0.005
   rho: 0.0
@@ -123,7 +123,7 @@ NCLQLC51Critic:
 # bootstrap NCLQLC51Critic also brings.
 NCLQLHLGaussCritic:
   kind: critic
-  extends: [net.mish, optim.critic_slow, time.fourier]
+  extends: [net.mish, optim.critic, time.fourier]
   num_bins: 151
   sigma_to_bin_ratio: 0.75
   entropy_coef: 0.0

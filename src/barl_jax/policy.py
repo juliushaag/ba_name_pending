@@ -745,62 +745,70 @@ class Policy(nnx.Module, ABC):
     return run_data
 
   def _run_episodes(self, env: gym.Env, n: int, render: bool, **inference_kwargs) -> list[dict]:
-    """`n` complete episodes, in parallel waves of `num_envs` if `env` is a
-    VectorEnv. A slot that finishes before the rest of its wave is reset and
-    stops recording -- autoreset_mode=DISABLED asserts rather than letting a
-    finished slot be stepped again -- so a wave costs its longest episode."""
-    if n <= 0:
-      return []
+    return run_episodes(self, env, n, render, **inference_kwargs)
 
-    is_vec = isinstance(env, gym.vector.VectorEnv)
-    n_envs = env.num_envs if is_vec else 1
 
-    def reset(**kwargs):
-      obs, _ = env.reset(**kwargs)
-      return obs if is_vec else obs[None, ...]
+def run_episodes(actor, env: gym.Env, n: int, render: bool, **inference_kwargs) -> list[dict]:
+  """`n` complete episodes, in parallel waves of `num_envs` if `env` is a
+  VectorEnv. A slot that finishes before the rest of its wave is reset and
+  stops recording -- autoreset_mode=DISABLED asserts rather than letting a
+  finished slot be stepped again -- so a wave costs its longest episode.
 
-    act_scale_np, act_bias_np = self.action_bounds_numpy()
-    act = self.inference_fn()
-    key = jax.random.PRNGKey(0)
+  `actor` is anything exposing `action_bounds_numpy()` and `inference_fn()`,
+  which is a Policy or a StackedPolicy -- the latter is how the trainer
+  evaluates every seed in one vmapped pass instead of one loop per seed."""
+  if n <= 0:
+    return []
 
-    out = []
-    while len(out) < n:
-      wave = min(n_envs, n - len(out))
-      obs  = reset()
-      data = [dict(frames=[], rewards=[], terminated=False) for _ in range(n_envs)]
-      live = np.zeros(n_envs, dtype=bool)
-      live[:wave] = True
+  is_vec = isinstance(env, gym.vector.VectorEnv)
+  n_envs = env.num_envs if is_vec else 1
 
-      while live.any():
-        key, subkey = jax.random.split(key)
-        action, _ = act(jnp.asarray(obs, dtype=jnp.float32), subkey)
-        action_np  = np.asarray(action)
-        env_action = action_np if act_scale_np is None else action_np * act_scale_np + act_bias_np
-        # .copy(): np.asarray() on a JAX array can alias its buffer, and MuJoCo
-        # writes through the action array it is handed.
-        env_action = np.ascontiguousarray(env_action, dtype=np.float32).copy()
-        obs, reward, term, trunc, _ = env.step(env_action if is_vec else env_action[0])
+  def reset(**kwargs):
+    obs, _ = env.reset(**kwargs)
+    return obs if is_vec else obs[None, ...]
 
-        if not is_vec:
-          obs, reward, term, trunc = obs[None, ...], np.array([reward]), np.array([term]), np.array([trunc])
+  act_scale_np, act_bias_np = actor.action_bounds_numpy()
+  act = actor.inference_fn()
+  key = jax.random.PRNGKey(0)
 
-        frames = (env.call("render") if is_vec else [env.render()]) if render else None
+  out = []
+  while len(out) < n:
+    wave = min(n_envs, n - len(out))
+    obs  = reset()
+    data = [dict(frames=[], rewards=[], terminated=False) for _ in range(n_envs)]
+    live = np.zeros(n_envs, dtype=bool)
+    live[:wave] = True
 
-        done = term | trunc
-        for i in np.flatnonzero(live):
-          data[i]["rewards"].append(reward[i])
-          if render:
-            data[i]["frames"].append(frames[i])
-          if done[i]:
-            data[i]["terminated"] = bool(term[i])
-            live[i] = False
+    while live.any():
+      key, subkey = jax.random.split(key)
+      action, _ = act(jnp.asarray(obs, dtype=jnp.float32), subkey)
+      action_np  = np.asarray(action)
+      env_action = action_np if act_scale_np is None else action_np * act_scale_np + act_bias_np
+      # .copy(): np.asarray() on a JAX array can alias its buffer, and MuJoCo
+      # writes through the action array it is handed.
+      env_action = np.ascontiguousarray(env_action, dtype=np.float32).copy()
+      obs, reward, term, trunc, _ = env.step(env_action if is_vec else env_action[0])
 
-        if live.any() and done.any():
-          obs = reset(options={"reset_mask": done}) if is_vec else reset()
+      if not is_vec:
+        obs, reward, term, trunc = obs[None, ...], np.array([reward]), np.array([term]), np.array([trunc])
 
-      out += data[:wave]
+      frames = (env.call("render") if is_vec else [env.render()]) if render else None
 
-    return out
+      done = term | trunc
+      for i in np.flatnonzero(live):
+        data[i]["rewards"].append(reward[i])
+        if render:
+          data[i]["frames"].append(frames[i])
+        if done[i]:
+          data[i]["terminated"] = bool(term[i])
+          live[i] = False
+
+      if live.any() and done.any():
+        obs = reset(options={"reset_mask": done}) if is_vec else reset()
+
+    out += data[:wave]
+
+  return out
 
 
 def register_policy(cls: type):
