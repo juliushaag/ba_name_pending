@@ -169,11 +169,6 @@ class MultiSeedReplay(ReplayBuffer):
     is what keeps the seeds independent rather than merely differently
     initialized."""
     per_seed = [buffer.sample_numpy(batch_size) for buffer in self.seeds]
-    # Stacked on the host and handed over in **one** device_put for the whole
-    # dict: going through ReplayBuffer.sample() instead would cross the bus
-    # num_seeds x num_fields times every gradient step, and even one jnp.asarray
-    # per field costs ~80 us of dispatch apiece regardless of the few KB it
-    # carries -- five of them were 455 us of host time per grad step.
     return jax.device_put({key: np.stack([s[key] for s in per_seed])
                            for key in per_seed[0]})
 

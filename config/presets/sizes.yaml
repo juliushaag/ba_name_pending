@@ -25,7 +25,7 @@ critic:
   xlarge: {latent_dim: 2048, layers: 1, n_models: 2}
 
 actor:
-  small:  {latent_dim: 256,  layers: 3}
-  medium: {latent_dim: 512,  layers: 3}
-  large:  {latent_dim: 1024, layers: 3}
-  xlarge: {latent_dim: 2048, layers: 3}
+  small:  {latent_dim: 256,  layers: 2}
+  medium: {latent_dim: 512,  layers: 2}
+  large:  {latent_dim: 1024, layers: 2}
+  xlarge: {latent_dim: 2048, layers: 2}

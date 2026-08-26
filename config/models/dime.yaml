@@ -16,12 +16,9 @@ DIME:
     # head, so that depth is `layers: 2` -- stated inline because the size
     # ladder is width-at-fixed-depth by design.
     #
-    # DISActor, not OUDiffusionActor: the reference's actor is a time-reversed
-    # diffusion *sampler* with a learned step size and per-dimension friction,
-    # not a DDPM denoiser, and its entropy term is the path KL the integration
-    # accumulates. OUDiffusionActor stays registered so the two are comparable
-    # as a `--set model.components.actor.class=` axis.
+    # The reference's actor is a time-reversed diffusion *sampler* with a
+    # learned step size and per-dimension friction, not a DDPM denoiser, and its
+    # entropy term is the path KL the integration accumulates.
     actor:   {class: DISActor,           size: medium, layers: 2}
     critic:  {class: C51Critic,          size: xlarge}
-    squash:  {class: TanhSquash}
     entropy: {class: AutotuneRegulator}

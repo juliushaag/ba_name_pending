@@ -4,16 +4,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`barl_jax` is a research framework for online off-policy deep-RL experiments across MuJoCo Gym
-and DeepMind Control Suite continuous-control benchmarks. It implements a range of actor-critic
+`barl_jax` is a research framework for online off-policy deep-RL experiments across MuJoCo Gym,
+DeepMind Control Suite and ManiSkill continuous-control benchmarks. It implements a range of actor-critic
 algorithms (`SAC`, `AMDP`, `DIME`, `SDAC`, `NCLQL`) behind one shared `Policy`/`Environment`
 interface so any algorithm can be pointed at any registered environment through a single training
 script and YAML config.
 
-**JAX only.** The framework is jax/flax-nnx/optax; there is no torch dependency, and the torch
-implementation this was ported from (`src/barl`) is gone. Comments that say "the torch version
-did X" are kept where they explain *why* the current code looks the way it does, not because that
-code is still around.
+**JAX only.** The framework is jax/flax-nnx/optax, and the torch implementation this was ported
+from (`src/barl`) is gone. Comments that say "the torch version did X" are kept where they explain
+*why* the current code looks the way it does, not because that code is still around.
+
+Torch *is* installed, but only as a transitive dependency of `mani_skill` (via sapien) -- no
+`barl_jax` module imports it, and nothing in a training step touches it. The ManiSkill family is
+wired on the CPU backend precisely so it hands back numpy and that stays true; ManiSkill's
+GPU-parallel simulator would put torch tensors in the rollout loop and is deliberately not used
+(see `environments/mani_skill.py`).
 
 > **Stale below this point.** Everything from "### Registries" down still describes the torch
 > implementation — its file paths (`src/barl/...`), its `DataLoader`/`retain_graph` training loop,
@@ -391,7 +396,7 @@ wandb's sidebar reads as one section per component (`critic/`, `actor/`, `entrop
 algorithm (`amdp/`, `ppo/`, `iql/`).
 
 `Policy.build_component()` hands each slot a `child(slot)` view as `self.metrics`, so a component
-writes `self.metrics.dist("q", pred)` and it lands at `critic/q/*` **without naming itself** — the
+writes `self.metrics.dist("critic", pred)` and it lands at `critic/q/*` **without naming itself** — the
 same mechanism that lets `AutotuneRegulator` key its optimizer off `self.slot` rather than a `name`
 kwarg. A Policy's own `self.metrics` is pre-namespaced to `algo_name()`. This is why a critic's
 `loss()` no longer takes a `log` dict.

@@ -29,6 +29,7 @@ dependencies = [
     "playground>=0.2.0",
     "warp-lang==1.13.0",
     "cloc>=0.2.5",
+    "mani-skill>=3.0.1",
 ]
 
 

@@ -111,7 +111,7 @@ class Component:
   registers each slot it builds and forwards both hooks below, so no Policy
   has to hand-roll a critic's Polyak update from its own train_step; and hold a
   `metrics` sink already namespaced to this component's slot, so writing
-  `self.metrics.dist("q", pred)` lands at `critic/q/*` without the component
+  `self.metrics.dist("critic", pred)` lands at `critic/q/*` without the component
   ever naming itself.
 
   Unlike the torch original, the EnvStats itself is *not* retained -- only the
@@ -162,15 +162,18 @@ class Component:
 
 
 class Actor(Component, nnx.Module, ABC):
-  """A network that can produce actions -- pure architecture; every
-  algorithm-level decision (loss, squash choice, etc.) stays on the owning
-  Policy's train_step."""
+  """A network that can produce actions.
 
-  @abstractmethod
-  def sample(self, s, key, critic: "Critic" = None):
-    """`critic` is unused by generative actors; implicit/Q-derived actors need
-    it to compute an action at all. `key` is explicit -- there is no global RNG."""
-    ...
+  Deliberately contract-free: each actor now lives next to the one Policy that
+  owns it and carries that algorithm's loss, so how the Policy reaches it is
+  between the two of them -- `sample` for SAC/DIME/SDAC, `generate_action` for
+  AMDP. Nothing Policy-agnostic calls an actor (rollout and eval both go through
+  `Policy.inference_step`), so an abstract `sample` here bought uniformity no
+  caller needed, at the price of a shim on every actor whose natural entry point
+  is something else. What every actor still shares is `Component`: EnvStats, the
+  slot name, the metrics sink and the lifecycle hooks.
+
+  Whatever draws randomness takes an explicit `key` -- there is no global RNG."""
 
 
 class Critic(Component, nnx.Module, ABC):
@@ -748,6 +751,29 @@ class Policy(nnx.Module, ABC):
     return run_episodes(self, env, n, render, **inference_kwargs)
 
 
+def episode_success(info, i: int, is_vec: bool, terminated: bool) -> bool:
+  """Did the episode that just ended on slot `i` succeed?
+
+  Where the env says so itself, that answer wins: ManiSkill reports
+  `info["success"]` and sets `terminated` *from* it, so the survival convention
+  below would read its success rate exactly backwards. Every other family here
+  reports no such key, and for them an episode that never terminated is one the
+  agent did not fail out of -- a MuJoCo humanoid terminates by falling over.
+
+  Gymnasium's vector envs batch each sub-env info key into an array plus an
+  `_<key>` presence mask (a key only some sub-envs reported); a plain env just
+  carries the key."""
+  value = info.get("success")
+  if value is None:
+    return not terminated
+  if not is_vec:
+    return bool(np.asarray(value).reshape(-1)[0])
+  present = info.get("_success")
+  if present is not None and not bool(np.asarray(present)[i]):
+    return not terminated
+  return bool(np.asarray(value)[i])
+
+
 def run_episodes(actor, env: gym.Env, n: int, render: bool, **inference_kwargs) -> list[dict]:
   """`n` complete episodes, in parallel waves of `num_envs` if `env` is a
   VectorEnv. A slot that finishes before the rest of its wave is reset and
@@ -775,7 +801,8 @@ def run_episodes(actor, env: gym.Env, n: int, render: bool, **inference_kwargs) 
   while len(out) < n:
     wave = min(n_envs, n - len(out))
     obs  = reset()
-    data = [dict(frames=[], rewards=[], terminated=False) for _ in range(n_envs)]
+    data = [dict(frames=[], rewards=[], terminated=False, success=False)
+            for _ in range(n_envs)]
     live = np.zeros(n_envs, dtype=bool)
     live[:wave] = True
 
@@ -784,10 +811,8 @@ def run_episodes(actor, env: gym.Env, n: int, render: bool, **inference_kwargs) 
       action, _ = act(jnp.asarray(obs, dtype=jnp.float32), subkey)
       action_np  = np.asarray(action)
       env_action = action_np if act_scale_np is None else action_np * act_scale_np + act_bias_np
-      # .copy(): np.asarray() on a JAX array can alias its buffer, and MuJoCo
-      # writes through the action array it is handed.
       env_action = np.ascontiguousarray(env_action, dtype=np.float32).copy()
-      obs, reward, term, trunc, _ = env.step(env_action if is_vec else env_action[0])
+      obs, reward, term, trunc, info = env.step(env_action if is_vec else env_action[0])
 
       if not is_vec:
         obs, reward, term, trunc = obs[None, ...], np.array([reward]), np.array([term]), np.array([trunc])
@@ -801,6 +826,7 @@ def run_episodes(actor, env: gym.Env, n: int, render: bool, **inference_kwargs) 
           data[i]["frames"].append(frames[i])
         if done[i]:
           data[i]["terminated"] = bool(term[i])
+          data[i]["success"] = episode_success(info, i, is_vec, bool(term[i]))
           live[i] = False
 
       if live.any() and done.any():

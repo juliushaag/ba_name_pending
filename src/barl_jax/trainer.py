@@ -143,7 +143,7 @@ def evaluate(run: Run, envs, log, ckpt_dir, best):
     reward = float(np.mean([np.sum(r["rewards"]) for r in runs]))
     rewards.append(reward)
     lengths.append(np.mean([len(r["rewards"]) for r in runs]))
-    successes.append(np.mean([int(not bool(r["terminated"])) for r in runs]))
+    successes.append(np.mean([float(r["success"]) for r in runs]))
 
     policy, _ = unstack(run.graphdef, run.state, i)
     root = _checkpoint_dir(run, ckpt_dir, i)

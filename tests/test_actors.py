@@ -10,22 +10,22 @@ import jax.numpy as jnp
 import pytest
 from flax import nnx
 
-from barl_jax.networks.actor import DDPMActor, DiscreteDiffusionActorBase
 from barl_jax.networks.registry import get_component
+from barl_jax.policies.sdac import DDPMActor
 from barl_jax.policy import TRAINABLE
 
 from conftest import ACT_DIM, ACTORS, BATCH, build, built, finite
 
-DIFFUSION = [n for n in ACTORS if issubclass(get_component(n), DiscreteDiffusionActorBase)]
+DIFFUSION = [n for n in ACTORS if issubclass(get_component(n), DDPMActor)]
 
-# The eps/score duality is a property of the *ladder*, not of the base class:
-# it holds wherever `to_score` is -raw/sqrt(nu), which is every DDPM schedule.
-# OUDiffusionActor parameterizes an anchored score directly (`raw - x*inv_eta2`),
-# so `predict_raw` is not eps_theta there and the base's eps helpers do not apply.
-DDPM_FAMILY = [n for n in ACTORS if issubclass(get_component(n), DDPMActor)]
+# `Actor` no longer declares `sample`: an actor's entry point is whatever the one
+# Policy that owns it calls (AMDP's is `generate_action`, and it returns the path
+# weight alongside the sample). The contract below is what `sample` means where
+# it exists, not a claim that every actor has one.
+SAMPLERS = [n for n in ACTORS if hasattr(get_component(n), "sample")]
 
 
-@pytest.mark.parametrize("name", ACTORS)
+@pytest.mark.parametrize("name", SAMPLERS)
 def test_sample_contract(name, obs, key):
     """One action per row, finite, and a pure function of the key it was given --
     every draw takes an explicit key because there is no global RNG here."""
@@ -38,7 +38,7 @@ def test_sample_contract(name, obs, key):
     assert not jnp.array_equal(action, a.sample(obs, jax.random.PRNGKey(7)))
 
 
-@pytest.mark.parametrize("name", ACTORS)
+@pytest.mark.parametrize("name", SAMPLERS)
 def test_sample_is_differentiable_wrt_params(name, obs, key):
     a = build(name)
     grads = nnx.grad(lambda actor: actor.sample(obs, key).sum(),
@@ -63,11 +63,11 @@ def test_x0_from_eps_inverts_the_marginal(name):
     assert jnp.allclose(a.x0_from_eps(x_n, eps, n), x0, atol=1e-3)
 
 
-@pytest.mark.parametrize("name", DDPM_FAMILY)
+@pytest.mark.parametrize("name", DIFFUSION)
 def test_eps_and_score_parameterizations_agree(name, obs):
     """The codebase states its losses in score space and the DDPM literature in
-    eps space; the base class calls them renamings and one division over any
-    ladder whose `to_score` is -raw/sqrt(nu). This is that claim."""
+    eps space; `DDPMActor` calls them renamings and one division, its score
+    being -eps/sqrt(nu) over every ladder. This is that claim."""
     a = built(name)
     x = jax.random.normal(jax.random.PRNGKey(5), (BATCH, ACT_DIM))
     n = jnp.ones((BATCH,), jnp.int32)

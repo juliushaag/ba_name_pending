@@ -14,23 +14,12 @@ _ACTIVATIONS = dict(
   mish=jax.nn.mish,
 )
 
-# The *compute* dtype. Parameters are always stored and updated in float32
-# (`param_dtype` below), so this is torch's autocast contract rather than a
-# half-precision model: fp32 master weights, reduced-precision matmuls. bf16
-# needs no loss scaling -- it keeps float32's exponent range, only the mantissa
-# is shorter. Every consumer of a network's output already casts back to
-# float32 (see e.g. QCriticBase's reductions), which is what makes this safe to
-# switch on per component.
 _DTYPES = dict(
   float32=jnp.float32,
   bfloat16=jnp.bfloat16,
   float16=jnp.float16,
 )
 
-# dime_am's `nn.Dense` defaults: lecun_normal kernel, zero bias. barl previously
-# used torch's nn.Linear scheme (U(+-1/sqrt(fan_in)) on both) to keep the torch
-# and jax backends' curves comparable; that comparability is given up here in
-# favour of matching the reference.
 def Linear(in_features: int, out_features: int, *, rngs: nnx.Rngs,
            dtype=jnp.float32) -> nnx.Linear:
   return nnx.Linear(in_features, out_features,

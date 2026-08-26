@@ -45,17 +45,6 @@ class AutotuneRegulator(Component, nnx.Module):
     return jnp.exp(self.log_alpha[...])
 
   def loss(self, value, losses: dict) -> None:
-    """`alpha * (value - target)`, differentiated wrt log_alpha, so the gradient
-    is `alpha * (value - target)` -- it scales with alpha rather than being flat
-    in it. That is dime_am's form (am_diff.py / dime.py `update_temperature`:
-    `ent_coef_value * (entropy - target_entropy)`), and it was the last place
-    the port still spelled the dual differently: `log_alpha * (value - target)`
-    gives a gradient of `value - target`, the same sign but a magnitude that
-    does not shrink as alpha does. Under Adam the two are close, since a scalar
-    parameter's step is ~lr either way until the gradient approaches Adam's eps
-    -- but "close under the optimizer we happen to use" is not the same as the
-    reference's update, and the difference shows in how far alpha overshoots
-    before the measured value pulls it back."""
     value = jax.lax.stop_gradient(value)
     losses[f"{self.slot}_alpha"] = self.value() * (value - self.target_value).mean()
 

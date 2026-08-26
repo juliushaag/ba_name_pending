@@ -188,32 +188,16 @@ class ReplayBuffer():
     else:
       obs = state["obs"]
 
-    # Only `obs` is carried between calls: a transition is stored whole, the
-    # step it completes, so there is never an open chunk to flush.
-
-    # JAX transfers are already async and it has no pinned-host-buffer API, so
-    # the torch version's staging buffer has no counterpart -- jnp.asarray is
-    # the whole H2D path.
     def to_device(o):
       return jnp.asarray(o, jnp.float32)
 
-    # RandomPolicy has no jitted path (and needs none); a real Policy must not
-    # run inference eagerly here -- this is the hot loop. Built once per
-    # rollout, so it is pinned to the weights this rollout collects under.
     inference_fn = getattr(policy, "inference_fn", None)
     act = inference_fn() if inference_fn else (lambda o, _k: policy.inference_step(o))
     key = jax.random.PRNGKey(int(np.random.randint(0, 2 ** 31 - 1)))
 
-    # Host-side copies of the policy's action bounds. Scaling on the device
-    # instead costs a second round-trip per step for an affine map on an array
-    # that came back to the host one line earlier.
     act_scale_np, act_bias_np = policy.action_bounds_numpy()
 
-    # Running scalar (not per-dimension) sums -- cheap "is anything blowing up"
-    # signal. Kept per *sub-env slot* rather than as one running total: a
-    # MultiSeedReplay owns a block of slots per seed (see StackedPolicy), so
-    # only this granularity lets it report each seed's own rollout rather than
-    # a blend of all of them. `_summarize` collapses them either way.
+   
     zeros = lambda: np.zeros(n_envs, dtype=np.float64)
     acc = dict(rew_sum=zeros(), rew_sq_sum=zeros(), n_rew=zeros(),
                obs_sum=zeros(), obs_sq_sum=zeros(), n_obs=zeros(),
@@ -240,18 +224,12 @@ class ReplayBuffer():
       acc["act_max"]     = np.maximum(acc["act_max"], act64.max(axis=1))
       acc["n_act"]      += act64.shape[1]
 
-      # Failsafe on the one path that leaves the framework. Counted, not just
-      # clamped: silently repairing a NaN action would hide the actor blowing up
-      # behind a policy that merely looks bad, and this is the last place the
-      # distinction is still visible.
       acc["act_nonfinite"] += (~np.isfinite(act64)).sum(axis=1)
       acc["act_clipped"]   += (np.abs(act64) > 1.0).sum(axis=1)
       action_np = sanitize_action(action_np, xp=np)
 
-      # Only the env needs real-scale actions -- everything stored/returned here is canonical.
       env_action_np = action_np if act_scale_np is None else action_np * act_scale_np + act_bias_np
-      # .copy(): np.asarray() on a JAX array can alias the device buffer, and
-      # MuJoCo writes through the action array it is handed.
+
       env_action_np = np.ascontiguousarray(env_action_np, dtype=np.float32).copy()
       env_action = env_action_np[0] if not is_vec else env_action_np
       next_obs, reward, term, trunc, _ = env.step(env_action)
@@ -266,9 +244,6 @@ class ReplayBuffer():
 
       done = term | trunc
 
-      # The whole transition is stored the step it completes. `next_obs` is the
-      # observation the env returned *before* any reset below, which is what
-      # makes a truncated step bootstrap from where it actually left off.
       self.add(obs=obs.reshape(n_envs, -1).astype(np.float32),
                next_obs=next_obs.reshape(n_envs, -1).astype(np.float32),
                act=action_np,

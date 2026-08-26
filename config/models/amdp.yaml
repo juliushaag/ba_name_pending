@@ -19,5 +19,4 @@ AMDP:
     # as DIME's; see the note there on `layers: 2`.
     actor:   {class: ScoreContinuousActor, size: medium, layers: 2}
     critic:  {class: C51Critic,            size: xlarge}
-    squash:  {class: ErfSquash}
     entropy: {class: AutotuneRegulator}

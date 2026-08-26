@@ -68,7 +68,7 @@ class NoiseConditionedCritic:
   def noise_conditioned_loss(self, obs, action, next_obs, next_action, reward, term,
                              sigmas, key, losses: dict, shift=0.0) -> None:
     """`td_loss` at the clean level, plus a smoothing loss pulling every noisier
-    level onto it -- one `losses["q"]`, since both fit the same heads.
+    level onto it -- one `losses["critic"]`, since both fit the same heads.
 
     `sigmas` is passed in rather than owned here because it is the same ladder
     the owning Policy's sampler anneals over; index L-1 is the clean level, by
@@ -97,7 +97,7 @@ class NoiseConditionedCritic:
     # a detached distribution over atoms.
     smoothing_loss = self.regression_loss(pred_noisy, self.target_from_raw(pred_clean))
 
-    losses["q"] = td_loss + self.smoothing_coef * smoothing_loss
+    losses["critic"] = td_loss + self.smoothing_coef * smoothing_loss
 
     # Once, and against the clean pass: recording both would have the second
     # overwrite the first's `critic/q/*`.

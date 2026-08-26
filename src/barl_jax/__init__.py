@@ -11,7 +11,6 @@ from barl_jax.env import Environment, register_environment
 # Imported purely for @register_component side effects -- config/models.yaml
 # resolves these by name, so an unused-import cleanup here would silently
 # break that.
-import barl_jax.networks.actor
 import barl_jax.networks.critic
 import barl_jax.networks.squash
 import barl_jax.networks.regulator
@@ -20,3 +19,4 @@ import barl_jax.networks.schedule
 from barl_jax.policies import *
 from barl_jax.environments.mujoco_gym import *
 from barl_jax.environments.dm_control import *
+from barl_jax.environments.mani_skill import *

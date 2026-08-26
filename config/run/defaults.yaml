@@ -92,11 +92,17 @@ lr_decay: constant         # shape of the post-warmup decay (Policy.DECAYS).
                            # component's optimizer (config/presets/optim.yaml).
 
 # --- evaluation ------------------------------------------------------------
-eval_every: 25000          # grad steps between evals
+eval_every: 25000          # env steps between evals (trainer.py keys this off
+                           # `env_steps`, not grad steps)
 eval_runs: 20              # episodes per eval, run in parallel
 eval_videos: 1             # of those runs, how many render frames (they run on
-                           # their own env). Rendering costs ~140x the env step,
-                           # so this is most of an eval's wall clock. null = all.
+                           # their own env, sequentially). Rendering costs ~7x
+                           # the env step, so one video is ~2 s of a 1000-step
+                           # episode -- next to nothing beside the eval wave
+                           # itself, which is `eval_runs` x num_seeds envs
+                           # stepped *synchronously* (45 s for 100 HumanoidRun
+                           # envs). Cut `eval_runs`/raise `eval_every` before
+                           # reaching for this. null = all.
 
 # --- logging ---------------------------------------------------------------
 log_every: 250             # grad steps between primary-tier logs

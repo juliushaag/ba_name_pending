@@ -73,5 +73,4 @@ class ErfSquash(Squash):
     return jax.scipy.special.erfinv(jnp.clip(y, -1 + eps, 1 - eps)) / self.erf_k
 
   def log_abs_det_jacobian(self, x, y=None):
-    return (math.log(2 / math.sqrt(math.pi)) + math.log(self.erf_k)
-            - (self.erf_k * x) ** 2)
+    return (math.log(2 / math.sqrt(math.pi)) + math.log(self.erf_k) - (self.erf_k * x) ** 2)

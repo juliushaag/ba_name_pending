@@ -262,7 +262,7 @@ def test_augment_widens_the_action_by_the_level_embedding(name, act):
 @pytest.mark.parametrize("name", NOISE_CONDITIONED)
 def test_smoothing_coefficient_is_actually_wired_in(name, obs, act, key):
     """`noise_conditioned_loss` folds TD at the clean level and smoothing of the
-    noisier ones into one `losses["q"]`, since both fit the same heads."""
+    noisier ones into one `losses["critic"]`, since both fit the same heads."""
     sigmas = jnp.array([0.5, 0.2, 0.05])
     c = build(name)                     # one build, two coefficients -- it is a plain float
 
@@ -271,8 +271,8 @@ def test_smoothing_coefficient_is_actually_wired_in(name, obs, act, key):
         losses = {}
         c.noise_conditioned_loss(obs, act, obs[::-1], act, jnp.zeros((BATCH,)),
                                  jnp.zeros((BATCH,)), sigmas, key, losses)
-        assert set(losses) == {"q"}
-        return losses["q"]
+        assert set(losses) == {"critic"}
+        return losses["critic"]
 
     off, on = loss_at(0.0), loss_at(1.0)
     assert finite(off) and finite(on)

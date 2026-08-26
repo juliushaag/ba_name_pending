@@ -5,7 +5,7 @@ computed it and collected by `nnx.capture` at the jit boundary. Two things fall
 out of using nnx's own mechanism rather than a side-channel object:
 
 - **Keys come from the module hierarchy.** A critic writing
-  `self.metrics.dist("q", pred)` lands at `critic/q/*` because the critic *is*
+  `self.metrics.dist("critic", pred)` lands at `critic/q/*` because the critic *is*
   at `policy.critic` -- nothing is passed a namespace and nothing names itself.
 - **Nothing can leak a tracer.** The old sink held traced values on a plain
   Python object; if it outlived the transform that produced them, JAX raised

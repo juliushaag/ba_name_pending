@@ -37,6 +37,18 @@ environments:
   # one env's own entry below overrides a single key.
   DMControlEnvironment:    {stats: {return_min: -200.0, return_max: 200.0}}
 
+  # ManiSkill's reward is `normalized_dense`, so in [0, 1] per step like DMC's --
+  # what differs is the horizon, 50 steps against DMC's 1000. Same derivation:
+  # twice the discounted bound (1 - gamma^T)/(1 - gamma) at gamma 0.99, symmetric.
+  # PegInsertionSide runs 100 steps and so declares its own.
+  #
+  # NOTE: on these envs `terminated` means the task *succeeded*
+  # (envs/sapien_env.py sets it from info["success"]), the opposite of a MuJoCo
+  # humanoid falling over. `eval/success_rate` reads ManiSkill's own
+  # info["success"] rather than inferring it -- see policy.episode_success.
+  ManiSkillEnvironment:    {stats: {return_min: -79.0,  return_max: 79.0}}
+  PegInsertionSide:        {stats: {return_min: -126.79, return_max: 126.79}}
+
   HalfCheetah:            {stats: {return_min: -3200.0,  return_max: 3200.0}}
   Hopper:                 {stats: {return_min: -900.0,   return_max: 900.0}}
   Walker2d:               {stats: {return_min: -1400.0,  return_max: 1400.0}}

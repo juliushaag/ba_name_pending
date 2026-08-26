@@ -82,15 +82,15 @@ def test_bellman_contract(name, obs, act):
 
 @pytest.mark.parametrize("name", CRITICS)
 def test_td_loss_is_differentiable(name, obs, act):
-    """`td_loss` fills exactly `losses["q"]`, and that scalar moves the heads."""
+    """`td_loss` fills exactly `losses["critic"]`, and that scalar moves the heads."""
     c = build(name)                       # fresh: td_loss updates BatchRenorm state
     a = critic_action(c, act)
 
     def loss_fn(critic):
         losses = {}
         critic.td_loss(obs, a, obs[::-1], a, REWARD, jnp.zeros((BATCH,)), losses)
-        assert set(losses) == {"q"}
-        return losses["q"]
+        assert set(losses) == {"critic"}
+        return losses["critic"]
 
     grads = nnx.grad(loss_fn, argnums=nnx.DiffState(0, TRAINABLE))(c)
     leaves = jax.tree.leaves(nnx.state(grads))
@@ -110,12 +110,12 @@ def test_polyak_target_tracks_the_live_net(name, obs, act):
     nnx.update(c.q_function, jax.tree.map(lambda x: x + 1.0,
                                           nnx.state(c.q_function, nnx.Param)))
     live = nnx.state(c.q_function, nnx.Param)
-    before = jax.tree.map(jnp.copy, nnx.state(c.q_target, nnx.Param))
+    before = jax.tree.map(jnp.copy, nnx.state(c.critic_target, nnx.Param))
 
     c.after_step()
 
     expected = jax.tree.map(lambda b, l: b + c.polyak_tau * (l - b), before, live)
-    for got, want in zip(jax.tree.leaves(nnx.state(c.q_target, nnx.Param)),
+    for got, want in zip(jax.tree.leaves(nnx.state(c.critic_target, nnx.Param)),
                          jax.tree.leaves(expected)):
         assert jnp.allclose(got, want, atol=1e-5)
 

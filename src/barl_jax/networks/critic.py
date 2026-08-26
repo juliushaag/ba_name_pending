@@ -59,15 +59,15 @@ class QCriticBase(Critic):
 
   def target_modules(self) -> dict:
     """Live modules to keep a Polyak copy of, keyed by the name their copy takes
-    (`q` -> `self.q_target`). The `_target` suffix is what keeps the clone out of
+    (`critic` -> `self.critic_target`). The `_target` suffix keeps the clone out of
     TRAINABLE, so a subclass adding an entry gets that for free. Called from
     `__init__`, so anything it names must already be assigned."""
-    return {"q": self.q_function}
+    return {"critic": self.q_function}
 
   def target_raw(self, s, a):
     """The bootstrap's un-reduced prediction: from the target copy if there is
     one, else from a frozen view of the live net -- so `td_loss` has one path."""
-    net = self.q_target if self.has_target else frozen(self.q_function)
+    net = self.critic_target if self.has_target else frozen(self.q_function)
     return jax.lax.stop_gradient(net(s, a))
 
   def after_step(self):
@@ -137,7 +137,7 @@ class QCriticBase(Critic):
     return self.mean_expectation(self.raw(s, a))
 
   def create_optimizer(self) -> dict:
-    return {"q": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}
+    return {"critic": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}
 
   # ---- regression ----------------------------------------------------------
 
@@ -175,7 +175,7 @@ class QCriticBase(Critic):
     raise NotImplementedError
 
   def loss_from_raw(self, raw, target, losses: dict) -> None:
-    losses["q"] = self.regression_loss(raw, target)
+    losses["critic"] = self.regression_loss(raw, target)
     self.record(raw, target)
 
   def td_loss(self, obs, action, next_obs, next_action, reward, term,
@@ -254,8 +254,6 @@ class EnsembleCritic(QCriticBase):
 
   def reduce_value(self, raw):
     raw = raw.astype(jnp.float32)
-    # maximum(): sqrt is not differentiable at 0, which is exactly where two
-    # heads that happen to agree on a state would put the variance.
     std = jnp.sqrt(jnp.maximum(raw.var(axis=0), 1e-8))
     return raw.mean(axis=0) - self.rho * std
 
@@ -267,7 +265,7 @@ class EnsembleCritic(QCriticBase):
   def record(self, raw, target) -> None:
     pred = raw.astype(jnp.float32)
 
-    self.metrics.dist("q", pred.mean(axis=0))
+    self.metrics.dist("critic", pred.mean(axis=0))
     self.metrics.dist("q_target", jax.lax.stop_gradient(target).astype(jnp.float32))
     self.metrics.ensemble("ensemble", pred, gap=self.pessimism_gap(raw))
 
@@ -348,17 +346,10 @@ class CategoricalCriticBase(QCriticBase):
     probs   = self.probs(raw)                                    # (n_models, B, atoms)
     exp     = (probs * support).sum(axis=-1, keepdims=True)      # expectation_from_raw
 
-    self.metrics.dist("q", exp.mean(axis=0))
+    self.metrics.dist("critic", exp.mean(axis=0))
     self.metrics.dist("q_target", (tgt * support).sum(axis=-1, keepdims=True))
     self.metrics.ensemble("ensemble", exp, gap=self.pessimism_gap(raw))
 
-    # The spread of the predicted return distribution itself -- aleatoric, and
-    # the one quantity that distinguishes these critics from a scalar ensemble.
-    # Nothing logged it before, so a C51 run and an EnsembleCritic run produced
-    # identical metric families. Distinct from `ensemble/disagreement` (spread
-    # across heads) and from `q/std` (spread of E[Z] across the batch); the
-    # `return_std/std` this family emits is what shows whether the spread is
-    # state-dependent at all, which for HL-Gauss it should not be.
     var = (probs * (support - exp) ** 2).sum(axis=-1)
     self.metrics.dist("return_std", jnp.sqrt(var).mean(axis=0))
 
@@ -423,13 +414,6 @@ class C51Critic(CategoricalCriticBase):
                v_min: float = None, v_max: float = None,
                rngs: nnx.Rngs, **kwargs):
 
-    # Defaulted, not required: the support is a fact about the environment, so
-    # EnvStats supplies it -- but unlike a pure env fact it is also worth
-    # sweeping (the declared range is a bound, and a loose one wastes atoms:
-    # ~200 over 101 atoms is a 4.0-wide bin, while gamma=0.99 on a [0,1]-reward
-    # env caps |Q| at 100 and never uses the negative half at all). This is the
-    # kwarg-falling-back-to-EnvStats pattern, so `model.components.critic.v_min`
-    # is a sweep axis without EnvStats becoming tunable.
     v_min = env_stats["return_min"] if v_min is None else float(v_min)
     v_max = env_stats["return_max"] if v_max is None else float(v_max)
 

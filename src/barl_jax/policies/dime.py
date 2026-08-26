@@ -5,124 +5,176 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from barl_jax.networks.actor import DiscreteDiffusionActorBase, PathEntropyActor
+from barl_jax.networks import gaussian
 from barl_jax.networks.critic import QCriticBase
-from barl_jax.networks.registry import register_component
+from barl_jax.networks.diffusion import TimeConditionedField, controlled_sde
+from barl_jax.networks.optim import adam
+from barl_jax.networks.registry import get_component, register_component
 from barl_jax.networks.regulator import AutotuneRegulator
-from barl_jax.networks.squash import Squash
-from barl_jax.policy import Buffer, Policy, frozen, register_policy
+from barl_jax.policy import Actor, Buffer, Critic, Policy, frozen, register_policy
 
 
-def _inv_sigmoid(y: float) -> float:
-  return math.log(y / (1.0 - y))
+def _inv_softplus(x: float) -> float:
+  """dime_am's `inverse_softplus`, so a raw parameter initialized with this
+  passes through softplus back to the value the config states."""
+  return float(x) if x > 20.0 else float(math.log(math.expm1(x)))
 
 
 @register_component
-class OUDiffusionActor(DiscreteDiffusionActorBase):
-  """DIME (Celik et al. 2025). Ornstein-Uhlenbeck forward process with prior
-  N(0, eta^2 I) (Table 2), and a per-dimension learnable scaling of the beta
-  ladder."""
+class DISActor(Actor):
+  """The time-reversed diffusion sampler (DIS) DIME actually uses --
+  `dime_am/diffusion/od/dis.py` plus `od_integrators.py`.
+
+  Not a denoiser, and not a reparameterization of one. The chain starts at a
+  sample from a **fixed** Gaussian prior and is integrated *forward* under a
+  learned control, accumulating the log-ratio between the controlled forward
+  kernel and an uncontrolled backward kernel. That log-ratio is the path's KL,
+  which is what DIME's entropy term is -- so here the entropy falls out of the
+  integration rather than being read off a closed-form density, and the step
+  size and diffusion coefficient are themselves learned.
+
+  One Euler-Maruyama step at index i, with `f` the control net:
+
+      dt    = softplus(dt_raw) * cosine_schedule(i)
+      s2    = 1 / softplus(friction_raw)          # per action dim
+      eta   = dt * s2 ;  scale = sqrt(2 * eta)
+      drift = grad log p_prior(x) = -x / prior_std^2
+      x'    ~ N(x + eta * (drift + f(i, x, obs)), scale^2)
+      log_w += log N(x | x' + eta * grad log p_prior(x'), scale)
+             - log N(x' | x  + eta * (drift + f), scale)
+
+  `generate` returns a raw, unsquashed terminal state, so `aux` stops one term
+  short of the reference's `running_cost - terminal_cost`: `squash_correction`
+  supplies the log-det, and adding it inside the integration would count it
+  twice."""
 
   def __init__(self, env_stats, *, latent_dim: int, layers: int, num_steps: int,
-               beta_min: float, beta_max: float, beta_scale_min: float,
-               beta_scale_max: float, learn_beta_scale: bool,
-               prior_var: float, anchor_score: bool,
-               euler_max_step: float, min_total_noise: float,
+               squash_cls: str, prior_std: float,
+               dt_init: float, dt_min: float, dt_s: float, dt_pow: float,
+               friction_init: float, per_dim_friction: bool,
+               learn_dt: bool, learn_friction: bool, out_clip: float,
+               time_dim: int, time_embed: str, time_kwargs: dict,
+               lr: float, adam_b1: float, grad_clip: float, grad_clip_mode: str,
+               activation: str, norm: str,
+               norm_input: bool, norm_stem: bool, norm_after_act: bool,
+               dropout: float, final_activation: bool,
+               residual: bool, norm_kwargs: dict, dtype: str,
                rngs: nnx.Rngs, **kwargs):
+    super().__init__(env_stats, **kwargs)
 
-    super().__init__(env_stats, latent_dim=latent_dim, layers=layers, num_steps=num_steps,
-                     rngs=rngs, **kwargs)
+    self.num_steps = int(num_steps)
+    self.time_dim  = int(time_dim)
+    self.prior_std = float(prior_std)
+    self.out_clip  = float(out_clip)
+    self.lr        = float(lr)
+    self.adam_b1   = float(adam_b1)
+    self.grad_clip, self.grad_clip_mode = float(grad_clip), str(grad_clip_mode)
 
-    # Used to be module constants, which meant the bound that silently clamps
-    # beta_scale_max below was invisible to every run that hit it.
-    self.euler_max_step  = float(euler_max_step)
-    self.min_total_noise = float(min_total_noise)
-    self.anchor_score = bool(anchor_score)
-    self.eta2 = float(prior_var)
-    self.eta  = math.sqrt(prior_var)
-    self.inv_eta2 = 1.0 / prior_var
+    # Both are stored through softplus, the reference's parameterization, so the
+    # positivity a step size and a friction need is structural rather than a
+    # clamp. `learn_*` picks Param vs Buffer -- the reference spells the same
+    # choice as a stop_gradient on the read.
+    hold = (lambda v: nnx.Param(v)) if learn_dt else (lambda v: Buffer(v))
+    self.dt_raw = hold(jnp.full((1,), _inv_softplus(dt_init), jnp.float32))
+    hold = (lambda v: nnx.Param(v)) if learn_friction else (lambda v: Buffer(v))
+    friction_shape = (self.action_dim,) if per_dim_friction else (1,)
+    self.friction_raw = hold(jnp.full(friction_shape, _inv_softplus(friction_init), jnp.float32))
 
-    t    = jnp.linspace(0.0, 1.0, num_steps + 1, dtype=jnp.float32)
-    beta = beta_min + 0.5 * (beta_max - beta_min) * (1.0 - jnp.cos(math.pi * t))
-    self.beta = Buffer(beta)
-    self.logvar_offset = Buffer(0.5 * self.action_dim * (jnp.log(beta[1:]) - jnp.log(beta[:-1])))
+    # dime_am's `get_cosine_schedule`, tabulated once: `per_step_dt` is False
+    # there, so the learned dt is a single scalar the schedule shapes.
+    i = jnp.arange(self.num_steps, dtype=jnp.float32)
+    t = (self.num_steps - i) / self.num_steps
+    offset = 1.0 + dt_s
+    self.dt_scale = Buffer((1.0 - dt_min) * jnp.cos(0.5 * jnp.pi * (offset - t) / offset) ** dt_pow + dt_min)
 
-    lo = self.beta_scale_min = float(beta_scale_min)
-    hi = self.beta_scale_max = min(float(beta_scale_max),
-                                   self.euler_max_step / float(beta[1:].max()))
-    raw = jnp.full((self.action_dim,), _inv_sigmoid((1.0 - lo) / (hi - lo)), jnp.float32)
-    # Trainable only when it is meant to be: a frozen Buffer keeps it out of
-    # every optimizer, which is what `requires_grad=False` did in torch.
-    self.beta_scale_raw = nnx.Param(raw) if learn_beta_scale else Buffer(raw)
+    self.field = TimeConditionedField(
+      self.obs_dim, self.action_dim, latent_dim=latent_dim, layers=layers,
+      time_dim=self.time_dim, time_embed=time_embed, time_kwargs=time_kwargs,
+      activation=activation, norm=norm, norm_input=norm_input, norm_stem=norm_stem,
+      norm_after_act=norm_after_act, dropout=dropout, final_activation=final_activation,
+      residual=residual, norm_kwargs=norm_kwargs, dtype=dtype, rngs=rngs)
 
-    self.prior_logZ = 0.5 * self.action_dim * math.log(2 * math.pi * prior_var)
-    self._assert_mixed()
+    self.field.zero_init_head()
 
-  def _assert_mixed(self):
-    # The reverse update is an Euler step, only stable while beta*scale stays
-    # small; and the forward process only reaches the N(0, eta^2) prior if it
-    # accumulates enough total noise (signal decays as exp(-total)).
-    used  = self.beta[...][1:, None] * self.beta_scale
-    total = float(used.sum(axis=0).min())
-    peak  = float(used.max())
-    assert peak <= self.euler_max_step, (
-      f"beta*scale peaks at {peak:.3f} > euler_max_step {self.euler_max_step} "
-      f"-- lower beta_max or beta_scale_max")
-    assert total >= self.min_total_noise, (
-      f"total forward noise {total:.3f} < min_total_noise {self.min_total_noise} "
-      f"(signal at step N still {math.exp(-total):.3f}) -- raise num_steps or beta_min/beta_max")
+    self.squash = get_component(squash_cls)(env_stats)
+    self.rngs = rngs
 
-  @property
-  def beta_scale(self):
-    lo, hi = self.beta_scale_min, self.beta_scale_max
-    return lo + (hi - lo) * jax.nn.sigmoid(self.beta_scale_raw[...])
+  # ---- the process ---------------------------------------------------------
 
-  # ---- hooks -------------------------------------------------------------
-  def prior_sample(self, batch: int, key):
-    return self.eta * jax.random.normal(key, (batch, self.action_dim), jnp.float32)
+  def step_coef(self, i: int):
+    """(eta, scale) at step `i`; both broadcast over the action dimension."""
+    dt    = jax.nn.softplus(self.dt_raw[...]) * self.dt_scale[...][i]
+    eta   = dt / jax.nn.softplus(self.friction_raw[...])
+    return eta, jnp.sqrt(2.0 * eta)
 
-  def to_score(self, raw, x, n):
-    return raw - x * self.inv_eta2 if self.anchor_score else raw
+  def prior_score(self, x):
+    """grad_x log N(x; 0, prior_std^2 I), the reference's uncontrolled drift."""
+    return -x / self.prior_std**2
 
-  def init_aux(self, x):
-    return self.prior_logZ + 0.5 * self.inv_eta2 * (x ** 2).sum(axis=-1, keepdims=True)
+  def prior_log_prob(self, x):
+    return gaussian.diag_log_prob(x, 0.0, self.prior_std)
 
-  def _noise_table(self):
-    b    = self.beta[...][1:, None] * self.beta_scale          # (N, D)
-    keep = 1.0 - b
-    gamma = jnp.concatenate([jnp.ones_like(b[:1]), jnp.cumprod(keep, axis=0)], axis=0)
-    w, cur = [jnp.zeros_like(b[0])], jnp.zeros_like(b[0])
-    for k in range(self.num_steps):
-      cur = keep[k] ** 2 * cur + b[k]                          # eta-free
-      w.append(cur)
-    return gamma, jnp.stack(w)
+  def control_at(self, obs, x, i: int):
+    t = jnp.full((x.shape[0], 1), float(i), jnp.float32)
+    u = self.field(obs, x, t).astype(jnp.float32)
+    return jnp.clip(u, -self.out_clip, self.out_clip)
 
-  def marginal_coef(self, n):
-    g, w = self._noise_table()
-    return g[n], jnp.maximum(2.0 * self.eta2 * w[n], 1e-6)
+  def generate(self, obs, key=None, squash=True):
 
-  def reverse_step(self, obs, x, n, key):
-    e2, scale = self.eta2, self.beta_scale
-    b_rev, b_fwd = self.beta[...][n] * scale, self.beta[...][n - 1] * scale
-    var_rev, var_fwd = 2.0 * e2 * b_rev, 2.0 * e2 * b_fwd      # (D,), broadcast
+    key = self.rngs.noise() if key is None else key
+    key, prior_key = jax.random.split(key)
 
-    eps   = jax.random.normal(key, x.shape, x.dtype)
-    x_new = x + b_rev * x + 2.0 * e2 * b_rev * self.predict_score(obs, x, n) \
-            + jnp.sqrt(var_rev) * eps
-    resid = x - (x_new - b_fwd * x_new)
-    inc   = (0.5 * eps ** 2 - 0.5 * resid ** 2 / var_fwd).sum(axis=-1, keepdims=True) \
-            + self.logvar_offset[...][n - 1]
-    return x_new, inc
+    x = self.prior_std * jax.random.normal(prior_key, (obs.shape[0], self.action_dim), jnp.float32)
+
+    def euler_step(x, i, step_key):
+      eta, scale = self.step_coef(i)
+      fwd_mean = x + eta * (self.prior_score(x) + self.control_at(obs, x, i))
+      x_new    = fwd_mean + scale * jax.random.normal(step_key, x.shape, jnp.float32)
+     
+      bwd_mean = x_new + eta * self.prior_score(x_new)
+      return x_new, gaussian.diag_log_prob(x, bwd_mean, scale) \
+                    - gaussian.diag_log_prob(x_new, fwd_mean, scale)
+
+    X, entropy =  controlled_sde(euler_step, x, self.num_steps, key,
+                          aux=-self.prior_log_prob(x))
+
+    if squash:
+      entropy = entropy + self.squash.log_abs_det_jacobian(X).sum(axis=-1, keepdims=True)
+      X = self.squash(X)
+    
+    return X, entropy
+  
+  def actor_loss(self, obs, critic: Critic, alpha, losses: dict, key=None):
+
+    action, entropy = self.generate(obs, key=key)
+
+    q = frozen(critic).value(obs, action)
+    losses["actor"] = -(q + jax.lax.stop_gradient(alpha) * entropy).mean()
+
+    return entropy
+
+  def sample(self, s, key=None, critic: Critic = None):
+    return self.generate(s, key=key)[0]
+
+  def create_optimizer(self) -> dict:
+    return {"actor": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}
+
+  def derived(self) -> dict:
+    return {"dt_0": float(jax.nn.softplus(self.dt_raw[...])[0] * self.dt_scale[...][0]),
+            "dt_last": float(jax.nn.softplus(self.dt_raw[...])[0] * self.dt_scale[...][-1]),
+            "prior_var": self.prior_std**2}
 
 
 @register_policy
 class DIME(Policy):
-  """Diffusion-policy MaxEnt actor-critic over an OUDiffusionActor's DDPM-style
-  reverse process, with an entropy dual auto-tuned against a target entropy.
+  """Diffusion-policy MaxEnt actor-critic over a path-entropy sampler's chain,
+  with an entropy dual auto-tuned against a target entropy.
 
-  The actor loss is differentiated through the *whole* reverse chain -- 16
-  network evaluations deep with a critic on top -- which is what makes this the
-  most expensive train_step in the framework."""
+  The actor loss is differentiated through the *whole* sampling chain -- 16
+  network evaluations deep with a critic on top -- so it stores 16 sets of
+  activations, which is what bounds the batch it fits in rather than its
+  runtime: at batch 256 the chain adds ~130ms to a ~190ms step, where SDAC's
+  best-of-32 sampler runs the same kind of chain over 64x the rows."""
 
   def __init__(self, env: gym.Env, **kwargs):
     super().__init__(env, **kwargs)
@@ -134,28 +186,11 @@ class DIME(Policy):
     self.policy_delay           = params["policy_delay"]
 
     self.critic: QCriticBase = self.build_component("critic", QCriticBase)
-    self.actor: PathEntropyActor = self.build_component("actor", PathEntropyActor)
-    self.squash: Squash = self.build_component("squash", Squash)
+    self.actor: DISActor = self.build_component("actor", DISActor)
     self.entropy: AutotuneRegulator = self.build_component(
       "entropy", AutotuneRegulator, target=self.action_dim * self.entropy_scale)
 
-  def _squash_correction(self, X):
-    """The change of variables taking the entropy of the raw terminal state to
-    the entropy of the squashed action: H(y) = H(x) + E[log|dy/dx|].
-
-    `log_abs_det_jacobian`, not `inverse`. The reference implementation
-    (dime_am, od_sampling.single_sample) adds Tanh().forward_log_det_jacobian
-    here; atanh of `X` is not a change of variables at all -- and since `X` is
-    the *pre*-tanh latent, TanhSquash.inverse's clamp pinned every |x| > 1 to a
-    constant +-7.25, so most of the batch contributed no gradient and a wrong
-    value."""
-    return self.squash.log_abs_det_jacobian(X).sum(axis=-1, keepdims=True)
-
-
   def optimizer_cadence(self) -> dict:
-    """dime_am's `policy_delay`: the critic steps every gradient step, the actor
-    and the entropy dual only every `policy_delay`-th -- both gated by the same
-    branch there, so both are gated by the same key here."""
     return {"actor": self.policy_delay, "entropy_alpha": self.policy_delay}
 
   def train_step(self, batch):
@@ -168,24 +203,24 @@ class DIME(Policy):
     alpha  = self.entropy.value()
     losses = {}
 
+    # Every draw this step descends from one key, split here: the bootstrap
+    # chain and the differentiated chain must not share a stream, and a step's
+    # randomness should be readable off train_step rather than hidden in each
+    # component's `rngs`.
+    keys = jax.random.split(self.rngs.noise(), 2)
+
     # ---- critic: the bootstrap sample is a target, not a path to train through
-    next_X, entropy = jax.lax.stop_gradient(self.actor.generate(next_obs))
-    entropy = entropy + self._squash_correction(next_X)
-    next_action = self.squash(next_X)
+    next_action, entropy = jax.lax.stop_gradient(
+      self.actor.generate(next_obs, key=keys[0]))
 
     entropy_bonus = jax.lax.stop_gradient(alpha * entropy)
     self.critic.td_loss(obs, action, next_obs, next_action, reward, term,
                         losses, shift=entropy_bonus)
 
     # ---- actor: backprop through the reverse chain into the diffusion net
-    new_X, new_entropy = self.actor.generate(obs)
-    new_entropy = new_entropy + self._squash_correction(new_X)
-
-    q_new = frozen(self.critic).value(obs, self.squash(new_X))
-    dime_loss = -(q_new + jax.lax.stop_gradient(alpha) * new_entropy).mean()
+    self.actor.actor_loss(obs, self.critic, alpha, losses, key=keys[1])
 
     self.entropy.loss(entropy, losses)
-    losses["actor"] = dime_loss
 
     self.actor.metrics.dist("entropy", entropy)
     self.actor.metrics.vec("action", next_action, limit=1.0)
@@ -194,4 +229,4 @@ class DIME(Policy):
 
   def inference_step(self, observation, step_info=None, key=None):
     obs = self.normalize_obs(observation)
-    return self.squash(self.actor.sample(obs, key)), {}
+    return self.actor.sample(obs, key=key), {}
