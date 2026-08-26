@@ -22,7 +22,7 @@ SDAC:
     # actor 256x3 with Mish; the critic is deliberately left at the same `medium`
     # every other policy here resolves, so an {algo x env} sweep is an algorithm
     # comparison rather than an algorithm-and-critic one.
-    actor:   {class: VPDiffusionActor, size: small, num_steps: 20, activation: Mish}
+    actor:   {class: VPDiffusionActor, size: medium, num_steps: 20, activation: Mish}
     critic:  {class: C51Critic,        size: xlarge}
     squash:  {class: TanhSquash}
     entropy: {class: AutotuneRegulator}

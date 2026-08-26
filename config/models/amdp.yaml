@@ -17,7 +17,7 @@ AMDP:
     # dime_am's control net is 3 hidden Dense(256) + head (ctrl_net.py:
     # num_hid 256, num_layers 4, whose last entry is the head). Same depth
     # as DIME's; see the note there on `layers: 2`.
-    actor:   {class: ScoreContinuousActor, size: small, layers: 2}
+    actor:   {class: ScoreContinuousActor, size: medium, layers: 2}
     critic:  {class: C51Critic,            size: xlarge}
     squash:  {class: ErfSquash}
     entropy: {class: AutotuneRegulator}

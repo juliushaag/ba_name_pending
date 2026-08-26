@@ -21,7 +21,7 @@ DIME:
     # not a DDPM denoiser, and its entropy term is the path KL the integration
     # accumulates. OUDiffusionActor stays registered so the two are comparable
     # as a `--set model.components.actor.class=` axis.
-    actor:   {class: DISActor,           size: small, layers: 2}
+    actor:   {class: DISActor,           size: medium, layers: 2}
     critic:  {class: C51Critic,          size: xlarge}
     squash:  {class: TanhSquash}
     entropy: {class: AutotuneRegulator}
