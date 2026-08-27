@@ -206,7 +206,7 @@ class LocalExecutor(Executor):
 
 class SlurmExecutor(Executor):
     name = "slurm"
-    default_parallelism = 4
+    default_parallelism = 8
 
     # --debug overrides for run_rl.slurm's own #SBATCH lines: sbatch's CLI wins
     # over them, so the job script stays the single description of a *real* run.

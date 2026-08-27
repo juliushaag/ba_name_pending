@@ -31,7 +31,7 @@ random_steps: 5000         # random-action buffer fill before training starts.
                            # it exists to avoid.
 
 # --- rollout ---------------------------------------------------------------
-rollout_steps: 32          # env steps collected per outer iteration (across all
+rollout_steps: 1          # env steps collected per outer iteration (across all
                            # num_envs) before the next batch of gradient steps,
                            # i.e. how stale the behaviour policy is allowed to
                            # get. Set to `num_envs`: one step per env slot per
@@ -56,7 +56,7 @@ rollout_steps: 32          # env steps collected per outer iteration (across all
                            # remainder makes the two drift apart, and anything
                            # above num_envs only buys back staleness.
 
-num_envs: 32               # parallel rollout envs (policy inference is flat in
+num_envs: 1               # parallel rollout envs (policy inference is flat in
                            # batch size out to ~512, so the whole batch costs what
                            # one env would; episodes persist across rollouts, so
                            # this no longer shortens the horizon)
