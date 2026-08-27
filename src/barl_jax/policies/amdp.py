@@ -11,7 +11,8 @@ from barl_jax.networks.critic import QCriticBase
 from barl_jax.networks.optim import adam
 from barl_jax.networks.registry import get_component, register_component
 from barl_jax.networks.regulator import AutotuneRegulator
-from barl_jax.policy import Actor, Buffer, Critic, Policy, frozen, register_policy
+from barl_jax.policy import (Actor, Buffer, Critic, Policy, frozen, gated_loss,
+                             register_policy)
 
 
 def clip_score(score, max_norm: float, percentile: float):
@@ -27,6 +28,7 @@ class ScoreContinuousActor(Actor):
   def __init__(self, env_stats, *, latent_dim: int, layers: int, max_steps: int,
                squash_cls: str,
                sigma_min: float, sigma_max: float, tau_min: float, tau_max: float,
+               out_clip: float,
                lr: float, adam_b1: float,
                grad_clip: float, grad_clip_mode: str,
                time_dim: int, time_embed: str, time_kwargs: dict,
@@ -41,6 +43,7 @@ class ScoreContinuousActor(Actor):
     self.sigma_min, self.sigma_max = float(sigma_min), float(sigma_max)
     self.tau_min,   self.tau_max   = float(tau_min),   float(tau_max)
     self.max_steps, self.time_dim  = int(max_steps), int(time_dim)
+    self.out_clip  = float(out_clip)
     self.lr        = float(lr)
     self.adam_b1   = float(adam_b1)
     self.grad_clip = float(grad_clip)
@@ -113,6 +116,13 @@ class ScoreContinuousActor(Actor):
   def prior_surprisal(self, X):
     return gaussian.surprisal(X, self._terminal_var, self.action_dim)
 
+  def control(self, obs, x, tau):
+    """The control net's output, clipped the way dime_am's does it
+    (ctrl_net.py `outer_clip`). At 1e4 it never binds on a healthy run; it is
+    what keeps one blown-up step from writing inf into the whole chain."""
+    u = self.field(obs, x, self.scaled_time(tau))
+    return jnp.clip(u, -self.out_clip, self.out_clip)
+
   def scaled_time(self, tau):
     """The level the control net conditions on. The reference scales it into
     [-1, 1] before its fourier coder (ctrl_net.py), so the fixed frequency ladder
@@ -126,7 +136,7 @@ class ScoreContinuousActor(Actor):
 
     def euler_step(X, i, step_key):
       tau     = jnp.broadcast_to(self.taus[...][i], (B, 1))
-      u_tilde = self.field(obs, X, self.scaled_time(tau))
+      u_tilde = self.control(obs, X, tau)
       v       = self.step_var[...][i]
       eps     = jax.random.normal(step_key, u_tilde.shape, u_tilde.dtype)
 
@@ -146,15 +156,17 @@ class ScoreContinuousActor(Actor):
 
     return X, log_w
 
-  def actor_loss(self, obs, critic: Critic, alpha, losses: dict,
-                 *, max_norm: float, percentile: float, key=None):
-    key = self.rngs.noise() if key is None else key
+  def actor_loss(self, obs, critic: Critic, alpha,
+                 *, max_norm: float, percentile: float, key):
+    """Returns the loss rather than writing it into a `losses` dict, because the
+    owning Policy runs it under `gated_loss` -- a branch has to hand its value
+    back, it cannot mutate a dict on one side and not the other."""
     rollout_key, noise_key = jax.random.split(key)
 
     X, _ = jax.lax.stop_gradient(self.generate_action(obs, squash=False, key=rollout_key))
 
     X_t, tau = self.sample_noised(X, noise_key)
-    u_tilde  = self.field(obs, X_t, self.scaled_time(tau[:, None]))
+    u_tilde  = self.control(obs, X_t, tau[:, None])
 
     def q_values(critic, x):
       return critic.value(obs, self.squash(x)).sum()
@@ -166,14 +178,15 @@ class ScoreContinuousActor(Actor):
 
     u      = sigma_tau * u_tilde
     target = jax.lax.stop_gradient(sigma_tau * (x_score / alpha))
-    losses["actor"] = (0.5 * ((u - target) ** 2).sum(axis=-1) / sigma_tau.squeeze(-1)).mean()
+    loss   = (0.5 * ((u - target) ** 2).sum(axis=-1) / sigma_tau.squeeze(-1)).mean()
 
-    self.metrics.scalar("score_loss", losses["actor"])
+    self.metrics.scalar("score_loss", loss)
     self.metrics.dist("score_target", target)
     self.metrics.vec("u", u)
     self.metrics.scalar("score_clipped_frac", clipped_frac)
-    critic.metrics.dist("q_at_sample", q_new)
+    critic.metrics.scalar("q_at_sample", q_new / obs.shape[0])
     critic.metrics.vec("score", x_score)
+    return loss
 
   def create_optimizer(self) -> dict:
     return {"actor": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}
@@ -237,9 +250,17 @@ class AMDP(Policy):
     self.critic.td_loss(obs, action, next_obs, next_action, reward, term,
                         losses, shift=entropy_bonus)
 
-    self.actor.actor_loss(obs, self.critic, alpha, losses,
-                          max_norm=self.q_score_max_norm,
-                          percentile=self.q_score_max_percentile, key=keys[1])
+    # Skipped outright on the two steps in three `policy_delay` would mask the
+    # update on anyway: the loss prices through `frozen` and its target is
+    # stop_gradient'd, so nothing here reaches the critic's parameters and the
+    # skip is parameter-identical. What it drops is the second 16-step chain and
+    # a value_and_grad through the 2048-wide ensemble.
+    losses["actor"] = gated_loss(
+      self, self.policy_delay,
+      lambda actor, critic: actor.actor_loss(
+        obs, critic, alpha, max_norm=self.q_score_max_norm,
+        percentile=self.q_score_max_percentile, key=keys[1]),
+      self.actor, self.critic)
 
     self.entropy.loss(entropy, losses)
 

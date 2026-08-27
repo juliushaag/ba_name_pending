@@ -35,7 +35,23 @@
 environments:
   # Family bases first: an entry here applies to every env deriving from it, and
   # one env's own entry below overrides a single key.
-  DMControlEnvironment:    {stats: {return_min: -200.0, return_max: 200.0}}
+  # `rollout_steps: 1` collects one env step per outer iteration, so every
+  # per-iteration cost -- StackedPolicy, num_params(), and the ~40 wandb.log()
+  # calls a 10-seed run fans out per iteration at ~150 us each -- is paid once
+  # per env step. At 1M steps that was ~1.7 h of an 8 h budget in logging alone.
+  # DMC is synchronous, so raising num_envs does not change the physics cost per
+  # env step (N sub-envs step sequentially either way); it only amortizes the
+  # fixed part. Kept equal to rollout_steps, per the note in run/defaults.yaml.
+  DMControlEnvironment:
+    stats:    {return_min: -200.0, return_max: 200.0}
+    defaults: {num_envs: 16, rollout_steps: 16}
+
+  # Dog is the heaviest model in the suite -- 223-dim obs, 38-dim action, 97 MB
+  # of RSS per env against ~10 MB for the rest -- and the envs are resident for
+  # the whole run. Halved so the rollout envs, the `eval_runs` x num_seeds eval
+  # envs and a 10-seed replay buffer fit the job's --mem together.
+  DogRun:
+    defaults: {num_envs: 8, rollout_steps: 8}
 
   # ManiSkill's reward is `normalized_dense`, so in [0, 1] per step like DMC's --
   # what differs is the horizon, 50 steps against DMC's 1000. Same derivation:

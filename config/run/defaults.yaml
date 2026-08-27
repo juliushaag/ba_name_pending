@@ -94,7 +94,12 @@ lr_decay: constant         # shape of the post-warmup decay (Policy.DECAYS).
 # --- evaluation ------------------------------------------------------------
 eval_every: 25000          # env steps between evals (trainer.py keys this off
                            # `env_steps`, not grad steps)
-eval_runs: 20              # episodes per eval, run in parallel
+eval_runs: 10              # episodes per eval, run in parallel. The eval env is
+                           # `eval_runs` x num_seeds wide and DMC is synchronous,
+                           # so this multiplies straight into both wall clock and
+                           # host RAM: at 20 x 10 seeds, DogRun held 200 mujoco
+                           # models (19 GB) and spent 173 s per eval, 1.9 h of an
+                           # 8 h budget. dime_am evaluates on 10.
 eval_videos: 1             # of those runs, how many render frames (they run on
                            # their own env, sequentially). Rendering costs ~7x
                            # the env step, so one video is ~2 s of a 1000-step
@@ -103,6 +108,10 @@ eval_videos: 1             # of those runs, how many render frames (they run on
                            # stepped *synchronously* (45 s for 100 HumanoidRun
                            # envs). Cut `eval_runs`/raise `eval_every` before
                            # reaching for this. null = all.
+eval_video_every: 200000   # env steps between *rendered* evals. The video is an
+                           # extra episode plus a synchronous mp4 encode, and one
+                           # per eval is 40 of them per run; on its own cadence it
+                           # is 5. null = never render.
 
 # --- logging ---------------------------------------------------------------
 log_every: 250             # grad steps between primary-tier logs

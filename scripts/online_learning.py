@@ -19,8 +19,20 @@ barl_jax.trainer -- this file is the CLI around it.
 """
 
 import argparse
+import faulthandler
 import os
+import signal
+import sys
 import warnings
+
+# Installed before jax and mujoco get a chance to fault: an EGL/mjr allocation
+# failure inside the driver, or an XLA `Check failed`, kills the process with
+# SIGSEGV/SIGABRT and no Python output at all -- which is exactly what sweep
+# 2026-08-26_17-59-33's DIME/DogRun task left behind. `chain=True` keeps the
+# normal handling (slurm's walltime USR1 still terminates) and only adds the dump.
+faulthandler.enable(file=sys.stderr, all_threads=True)
+for _sig in (signal.SIGUSR1, signal.SIGUSR2, signal.SIGTERM):
+  faulthandler.register(_sig, file=sys.stderr, all_threads=True, chain=True)
 
 # Must be set before the first `import mujoco` (transitively, via `barl_jax`
 # below) -- mujoco picks its GL backend at import time, so setting this later

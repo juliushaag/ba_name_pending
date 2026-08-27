@@ -21,6 +21,7 @@ ScoreContinuousActor:
   squash_cls: ErfSquash   # `erf_k` is derived from the noise schedule below
 
   max_steps: 16
+  out_clip: 10000.0     # ctrl_net.py's `outer_clip`
   sigma_min: 0.01
   sigma_max: 2.0
   tau_min: 0.0

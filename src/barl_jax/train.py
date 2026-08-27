@@ -13,7 +13,7 @@ import optax
 from flax import nnx
 
 from barl_jax.metrics import DEBUG, PRIMARY, DebugMetric, Metric, collect, recording
-from barl_jax.policy import TRAINABLE
+from barl_jax.policy import TRAINABLE, gating
 
 
 # ----------------------------------------------------------------------
@@ -29,7 +29,10 @@ from barl_jax.policy import TRAINABLE
 # -- at most three variants get built (none / primary / primary+debug).
 
 @partial(jax.jit, static_argnums=(0, 3))
-def train_step(graphdef, state, batch, tiers):
+def train_step(graphdef, state, batch, tiers, grad_step=None):
+  """`grad_step` is the *unbatched* gradient-step index -- see `policy.gating`.
+  It is an ordinary traced argument, not a static one: making it static would
+  recompile the step every time it changed."""
   policy, opt = nnx.merge(graphdef, state)
 
   def scalar_loss(policy):
@@ -42,7 +45,7 @@ def train_step(graphdef, state, batch, tiers):
     sown, sown_debug = nnx.pop(policy, Metric, DebugMetric)
     return total, (losses, sown, sown_debug)
 
-  with recording(*tiers):
+  with recording(*tiers), gating(grad_step):
     policy.before_step()
     (_, (losses, sown, sown_debug)), grads = nnx.value_and_grad(
       loss_fn, argnums=nnx.DiffState(0, TRAINABLE), has_aux=True)(policy)

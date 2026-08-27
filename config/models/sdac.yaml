@@ -6,7 +6,12 @@ SDAC:
   params:
     entropy_scale: -0.9
 
-    num_candidates: 64   # K: softmax candidates in the soft denoising loss
+    # K: softmax candidates in the soft denoising loss. 64 was unused capacity --
+    # sweep 2026-08-26_17-59-33 logged `actor/weight_ess` at a mean of 6.4
+    # (DogRun) and 17 (HumanoidRun), so the softmax was never spreading over more
+    # than a third of them, while K x batch = 16384 critic rows was a third of the
+    # step. 24 still covers the higher of the two with headroom.
+    num_candidates: 24
     num_bon: 32          # N: best-of-N, for the played action and the bootstrap
 
     softmax_temp: 0.25

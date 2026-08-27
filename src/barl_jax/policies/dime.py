@@ -11,7 +11,8 @@ from barl_jax.networks.diffusion import TimeConditionedField, controlled_sde
 from barl_jax.networks.optim import adam
 from barl_jax.networks.registry import get_component, register_component
 from barl_jax.networks.regulator import AutotuneRegulator
-from barl_jax.policy import Actor, Buffer, Critic, Policy, frozen, register_policy
+from barl_jax.policy import (Actor, Buffer, Critic, Policy, frozen, gated_loss,
+                             register_policy)
 
 
 def _inv_softplus(x: float) -> float:
@@ -144,14 +145,14 @@ class DISActor(Actor):
     
     return X, entropy
   
-  def actor_loss(self, obs, critic: Critic, alpha, losses: dict, key=None):
-
+  def actor_loss(self, obs, critic: Critic, alpha, key=None):
+    """Returns the loss rather than writing it into a `losses` dict, because the
+    owning Policy runs it under `gated_loss` -- a branch has to hand its value
+    back, it cannot mutate a dict on one side and not the other."""
     action, entropy = self.generate(obs, key=key)
 
     q = frozen(critic).value(obs, action)
-    losses["actor"] = -(q + jax.lax.stop_gradient(alpha) * entropy).mean()
-
-    return entropy
+    return -(q + jax.lax.stop_gradient(alpha) * entropy).mean()
 
   def sample(self, s, key=None, critic: Critic = None):
     return self.generate(s, key=key)[0]
@@ -217,8 +218,15 @@ class DIME(Policy):
     self.critic.td_loss(obs, action, next_obs, next_action, reward, term,
                         losses, shift=entropy_bonus)
 
-    # ---- actor: backprop through the reverse chain into the diffusion net
-    self.actor.actor_loss(obs, self.critic, alpha, losses, key=keys[1])
+    # ---- actor: backprop through the reverse chain into the diffusion net.
+    # Skipped outright on the two steps in three `policy_delay` would mask the
+    # update on anyway -- the loss carries no gradient into the critic (it prices
+    # through `frozen`), so this is parameter-identical and drops the chain's
+    # 16 forward + 16 backward passes, the dominant term in the step.
+    losses["actor"] = gated_loss(
+      self, self.policy_delay,
+      lambda actor, critic: actor.actor_loss(obs, critic, alpha, key=keys[1]),
+      self.actor, self.critic)
 
     self.entropy.loss(entropy, losses)
 

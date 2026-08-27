@@ -34,6 +34,16 @@ set -euo pipefail
 
 export PYTHONUNBUFFERED=1
 
+# Belt-and-braces duplicate of online_learning.py's faulthandler.enable(): a
+# fatal signal in a C library (EGL, mujoco, XLA) otherwise kills the process with
+# nothing on stderr at all.
+export PYTHONFAULTHANDLER=1
+
+# jax otherwise takes 75% of the device up front. The offscreen GL context
+# mujoco creates lazily on the first render() -- 1920x1080 with 4x MSAA for
+# dog.xml, the only DMC model that asks for one -- has to fit in what is left.
+export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.6}"
+
 # `--export=ALL` hands this task whatever the submitting shell happened to hold,
 # so where jax runs is decided here rather than there: a JAX_PLATFORMS=cpu left
 # over from a config check or exported by hand trains the run on the CPU, ~160x
@@ -54,6 +64,7 @@ MANIFEST="${MANIFEST:-$RESULT_DIR/experiments.csv}"
 # where submit.py put its config.yaml -- so this merges into it rather than
 # replacing it.
 save_results() {
+  exit_code=$?
   [ -d "$SCRATCH" ] || return 0
   mkdir -p "$RESULT_DIR"
 
@@ -62,6 +73,23 @@ save_results() {
     dest="$RESULT_DIR/$(basename "$run")"
     mkdir -p "$dest"
     cp -a "$run." "$dest/" || true
+
+    # What slurm knows and the run does not: whether this was a walltime kill, a
+    # cgroup OOM (the limit is --mem above, *not* the node's RAM -- which is why
+    # a node-level memory graph can look flat right through one), or a raw
+    # signal. Nothing asked it before sweep 2026-08-26_17-59-33 lost a task to an
+    # unexplained kill.
+    {
+      echo "=== postmortem: exit $exit_code at $(date) ==="
+      sacct -j "$SLURM_JOB_ID" --units=G \
+        -o JobID%20,State,ExitCode,DerivedExitCode,MaxRSS,MaxVMSize,Elapsed,Timelimit,Reason 2>&1
+      echo "--- cgroup memory ---"
+      for f in /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.events; do
+        [ -r "$f" ] && { echo "$f:"; cat "$f"; }
+      done
+      echo "--- gpu ---"
+      nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv 2>&1
+    } >> "$dest/postmortem.txt" 2>&1
 
     # `mv`, not `cp`: slurmstepd keeps writing through its open descriptor, so a
     # rename relocates the log *and* keeps collecting what comes after -- the
@@ -105,12 +133,38 @@ echo ""
 
 # --run-dir redirects this run's output to node-local scratch; the config itself
 # stays the shared one submit.py wrote, so the run is reproducible from it.
+# --signal=B:USR1@300 above sends USR1 to *this* shell 300s before the wall, and
+# bash's default action for it is to terminate -- so without this trap the run
+# died silently and the EXIT trap saved whatever happened to be on disk. Forward
+# it to python, whose faulthandler dumps every thread's stack before it goes.
+on_usr1() {
+  echo "=== USR1 at $(date): walltime in <300s, forwarding to $TRAIN_PID ==="
+  kill -USR1 "$TRAIN_PID" 2>/dev/null || true
+}
+trap on_usr1 USR1
+
 uv run python scripts/online_learning.py \
     --config "$RESULT_DIR/$CONFIG" \
-    --run-dir "$SCRATCH/$TAG"
+    --run-dir "$SCRATCH/$TAG" &
+TRAIN_PID=$!
+
+# `wait` is interruptible, which is the whole point: a foreground command would
+# not let the shell run on_usr1 until it finished. The cost is that a handled
+# signal makes `wait` return 128+n straight away while the child is still going,
+# so this waits again until the child is actually gone -- otherwise USR1 would
+# end the job 300s early instead of just dumping a stack.
+set +e
+wait "$TRAIN_PID"; STATUS=$?
+while [ "$STATUS" -gt 128 ] && kill -0 "$TRAIN_PID" 2>/dev/null; do
+  wait "$TRAIN_PID"; STATUS=$?
+done
+set -e
 
 echo ""
 echo "=================================================="
 echo "Results:      $RESULT_DIR"
 echo "Job finished: $(date)"
+echo "Exit status:  $STATUS"
 echo "=================================================="
+
+exit "$STATUS"

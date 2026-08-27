@@ -78,6 +78,12 @@ def recording(*tiers: str):
     _ACTIVE = previous
 
 
+def armed(*tiers: str) -> bool:
+  """Whether any of `tiers` is recording -- a **trace-time** bool, so a caller
+  can branch on it in python. With no argument: any tier at all."""
+  return bool(_ACTIVE & (frozenset(tiers) if tiers else frozenset(_TIER_TYPE)))
+
+
 def collect(state) -> dict:
   """A popped Metric State -> a flat `owner/quantity/reduction` dict, still on
   the device. The owner is the sowing module's path, so it needs no separate

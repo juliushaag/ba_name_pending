@@ -111,8 +111,8 @@ NCLQLC51Critic:
   extends: [net.mish, optim.critic, time.fourier]
   num_atoms: 101
   entropy_coef: 0.005
-  rho: 0.0
-  pessimistic_target: false
+  rho: 1.0
+  pessimistic_target: true
   smoothing_coef: 1.0
   gamma: 0.99
   polyak_tau: 0.005

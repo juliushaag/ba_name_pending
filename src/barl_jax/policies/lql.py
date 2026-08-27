@@ -3,6 +3,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from barl_jax.metrics import DEBUG
 from barl_jax.networks.critic import C51Critic, EnsembleCritic, HLGaussCritic
 from barl_jax.networks.flow import TimeEmbedding
 
@@ -236,7 +237,19 @@ class NCLQL(Policy):
         noise = jax.random.normal(keys[i * self.steps_per_level + t], a.shape, a.dtype)
         a = a + drift + jnp.sqrt(alpha) * noise
 
+        # Per level, because the ladder spans four orders of magnitude in `alpha`
+        # and the two terms scale differently under it: `normalize_score` fixes
+        # |g| at 1, so the drift is 0.5*alpha*temperature outright while the
+        # noise is sqrt(alpha). Whether either is comparable to `action_limit`
+        # is the difference between a chain that anneals and one that spends its
+        # first levels slamming into the clip.
+        self.metrics.scalar(f"chain/drift_norm_l{i}",
+                            jnp.linalg.norm(drift, axis=-1).mean(), tier=DEBUG)
+        self.metrics.scalar(f"chain/noise_scale_l{i}", jnp.sqrt(alpha), tier=DEBUG)
+
         if self.clip_actions:
+          clipped = (jnp.abs(a) > self.action_limit).astype(jnp.float32).mean()
+          self.metrics.scalar(f"chain/clipped_frac_l{i}", clipped, tier=DEBUG)
           a = jnp.clip(a, -self.action_limit, self.action_limit)
 
     return a, score_norm
