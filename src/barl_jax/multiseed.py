@@ -168,9 +168,25 @@ class MultiSeedReplay(ReplayBuffer):
     """`(num_seeds, batch_size, ...)` -- each seed draws from its own data, which
     is what keeps the seeds independent rather than merely differently
     initialized."""
-    per_seed = [buffer.sample_numpy(batch_size) for buffer in self.seeds]
-    return jax.device_put({key: np.stack([s[key] for s in per_seed])
-                           for key in per_seed[0]})
+    return self.sample_chunk(1, batch_size, leading=False)
+
+  def sample_chunk(self, k: int, batch_size: int, *, leading: bool = True) -> dict:
+    """`k` consecutive minibatches as one `(k, num_seeds, batch_size, ...)` array,
+    crossing to the device once instead of `k` times.
+
+    Drawn in the same order the per-step path drew them -- k-major, seeds within
+    -- and the buffer cannot change between the gradient steps of one iteration,
+    so a chunk is the same data those k calls would have produced. The transfer
+    is what this is for: the numpy gather is 0.07 ms but the `device_put` around
+    it is 0.5-1.5 ms, paid per gradient step."""
+    per_step = [[buffer.sample_numpy(batch_size) for buffer in self.seeds]
+                for _ in range(k)]
+    stack_seeds = lambda step, key: np.stack([seed[key] for seed in step])
+    out = {key: np.stack([stack_seeds(step, key) for step in per_step])
+           for key in per_step[0][0]}
+    if not leading:
+      out = {key: value[0] for key, value in out.items()}
+    return jax.device_put(out)
 
 
 def split_metrics(metrics: dict, num_seeds: int) -> tuple[dict, list[dict]]:

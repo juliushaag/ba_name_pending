@@ -4,45 +4,83 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from barl_jax.configs import ConfigMixin
+from barl_jax.hparam import Config, HParam
 from barl_jax.networks.ensemble import Ensemble
-from barl_jax.networks.mlp import MLP
-from barl_jax.networks.optim import adam
+from barl_jax.networks.mlp import MLP, MLP_STYLES
+from barl_jax.networks.optim import adam, CriticOptim
 from barl_jax.networks.registry import register_component
 from barl_jax.policy import TARGET_SUFFIX, Buffer, Critic, frozen
 
 
-class QCriticBase(Critic):
+# ---------------------------------------------------------------------------
+# Critic config mixins -- the algorithm geometry a critic owns, so a concrete
+# critic class states only what its representation adds (a distribution's
+# atoms, an ensemble's rho) and inherits the rest.
+# ---------------------------------------------------------------------------
+
+
+class CriticLossConfig:
+  """The Bellman geometry every critic shares: the discount, whether to price
+  the heads' disagreement into the price and/or the target, and the Polyak
+  target net."""
+
+  gamma             = HParam(0.99)
+  pessimistic_target = HParam(False)
+  polyak_tau        = HParam(0.0)
+  target_delay      = HParam(1)
+
+
+class CriticDistConfig:
+  """The distributional critics' geometry (C51 / HLGauss): how many atoms / bins
+  the support carries and the smoothing around it. All are HParams -- the return
+  representation a sweep may vary."""
+
+  num_atoms          = HParam(101)
+  num_bins           = HParam(151)
+  sigma_to_bin_ratio = HParam(0.75)
+  entropy_coef       = HParam(0.0)
+  rho                = HParam(0.0)
+
+
+class Polyak:
+  """Opts the inheriting critic into a Polyak target net at the NC-LQL tau.
+  *Must* be used with a non-BatchRenorm MLP style -- `QCriticBase` raises on the
+  polyak+batchrenorm pairing."""
+
+  polyak_tau = HParam(0.005)
+
+
+class QCriticBase(CriticLossConfig, CriticOptim, Critic):
   """`polyak_tau > 0` opts this critic into a Polyak-averaged target network.
 
   At the default `0.0` nothing is cloned: no target modules, no extra state, no
-  work in `after_step()`, and `td_loss` keeps the single fused forward over
+  work in `after_step()`, and `loss` keeps the single fused forward over
   `[(s,a), (s',a')]` that CrossQ's shared BatchRenorm pass exists to exploit.
   That is why the two are mutually exclusive rather than merely discouraged --
   they are alternative answers to the same overestimation problem, and running
-  both gives two half-cancelling mechanisms and a plausible-looking curve."""
+  both gives two half-cancelling mechanisms and a plausible-looking curve.
 
-  def __init__(self, env_stats, q_function, *, gamma: float, lr: float,
-               pessimistic_target: bool, adam_b1: float, grad_clip: float,
-               grad_clip_mode: str, polyak_tau: float,
-               target_delay: int, norm: str, **kwargs):
-    super().__init__(env_stats, **kwargs)
+  Declarations come from the `CriticLossConfig`/`CriticOptim` mixins (the Bellman
+  geometry and the critic optimizer); a concrete class adds its `net_style`
+  selector and its own reduction geometry."""
 
-    self.gamma   = float(gamma)
-    self.lr      = float(lr)
-    self.adam_b1 = float(adam_b1)
-    self.grad_clip, self.grad_clip_mode = float(grad_clip), str(grad_clip_mode)
+  # False on the plain contract; `NoiseConditionedCritic` flips it because its
+  # `loss` is a wider signature (TD at the clean level plus smoothing over the
+  # noisier ones) that the RLPolicy template's one-backward call cannot drive.
+  noise_conditioned = False
 
-    self.pessimistic_target = bool(pessimistic_target)
+  def __init__(self, env_stats, config: ConfigMixin, q_function, **kwargs):
+    super().__init__(env_stats, config, **kwargs)
 
     self.q_function = q_function
 
-    self.polyak_tau   = float(polyak_tau)
-    self.target_delay = int(target_delay)
-
+    # HParam values (gamma/lr/.../norm) are already resolved onto self by
+    # Component.__init__; the polyak check and the clone are the rest.
     if self.polyak_tau > 0.0:
-      if norm in ("batch", "batchrenorm"):
+      if self.norm in ("batch", "batchrenorm"):
         raise ValueError(
-          f"{type(self).__name__}: polyak_tau={polyak_tau} with norm={norm!r}. A target net "
+          f"{type(self).__name__}: polyak_tau={self.polyak_tau} with norm={self.norm!r}. A target net "
           f"and CrossQ-style running-statistic normalization are alternative answers to the "
           f"same problem -- the target's separate forward pass removes the shared "
           f"[(s,a), (s',a')] batch that makes BatchRenorm worth having. Pick one: either "
@@ -178,7 +216,7 @@ class QCriticBase(Critic):
     losses["critic"] = self.regression_loss(raw, target)
     self.record(raw, target)
 
-  def td_loss(self, obs, action, next_obs, next_action, reward, term,
+  def loss(self, obs, action, next_obs, next_action, reward, term,
               losses: dict, shift=0.0) -> None:
     if self.has_target:
       # The bootstrap comes from a different network, so there is no shared
@@ -233,24 +271,29 @@ class EnsembleCritic(QCriticBase):
   the plain mean, and at `n_models: 2` the population std is |q1 - q2|/2, soy
   `rho: 1.0` is exactly the min-over-heads that C51EnsembleCritic takes."""
 
-  def __init__(self, env_stats, *, latent_dim: int, layers: int, n_models: int, rho: float,
-               activation: str, norm: str,
-               norm_input: bool, norm_stem: bool, norm_after_act: bool,
-               dropout: float, final_activation: bool,
-               residual: bool, norm_kwargs: dict, dtype: str,
-               rngs: nnx.Rngs, **kwargs):
+  kind = "critic"
+  # CrossQ net: BatchRenorm over the shared [(s,a),(s',a')] forward.
+  net_style = Config("crossq", style=MLP_STYLES)
+  rho                = HParam(1.0)
+  pessimistic_target = HParam(True)
+
+  def __init__(self, env_stats, config: ConfigMixin, *, rngs: nnx.Rngs, **kwargs):
+    self.resolve_hparams(config, env_stats=env_stats)
+    # latent_dim/layers/n_models are size-ladder-owned -- not declared on any
+    # class, so they are read structurally from the resolved layer.
+    latent_dim, layers, n_models = (config.get(k, int) for k in ("latent_dim", "layers", "n_models"))
 
     q_function = ConcatQ(env_stats["obs_dim"] + env_stats["act_dim"], 1,
                          latent_dim, layers, n_models=n_models,
-                         activation=activation, norm=norm, norm_input=norm_input,
-                         norm_stem=norm_stem, norm_after_act=norm_after_act,
-                         dropout=dropout, final_activation=final_activation,
-                         residual=residual, norm_kwargs=norm_kwargs, dtype=dtype, rngs=rngs)
+                         activation=self.activation, norm=self.norm, norm_input=self.norm_input,
+                         norm_stem=self.norm_stem, norm_after_act=self.norm_after_act,
+                         dropout=self.dropout, final_activation=self.final_activation,
+                         residual=self.residual, norm_kwargs=self.hparam("norm_kwargs"), dtype=self.dtype,
+                         rngs=rngs)
 
-    super().__init__(env_stats, q_function, norm=norm, rngs=rngs, **kwargs)
+    super().__init__(env_stats, config, q_function, **kwargs)
 
-    self.n_models = int(n_models)
-    self.rho      = float(rho)
+    self.n_models = n_models
 
   def reduce_value(self, raw):
     raw = raw.astype(jnp.float32)
@@ -271,16 +314,19 @@ class EnsembleCritic(QCriticBase):
 
 
 @register_component
-class TargetEnsembleCritic(EnsembleCritic):
+class TargetEnsembleCritic(Polyak, EnsembleCritic):
   """`EnsembleCritic` that bootstraps from a Polyak target instead of leaning on
   CrossQ's shared-forward BatchRenorm.
 
   It exists as a class rather than as two keys in a slot because the two
   mechanisms are mutually exclusive (`QCriticBase` raises if both are on) and
-  setting `polyak_tau` while leaving `norm: batchrenorm` is the easy mistake --
-  it does not fail, it just half-cancels and produces a plausible curve. Pairing
-  them in one `config/components.yaml` baseline makes the swap one word:
-  `class: EnsembleCritic` -> `class: TargetEnsembleCritic`."""
+  setting `polyak_tau` while leaving the crossq `net_style` is the easy mistake
+  -- it does not fail, it just half-cancels and produces a plausible curve.
+  `net_style` needs the layer variant and the `Polyak` marker the tau; the swap
+  is then one word: `class: EnsembleCritic` -> `class: TargetEnsembleCritic`."""
+
+  kind = "critic"
+  net_style = Config("layer_relu", style=MLP_STYLES)
 
 
 # ----------------------------------------------------------------------
@@ -288,7 +334,7 @@ class TargetEnsembleCritic(EnsembleCritic):
 # ----------------------------------------------------------------------
 
 
-class CategoricalCriticBase(QCriticBase):
+class CategoricalCriticBase(QCriticBase, CriticDistConfig):
   """A head emitting logits over a **fixed support**, fitted by cross-entropy
   against a target distribution.
 
@@ -298,14 +344,14 @@ class CategoricalCriticBase(QCriticBase):
   -- so `bellman_target` is the entire difference, and everything about pricing
   and the loss is shared, including the `n_models` heads and their reduction."""
 
-  def __init__(self, env_stats, q_function, support, *, n_models: int, rho: float,
-               entropy_coef: float, **kwargs):
-    super().__init__(env_stats, q_function, **kwargs)
+  net_style = Config("crossq", style=MLP_STYLES)
 
-    self.support      = Buffer(support)
-    self.n_models     = int(n_models)
-    self.rho          = float(rho)
-    self.entropy_coef = float(entropy_coef)
+  def __init__(self, env_stats, config: ConfigMixin, q_function, support, **kwargs):
+    super().__init__(env_stats, config, q_function, **kwargs)
+
+    self.support = Buffer(support)
+    # n_models is size-ladder-owned and read structurally (see EnsembleCritic).
+    self.n_models = config.get("n_models", int)
 
   def probs(self, raw):
     return jax.nn.softmax(raw.astype(jnp.float32), axis=-1)
@@ -405,32 +451,33 @@ class C51Critic(CategoricalCriticBase):
   reference's `hs` of the same length (`layers: 1` + `norm_stem: true` is its
   `hs: [w, w]`)."""
 
-  def __init__(self, env_stats, *, latent_dim: int, layers: int, n_models: int,
-               num_atoms: int, entropy_coef: float,
-               activation: str, norm: str,
-               norm_input: bool, norm_stem: bool, norm_after_act: bool,
-               dropout: float, final_activation: bool,
-               residual: bool, norm_kwargs: dict, dtype: str,
-               v_min: float = None, v_max: float = None,
-               rngs: nnx.Rngs, **kwargs):
+  # The C51 defaults that differ from CriticDistConfig's: entropy_coef on,
+  # rho/pessimistic off (both already CriticDistConfig's defaults -- stated so
+  # the swapped-versus-EnsembleCritic story stays a single `class:` edit).
+  kind = "critic"
+  entropy_coef = HParam(0.005)
 
-    v_min = env_stats["return_min"] if v_min is None else float(v_min)
-    v_max = env_stats["return_max"] if v_max is None else float(v_max)
+  def __init__(self, env_stats, config: ConfigMixin, *, rngs: nnx.Rngs, **kwargs):
+    self.resolve_hparams(config, env_stats=env_stats)
+    # n_models is size-ladder-owned; v_min/v_max fall back to the env's declared
+    # return range -- a property of the env, not a class default.
+    n_models = config.get("n_models", int)
+    v_min = config.get("v_min", float, default=env_stats["return_min"])
+    v_max = config.get("v_max", float, default=env_stats["return_max"])
 
-    q_function = ConcatQ(env_stats["obs_dim"] + env_stats["act_dim"], num_atoms,
-                         latent_dim, layers, n_models=n_models,
-                         activation=activation, norm=norm, norm_input=norm_input,
-                         norm_stem=norm_stem, norm_after_act=norm_after_act,
-                         dropout=dropout, final_activation=final_activation,
-                         residual=residual, norm_kwargs=norm_kwargs, dtype=dtype, rngs=rngs)
+    q_function = ConcatQ(env_stats["obs_dim"] + env_stats["act_dim"], self.num_atoms,
+                         config.get("latent_dim", int), config.get("layers", int),
+                         n_models=n_models,
+                         activation=self.activation, norm=self.norm, norm_input=self.norm_input,
+                         norm_stem=self.norm_stem, norm_after_act=self.norm_after_act,
+                         dropout=self.dropout, final_activation=self.final_activation,
+                         residual=self.residual, norm_kwargs=self.hparam("norm_kwargs"),
+                         dtype=self.dtype, rngs=rngs)
 
-    super().__init__(env_stats, q_function,
-                     jnp.linspace(v_min, v_max, num_atoms, dtype=jnp.float32),
-                     n_models=int(n_models), entropy_coef=entropy_coef,
-                     norm=norm, rngs=rngs, **kwargs)
+    super().__init__(env_stats, config, q_function,
+                     jnp.linspace(v_min, v_max, self.num_atoms, dtype=jnp.float32), **kwargs)
 
-    self.num_atoms = int(num_atoms)
-    self.v_min, self.v_max = float(v_min), float(v_max)
+    self.v_min, self.v_max = v_min, v_max
 
   def derived(self) -> dict:
     """The support is the env's return range unless a kwarg pins it, so it is
@@ -469,33 +516,30 @@ class HLGaussCritic(CategoricalCriticBase):
   EnsembleCritic. The ensemble is this codebase's, not the paper's, and exists
   so all three critics differ only in the return representation."""
 
-  def __init__(self, env_stats, *, latent_dim: int, layers: int, n_models: int,
-               num_bins: int, sigma_to_bin_ratio: float,
-               activation: str, norm: str,
-               norm_input: bool, norm_stem: bool, norm_after_act: bool,
-               dropout: float, final_activation: bool,
-               residual: bool, norm_kwargs: dict, dtype: str,
-               v_min: float = None, v_max: float = None,
-               rngs: nnx.Rngs, **kwargs):
+  kind = "critic"
+
+  def __init__(self, env_stats, config: ConfigMixin, *, rngs: nnx.Rngs, **kwargs):
+    self.resolve_hparams(config, env_stats=env_stats)
+    n_models = config.get("n_models", int)
 
     # Same kwarg-over-EnvStats fallback as C51Critic -- see its __init__.
-    v_min = env_stats["return_min"] if v_min is None else float(v_min)
-    v_max = env_stats["return_max"] if v_max is None else float(v_max)
-    edges = jnp.linspace(v_min, v_max, num_bins + 1, dtype=jnp.float32)
+    v_min = config.get("v_min", float, default=env_stats["return_min"])
+    v_max = config.get("v_max", float, default=env_stats["return_max"])
+    edges = jnp.linspace(v_min, v_max, self.num_bins + 1, dtype=jnp.float32)
 
-    q_function = ConcatQ(env_stats["obs_dim"] + env_stats["act_dim"], num_bins,
-                         latent_dim, layers, n_models=n_models,
-                         activation=activation, norm=norm, norm_input=norm_input,
-                         norm_stem=norm_stem, norm_after_act=norm_after_act,
-                         dropout=dropout, final_activation=final_activation,
-                         residual=residual, norm_kwargs=norm_kwargs, dtype=dtype, rngs=rngs)
+    q_function = ConcatQ(env_stats["obs_dim"] + env_stats["act_dim"], self.num_bins,
+                         config.get("latent_dim", int), config.get("layers", int),
+                         n_models=n_models,
+                         activation=self.activation, norm=self.norm, norm_input=self.norm_input,
+                         norm_stem=self.norm_stem, norm_after_act=self.norm_after_act,
+                         dropout=self.dropout, final_activation=self.final_activation,
+                         residual=self.residual, norm_kwargs=self.hparam("norm_kwargs"),
+                         dtype=self.dtype, rngs=rngs)
 
-    super().__init__(env_stats, q_function, (edges[:-1] + edges[1:]) / 2,
-                     n_models=n_models, norm=norm, rngs=rngs, **kwargs)
+    super().__init__(env_stats, config, q_function, (edges[:-1] + edges[1:]) / 2, **kwargs)
 
-    self.v_min, self.v_max = float(v_min), float(v_max)
-    self.num_bins = int(num_bins)
-    self.sigma    = sigma_to_bin_ratio * (self.v_max - self.v_min) / num_bins
+    self.v_min, self.v_max = v_min, v_max
+    self.sigma    = self.sigma_to_bin_ratio * (self.v_max - self.v_min) / self.num_bins
     self.edges    = Buffer(edges)
 
   def derived(self) -> dict:

@@ -259,36 +259,64 @@ Only two call sites ever need it: `ReplayBuffer.rollout()` (immediately before `
 canonical — a Policy re-invoking its own actor mid-`train_step` (e.g. for a Bellman bootstrap
 action) can feed the result straight to its critic with no further conversion.
 
-### Tunables all live in `config/` -- there are no Python-level defaults
+### Tunables and structure are declared next to the code -- YAML is override-only
 
-Every value that affects a run -- architecture kwargs, optimizer kwargs, algorithm tunables, the
-run loop's own knobs -- is a required, no-default **keyword-only** argument supplied from the
-config tree. This is enforced, not conventional: `model_config.no_default_problems()` fails any
-registered component whose `__init__` carries a Python default or a positional tunable, and
-`scripts/lint_config.py` runs that over every component (`validate()` runs it per slot before
-every training run). The point is that a run's wandb config is a *complete* account of what ran.
+Defaults live on the classes that use them, as class attributes, in two kinds (`src/barl_jax/hparam.py`):
+
+- **`HParam(default, *, range=, choices=, descr=)`** -- a *searchable algorithmic knob*: the default
+  the code ships, the range/choices a hyperparameter sweep varies, and a description. These are
+  the only class attributes a search (scripts/hpo.py) may target.
+- **`Config(default)`** -- a *structural default*, type inferred: how a net is put together, the
+  squash/ladder-class selection, an optimizer role. Not searchable -- you vary structure with
+  `--set` or a grid axis, not per-trial.
+
+**Which net / which time embedding is a configuration value, not an inheritance
+choice.** The named styles (MLP surfaces, time/level-embedding coders) live in
+code registries (`barl_jax.hparam.STYLES`: `net.gelu`, `time.fourier`, ...),
+registered by `networks/mlp.py` and `networks/flow.py`. A component *selects*
+one with a style-tagged `Config`:
+
+    class DDPMActor(Actor, ActorOptim):
+        net_style = Config("gelu",   style="net")    # net.gelu's whole surface
+        time_emb  = Config("sin_20", style="time")   # time.sin_20's whole surface
+
+so switching `--set model.components.actor.net_style=silu` (or a grid axis)
+changes the whole net, and the resolved config records the *choice* -- a style's
+surface keys are attributed as `style: net.gelu`, never hidden as class
+defaults. A component can still pin one key on top of a style (a per-slot
+`activation:` beats the style's), and a style's surface sits below the component
+own declarations and the slot's YAML.
+
+What is still composed by **class inheritance** is *algorithm geometry* -- an
+optimizer role (`CriticOptim`/`ActorOptim`/`DualOptim` in networks/optim.py), a
+critic's Bellman geometry (`CriticLossConfig`/`CriticDistConfig`/`Polyak` in
+networks/critic.py): those are decisions about which algorithm code a component
+implements, not about a selectable default. A concrete component states nothing
+beyond its geometry bases, its style selectors, and the HParams only it owns:
+
+`Component`/`Policy` collect `HParam`s and `Config`s down the MRO into `_hparams`/`_configs` (own /
+more-derived declarations win, so a mixin listed earlier in a class's bases takes precedence) and
+resolve each to an instance attribute at construction: the YAML layer wins if present, the class
+default otherwise. Because the default lives in the declaration, **the resolved config a run logs
+can never be silent about it** -- every value is attributed to the layer that set it (`decl configs:`,
+`decl hparams:`, `models: <model>.components.<slot>`, `size: <kind>.<name>`, `override: ...`).
 
 ```
 config/
-  presets/      sizes.yaml  net.yaml  optim.yaml  time.yaml   named reusable fragments
-  components/   actors.yaml  critics.yaml  duals.yaml         per component *class* baselines
-  models/       sac.yaml  dime.yaml  ...  aliases.yaml        per *policy* slots/params/training
-  run/          defaults.yaml  envs.yaml                      every run key; per-env facts
+  models/       sac.yaml  dime.yaml  ...  aliases.yaml        per *policy* overrides (slots/params/training)
   experiments/  online_learning.yaml  sweep_grid.yaml         run lists and sweep specs
+  search/       demo.yaml                                     HPO search spaces (scripts/hpo.py)
 ```
 
-Each directory merges into one map; a key defined in two files of the same directory is a load
-error, so which file an entry lives in is organizational, never semantic.
+`config/components/`, `config/presets/`, `config/run/defaults.yaml` and `config/run/envs.yaml` are
+gone: component defaults are class HParams/Configs (inherited from style mixins), run-key defaults
+are `barl_jax.run_config.RUN_HPARAMS`, and per-env facts/overrides are `Environment.stats` /
+`Environment.defaults` class attributes merged down the MRO.
 
-**Composition is `extends:` and `size:`.** A block names preset fragments by dotted path
-(`extends: [net.crossq, optim.critic]`, recursively -- a preset may extend another), which is what
-keeps `config/components/` free of the ten-line MLP block that used to be copy-pasted into all
-thirteen entries. Nested dicts (`norm_kwargs`, `time_kwargs`) deep-merge, so a fragment can add one
-key to an inherited dict.
-
-`size: large` is sugar for `extends: [sizes.<kind>.large]`, where `<kind>` is the component's
-declared `kind:`. **The size tables own their keys exclusively**: no component entry may set
-`latent_dim`/`layers`/`n_models`, every slot of a sized kind must name a `size:`, and all sizes of
+`size: large` resolves one rung of the component kind's *capacity ladder* (code-declared in
+`barl_jax.hparam`), where `<kind>` is the component's declared `kind:`. **The size tables own their
+keys exclusively**: no component class declares `latent_dim`/`layers`/`n_models`, every slot of a
+sized kind must name a `size:`, and all sizes of
 a kind must declare the same keys -- all three checked by the lint. That is what makes `large`
 mean one net for every critic class, so `--set model.components.critic.size=large` is a capacity
 comparison rather than an incidental-architecture one. Ladders are width at fixed depth; a net
@@ -298,19 +326,19 @@ Precedence for a component kwarg, lowest first:
 
 | # | layer |
 |---|---|
-| 1 | the component entry's `extends:` presets, in list order |
-| 2 | the component entry's own keys (`config/components/critics.yaml`) |
-| 3 | the slot's `size:` |
-| 4 | the slot's `extends:` presets |
-| 5 | the slot's own keys (`config/models/<policy>.yaml`) |
-| 6 | the active profile's block for that slot |
-| 7 | the run's dotted overrides (`model_overrides:`, i.e. a `model.*` sweep axis) |
-| 8 | the Policy's leftover `**kwargs` |
-| 9 | the explicit kwargs at its own `build_component()` call site |
+| 1 | the class's inherited `Config` structural defaults (composed down the MRO) |
+| 2 | the class's inherited `HParam` algorithmic defaults |
+| 3 | the slot's `size:` (a capacity-ladder rung) |
+| 4 | the slot's own keys (`config/models/<policy>.yaml`) |
+| 5 | the active profile's block for that slot |
+| 6 | the run's dotted overrides (`model_overrides:`, i.e. a `model.*` sweep axis) |
+| 7 | the Policy's leftover `**kwargs` |
+| 8 | the explicit kwargs at its own `build_component()` call site |
 
-1-7 live in `config_tree.py`; 8-9 in `policy.py`. `params:` and `training:` use the same chain
-minus the component layers. `components.<slot>.class` and `.size` are overridable too, which is
-what makes an architecture axis and a capacity axis sweepable without editing a file.
+1-6 live in `config_tree.py`; 7-8 in `policy.py`. `params:` and `training:` use the same chain
+minus the structural rungs, with the policy class's own HParams as their lowest rung.
+`components.<slot>.class` and `.size` are overridable too, which is what makes an architecture axis
+and a capacity axis sweepable without editing a file.
 
 ```bash
 uv run python scripts/print_config.py AMDP          # resolved, every value attributed to its layer
@@ -318,34 +346,35 @@ uv run python scripts/print_config.py AMDP --json   # the flat form a run snapsh
 uv run python scripts/lint_config.py                # the whole-tree gate
 ```
 
-**`src/barl_jax/config_tree.py` is the only resolver**, and it imports nothing but `yaml` --
-which is what lets `scripts/submit.py` and `scripts/grid.py` resolve and snapshot a model config on
-a login node without pulling in jax — and what removed the hand-maintained copy of `snapshot_for()`
-the launcher used to carry. `model_config.py` is a thin registry-aware facade over it (class lookup,
-`__init__` signature checks, the no-defaults lint) plus a process-wide default tree.
+**`src/barl_jax/config_tree.py` is the only resolver.** It imports only `yaml`/`os`/`pathlib` and
+`barl_jax.configs` at import time; the component/policy class registry is pulled lazily when a class's
+declared defaults (or `kind`) are needed. Because defaults live on the classes, the launcher
+(`scripts/grid.py`, `scripts/hpo.py`, `scripts/submit.py`'s check) now imports `barl_jax` directly
+under `JAX_PLATFORMS=cpu` -- that is the price of code-coupled defaults, and `test_launcher_devices.py`
+still holds the run-reaches-GPU guarantee. `model_config.py` is a thin registry-aware facade over it
+(class lookup, validation) plus a process-wide default tree.
 
 **A run's snapshot is fully resolved.** `ConfigTree.snapshot_for()` returns the complete flat
-resolved config under `resolved:`, and a tree constructed with that snapshot *serves those values
-directly* rather than re-running the layering -- so a saved sweep run and a checkpoint replay
-exactly, whatever `config/` says later. `Policy.save` writes the same snapshot into `meta.json`,
-which is what closes the old gap where a checkpoint silently reconstructed a different
-architecture. `Policy.load` restores it and the run's overrides, then puts both back, so loading a
-checkpoint no longer redefines the config for the rest of the process.
+resolved config under `resolved:` -- every declared HParam/Config with its effective value -- and a
+tree constructed with that snapshot *serves those values directly* rather than re-running the
+layering -- so a saved sweep run and a checkpoint replay exactly, whatever the code or YAML says
+later. `Policy.save` writes the same snapshot into `meta.json`, which is what closes the old gap
+where a checkpoint silently reconstructed a different architecture. `Policy.load` restores it and
+the run's overrides, then puts both back, so loading a checkpoint no longer redefines the config
+for the rest of the process.
 
-**What is not resolvable from `config/` alone is reported by the component.** A critic's support
-follows the env (`v_min`/`v_max` from `EnvStats`), `HLGaussCritic`'s `sigma` is derived from it and
-`num_bins`, and AMDP's `erf_k` from its actor's noise schedule. Each such component overrides
-`Component.derived()`, the Policy collects them, and the trainer logs them under
-`model/derived.*` -- the exemption in the no-defaults lint (`ENV_BACKED_PARAMS`) exists only
-because of that reporting path.
+**What is not resolvable from the declarations alone is reported by the component.** A critic's
+support follows the env (`v_min`/`v_max` from `EnvStats`), `HLGaussCritic`'s `sigma` is derived from
+it and `num_bins`, and AMDP's `erf_k` from its actor's noise schedule. Each such component overrides
+`Component.derived()`, the Policy collects them, and the trainer logs them under `model/derived.*`.
 
-**Run keys** are declared in `config/run/defaults.yaml` and nowhere else. `config.load_config()`
-rejects a resolved run carrying a key that file doesn't declare, `trainer.py` indexes `cfg[...]`
-with no `cfg.get(key, default)` anywhere, and the lint checks the two directions agree. Six of them
-(`config_tree.TRAINING_KEYS`) may also be set by a model's own `training:` block, for knobs that
-belong to the *algorithm* rather than the experiment; per-env facts and per-env run overrides live
-in `config/run/envs.yaml`, including the `return_min`/`return_max` that used to sit in the
-`Environment` class bodies.
+**Run keys** are declared in `barl_jax.run_config.RUN_HPARAMS` and nowhere else. A resolved run is
+complete by construction (every run key present), `trainer.py` indexes `cfg[...]` with no
+`cfg.get(key, default)` anywhere, and the lint rejects a YAML key that names no code declaration.
+Six of them (`config_tree.TRAINING_KEYS`) may also be set by a model's own `training:` block, for
+knobs that belong to the *algorithm* rather than the experiment; per-env facts and per-env run
+overrides are `Environment.stats` / `Environment.defaults` class attributes (`return_min`/`return_max`
+included), merged down the MRO in `get_env_stats()`/`merged_defaults()`.
 
 **What every run logs to wandb** (`trainer.wandb_config`): `run/*` every run key, `model/*` every
 resolved component kwarg plus its `class` and `size`, `model/derived.*` the values above,

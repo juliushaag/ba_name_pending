@@ -8,9 +8,8 @@ declare is an error. That is what lets trainer.py index `cfg[...]` directly
 instead of carrying a `cfg.get(key, default)` fallback the wandb config would
 never show."""
 
-import yaml
-
 from barl_jax.config_tree import CONFIG_DIR, ConfigTree
+from barl_jax.configs import load_yaml_with_includes
 
 # Keys a run carries that are set by the machinery rather than declared as
 # tunables: what to run, where to put it, and the frozen config it runs under.
@@ -24,6 +23,15 @@ INJECTED_KEYS = frozenset({
 def run_keys(root=CONFIG_DIR) -> set:
   """The declared run keys -- the contents of config/run/defaults.yaml."""
   return set(ConfigTree(root).run)
+
+
+def _env_defaults(env_name: str) -> dict:
+  """The env class's declared run-key overrides, merged down its MRO. A class
+  that is not registered (unknown env in a synthetic tree) contributes
+  nothing -- the unknown-name error comes from elsewhere."""
+  from barl_jax.env import Environment
+  cls = Environment._classes.get(env_name)
+  return cls.merged_defaults() if cls is not None else {}
 
 
 def load_config(path: str, root=CONFIG_DIR) -> list[dict]:
@@ -45,9 +53,12 @@ def load_config(path: str, root=CONFIG_DIR) -> list[dict]:
   `model_overrides:` is the one key merged key-wise across the levels instead of
   replaced wholesale, since a per-env and a per-run override normally mean to
   stack. A top-level `snapshot:` key (see scripts/grid.py) rides along on
-  every resolved run and is applied by model_config.set_snapshot()."""
-  with open(path) as f:
-    raw = yaml.safe_load(f) or {}
+  every resolved run and is applied by model_config.set_snapshot().
+
+  `$()` includes (barl_jax.configs) are resolved against `root` as the config
+  root, so e.g. a `runs:` list shared by more than one experiment file can
+  live in one place: `runs: $(/experiments/shared_runs.yaml)`."""
+  raw = load_yaml_with_includes(path, config_root=root)
 
   snapshot = raw.get("snapshot")
   runs = raw.get("runs")
@@ -63,7 +74,7 @@ def load_config(path: str, root=CONFIG_DIR) -> list[dict]:
       raise ValueError(f"{path}: runs[{i}] is missing a required 'model' or 'env' key")
 
     levels = [tree.run, raw.get("defaults") or {}, tree.resolve_training(run["model"]),
-              tree.env_defaults(run["env"]), run]
+              _env_defaults(run["env"]), run]
 
     entry = {k: v for level in levels for k, v in level.items()}
     overrides = {k: v for level in levels for k, v in (level.get("model_overrides") or {}).items()}

@@ -28,13 +28,10 @@ DM_HORIZON = 1000                      # every suite task; see DMControlEnvironm
 
 
 def declared(cls) -> dict:
-    """config/run/envs.yaml's stats merged down the MRO, as
+    """The env class's `stats`, merged down the MRO as
     Environment.get_env_stats does it -- replicated rather than called so this
     stays free of a real gym env."""
-    out = {}
-    for klass in reversed(cls.__mro__):
-        out.update(model_config.tree().env_stats(klass.__name__))
-    return out
+    return cls.merged_stats()
 
 
 def test_dm_control_support_matches_the_reference():

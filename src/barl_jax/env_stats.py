@@ -4,11 +4,7 @@ Environment.get_env_stats(), stored on the Policy and injected into every slot
 by Policy.build_component(). Deliberately *not* part of the models.yaml /
 components.yaml layering -- this is a function of the environment, not a
 tunable; a component that wants it tunable takes a normal kwarg that falls
-back to its EnvStats entry (see HLGaussCritic's v_min/v_max).
-
-The `live` sub-dict is the one mutable part: scripts/jax/online_learning.py
-refreshes it from ReplayBuffer.rollout()'s stats after every rollout, and since
-every component holds a reference to the same object, they all see it."""
+back to its EnvStats entry (see HLGaussCritic's v_min/v_max)."""
 
 import gymnasium as gym
 import numpy as np
@@ -33,18 +29,15 @@ class EnvStats(dict):
       max_episode_steps = None,
       return_min   = None,
       return_max   = None,
-      live         = dict(),
     )
     stats.update(declared)
     return stats
 
   def derive(self, **overrides) -> "EnvStats":
     """Shallow copy with some keys replaced, for a component that feeds its
-    inner network something other than the raw env dims. `live` is shared by
-    reference, so the copy still tracks each rollout."""
+    inner network something other than the raw env dims."""
     return EnvStats({**self, **overrides})
 
   def static(self) -> dict:
-    """Everything but the per-rollout `live` section -- what's worth logging
-    once as run config."""
-    return {k: v for k, v in self.items() if k != "live"}
+    """Everything in this stats dict -- the run-config view, safe to log once."""
+    return dict(self)

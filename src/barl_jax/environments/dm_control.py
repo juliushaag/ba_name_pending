@@ -11,7 +11,16 @@ class DMControlEnvironment(Environment):
   its Dict observation into a single flat Box (every Policy/MLP here assumes
   that shape). Online-only, like MuJoCoGymEnvironment."""
 
-  use_async_vector_env = False
+  use_async_vector_env = True
+
+  # dime_am's tuned DMC value, `v_min: -200, v_max: 200` at `n_atoms: 101` --
+  # reward in [0, 1] over a 1000-step horizon, so the discounted value is
+  # bounded by (1-gamma^T)/(1-gamma) and the support is twice that, symmetric.
+  stats = {"return_min": -200.0, "return_max": 200.0}
+  # DMC is synchronous: raising num_envs does not change the physics cost per
+  # env step (N sub-envs step sequentially either way), it only amortizes the
+  # per-iteration fixed costs. Kept equal to rollout_steps.
+  defaults = {"num_envs": 16, "rollout_steps": 16}
 
   def domain_task(self) -> tuple[str, str]:
     raise NotImplementedError
@@ -29,6 +38,11 @@ class DMControlEnvironment(Environment):
 
 @register_environment
 class DogRun(DMControlEnvironment):
+  # Dog is the heaviest model in the suite -- 223-dim obs, 38-dim action, 97 MB
+  # of RSS per env against ~10 MB for the rest -- halved so the rollout envs,
+  # the eval_runs x num_seeds eval envs and a 10-seed replay buffer fit the
+  # job's --mem together.
+  defaults = {"num_envs": 8, "rollout_steps": 8}
   def domain_task(self): return ("dog", "run")
 
 

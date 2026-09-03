@@ -13,10 +13,20 @@ import jax.numpy as jnp
 import pytest
 from flax import nnx
 
+from barl_jax.networks.registry import get_component
+from barl_jax.policies.lql import NoiseConditionedCritic
 from barl_jax.policy import TRAINABLE, frozen
 
 from conftest import (BATCH, CRITICS, build, built, critic_action, finite,
                       target_expectation)
+
+# `NoiseConditionedCritic.loss` overrides `QCriticBase.loss` with a different
+# signature -- it takes the sigma ladder and a key, because TD at the clean level
+# plus smoothing of the noisier ones is one loss over two forwards. So the shared
+# contract below is the plain one, and the noise-conditioned critics get the same
+# assertions through their own entry point.
+PLAIN = [n for n in CRITICS if not issubclass(get_component(n), NoiseConditionedCritic)]
+NOISE_CONDITIONED = [n for n in CRITICS if issubclass(get_component(n), NoiseConditionedCritic)]
 
 REWARD = jnp.array([-2.0, -0.5, 0.5, 2.0])          # BATCH values, well inside every support
 
@@ -80,15 +90,38 @@ def test_bellman_contract(name, obs, act):
         assert loss.shape == () and finite(loss)
 
 
-@pytest.mark.parametrize("name", CRITICS)
-def test_td_loss_is_differentiable(name, obs, act):
-    """`td_loss` fills exactly `losses["critic"]`, and that scalar moves the heads."""
-    c = build(name)                       # fresh: td_loss updates BatchRenorm state
+@pytest.mark.parametrize("name", PLAIN)
+def test_loss_is_differentiable(name, obs, act):
+    """`loss` fills exactly `losses["critic"]`, and that scalar moves the heads."""
+    c = build(name)                       # fresh: loss updates BatchRenorm state
     a = critic_action(c, act)
 
     def loss_fn(critic):
         losses = {}
-        critic.td_loss(obs, a, obs[::-1], a, REWARD, jnp.zeros((BATCH,)), losses)
+        critic.loss(obs, a, obs[::-1], a, REWARD, jnp.zeros((BATCH,)), losses)
+        assert set(losses) == {"critic"}
+        return losses["critic"]
+
+    grads = nnx.grad(loss_fn, argnums=nnx.DiffState(0, TRAINABLE))(c)
+    leaves = jax.tree.leaves(nnx.state(grads))
+    assert leaves and all(finite(g) for g in leaves)
+    assert any(jnp.any(g != 0) for g in leaves), "no head received gradient"
+
+
+@pytest.mark.parametrize("name", NOISE_CONDITIONED)
+def test_noise_conditioned_loss_is_differentiable(name, obs, act):
+    """The same contract as above through the noise-conditioned entry point: one
+    `losses["critic"]` covering both the TD and the smoothing term, and it moves
+    the heads."""
+    # The raw action, not `critic_action`: `augment()` is what widens it to the
+    # inner critic's input, and doing both would widen it twice.
+    c = build(name)
+    sigmas = jnp.array([0.5, 0.2, 0.05])
+
+    def loss_fn(critic):
+        losses = {}
+        critic.loss(obs, act, obs[::-1], act, REWARD, jnp.zeros((BATCH,)),
+                    sigmas, jax.random.PRNGKey(0), losses)
         assert set(losses) == {"critic"}
         return losses["critic"]
 

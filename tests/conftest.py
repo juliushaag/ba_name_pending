@@ -38,6 +38,7 @@ from flax import nnx
 
 import barl_jax  # noqa: F401  -- import side effects populate the registry
 import barl_jax.model_config as model_config
+from barl_jax.configs import ConfigMixin
 from barl_jax.env_stats import EnvStats
 from barl_jax.networks.registry import available_components, get_component
 from barl_jax.networks.schedule import Schedule
@@ -76,8 +77,7 @@ def make_env_stats(**overrides) -> EnvStats:
         act_low=np.full(ACT_DIM, -1.0, np.float32),
         act_high=np.full(ACT_DIM, 1.0, np.float32),
         max_episode_steps=16,
-        return_min=RETURN_MIN, return_max=RETURN_MAX,
-        live={})
+        return_min=RETURN_MIN, return_max=RETURN_MAX)
     base.update(overrides)
     return EnvStats(**base)
 
@@ -95,15 +95,26 @@ def tiny_kwargs(name: str, **extra) -> dict:
     base = model_config.tree().component_kwargs(name)
     if issubclass(get_component(name), Schedule):
         base.update(SCHEDULE_KWARGS)
-    base.update(POLICY_SUPPLIED.get(name, {}))
     base.update({k: v for k, v in TINY.items() if k in base})
     base.update(extra)
     return base
 
 
 def build(name: str, *, seed: int = 0, env_stats: EnvStats = None, **extra):
+    """`extra` overrides `tiny_kwargs`'s config dict, except for the keys
+    `POLICY_SUPPLIED` names for this class -- those are real plumbing kwargs
+    (a Policy passes them explicitly, never through config/), so an override
+    of one (e.g. `build("AutotuneRegulator", target=-1.0)`) routes there
+    instead of into the resolved config dict."""
     stats = make_env_stats() if env_stats is None else env_stats
-    return get_component(name)(stats, **tiny_kwargs(name, **extra), rngs=nnx.Rngs(seed))
+    plumbing_keys = set(POLICY_SUPPLIED.get(name, {}))
+    plumbing = {**POLICY_SUPPLIED.get(name, {}),
+                **{k: v for k, v in extra.items() if k in plumbing_keys}}
+    config_extra = {k: v for k, v in extra.items() if k not in plumbing_keys}
+    config = ConfigMixin("", tiny_kwargs(name, **config_extra), config_path=name)
+    component = get_component(name)(stats, config, rngs=nnx.Rngs(seed), **plumbing)
+    config.assert_all_consumed(owner=name)
+    return component
 
 
 @functools.lru_cache(maxsize=None)

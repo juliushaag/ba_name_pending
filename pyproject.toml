@@ -30,11 +30,42 @@ dependencies = [
     "warp-lang==1.13.0",
     "cloc>=0.2.5",
     "mani-skill>=3.0.1",
+    "humanoid_bench",
 ]
 
 
 [tool.uv.sources]
 barl_jax = { path = "src/barl_jax", editable = true }
+
+# humanoid_bench's own setup.py uses find_packages(), which silently drops
+# every subpackage missing an __init__.py (dmc_deps, envs, mjx/envs) from a
+# normal wheel build -- installing from git directly hits that and fails at
+# import time. An editable install of a local checkout sidesteps it (setuptools'
+# compat editable mode puts the whole source tree on sys.path instead of just
+# the packages it found), which is why this is a path source rather than a git
+# one -- uv doesn't support `editable` on a git source. See
+# third_party/humanoid-bench (a submodule, not vendored, since it carries ~250
+# MB of MuJoCo mesh/texture assets this project doesn't own).
+humanoid_bench = { path = "third_party/humanoid-bench", editable = true }
+
+[tool.uv]
+# humanoid_bench's setup.py pins exact (and by now ancient) versions of deps
+# this project already depends on at much newer versions -- resolution is
+# otherwise unsatisfiable. override-dependencies lets this project's own
+# constraints win; HumanoidBenchEnvironment.__init__ monkeypatches the one
+# place (dm_control-style named MuJoCo struct indexing) where a mujoco this
+# much newer than 3.1.6 actually breaks humanoid_bench at runtime.
+override-dependencies = [
+    "rich>=13.7.1",
+    "gymnasium>=1.3.0",
+    "mujoco>=3.10.0",
+    "dm_control>=1.0.43",
+    "torch>=2.3.1",
+    "opencv-python>=4.13.0.92",
+    "imageio>=2.37.3",
+    "brax>=0.14.2",
+    "mujoco-mjx>=3.6.0",
+]
 
 [dependency-groups]
 dev = [

@@ -14,7 +14,9 @@ import optax
 import orbax.checkpoint as ocp
 from flax import nnx
 
+from barl_jax.configs import ConfigMixin
 from barl_jax.env_stats import EnvStats
+from barl_jax.hparam import Config, HParam
 from barl_jax.metrics import Recorder, armed
 
 
@@ -157,25 +159,129 @@ class _Static:
     return f"_Static({self.value!r})"
 
 
-class Component:
+class HParamsOwner:
+  """Collects class-attribute declarations (HParam and Config) and resolves
+  them to instance attributes against a ConfigMixin of the YAML-override layer.
+
+  `_hparams` is every searchable `HParam` in the MRO (own declarations win), and
+  `_configs` every structural `Config` -- together `_decls`, which is what gets
+  resolved. `resolve_hparams` reads each against `config`: the YAML value if
+  present, the declaration's default otherwise -- which is what moves the
+  default out of YAML and into the class that uses the value. Because the
+  default lives in the declaration, the resolved config a run logs can
+  attribute every value to a layer, and no value is ever silent.
+
+  Two nnx constraints shape the storage:
+  - a value resolved onto `self` before `Component.__init__` has run is fine
+    for a scalar, but a subclass building a nested module first passes
+    `env_stats` so `obs_dim`/`action_dim` exist too;
+  - an unhashable value (a dict `norm_kwargs`, `time_kwargs`, `ladder_kwargs`)
+    cannot live on the module as a plain attribute -- it would make the
+    GraphDef unhashable -- so it is held in a single identity-hashable
+    `_Static` and read back through `hparam(name)`.
+
+  `nnx.Module` is not involved here: this mixin is pure Python and only reads
+  the class hierarchy at `__init_subclass__` time."""
+
+  _hparams: dict[str, HParam] = {}
+  _configs: dict[str, "Config"] = {}
+
+  def __init_subclass__(cls, **kw):
+    # Every class in the MRO contributes its own declarations, including plain
+    # geometry mixins (CriticOptim, CriticLossConfig, Polyak, ...) that are not
+    # themselves
+    # HParamsOwner -- a mixin *is* the config, and inheritance is how a class
+    # composes it. A later (more-derived) declaration wins over an earlier one.
+    super().__init_subclass__(**kw)
+    hparams, configs = {}, {}
+    for base in reversed(cls.__mro__):
+      for name, value in base.__dict__.items():
+        if isinstance(value, HParam):
+          hparams[name] = value
+        elif isinstance(value, Config):
+          configs[name] = value
+    cls._hparams = hparams
+    cls._configs = configs
+
+  @property
+  def _decls(self) -> dict[str, Config]:
+    """Every declaration, hparams overriding configs of the same name."""
+    return {**type(self)._configs, **type(self)._hparams}
+
+  def resolve_hparams(self, config: ConfigMixin, names: tuple = None,
+                      env_stats: EnvStats = None) -> None:
+    """Resolve every (or `names`-subset of) declared HParam/Config. Idempotent:
+    a name already resolved (pre-super, by a subclass that needed a value to
+    build a nested module) is re-set to the same value. A style-tagged Config
+    (a `net_style`/`time_emb` selector) additionally materializes its named
+    style's whole surface as instance attributes, so the component reads
+    `self.activation`/`self.norm`/... exactly as if it had declared them."""
+    if env_stats is not None:
+      self._derive_env(env_stats)
+    decls = self._decls if names is None else {n: self._decls[n] for n in names}
+    owner = type(self).__name__
+    for name, decl in decls.items():
+      value = config.resolve(name, decl, owner=owner)
+      if decl.style is not None:
+        # A style-selector Config: materialize the chosen style's whole
+        # surface so the component reads self.activation/self.norm/... as if
+        # it had declared them.
+        for surface_key, surface_value in decl.style[value].items():
+          # The resolver has already layered slot/profile/run overrides over the
+          # selected style. Consume that effective value rather than rebuilding
+          # the style default here, or the logged config and built module diverge.
+          self._absorb(surface_key, config.get(surface_key, type(surface_value)))
+      self._absorb(name, value)
+
+  def _absorb(self, name: str, value) -> None:
+    """Store a resolved value: unhashable (dict/list/set) values are kept out of
+    the GraphDef in a single identity-hashable `_Static`; the rest as plain
+    instance attributes."""
+    if isinstance(value, (dict, list, set)):
+      if not hasattr(self, "_hparams_s"):
+        self._hparams_s = _Static({})
+      self._hparams_s.value[name] = value
+    else:
+      setattr(self, name, value)
+
+  def hparam(self, name: str):
+    """A resolved value that could not live on the module (a dict, list or set
+    declaration) -- see `resolve_hparams`."""
+    return self._hparams_s.value[name]
+
+  def _derive_env(self, env_stats: EnvStats) -> None:
+    self.obs_dim    = env_stats.get("obs_dim")
+    self.action_dim = env_stats.get("act_dim")
+
+
+class Component(HParamsOwner):
   """Mixin for anything Policy.build_component() constructs. Three jobs: consume
-  the run's EnvStats, which every component takes as its first positional
-  argument; give the owning Policy a uniform lifecycle to fan out to -- it
-  registers each slot it builds and forwards both hooks below, so no Policy
-  has to hand-roll a critic's Polyak update from its own train_step; and hold a
-  `metrics` sink already namespaced to this component's slot, so writing
-  `self.metrics.dist("critic", pred)` lands at `critic/q/*` without the component
-  ever naming itself.
+  the run's EnvStats and resolved config, which every component takes as its
+  first two positional arguments; give the owning Policy a uniform lifecycle
+  to fan out to -- it registers each slot it builds and forwards both hooks
+  below, so no Policy has to hand-roll a critic's Polyak update from its own
+  train_step; and hold a `metrics` sink already namespaced to this component's
+  slot, so writing `self.metrics.dist("critic", pred)` lands at `critic/q/*`
+  without the component ever naming itself.
 
   Unlike the torch original, the EnvStats itself is *not* retained -- only the
   two scalars every component wants. Anything else a component needs from it
-  (HLGaussCritic's return range) is read in __init__ and kept as a plain float."""
+  (HLGaussCritic's return range) is read in __init__ and kept as a plain float.
 
-  def __init__(self, env_stats: EnvStats = None, **kwargs):
-    # Not forwarded: nnx.Module's __init__ is object's, and every component has
-    # a **kwargs catch-all that config/components.yaml leftovers land in (that
-    # is what model_config.validate() exists to police). Passing them on would
-    # just be a TypeError from object.__init__.
+  `config` (a `barl_jax.configs.ConfigMixin`) is likewise not retained: a
+  subclass reads whatever it needs via `config.get("key", type)` once, in its
+  own __init__, and keeps the result as a plain attribute -- exactly the
+  pattern a keyword-only kwarg + `self.x = x` used to be, just sourced from
+  the resolved config instead of from a named parameter. Threading `config`
+  through every level's `super().__init__(env_stats, config, ...)` (the same
+  way `env_stats` already is) is what lets a subclass read config values
+  *before* calling super() -- e.g. to build a `q_function` -- with no ordering
+  constraint a stored `self.config` would have imposed."""
+
+  def __init__(self, env_stats: EnvStats = None, config: ConfigMixin = None, **kwargs):
+    # Neither env_stats nor config is forwarded: nnx.Module's __init__ is
+    # object's, taking no args. A component that needs nothing beyond what
+    # Component itself reads (e.g. TanhSquash) just never calls config.get().
     super().__init__()
     env_stats = env_stats if env_stats is not None else EnvStats()
     self.obs_dim    = env_stats.get("obs_dim")
@@ -183,6 +289,12 @@ class Component:
     # Both are overwritten by build_component with the real slot; the defaults
     # only keep a component constructed outside a Policy usable.
     self.slot       = type(self).__name__.lower()
+    # Every HParam class attribute becomes an instance attribute: the YAML
+    # layer's value if present, the declaration's default otherwise. A subclass
+    # that needed values before this ran (to build a nested module first) calls
+    # resolve_hparams itself and this re-sets the same values.
+    if config is not None:
+      self.resolve_hparams(config, env_stats=env_stats)
 
   @property
   def metrics(self) -> Recorder:
@@ -215,18 +327,49 @@ class Component:
 
 
 class Actor(Component, nnx.Module, ABC):
-  """A network that can produce actions.
+  """A network that can produce actions and train itself against a critic.
 
-  Deliberately contract-free: each actor now lives next to the one Policy that
-  owns it and carries that algorithm's loss, so how the Policy reaches it is
-  between the two of them -- `sample` for SAC/DIME/SDAC, `generate_action` for
-  AMDP. Nothing Policy-agnostic calls an actor (rollout and eval both go through
-  `Policy.inference_step`), so an abstract `sample` here bought uniformity no
-  caller needed, at the price of a shim on every actor whose natural entry point
-  is something else. What every actor still shares is `Component`: EnvStats, the
-  slot name, the metrics sink and the lifecycle hooks.
+  The shared contract that lets `RLPolicy`/`MaxEntRLPolicy` back every
+  actor-critic algorithm here: `generate_action` is the one entry point every
+  Policy calls for a stop-gradiented bootstrap draw, `loss` is this actor's own
+  training objective, and `extra_losses` is how an actor with more than one
+  objective (SDAC's exploration-noise term, trained on its own optimizer key)
+  states the rest without a second calling convention. `loss` *returns* its
+  scalar rather than mutating a `losses` dict, because the owning Policy runs
+  it under `gated_loss` (see `gated_loss`) -- an `nnx.cond` branch has to hand
+  back a value on both sides, it cannot mutate a dict on one and not the other.
 
-  Whatever draws randomness takes an explicit `key` -- there is no global RNG."""
+  `critic` reaches an actor only as an explicit keyword at call time, never
+  stored: freezing it (`frozen(critic)`) is a per-call decision, and a stored
+  reference would make the actor's subtree non-independent for anything that
+  splits or clones it. Whatever draws randomness takes an explicit `key` --
+  there is no global RNG."""
+
+  @abstractmethod
+  def generate_action(self, obs, *, critic: "Critic" = None, key=None) -> tuple:
+    """(action, entropy): a canonical [-1, 1] action, one row per obs row, and
+    the differential entropy of whatever distribution produced it (shaped
+    `(B, 1)`, or a scalar for an actor whose "entropy" is a property of a
+    parameter rather than of the draw -- SDAC's `noise_entropy`)."""
+
+  @abstractmethod
+  def loss(self, obs, critic: "Critic", alpha, *, key=None):
+    """This actor's own scalar training objective at `obs`, priced against a
+    frozen `critic`. Never mutates a `losses` dict -- see the class docstring."""
+
+  def extra_losses(self, obs, critic: "Critic", alpha, *, key=None) -> dict:
+    """Any further optimizer-keyed losses this actor trains, beyond `loss`'s
+    `"actor"` key -- e.g. SDAC's `"explore"`. Every key here must be one
+    `create_optimizer()` also declares, and none of them are gated by
+    `optimizer_cadence` (that only ever names `"actor"`/`"entropy_alpha"`), so
+    an actor that wants a delayed extra loss has to gate it itself."""
+    return {}
+
+  def sample(self, obs, *, critic: "Critic" = None, key=None):
+    """The played action alone -- the default just discards the entropy
+    `generate_action` also returns. `Policy.inference_step` and the rollout
+    loop call this, never `generate_action` directly."""
+    return self.generate_action(obs, critic=critic, key=key)[0]
 
 
 class Critic(Component, nnx.Module, ABC):
@@ -251,13 +394,20 @@ def _jitted_infer(graphdef, state, observation, key):
   return nnx.merge(graphdef, state).inference_step(observation, key=key)
 
 
-class Policy(nnx.Module, ABC):
+class Policy(HParamsOwner, nnx.Module, ABC):
 
   _classes = dict()
 
   # True for strictly on-policy algorithms (e.g. PPO) -- the training script
   # clears the replay buffer after each rollout's training pass when set.
   on_policy = False
+
+  # The component slots this Policy builds, by attribute name -- the contract a
+  # model YAML's `components:` must match. An omitted slot already fails at
+  # build_component(); naming an *extra* one would resolve silently into the
+  # snapshot and the wandb config with nothing behind it, so lint_config.py and
+  # model_config.validate() check both directions against this.
+  SLOTS: tuple[str, ...] = ()
 
   # Parameters the Policy owns directly rather than through a slot, mapped to
   # the optimizer key that trains them: `{"log_std": "explore"}`. Without an
@@ -276,22 +426,53 @@ class Policy(nnx.Module, ABC):
     if profile is not None:
       kwargs.setdefault("profile", profile)
 
-    if name not in Policy._classes:
-      raise KeyError(f"{name} not in registered policies: {list(Policy._classes.keys())}")
-    return Policy._classes[name](env, *args, **kwargs)
+    cls = Policy._class_for(name)
+    return cls(env, *args, model_name=name, **kwargs)
+
+  @staticmethod
+  def _class_for(name: str) -> type:
+    """A model or class name -> the `Policy` subclass to build.
+
+    Model-name-first: `config/models/<name>.yaml`'s `policy:` key (defaulting to
+    `name` itself) is checked before the raw class registry, which is what lets
+    `Policy.load` resolve an old checkpoint's `meta["policy_class"]` (e.g.
+    `"SDAC"`) to whatever template now implements it (`MaxEntRLPolicy`) without
+    a legacy shim class. A bare class name with no model block (there is no
+    requirement that one exists) falls through to the registry directly."""
+    from barl_jax.model_config import tree
+    t = tree()
+    if t.policy_cfg(name):
+      class_name = t.policy_class_name(name)
+    else:
+      class_name = name
+    if class_name not in Policy._classes:
+      raise KeyError(f"{class_name!r} (from model {name!r}) not in registered "
+                     f"policies: {list(Policy._classes.keys())}")
+    return Policy._classes[class_name]
 
   @staticmethod
   def available() -> list[str]:
-    return list(Policy._classes.keys())
+    """Every model name a `model:` string can resolve to -- not the raw class
+    registry, which is an implementation detail once one class can back several
+    models."""
+    from barl_jax.model_config import tree
+    return tree().available_models()
 
   # ------------------------------------------------------------------
   # Construction
   # ------------------------------------------------------------------
 
   def __init__(self, env: gym.Env, profile: str = None, env_stats: EnvStats = None,
-               rngs: nnx.Rngs = None, seed: int = 0, **kwargs):
-    from barl_jax.model_config import get_overrides, snapshot_for
+               rngs: nnx.Rngs = None, seed: int = 0, model_name: str = None, **kwargs):
+    from barl_jax.model_config import get_overrides, get_snapshot, snapshot_for
 
+    # The `model:` string this Policy was built from -- distinct from
+    # `type(self).__name__` once one class backs several models (RLPolicy /
+    # MaxEntRLPolicy). Plain str, so it is static in nnx: it lands in the
+    # GraphDef (SAC and AMDP get distinct jit cache entries) and never enters
+    # the state tree `multiseed.stack()` compares. Defaults to the class name
+    # so a policy built directly (a test, a notebook) still resolves.
+    self.model_name = model_name or type(self).__name__
     self._profile  = profile
     # Held behind _Static for hashability (see _Static): these are dicts/lists,
     # and the GraphDef they end up in is a static jit argument.
@@ -299,7 +480,8 @@ class Policy(nnx.Module, ABC):
     # Captured so a checkpoint reconstructs under the same config it was built
     # from -- see save()/load().
     self._overrides_s  = _Static(get_overrides())
-    self._snapshot_s   = _Static(snapshot_for(type(self).__name__, profile))
+    self._snapshot_s   = _Static(snapshot_for(self.model_name, profile))
+    self._replaying    = get_snapshot() is not None
 
     # Every module that needs randomness draws from this; nnx threads and
     # advances the key state across the jit boundary, so no call signature has
@@ -346,6 +528,19 @@ class Policy(nnx.Module, ABC):
     # Gradient steps taken, for algorithms whose update cadence is `step % k`.
     self.train_steps = Buffer(jnp.zeros((), jnp.int32))
 
+    # The Policy's own tunables declared as HParam class attributes are resolved
+    # here against the resolved `params:` layer (model YAML, profile and run
+    # overrides). Subclasses read them off `self` (self.policy_delay, ...) -- the
+    # same contract components get from Component.__init__.
+    params_config = ConfigMixin("", self.resolve_params(),
+                                config_path=f"{self.model_name}.params")
+    self.resolve_hparams(params_config)
+    # A replay may carry keys an older implementation consumed but today's no
+    # longer does. Recorded values remain useful provenance and must not make an
+    # otherwise loadable checkpoint fail; strict leftovers apply to live config.
+    if not self._replaying:
+      params_config.assert_all_consumed(owner=f"{self.model_name}.params [{type(self).__name__}]")
+
   @property
   def env_stats(self) -> EnvStats:
     return self._env_stats.value
@@ -374,40 +569,57 @@ class Policy(nnx.Module, ABC):
 
 
 
-  def resolve_component(self, slot: str, **explicit_kwargs) -> tuple[type, dict]:
-    """Resolves a named slot's class + kwargs from config/models.yaml (see
-    model_config.py), then layers `self._raw_kwargs` and `explicit_kwargs`
-    on top (highest precedence -- for algorithm-fixed choices that must never
-    be tunable)."""
-    from barl_jax.model_config import resolve_slot
-    cls, kwargs = resolve_slot(type(self).__name__, slot, self._profile)
-    return cls, {**kwargs, **self._raw_kwargs, **explicit_kwargs}
+  def resolve_component(self, slot: str) -> tuple[type, dict]:
+    """Resolves a named slot's class + kwargs from config/models.yaml.
 
-  def resolve_params(self, **explicit_kwargs) -> dict:
+    Policy constructor kwargs are deliberately not broadcast into every slot:
+    slot overrides use the normal `components.<slot>.<key>` path, so a policy
+    parameter cannot accidentally retune every component with the same name."""
+    from barl_jax.model_config import resolve_slot
+    cls, kwargs = resolve_slot(self.model_name, slot, self._profile)
+    return cls, kwargs
+
+  def resolve_params(self) -> dict:
     """Resolves this Policy's own top-level tunable kwargs (read directly off
     `self` in train_step, not part of any actor/critic slot) from
     config/models.yaml's `params:` block -- same precedence as
     resolve_component(), minus the components.yaml layer."""
     from barl_jax.model_config import resolve_params
-    params = resolve_params(type(self).__name__, self._profile)
-    return {**params, **self._raw_kwargs, **explicit_kwargs}
+    params = resolve_params(self.model_name, self._profile)
+    return {**params, **self._raw_kwargs}
 
   def build_component(self, slot: str, gate_cls: type, *args,
-                      env_stats: EnvStats = None, **explicit_kwargs):
+                      env_stats: EnvStats = None, config_overrides: dict = None,
+                      **explicit_kwargs):
     """Resolves + constructs a named slot (actor/critic/squash/...), gated to
     `gate_cls`: the resolved class must be `gate_cls` or a subclass. `env_stats`
     overrides the run's own for a slot another component wraps and feeds a
     transformed input -- pass an `EnvStats.derive()` of the run's, never an
-    unrelated one."""
-    cls, kwargs = self.resolve_component(slot, **explicit_kwargs)
+    unrelated one.
+
+    `explicit_kwargs` are for values that were never going to live in config/
+    because they're computed at run time and the component takes them as real
+    constructor arguments (a critic's `support`, an entropy dual's `target`) --
+    everything config *does* supply reaches the component through
+    `config.get()`, never through this. `config_overrides` is the rarer case
+    of a value that *is* a config-shaped tunable (so config/ may still declare
+    a baseline for it) but that this call site pins regardless -- NCLQL's
+    `sigmas` slot's `steps`, forced to `self.noise_levels` rather than
+    whatever config/models/nclql.yaml says, is the one real example."""
+    cls, kwargs = self.resolve_component(slot)
+    if config_overrides:
+      kwargs.update(config_overrides)
     assert issubclass(cls, gate_cls), (
-      f"config/models.yaml: {type(self).__name__}'s {slot!r} slot names {cls.__name__}, "
-      f"which is not a subclass of {gate_cls.__name__} -- {type(self).__name__} can only "
+      f"config/models.yaml: {self.model_name}'s {slot!r} slot names {cls.__name__}, "
+      f"which is not a subclass of {gate_cls.__name__} -- {self.model_name} can only "
       f"work with {gate_cls.__name__} (or a subclass of it) there."
     )
     stats = env_stats if env_stats is not None else self.env_stats
-    kwargs.setdefault("rngs", self.rngs)
-    component = cls(stats, *args, **kwargs)
+    config = ConfigMixin("", kwargs, config_path=f"{self.model_name}.{slot}")
+    explicit_kwargs.setdefault("rngs", self.rngs)
+    component = cls(stats, config, *args, **explicit_kwargs)
+    if not self._replaying:
+      config.assert_all_consumed(owner=f"{self.model_name}.{slot} [{cls.__name__}]")
     component.slot = slot
     return component
 
@@ -423,10 +635,11 @@ class Policy(nnx.Module, ABC):
   # Metrics
   # ------------------------------------------------------------------
 
-  @classmethod
-  def algo_name(cls) -> str:
-    """This algorithm's logging namespace -- `SACPolicy` -> `sac`, `AMDP` -> `amdp`."""
-    name = cls.__name__.lower()
+  def algo_name(self) -> str:
+    """This algorithm's logging namespace -- `SAC` -> `sac`, `AMDP` -> `amdp`.
+    From `model_name`, not `type(self).__name__`: several models can share one
+    Policy class (RLPolicy / MaxEntRLPolicy), and each keeps its own namespace."""
+    name = self.model_name.lower()
     return name[:-len("policy")] if name.endswith("policy") and len(name) > len("policy") else name
 
   def optimizer_slots(self) -> dict[str, str]:
@@ -498,7 +711,11 @@ class Policy(nnx.Module, ABC):
     this and adds its key."""
     out = {}
     for component in self.components.values():
-      out.update(component.create_optimizer())
+      for key, transform in component.create_optimizer().items():
+        if key in out:
+          raise KeyError(f"{self.model_name}: optimizer key {key!r} is owned by more than one "
+                         "component slot")
+        out[key] = transform
     return out
 
   def optimizer_cadence(self) -> dict:
@@ -542,7 +759,7 @@ class Policy(nnx.Module, ABC):
     if key is not None:
       return key
     raise KeyError(
-      f"{type(self).__name__}: parameter {'.'.join(map(str, path))} belongs to no "
+      f"{self.model_name}: parameter {'.'.join(map(str, path))} belongs to no "
       f"component slot, so no optimizer key owns it. Either build it through "
       f"build_component(), or declare it in `policy_params`."
     )
@@ -584,6 +801,11 @@ class Policy(nnx.Module, ABC):
     path = os.path.abspath(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     meta = {
+      # The model name is what resolves back to a class through _class_for
+      # (config-first, so an old sidecar resolves through whatever template now
+      # implements it); policy_class is kept as diagnostics -- the only record
+      # of which template actually produced these weights.
+      "model":        self.model_name,
       "policy_class": type(self).__name__,
       "profile":      self._profile,
       "overrides":    self._overrides,
@@ -599,11 +821,18 @@ class Policy(nnx.Module, ABC):
       json.dump(meta, f, indent=2)
 
   @staticmethod
-  def load(type_name: str, path: str, env: gym.Env, env_stats: EnvStats = None) -> "Policy":
+  def load(name: str, path: str, env: gym.Env, env_stats: EnvStats = None) -> "Policy":
+    """`name` is a model name where the sidecar has one (`meta["model"]`) and
+    falls back to the raw class name for a sidecar saved before that key
+    existed -- `_class_for` resolves either through the same model-first path
+    `Policy.make` uses, so an old `"SDAC"` sidecar loads into whatever template
+    now implements it."""
     from barl_jax import model_config
     path = os.path.abspath(path)
     with open(os.path.join(path, "meta.json")) as f:
       meta = json.load(f)
+
+    cls = Policy._class_for(name)
 
     # The architecture has to be back in place before the components are
     # constructed, and it has to be *this checkpoint's*, not whatever config/
@@ -616,7 +845,7 @@ class Policy(nnx.Module, ABC):
       model_config.set_snapshot(meta.get("snapshot"))
       model_config.set_overrides(meta.get("overrides"))
       # env_stats is a function of the env, so it is rebuilt rather than persisted.
-      policy = Policy._classes[type_name](env, profile=meta.get("profile"), env_stats=env_stats)
+      policy = cls(env, profile=meta.get("profile"), env_stats=env_stats, model_name=name)
     finally:
       model_config.set_snapshot(previous[0])
       model_config.set_overrides(previous[1])
@@ -630,14 +859,18 @@ class Policy(nnx.Module, ABC):
   def load_any(path: str, env: gym.Env, env_stats: EnvStats = None) -> "Policy":
     with open(os.path.join(os.path.abspath(path), "meta.json")) as f:
       meta = json.load(f)
-    return Policy.load(meta["policy_class"], path, env, env_stats)
+    return Policy.load(meta.get("model") or meta["policy_class"], path, env, env_stats)
 
   # ------------------------------------------------------------------
   # Observation normalisation
   # ------------------------------------------------------------------
 
-  def normalize_obs(self, obs):
-    return (obs - self.obs_mean[...]) / self.obs_std[...]
+  def normalize_observations(self, obs):
+    # `obs_std` is all-ones today (the running statistics are never written), so
+    # this is the identity -- but the division is the hazard: if a running-std
+    # wiring ever lands on a zero-variance channel it must clamp rather than
+    # blow up every normalize_obs caller.
+    return (obs - self.obs_mean[...]) / jnp.maximum(self.obs_std[...], 1e-6)
 
   # ------------------------------------------------------------------
   # Action scaling
@@ -854,7 +1087,8 @@ def run_episodes(actor, env: gym.Env, n: int, render: bool, **inference_kwargs) 
   while len(out) < n:
     wave = min(n_envs, n - len(out))
     obs  = reset()
-    data = [dict(frames=[], rewards=[], terminated=False, success=False)
+    data = [dict(frames=[], rewards=[], terminated=False, success=False,
+                 act_nonfinite=0, n_act=0)
             for _ in range(n_envs)]
     live = np.zeros(n_envs, dtype=bool)
     live[:wave] = True
@@ -863,6 +1097,12 @@ def run_episodes(actor, env: gym.Env, n: int, render: bool, **inference_kwargs) 
       key, subkey = jax.random.split(key)
       action, _ = act(jnp.asarray(obs, dtype=jnp.float32), subkey)
       action_np  = np.asarray(action)
+      # Same failsafe the rollout applies (rollout.py). Without it a NaN action
+      # reaches mj_step, which only warns and poisons qpos -- the eval returns
+      # quietly wrong numbers and the next render() aborts the process inside
+      # mjr_render with no python traceback (sweep 2026-08-27_13-23-15).
+      nonfinite = ~np.isfinite(action_np)
+      action_np = sanitize_action(action_np, xp=np)
       env_action = action_np if act_scale_np is None else action_np * act_scale_np + act_bias_np
       env_action = np.ascontiguousarray(env_action, dtype=np.float32).copy()
       obs, reward, term, trunc, info = env.step(env_action if is_vec else env_action[0])
@@ -875,6 +1115,8 @@ def run_episodes(actor, env: gym.Env, n: int, render: bool, **inference_kwargs) 
       done = term | trunc
       for i in np.flatnonzero(live):
         data[i]["rewards"].append(reward[i])
+        data[i]["act_nonfinite"] += int(nonfinite[i].sum())
+        data[i]["n_act"] += int(nonfinite[i].size)
         if render:
           data[i]["frames"].append(frames[i])
         if done[i]:

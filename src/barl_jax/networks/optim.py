@@ -1,5 +1,45 @@
 import optax
 
+from barl_jax.hparam import HParam
+
+
+# ---------------------------------------------------------------------------
+# Optimizer mixins -- the four optimizer knobs as class attributes, grouped by
+# role so every component that optimizes inherits exactly the one that fits it
+# (critic uses the critic's b1 and clip, actor the actor's, dual the dual's).
+# All four are HParams: learning rate and clip are exactly the values a
+# hyperparameter search varies.
+# ---------------------------------------------------------------------------
+
+
+class OptimizerConfig:
+  lr            = HParam(3.0e-4, range=(1.0e-4, 1.0e-3))
+  adam_b1       = HParam(0.9)
+  grad_clip     = HParam(1.0)
+  grad_clip_mode = HParam("element", choices=("global_norm", "element", "none"))
+
+
+class CriticOptim(OptimizerConfig):
+  """The critic's optimizer (dime_am's `optim.critic`): b1 0.5, global-norm
+  clip -- the b1 the SAC-style critics train with."""
+
+  adam_b1         = HParam(0.5)
+  grad_clip_mode  = HParam("global_norm", choices=("global_norm", "element", "none"))
+
+
+class ActorOptim(OptimizerConfig):
+  """The actors' optimizer (`optim.actor`): Adam with a per-element clip, which
+  is what actually bounds what one outlier sample can contribute under Adam."""
+
+  grad_clip_mode = HParam("element", choices=("global_norm", "element", "none"))
+
+
+class DualOptim(OptimizerConfig):
+  """The entropy dual's optimizer (`optim.dual`): a higher LR, unclipped."""
+
+  lr            = HParam(1.0e-3)
+  grad_clip_mode = HParam("global_norm", choices=("global_norm", "element", "none"))
+
 
 CLIP_MODES = ("global_norm", "element", "none")
 

@@ -17,9 +17,26 @@ class Environment(ABC):
 
   # Env facts no gym space can report -- `return_min`/`return_max` bound the
   # achievable episode return, which is what a categorical/histogram critic's
-  # fixed support needs. They live in config/run/envs.yaml, not in these class
-  # bodies: they are values a run may want to state, and a Python class attribute
-  # is exactly the kind of hidden default the config tree exists to remove.
+  # fixed support needs -- and per-env run-key overrides. Both are class
+  # attributes merged down the MRO (a family base's applies to every env under
+  # it, one env's own overrides a single key), declared in code because they
+  # are properties of the benchmark, not tunables.
+  stats: dict = {}
+  defaults: dict = {}
+
+  @classmethod
+  def merged_stats(cls) -> dict:
+    out = {}
+    for klass in reversed(cls.__mro__):
+      out.update(getattr(klass, "stats", {}))
+    return out
+
+  @classmethod
+  def merged_defaults(cls) -> dict:
+    out = {}
+    for klass in reversed(cls.__mro__):
+      out.update(getattr(klass, "defaults", {}))
+    return out
 
   @abstractmethod
   def get_env(self) -> gym.Env:
@@ -66,16 +83,10 @@ class Environment(ABC):
 
   def get_env_stats(self, env: gym.Env) -> EnvStats:
     """The env-derived facts every component is built with -- the spaces, plus
-    config/run/envs.yaml's entry for this env merged over its family's. Pass the
-    same `env` that goes to Policy.make()."""
-    from barl_jax import model_config
-    declared = {}
-    # Walked down the MRO so a family base's entry (MuJoCoGymEnvironment,
-    # DMControlEnvironment) applies to every env under it and one env's own entry
-    # overrides a single key.
-    for klass in reversed(type(self).__mro__):
-      declared.update(model_config.tree().env_stats(klass.__name__))
-    return EnvStats.from_env(env, max_episode_steps=self.get_max_traj_length(env), **declared)
+    this class's `stats` declared down the MRO. Pass the same `env` that goes
+    to Policy.make()."""
+    return EnvStats.from_env(env, max_episode_steps=self.get_max_traj_length(env),
+                             **self.merged_stats())
 
 
   def get_max_traj_length(self, env, max_length = 1000):

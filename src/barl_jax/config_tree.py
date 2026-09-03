@@ -1,44 +1,68 @@
-"""The config tree and its resolver -- the single definition of how a value in
-config/ becomes a kwarg.
+"""The config tree and its resolver -- the single definition of how a value
+becomes a kwarg.
 
-Deliberately dependency-free: this module imports `os`/`pathlib`/`yaml` and
-nothing else, so scripts/submit.py can resolve and snapshot a model config
-without importing barl_jax (and therefore jax/mujoco). model_config.py wraps it
-with the parts that do need the component registry -- class lookup, __init__
-signature checks, the no-defaults lint.
+Defaults now live **on the classes that use them** (see barl_jax/hparam.py:
+`HParam` for searchable algorithmic knobs, `Config` for structural defaults),
+composed by inheritance from style mixins (networks/mlp.py, networks/flow.py,
+networks/optim.py, networks/critic.py). There is no named-bundle or `extends:`
+indirection and no config/presets or config/components YAML -- a component's
+baseline *is* its class. This module is a resolver over layering only. It
+imports only `os`/`pathlib`/`yaml` and `barl_jax.configs` at import time; the
+class registry is pulled lazily once a component class / its declared defaults
+are needed.
 
-The tree, and what merges what:
+`barl_jax.configs` is the substrate this module is built on: `$()` file
+inclusion, deep merge, and the typed `ConfigMixin.get()` accessor.
 
-    config/presets/*.yaml      named fragments, referenced as `<stem>.<key path>`
-    config/components/*.yaml   per component *class* baselines (`kind:`, `extends:`)
-    config/models/*.yaml       per *policy* `components:`/`params:`/`training:`/`profiles:`
-    config/run/defaults.yaml   every run key
-    config/run/envs.yaml       per-env stats + per-env run overrides
+What merges what:
+
+    a component class             its inherited `Config` (structural) and
+                                  `HParam` (searchable) defaults, down the MRO
+    a policy class                its own `HParam` params
+    barl_jax.hparam               the `sizes.<kind>.<name>` capacity ladders a
+                                  slot's `size:` resolves against
+    config/models/*.yaml          per-*policy* `components:`/`params:`/`training:`/`profiles:`
+    an env class                  `stats`/`defaults` (return range, per-env overrides)
+    barl_jax.run_config           every run key's default (`RUN_HPARAMS`)
 
 Precedence for a component kwarg, lowest first:
 
-    1  the component entry's `extends:` presets, in list order (recursively)
-    2  the component entry's own keys
-    3  the slot's `size:` (sugar for `extends: [sizes.<kind>.<name>]`)
-    4  the slot's `extends:` presets
-    5  the slot's own keys
-    6  the active profile's block for that slot (its size/extends/own, same order)
-    7  the run's dotted overrides (`components.<slot>.<key>`)
+    1  the class's inherited `Config` structural defaults
+    2  the class's inherited `HParam` algorithmic defaults
+    3  the slot's `size:` (a capacity-ladder rung, `sizes.<kind>.<name>`)
+    4  the slot's own keys in config/models.yaml
+    5  the active profile's block for that slot
+    6  the run's dotted overrides (`components.<slot>.<key>`)
 
-Levels 8-9 -- a Policy's leftover `**kwargs` and the explicit kwargs it passes at
-its own build_component() call site -- are applied by policy.py, above everything
-here. `params:` and `training:` use the same chain minus the component layers.
+Explicit runtime kwargs passed by a Policy's build_component() call site are
+applied by policy.py above everything here. `params:` uses the same chain minus
+the structural rungs, with the policy class's own HParams as its lowest rung.
 
 Every merge is recorded as a `(source, kwargs)` pair so explain() can attribute
 each resolved value to the layer that set it and list what it shadows.
 """
 
+import importlib.util
 import os
 from pathlib import Path
 
 import yaml
 
-CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
+# Not `from barl_jax.configs import ...`: scripts/grid.py loads *this* module
+# by path precisely so a login node never pays for `barl_jax/__init__.py`'s
+# jax/mujoco imports (see its own comment), and an absolute `barl_jax.*`
+# import here would trigger exactly that package `__init__` regardless of how
+# this module itself was reached. Loading configs.py the same by-path way
+# grid.py loads this module keeps that guarantee intact.
+_CONFIGS_PATH = Path(__file__).resolve().with_name("configs.py")
+_spec = importlib.util.spec_from_file_location("barl_jax_configs", _CONFIGS_PATH)
+_configs = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_configs)
+CONFIG_DIR       = _configs.CONFIG_DIR
+ConfigMixin      = _configs.ConfigMixin
+_format_value    = _configs._format_value
+deep_merge       = _configs.deep_merge
+resolve_includes = _configs.resolve_includes
 
 # The run-config keys a policy may set from its own `training:` block -- the ones
 # that are a property of the *algorithm* rather than of the experiment.
@@ -56,10 +80,75 @@ TRAINING_KEYS = frozenset({
 })
 
 # Keys a component block carries that are not constructor kwargs.
-_META_KEYS = frozenset({"class", "kind", "extends", "size"})
+_META_KEYS = frozenset({"class", "kind", "size"})
 
-# The preset file whose tables `size:` resolves against, keyed by component kind.
+# The size-ladder namespace (barl_jax.hparam) a `size:` resolves against.
 SIZES = "sizes"
+
+
+def _component_cls(cls_name: str):
+  """The registered class behind a `class:` name -- what owns the HParam/Config
+  declarations, `kind`, and the completeness of the composed
+  config."""
+  # Lazy: pulling the registry imports barl_jax (jax, mujoco), which this module
+  # itself never does at import time; every reader of the resolved tree already
+  # runs inside or right after a barl_jax import by now.
+  from barl_jax.networks.registry import get_component
+  return get_component(cls_name)
+
+
+def _policy_cls(policy_name: str, tree=None):
+  """The registered Policy class behind a model name, for its declared params."""
+  from barl_jax.policy import Policy
+  class_name = tree.policy_class_name(policy_name) if tree is not None else policy_name
+  if class_name not in Policy._classes:
+    raise KeyError(f"config/models/: {policy_name!r} names unregistered policy {class_name!r}")
+  return Policy._classes[class_name]
+
+
+def _hparam_defaults(cls) -> dict:
+  """The class's declared HParam defaults as the base kwarg layer."""
+  return {name: decl.default for name, decl in getattr(cls, "_hparams", {}).items()}
+
+
+def _config_defaults(cls) -> dict:
+  """The class's declared structural Config defaults as a base kwarg layer."""
+  return {name: decl.default for name, decl in getattr(cls, "_configs", {}).items()}
+
+
+def _decl_layers(cls, chosen: dict = None) -> list[tuple[str, dict]]:
+  """A component class's own declaration, as the base layers of its slot:
+  each style selector's *whole surface*, then the structural `Config` defaults
+  (selectors included, so the resolved config records the choice), then the
+  searchable `HParam` defaults -- lowest precedence first, merged down the MRO.
+
+  `chosen` maps a style selector to its *effective* name (the class default
+  unless a slot/profile/override moved it); expanding the surface from the
+  effective value is what makes a `--set components.<slot>.net_style=silu`
+  change the whole net."""
+
+  configs = getattr(cls, "_configs", {})
+  layers = []
+  for name, decl in configs.items():
+    if decl.style is not None:
+      eff = (chosen or {}).get(name, decl.default)
+      layers.append((f"style: {eff}", decl.style[eff]))
+  if configs:
+    layers.append((f"decl configs: {cls.__name__}", _config_defaults(cls)))
+  layers.append((f"decl hparams: {cls.__name__}", _hparam_defaults(cls)))
+  return layers
+
+
+def _chosen_styles(cls, slot: str, slot_cfg: dict, profile_cfg: dict,
+                   overrides: dict) -> dict:
+  """The effective style-selector names for a class's slot: override >
+  profile > slot YAML > class default. Style surfaces are expanded from these."""
+  chosen = {}
+  for name, decl in getattr(cls, "_configs", {}).items():
+    if getattr(decl, "style", None):
+      chosen[name] = (overrides.get(f"components.{slot}.{name}")
+                      or profile_cfg.get(name) or slot_cfg.get(name) or decl.default)
+  return chosen
 
 
 # ---------------------------------------------------------------------------
@@ -67,10 +156,16 @@ SIZES = "sizes"
 # ---------------------------------------------------------------------------
 
 def _load_yaml(path: Path) -> dict:
+  """A YAML file, with any `$()` include it (or anything it includes) contains
+  resolved -- see barl_jax.configs.resolve_includes. No file under config/
+  currently uses `$()`, so this is a no-op for the tree as it stands; it makes
+  the syntax available as an alternative to `extends:` for splicing a whole
+  file at a point in the tree, rather than merging a named preset."""
   if not path.exists():
     return {}
   with open(path) as f:
-    return yaml.safe_load(f) or {}
+    data = yaml.safe_load(f) or {}
+  return resolve_includes(data, path.parent, CONFIG_DIR)
 
 
 def _load_dir(path: Path) -> dict:
@@ -95,22 +190,13 @@ def _load_dir_merged(path: Path) -> dict:
   return merged
 
 
-def _deep_update(base: dict, update: dict) -> dict:
-  """dict.update, except a value that is a dict on both sides merges key-wise --
-  so a preset can add one key to an inherited `norm_kwargs`/`time_kwargs` without
-  restating the rest of it."""
-  for key, value in update.items():
-    if isinstance(value, dict) and isinstance(base.get(key), dict):
-      base[key] = _deep_update(dict(base[key]), value)
-    else:
-      base[key] = value
-  return base
-
-
 def merge(layers: list[tuple[str, dict]]) -> dict:
+  """`deep_merge` (barl_jax.configs) folded over every layer, lowest
+  precedence first -- so a preset can add one key to an inherited
+  `norm_kwargs`/`time_kwargs` without restating the rest of it."""
   merged: dict = {}
   for _, kwargs in layers:
-    _deep_update(merged, kwargs)
+    merged = deep_merge(merged, kwargs)
   return merged
 
 
@@ -130,7 +216,12 @@ class ConfigTree:
     self.presets    = _load_dir(root / "presets")
     self.components = _load_dir_merged(root / "components")
     self.models     = _load_dir_merged(root / "models")
-    self.run        = _load_yaml(root / "run" / "defaults.yaml")
+    # Run-key defaults are code-declared (barl_jax.run_config.RUN_HPARAMS);
+    # config/run/defaults.yaml is an override layer that predates the move and
+    # is read when present so an old tree still resolves identically.
+    from barl_jax.run_config import run_defaults
+    self.run = run_defaults()
+    self.run.update(_load_yaml(root / "run" / "defaults.yaml"))
     self.envs       = _load_yaml(root / "run" / "envs.yaml")
     # A frozen snapshot makes this tree a replay of one past run: its `resolved:`
     # map is served directly by resolve_slot/resolve_params/resolve_training, so
@@ -140,7 +231,7 @@ class ConfigTree:
     self.snapshot = snapshot
     if snapshot:
       for attr, key in (("presets", "presets"), ("components", "components"), ("models", "models")):
-        setattr(self, attr, _deep_update(dict(getattr(self, attr)), snapshot.get(key) or {}))
+        setattr(self, attr, deep_merge(getattr(self, attr), snapshot.get(key) or {}))
 
   # -- replay ---------------------------------------------------------------
 
@@ -155,29 +246,11 @@ class ConfigTree:
 
   # -- presets --------------------------------------------------------------
 
-  def preset(self, path: str) -> dict:
-    """A preset by dotted path: `net.crossq`, `sizes.critic.large`."""
-    node, walked = self.presets, []
-    for part in path.split("."):
-      walked.append(part)
-      if not isinstance(node, dict) or part not in node:
-        raise KeyError(f"config/presets: no preset at {path!r} "
-                       f"(resolved as far as {'.'.join(walked[:-1]) or '<root>'})")
-      node = node[part]
-    if not isinstance(node, dict):
-      raise KeyError(f"config/presets: {path!r} is a {type(node).__name__}, not a block of kwargs")
-    return node
-
-  def _extends_layers(self, block: dict, source: str, stack: tuple) -> list[tuple[str, dict]]:
-    """A block's `extends:` presets expanded recursively (a preset may itself
-    extend another), then the block's own kwargs -- lowest precedence first."""
-    layers = []
-    for ref in block.get("extends") or []:
-      if ref in stack:
-        raise ValueError(f"config/presets: `extends` cycle {' -> '.join((*stack, ref))}")
-      layers += self._extends_layers(self.preset(ref), f"preset {ref}", (*stack, ref))
-    layers.append((source, {k: v for k, v in block.items() if k not in _META_KEYS}))
-    return layers
+  def ladder_kwargs(self, kind: str, name: str) -> dict:
+    """A size ladder rung by dotted path representation: `sizes.critic.large`
+    -> its kwargs. Entirely from the code-declared ladders (barl_jax.hparam)."""
+    from barl_jax import hparam
+    return hparam.ladder(kind, name)
 
   # -- names ----------------------------------------------------------------
 
@@ -192,15 +265,24 @@ class ConfigTree:
   def policy_cfg(self, policy_name: str) -> dict:
     return self.models.get(policy_name) or {}
 
+  def policy_class_name(self, policy_name: str) -> str:
+    """A model's Python class, from its own `policy:` key -- defaulting to the
+    model name itself, which is what leaves a 1:1 model (NCLQL, or any model
+    before this key existed) untouched. Deliberately YAML-only: scripts/grid.py
+    loads this module by path precisely to avoid importing barl_jax, so the
+    model->class mapping must not need the Python registry to resolve."""
+    return self.policy_cfg(policy_name).get("policy", policy_name)
+
   def available_models(self) -> list[str]:
     return ([k for k in self.models if k != "aliases"]
             + list(self.models.get("aliases") or {}))
 
   def _profile_cfg(self, policy_name: str, profile: str) -> dict:
-    cfg = self.policy_cfg(policy_name).get("profiles", {}).get(profile)
-    if cfg is None:
-      raise KeyError(f"{policy_name!r} has no profile {profile!r} in config/models/")
-    return cfg
+    profiles = self.policy_cfg(policy_name).get("profiles") or {}
+    if profile not in profiles:
+      raise KeyError(f"config/models/: {policy_name!r} has no profile {profile!r}\n"
+                     f"  Available profiles: {sorted(profiles)}")
+    return profiles[profile]
 
   def _override_layer(self, prefix: str) -> dict:
     return {key.rpartition(".")[2]: value
@@ -229,26 +311,33 @@ class ConfigTree:
     place the precedence chain is defined."""
     slot_cfg    = dict(self.policy_cfg(policy_name).get("components", {}).get(slot, {}))
     cls_name    = self.slot_class(policy_name, slot)
-    component   = self.components.get(cls_name)
-    if component is None:
-      raise KeyError(f"config/components/: no entry for {cls_name!r} "
-                     f"({policy_name}.{slot}); add one or spell its kwargs out on the slot")
-    kind        = component.get("kind")
     profile_cfg = dict(self._profile_cfg(policy_name, profile).get(slot, {})) if profile else {}
+    kind = self.component_kind(cls_name)
 
-    layers = self._extends_layers(component, f"components: {cls_name}", (cls_name,))
+    # The class's own declaration is the baseline: style surfaces (expanded
+    # from the effective selector, so an override swaps the whole net), then
+    # the structural Config and HParam defaults, composed down the MRO.
+    cls = _component_cls(cls_name)
+    chosen = _chosen_styles(cls, slot, slot_cfg, profile_cfg,
+                            {k: v for k, v in self.overrides.items()
+                             if k.startswith(f"components.{slot}.")})
+    layers = _decl_layers(cls, chosen=chosen)
 
-    # `size:` is sugar for `extends: [sizes.<kind>.<name>]`, resolved once at a
+    # `size:` resolves one rung of the component kind's capacity ladder, at a
     # fixed rung so an explicit `latent_dim:` on the slot still shadows it.
     size = (self.overrides.get(f"components.{slot}.size")
             or profile_cfg.get("size") or slot_cfg.get("size"))
     if size is not None:
-      layers.append((f"preset {SIZES}.{kind}.{size}", self.preset(f"{SIZES}.{kind}.{size}")))
+      layers.append((f"size: {kind}.{size}", self.ladder_kwargs(kind, size)))
 
-    layers += self._extends_layers(slot_cfg, f"models: {policy_name}.components.{slot}", ())
-    if profile:
-      layers += self._extends_layers(
-        profile_cfg, f"models: {policy_name}.profiles.{profile}.{slot}", ())
+    # The slot's own YAML kwargs (no extends -- structure lives in the class),
+    # then the profile's, then the run's dotted overrides.
+    if slot_cfg:
+      layers.append((f"models: {policy_name}.components.{slot}",
+                     {k: v for k, v in slot_cfg.items() if k not in _META_KEYS}))
+    if profile and profile_cfg:
+      layers.append((f"models: {policy_name}.profiles.{profile}.{slot}",
+                     {k: v for k, v in profile_cfg.items() if k not in _META_KEYS}))
 
     override_kwargs = self._override_layer(f"components.{slot}")
     for key in ("class", "size"):
@@ -266,10 +355,16 @@ class ConfigTree:
             or profile_cfg.get("size") or slot_cfg.get("size"))
 
   def component_kind(self, cls_name: str) -> str | None:
-    return (self.components.get(cls_name) or {}).get("kind")
+    entry = self.components.get(cls_name) or {}
+    if "kind" in entry:
+      return entry["kind"]
+    return getattr(_component_cls(cls_name), "kind", None)
 
   def size_table(self, kind: str) -> dict:
-    return (self.presets.get(SIZES) or {}).get(kind) or {}
+    from barl_jax import hparam
+    return {name[len(f"sizes.{kind}."):]: kwargs
+            for name, kwargs in hparam.BUNDLES.items()
+            if name.startswith(f"sizes.{kind}.")}
 
   def size_keys(self, kind: str) -> set:
     """The kwargs a kind's size ladder owns. Nothing else may set them."""
@@ -277,30 +372,38 @@ class ConfigTree:
 
   def component_kwargs(self, cls_name: str, size: str | None = None) -> dict:
     """A component class's own baseline, expanded, with no policy slot involved:
-    its `extends:` presets plus its own keys, optionally at a named size. This is
+    its inherited Config/HParam defaults plus a default-sized ladder. This is
     what a component built outside a Policy (a test, a notebook) resolves -- so
-    such a build sees exactly the layers a real run's first two rungs give it,
+    such a build sees exactly the first rungs a real run's resolution gives it,
     rather than a hand-written dict that drifts."""
-    entry = self.components.get(cls_name)
-    if entry is None:
-      raise KeyError(f"config/components/: no entry for {cls_name!r}")
-    layers = self._extends_layers(entry, f"components: {cls_name}", (cls_name,))
-    kind = entry.get("kind")
+    cls = _component_cls(cls_name)
+    layers = _decl_layers(cls)
+    kind = getattr(cls, "kind", None)
     table = self.size_table(kind)
     if table:
       if size is None:
         size = "small" if "small" in table else sorted(table)[0]
-      layers.append((f"preset {SIZES}.{kind}.{size}", self.preset(f"{SIZES}.{kind}.{size}")))
+      layers.append((f"size: {kind}.{size}", self.ladder_kwargs(kind, size)))
     return merge(layers)
 
   def resolve_slot(self, policy_name: str, slot: str, profile: str | None) -> tuple[str, dict]:
-    if self.replaying:
-      kwargs = self._replayed(f"components.{slot}.")
-      cls_name = kwargs.pop("class")
-      kwargs.pop("size", None)   # metadata, not a constructor kwarg
-      return cls_name, kwargs
     cls_name, layers = self.slot_layers(policy_name, slot, profile)
-    return cls_name, merge(layers)
+    live = merge(layers)
+    if not self.replaying:
+      return cls_name, live
+    # Overlay, not replace: a key the snapshot recorded is authoritative (it is
+    # what this run's weights were built against), but a key it never recorded
+    # -- because it predates a config change that added a new required kwarg --
+    # takes today's value instead of raising. `__init__` already deep-merges the
+    # snapshot's raw blocks over the live files, so the live layering under a
+    # snapshot already carries every key the snapshot doesn't override; this is
+    # what makes that union authoritative rather than the snapshot's kwargs
+    # alone. `class`/`size` are metadata, not constructor kwargs, and stay
+    # popped exactly as the pre-overlay replay path popped them.
+    replayed = dict(self._replayed(f"components.{slot}."))
+    replayed.pop("size", None)
+    cls_name = replayed.pop("class", cls_name)
+    return cls_name, {**live, **replayed}
 
   def slots(self, policy_name: str) -> list[str]:
     if self.replaying:
@@ -311,7 +414,10 @@ class ConfigTree:
   # -- params / training ----------------------------------------------------
 
   def params_layers(self, policy_name: str, profile: str | None) -> list[tuple[str, dict]]:
-    layers = [(f"models: {policy_name}.params", dict(self.policy_cfg(policy_name).get("params", {})))]
+    # The policy class's declared HParam defaults are the base layer, so a
+    # param a model YAML never mentions still resolves -- with attribution.
+    layers = [("decl params", _hparam_defaults(_policy_cls(policy_name, self)))]
+    layers += [(f"models: {policy_name}.params", dict(self.policy_cfg(policy_name).get("params", {})))]
     if profile:
       layers.append((f"models: {policy_name}.profiles.{profile}.params",
                      dict(self._profile_cfg(policy_name, profile).get("params", {}))))
@@ -327,11 +433,15 @@ class ConfigTree:
     return layers
 
   def resolve_params(self, policy_name: str, profile: str | None) -> dict:
-    if self.replaying:
-      return self._replayed("params.")
-    return merge(self.params_layers(policy_name, profile))
+    live = merge(self.params_layers(policy_name, profile))
+    if not self.replaying:
+      return live
+    # Same overlay as resolve_slot: a param the snapshot recorded wins, a param
+    # it never recorded (added to config/ after that run) falls back to today's
+    # value rather than being missing from the dict entirely.
+    return {**live, **self._replayed("params.")}
 
-  def resolve_training(self, name: str) -> dict:
+  def resolve_training(self, name: str, profile: str | None = None) -> dict:
     """The run keys `name` sets for itself, restricted to TRAINING_KEYS. Takes a
     *model* string rather than a policy class name, because its caller only ever
     has the `model:` a run entry named. Sits below the run config's own env/run
@@ -339,7 +449,8 @@ class ConfigTree:
     per-run statement still wins."""
     if self.replaying:
       return {k: v for k, v in self._replayed("training.").items() if k in TRAINING_KEYS}
-    policy_name, profile = self.resolve_model_name(name)
+    policy_name, alias_profile = self.resolve_model_name(name)
+    profile = profile if profile is not None else alias_profile
     return {k: v for k, v in merge(self.training_layers(policy_name, profile)).items()
             if k in TRAINING_KEYS}
 
@@ -366,7 +477,7 @@ class ConfigTree:
     profile = profile if profile is not None else alias_profile
     out = {"policy": policy_name, "profile": profile}
     out.update({f"params.{k}": v for k, v in self.resolve_params(policy_name, profile).items()})
-    out.update({f"training.{k}": v for k, v in self.resolve_training(name).items()})
+    out.update({f"training.{k}": v for k, v in self.resolve_training(policy_name, profile).items()})
     for slot in self.slots(policy_name):
       cls_name, kwargs = self.resolve_slot(policy_name, slot, profile)
       out[f"components.{slot}.class"] = cls_name
@@ -398,7 +509,7 @@ class ConfigTree:
             continue
           value = kwargs[key]
           if isinstance(value, dict) and isinstance(running, dict):
-            running = _deep_update(dict(running), value)
+            running = deep_merge(running, value)
           else:
             running = value
           hits.append((source, running))
@@ -423,10 +534,10 @@ class ConfigTree:
 
   def snapshot_for(self, name: str, profile: str | None = None) -> dict:
     """What a run embeds so it replays identically regardless of later edits to
-    config/: the fully resolved values under `resolved:` (the authoritative copy
-    -- replay reads these and never re-runs the layering), plus the raw blocks it
-    resolved against under `presets`/`components`/`models`, kept so a past run's
-    provenance is still explainable."""
+    the code or YAML: the fully resolved values under `resolved:` (the
+    authoritative copy -- replay reads these and never re-runs the layering),
+    plus the model blocks and the size-ladder rungs it resolved against, kept
+    so a past run's provenance is still explainable."""
     policy_name, alias_profile = self.resolve_model_name(name)
     profile = profile if profile is not None else alias_profile
     models: dict = {}
@@ -436,36 +547,23 @@ class ConfigTree:
     if policy_name in self.models:
       models[policy_name] = self.policy_cfg(policy_name)
 
-    used_classes, used_presets = {}, {}
-
-    def note_presets(block):
-      for ref in block.get("extends") or []:
-        used_presets.setdefault(ref, self.preset(ref))
-        note_presets(self.preset(ref))
-
+    used_presets = {}
     for slot in self.slots(policy_name):
       cls_name = self.slot_class(policy_name, slot)
-      entry = self.components.get(cls_name)
-      if entry is None:
-        continue
-      used_classes[cls_name] = entry
-      note_presets(entry)
-      note_presets(self.policy_cfg(policy_name)["components"][slot])
-      size, kind = self.slot_size(policy_name, slot, profile), entry.get("kind")
+      size, kind = self.slot_size(policy_name, slot, profile), self.component_kind(cls_name)
       if size is not None:
-        used_presets.setdefault(f"{SIZES}.{kind}.{size}", self.preset(f"{SIZES}.{kind}.{size}"))
+        used_presets[f"{SIZES}.{kind}.{size}"] = self.ladder_kwargs(kind, size)
 
     return {
       "resolved":   self.resolved(name, profile),
       "models":     models,
-      "components": used_classes,
       "presets":    _nest(used_presets),
     }
 
 
 def _nest(flat: dict) -> dict:
-  """`{"net.crossq": {...}}` -> `{"net": {"crossq": {...}}}`, so a snapshot's
-  presets load back into the same shape ConfigTree.preset() walks."""
+  """`{"sizes.critic.large": {...}}` -> `{"sizes": {"critic": {"large": {...}}}}`,
+  so a snapshot's presets load back into the same shape the config tree walks."""
   out: dict = {}
   for path, value in flat.items():
     node = out

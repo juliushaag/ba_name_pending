@@ -23,6 +23,8 @@ from abc import ABC, abstractmethod
 import jax.numpy as jnp
 from flax import nnx
 
+from barl_jax.configs import ConfigMixin
+from barl_jax.hparam import HParam, Config
 from barl_jax.networks.registry import register_component
 from barl_jax.policy import Component
 
@@ -32,17 +34,23 @@ class Schedule(Component, nnx.Module, ABC):
   runs `start` -> `end` over the remaining `steps - warmup`, then stays flat at
   `end` (so a `steps` estimate that undershoots the real run is harmless)."""
 
-  def __init__(self, env_stats=None, *, start: float, end: float | None,
-               steps: int, warmup: int, **kw):
+  kind     = "schedule"
+  warmup = Config(0)
 
-    super().__init__(env_stats, **kw)
+  def __init__(self, env_stats=None, config: ConfigMixin = None, **kw):
+    super().__init__(env_stats, config, **kw)
 
-    assert steps >= 1 and 0 <= warmup < steps
+    # start/end/steps are always spelled out by the slot that names this
+    # schedule -- there is no meaningful class default for a curve's domain.
+    start = config.get("start", float)
+    end   = config.get("end", float | None)
+    steps = config.get("steps", int)
 
-    self.start  = float(start)
-    self.end    = float(start if end is None else end)
-    self.steps  = int(steps)
-    self.warmup = int(warmup)
+    assert steps >= 1 and 0 <= self.warmup < steps
+
+    self.start  = start
+    self.end    = start if end is None else end
+    self.steps  = steps
 
   @abstractmethod
   def value(self, t: float) -> float:
@@ -104,9 +112,10 @@ class SineSchedule(Schedule):
 @register_component
 class PolynomialSchedule(Schedule):
 
-  def __init__(self, env_stats=None, *, power: float, **kw):
-    super().__init__(env_stats, **kw)
-    self.power = float(power)
+  power = Config(2.0)
+
+  def __init__(self, env_stats=None, config: ConfigMixin = None, **kw):
+    super().__init__(env_stats, config, **kw)
 
   def value(self, t: float) -> float:
     return self.lerp(t ** self.power)
@@ -118,8 +127,8 @@ class ExponentialSchedule(Schedule):
   difference, which is what a sigma ladder or a decay-to-1%-of-base wants.
   Both endpoints must be strictly positive."""
 
-  def __init__(self, env_stats=None, **kw):
-    super().__init__(env_stats, **kw)
+  def __init__(self, env_stats=None, config: ConfigMixin = None, **kw):
+    super().__init__(env_stats, config, **kw)
     assert self.start > 0.0 and self.end > 0.0
 
   def value(self, t: float) -> float:
@@ -131,9 +140,10 @@ class CosineAlphaBarSchedule(Schedule):
   """Nichol & Dhariwal's cosine alpha-bar ladder, rescaled to run
   `start` -> `end`; `s` is their small offset keeping beta_0 away from 0."""
 
-  def __init__(self, env_stats=None, *, s: float, **kw):
-    super().__init__(env_stats, **kw)
-    self.s = float(s)
+  s = Config(0.008)
+
+  def __init__(self, env_stats=None, config: ConfigMixin = None, **kw):
+    super().__init__(env_stats, config, **kw)
 
   def value(self, t: float) -> float:
     f  = lambda u: math.cos((u + self.s) / (1 + self.s) * math.pi / 2) ** 2

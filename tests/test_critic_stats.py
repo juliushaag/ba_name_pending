@@ -261,7 +261,7 @@ def test_augment_widens_the_action_by_the_level_embedding(name, act):
 
 @pytest.mark.parametrize("name", NOISE_CONDITIONED)
 def test_smoothing_coefficient_is_actually_wired_in(name, obs, act, key):
-    """`noise_conditioned_loss` folds TD at the clean level and smoothing of the
+    """`loss` folds TD at the clean level and smoothing of the
     noisier ones into one `losses["critic"]`, since both fit the same heads."""
     sigmas = jnp.array([0.5, 0.2, 0.05])
     c = build(name)                     # one build, two coefficients -- it is a plain float
@@ -269,7 +269,7 @@ def test_smoothing_coefficient_is_actually_wired_in(name, obs, act, key):
     def loss_at(coef):
         c.smoothing_coef = coef
         losses = {}
-        c.noise_conditioned_loss(obs, act, obs[::-1], act, jnp.zeros((BATCH,)),
+        c.loss(obs, act, obs[::-1], act, jnp.zeros((BATCH,)),
                                  jnp.zeros((BATCH,)), sigmas, key, losses)
         assert set(losses) == {"critic"}
         return losses["critic"]
@@ -284,13 +284,13 @@ def test_smoothing_coefficient_is_actually_wired_in(name, obs, act, key):
 # ----------------------------------------------------------------------
 
 def drain(name, obs, act) -> dict:
-    """One td_loss under `recording`, and the diagnostics it sowed."""
+    """One critic loss under `recording`, and the diagnostics it sowed."""
     from flax import nnx
 
     c = build(name)
     a = critic_action(c, act)
     with recording(PRIMARY, DEBUG):
-        c.td_loss(obs, a, obs[::-1], a, jnp.zeros((BATCH,)), jnp.zeros((BATCH,)), {})
+        c.loss(obs, a, obs[::-1], a, jnp.zeros((BATCH,)), jnp.zeros((BATCH,)), {})
         sown, sown_debug = nnx.pop(c, Metric, DebugMetric)
     return {**collect(sown), **collect(sown_debug)}
 

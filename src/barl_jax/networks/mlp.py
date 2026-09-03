@@ -2,7 +2,45 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from barl_jax.hparam import Config
 from barl_jax.networks.norm import make_norm
+
+# ---------------------------------------------------------------------------
+# MLP_STYLES -- the named MLP surfaces a component *selects* from. A component
+# declares `net_style = Config("gelu", style=MLP_STYLES)` and gets the whole
+# surface (activation/norm/dtype/...) below its own declarations; switching the
+# style is a `--set model.components.<slot>.net_style=silu`, not inheritance.
+# ---------------------------------------------------------------------------
+
+_NET_PLAIN = dict(activation="silu", norm="none", norm_stem=False, norm_input=False,
+                  norm_after_act=True, dropout=0.0, final_activation=False,
+                  residual=False, norm_kwargs={}, dtype="bfloat16")
+
+MLP_STYLES = {
+  "plain":    _NET_PLAIN,
+  "silu":     _NET_PLAIN,
+  "gelu":     {**_NET_PLAIN, "activation": "gelu"},
+  "relu":     {**_NET_PLAIN, "activation": "relu"},
+  # mish, unnormalized -- the NC-LQL critics' net.
+  "mish":     {**_NET_PLAIN, "activation": "mish"},
+  # A LayerNorm stem (epsilon 1e-5, torch's) over silu -- the Gaussian actor's net.
+  "layer":    {**_NET_PLAIN, "norm": "layer",
+               "norm_kwargs": {"epsilon": 1.0e-5}},
+  "layer_relu": {**_NET_PLAIN, "activation": "relu", "norm": "layer",
+                 "norm_stem": True, "norm_input": True,
+                 "norm_kwargs": {"epsilon": 1.0e-5}},
+  # BatchRenorm over the shared [(s,a),(s',a')] forward -- what replaces a
+  # Polyak target net, and the default critic net.
+  "crossq":   {**_NET_PLAIN, "activation": "relu", "norm": "batchrenorm",
+               "norm_stem": True, "norm_input": True,
+               "norm_kwargs": {"momentum": 0.99, "warmup_steps": 100000,
+                               "epsilon": 1.0e-3, "r_max": 3.0, "d_max": 5.0}},
+  # fp32 compute -- the score/SDE actors accumulate a log-weight over an fp32
+  # chain (they went non-finite in bf16 -- sweep 2026-08-27_13-23-15).
+  "silu_fp32": {**_NET_PLAIN, "dtype": "float32"},
+  "gelu_fp32": {**_NET_PLAIN, "activation": "gelu", "dtype": "float32"},
+}
+
 
 _ACTIVATIONS = dict(
   silu=jax.nn.silu,

@@ -38,6 +38,7 @@ trainer's job -- one `jax.device_get` on the whole captured State per logged
 step, never a `float()` per key (that serializes JAX's async dispatch the same
 way `.item()` did in torch)."""
 
+import types
 from contextlib import contextmanager
 
 import jax
@@ -141,6 +142,17 @@ class Recorder:
     value = jnp.asarray(value)
     value = value.reshape(-1)[0] if value.size > 1 else value.reshape(())
     key = f"{self._prefix}/{name}" if self._prefix else name
+    # A metric is sown as an attribute of its owning module, so its name must
+    # not collide with that module's own API: `setattr` onto a property with no
+    # setter raises (DDPMActor.explore_std used to), and onto a method it
+    # silently shadows the method for the rest of the trace. Both are config-
+    # name bugs; say so here rather than as whatever nnx or the next call makes
+    # of them.
+    member = type(self._owner).__dict__.get(key)
+    if isinstance(member, (property, types.FunctionType, staticmethod, classmethod)):
+      raise ValueError(
+        f"metric {key!r} collides with {type(self._owner).__name__}.{key} -- sow it "
+        f"under a name that is not already a method or property of the component")
     setattr(self._owner, key, _TIER_TYPE[tier](value))
 
   def scalar(self, name: str, value, tier: str = PRIMARY):

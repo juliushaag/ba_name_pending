@@ -26,4 +26,13 @@
 # `--set model.components.critic.size=large` needs no alias at all. Reach for a
 # profile when a variant is several coordinated changes that deserve one name.
 
+# `policy:` (each model's own top-level key, e.g. `config/models/sac.yaml`) is a
+# different indirection from this file's, and orthogonal to it: it says which
+# Python class implements a model, defaulting to the model's own name so a
+# 1:1 model (NCLQL) states nothing. Several models can name the same class --
+# that is what lets one `RLPolicy`/`MaxEntRLPolicy` template back SAC, AMDP,
+# DIME and SDAC, each configured entirely by its `components:`/`params:`. An
+# alias below still resolves to a *model* name first (`resolve_model_name`),
+# which then goes through that model's own `policy:` -- the two compose.
+
 aliases: {}

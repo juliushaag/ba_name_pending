@@ -1,4 +1,5 @@
 AMDP:
+  policy: MaxEntRLPolicy
   training:
     batch_size: 256
     utd_ratio: 2.0
@@ -9,9 +10,14 @@ AMDP:
     # dime_am configs/alg/am.yaml + dime.yaml: policy_delay: 3. Gates the actor
     # and the entropy dual together; the critic keeps stepping every grad step.
     policy_delay: 3
-
-    q_score_max_norm: 5.0
-    q_score_max_percentile: 95.0
+    # AMDP is the one algorithm here that does not normalize observations --
+    # ported from the torch implementation as it actually ran. `obs_mean`/
+    # `obs_std` are never written anywhere in this codebase, so today this flag
+    # is numerically a no-op for every model; it stays stated so the day
+    # running-stat normalization is wired up, AMDP's exemption is a config
+    # value instead of a silent behavior change.
+    normalize_obs: false
+    entropy_in_target: true
 
   components:
     # dime_am's control net is 3 hidden Dense(256) + head (ctrl_net.py:

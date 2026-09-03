@@ -5,18 +5,23 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from barl_jax.configs import ConfigMixin
 from barl_jax.networks.registry import register_component
 from barl_jax.policy import Component
 
 
 class Squash(Component, nnx.Module, ABC):
   """Maps an actor's unconstrained output to a canonical [-1, 1]-per-dimension
-  action and back (SAC's tanh, AMDP's erf, ...)."""
+  action and back (SAC's tanh, AMDP's erf, ...). An actor selects one with its
+  own `squash_cls` Config (`ErfSquash` sets its `erf_k` from the noise
+  schedule)."""
 
-  def __init__(self, env_stats=None, **kwargs):
+  kind = "squash"
+
+  def __init__(self, env_stats=None, config: ConfigMixin = None, **kwargs):
     """Absorbs kwargs a concrete Squash doesn't need -- e.g. AMDP always
     passes `erf_k=...` regardless of which class the squash slot resolves to."""
-    super().__init__(env_stats)
+    super().__init__(env_stats, config)
 
   @abstractmethod
   def __call__(self, x):
@@ -57,8 +62,8 @@ class ErfSquash(Squash):
   (not learned) function of the owning actor's noise schedule, chosen so
   this squash's log-Jacobian cancels out of AMDP's direct-score regression."""
 
-  def __init__(self, env_stats=None, *, erf_k: float, **kwargs):
-    super().__init__(env_stats, **kwargs)
+  def __init__(self, env_stats=None, config: ConfigMixin = None, *, erf_k: float, **kwargs):
+    super().__init__(env_stats, config, **kwargs)
     # A plain Python float, not a Variable: it is derived from the actor's
     # noise schedule at construction time and never trained or checkpointed.
     self.erf_k = float(erf_k)

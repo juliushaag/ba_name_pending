@@ -11,17 +11,17 @@ import pytest
 from flax import nnx
 
 from barl_jax.networks.registry import get_component
-from barl_jax.policies.sdac import DDPMActor
+from barl_jax.networks.actors.ddpm import DDPMActor
 from barl_jax.policy import TRAINABLE
 
 from conftest import ACT_DIM, ACTORS, BATCH, build, built, finite
 
 DIFFUSION = [n for n in ACTORS if issubclass(get_component(n), DDPMActor)]
 
-# `Actor` no longer declares `sample`: an actor's entry point is whatever the one
-# Policy that owns it calls (AMDP's is `generate_action`, and it returns the path
-# weight alongside the sample). The contract below is what `sample` means where
-# it exists, not a claim that every actor has one.
+# Every registered `Actor` gets `sample` from the ABC's default now (it calls
+# `generate_action(...)[0]`), so this is every actor rather than a subset --
+# kept as its own name since a few (StochasticActor) still override it with a
+# cheaper path that skips the log-prob `generate_action` also computes.
 SAMPLERS = [n for n in ACTORS if hasattr(get_component(n), "sample")]
 
 
@@ -30,18 +30,18 @@ def test_sample_contract(name, obs, key):
     """One action per row, finite, and a pure function of the key it was given --
     every draw takes an explicit key because there is no global RNG here."""
     a = built(name)
-    action = a.sample(obs, key)
+    action = a.sample(obs, key=key)
 
     assert action.shape == (BATCH, ACT_DIM)
     assert finite(action)
-    assert jnp.array_equal(action, a.sample(obs, key))
-    assert not jnp.array_equal(action, a.sample(obs, jax.random.PRNGKey(7)))
+    assert jnp.array_equal(action, a.sample(obs, key=key))
+    assert not jnp.array_equal(action, a.sample(obs, key=jax.random.PRNGKey(7)))
 
 
 @pytest.mark.parametrize("name", SAMPLERS)
 def test_sample_is_differentiable_wrt_params(name, obs, key):
     a = build(name)
-    grads = nnx.grad(lambda actor: actor.sample(obs, key).sum(),
+    grads = nnx.grad(lambda actor: actor.sample(obs, key=key).sum(),
                      argnums=nnx.DiffState(0, TRAINABLE))(a)
     leaves = jax.tree.leaves(nnx.state(grads))
     assert leaves and all(finite(g) for g in leaves)

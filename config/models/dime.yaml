@@ -1,4 +1,5 @@
 DIME:
+  policy: MaxEntRLPolicy
   training:
     batch_size: 256
     utd_ratio: 2.0
@@ -9,6 +10,8 @@ DIME:
     # dime_am configs/alg/am.yaml + dime.yaml: policy_delay: 3. Gates the actor
     # and the entropy dual together; the critic keeps stepping every grad step.
     policy_delay: 3
+    normalize_obs: true
+    entropy_in_target: true
 
   components:
     # dime_am's score net is 3 hidden Dense(256) + head (PISGRADNet:

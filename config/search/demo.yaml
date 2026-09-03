@@ -1,0 +1,49 @@
+# A hyperparameter search space, consumed by scripts/hpo.py and sampled by
+# scripts/search.py. A trial is one grid combo: `algo`/`env`/`seed` plus dotted
+# `run.*` (run-entry keys) and `model.*` (component/params overrides) axes --
+# the same language as scripts/submit.py's `--set`, so a sampled point is
+# checked, snapshotted and logged exactly like a hand-written one.
+#
+# Axis types:
+#   categorical: {type: categorical, values: [...]}
+#   bool:        {type: bool}
+#   int:         {type: int, low: ..., high: ..., log: true|false}
+#   float:       {type: float, low: ..., high: ..., log: true|false}
+#
+# **Only HParams are searchable.** hpo.py refuses a `model.*` axis that names a
+# structural Config (activation, norm, dtype, a slot's `size:`, ...) of the
+# resolved classes -- a hyperparameter search is over algorithmic knobs, and
+# structure is varied with `--set` or a grid `size:`/`net:` axis instead. Every
+# `model.*` axis below names a declared HParam of all the algos it searches.
+#
+# `algo` and `env` must be present and categorical. `base` is the experiment
+# config whose `defaults:` seed every trial. `seeds_per_trial` defaults to
+# config/run/defaults.yaml's num_seeds -- cheap trials usually want it lower.
+
+base: config/experiments/online_learning.yaml
+n_trials: 20
+sampler: random        # the only backend with no tuning of its own; the seam is
+                       # scripts/search.py's sample_trial, so an Optuna/TPE or
+                       # ASHA sampler replaces that one call.
+sampler_seed: 0
+seeds_per_trial: 1     # HPO wants many cheap trials; 3 seeds is the default run
+objective: eval/avg_cum_reward
+
+axes:
+  # Required categoricals: what the search is over.
+  algo: {type: categorical, values: [SAC, DIME, AMDP]}
+  env:  {type: categorical, values: [HalfCheetah, CheetahRun]}
+
+  # Run keys -- algorithmic experiment knobs, declared in barl_jax.run_config.
+  # `num_envs` is absent on purpose -- it must stay equal to `rollout_steps`.
+  run.batch_size:  {type: int,   low: 128, high: 1024, log: true}
+  run.utd_ratio:   {type: float, low: 0.5, high: 4.0}
+  run.lr_warmup_steps: {type: int, low: 0, high: 20000}
+
+  # Model HParams: named <slot>.<key> against each resolved component class.
+  # SAC/DIME/AMDP all share the MaxEntRLPolicy template but each has its own
+  # actor and the C51 critic -- the LR and the entropy temperature are HParams
+  # on all of them; a structural key (activation, dtype, size) would be refused.
+  model.components.actor.lr:  {type: float, low: 1.0e-4, high: 1.0e-3, log: true}
+  model.components.critic.lr: {type: float, low: 1.0e-4, high: 1.0e-3, log: true}
+  model.params.entropy_scale: {type: float, low: -4.0, high: -0.5}

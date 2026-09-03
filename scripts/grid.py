@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import yaml
 
@@ -30,16 +31,19 @@ REPO_ROOT  = os.path.dirname(SCRIPT_DIR)
 CONFIG_DIR = os.path.join(REPO_ROOT, "config")
 DEFAULT_BASE_CONFIG = os.path.join(CONFIG_DIR, "experiments", "online_learning.yaml")
 
-# config_tree.py imports nothing but yaml, and it is loaded from its path rather
-# than as `barl_jax.config_tree` so it stays that way: the package's __init__
-# imports every policy and environment to populate the registries, i.e. jax and
-# mujoco, which is exactly what a launcher on a login node must not pay for --
-# and what made a device-forcing env var look necessary here in the first place.
-_CONFIG_TREE = os.path.join(REPO_ROOT, "src", "barl_jax", "config_tree.py")
-_spec = importlib.util.spec_from_file_location("barl_jax_config_tree", _CONFIG_TREE)
-_config_tree = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_config_tree)
-ConfigTree = _config_tree.ConfigTree
+# config_tree.py / class resolution now needs the component (and policy) class
+# registry to serve class-declared HParam defaults -- which only exists once
+# barl_jax is imported. The old by-path, jax-free loading is gone with the
+# YAML defaults: a config is no longer resolvable without the code it
+# parameterizes. The launcher pays for jax on the CPU (JAX_PLATFORMS=cpu set
+# here), but never a GPU: the config check's child process pins its own
+# platforms and the executors' DEVICE_VARS stripping is unchanged.
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+os.environ.setdefault("MUJOCO_GL", "egl")
+
+import barl_jax  # noqa: F401  -- imports every policy/component; populates registries
+from barl_jax.config_tree import ConfigTree  # noqa: E402
+from barl_jax.configs import CONFIG_DIR, resolve_includes  # noqa: E402
 
 RESERVED_AXES = ("algo", "env", "seed")
 
@@ -76,12 +80,17 @@ def default_num_seeds() -> int:
 def build_axes(*, grid: str = None, algos: list = None, envs: list = None,
                sets: list = None) -> tuple[str | None, dict, list[dict]]:
   """The sweep's axes from a `--grid` file, the `--algos`/`--envs` shorthand and
-  any `--set` pins (which win per axis). Returns (base_config, axes, exclude)."""
+  any `--set` pins (which win per axis). Returns (base_config, axes, exclude).
+
+  `$()` includes (barl_jax.configs, loaded above by path for the same reason
+  config_tree.py itself is) are resolved against CONFIG_DIR, so e.g. an
+  `exclude:` list shared by more than one grid spec can live in one place."""
   base, axes, exclude = None, {}, []
 
   if grid:
     with open(grid) as f:
       spec = yaml.safe_load(f) or {}
+    spec = resolve_includes(spec, Path(grid).resolve().parent, Path(CONFIG_DIR))
     base = spec.get("base")
     axes = dict(spec.get("axes") or {})
     exclude = list(spec.get("exclude") or [])

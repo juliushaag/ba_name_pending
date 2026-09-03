@@ -17,6 +17,7 @@ import json
 import os
 import subprocess
 import time
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -37,13 +38,59 @@ from barl_jax.train import train_step
 seeded_step = jax.jit(jax.vmap(train_step, in_axes=(None, 0, 0, None, None)),
                       static_argnums=(0, 3), donate_argnums=(1,))
 
+
+@partial(jax.jit, static_argnums=(0, 3), donate_argnums=(1,))
+def seeded_chunk(graphdef, state, batches, k, grad_step):
+  """`k` gradient steps in one dispatch, over a `(k, num_seeds, batch, ...)` chunk.
+
+  The same update as `k` calls of `seeded_step` with no metric tier armed: the
+  same states in the same order, the same per-step `grad_step` feeding the
+  `policy_delay` gate, and the same batches (see `sample_chunk`). What it drops
+  is the Python between them -- ~1.6 ms of jit dispatch plus a `device_put` per
+  step, which for AMDP is 1.38x of the step and for DIME 1.22x.
+
+  The same update, but **not bit-identical**: XLA schedules the fused scan
+  differently from a standalone jit, and float addition does not associate. In
+  float32 that is 1e-11 on two leaves after one step; in the bfloat16 the nets
+  actually use, 2.5e-5, because bfloat16 carries 8 mantissa bits. It is
+  reassociation and not a second algorithm -- but a run does not replay a
+  pre-chunking run step for step.
+
+  Tier-armed steps do not come through here. They return metrics, and `tiers`
+  is static, so an armed step inside the scan would be a second compiled shape
+  per position it could occupy; the caller runs those iterations step-by-step
+  instead. `k` likewise stays the iteration's whole gradient-step count -- one
+  value for the life of a run, hence one compile."""
+  def body(carry, batch):
+    state, step = carry
+    state, _, _, _ = jax.vmap(train_step, in_axes=(None, 0, 0, None, None))(
+      graphdef, state, batch, (), step)
+    return (state, step + 1), None
+
+  (state, _), _ = jax.lax.scan(body, (state, grad_step), batches, length=k)
+  return state
+
+
 # Longest the training loop stays silent before saying it is still alive.
 PROGRESS_INTERVAL_S = 300
+
 
 # The only thing that reaches wandb *during* a phase that can run for minutes.
 # A killed run uploads no term.err, so without this the dashboard cannot tell
 # "died between iterations" from "died inside the eval wave".
 PHASE_TRAIN, PHASE_EVAL_WAVE, PHASE_EVAL_CKPT, PHASE_EVAL_VIDEO = 0, 1, 2, 3
+
+
+def enable_compilation_cache(cache_dir) -> None:
+  """Point jax at a persistent compilation cache, before anything compiles.
+
+  jax's own thresholds are already what we want (`min_compile_time_secs` 1.0,
+  `min_entry_size_bytes` 0), so the directory is the whole configuration."""
+  if not cache_dir:
+    return
+  path = os.path.abspath(os.path.expanduser(str(cache_dir)))
+  os.makedirs(path, exist_ok=True)
+  jax.config.update("jax_compilation_cache_dir", path)
 
 
 class Run:
@@ -63,6 +110,7 @@ class Run:
 def setup(cfg: dict, num_seeds: int, *, validate_only: bool = False) -> Run:
   run = Run(cfg, num_seeds)
   np.random.seed(run.base_seed)
+  enable_compilation_cache(cfg["compile_cache_dir"])
 
   # Unconditional: also resets anything left over from a previous run in this
   # process's `runs:` series when the current run doesn't carry one.
@@ -111,6 +159,10 @@ def setup(cfg: dict, num_seeds: int, *, validate_only: bool = False) -> Run:
 
   run.reference = policies[0]
   run.graphdef, run.state = stack(list(zip(policies, optimizers)))
+  # Constant for the run, and a full walk of the state tree (1.7 ms) -- at
+  # `rollout_steps: 1` it was 6% of a single-seed run to recompute it per
+  # iteration. Measured once here and logged from the cache.
+  run.num_params = run.reference.num_params()
   return run
 
 
@@ -132,7 +184,7 @@ def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
   are orbax writes, the video is an EGL render plus an mp4 encode."""
   cfg = run.cfg
   eval_env, render_env = envs
-  rewards, lengths, successes = [], [], []
+  rewards, lengths, successes, nonfinite = [], [], [], []
 
   # Entry/exit are logged because an eval is the one phase that can stall for
   # tens of minutes with nothing on stdout, and telling "stalled" from "running
@@ -167,6 +219,8 @@ def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
     rewards.append(reward)
     lengths.append(np.mean([len(r["rewards"]) for r in runs]))
     successes.append(np.mean([float(r["success"]) for r in runs]))
+    seen = sum(r["n_act"] for r in runs)
+    nonfinite.append(sum(r["act_nonfinite"] for r in runs) / seen if seen else 0.0)
 
     policy, _ = unstack(run.graphdef, run.state, i)
     root = _checkpoint_dir(run, ckpt_dir, i)
@@ -196,11 +250,24 @@ def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
   rewards = np.asarray(rewards)
   per_seed = [{"eval/avg_cum_reward": float(rewards[i]),
                "eval/avg_length":     float(lengths[i]),
-               "eval/success_rate":   float(successes[i])} for i in range(run.num_seeds)]
+               "eval/success_rate":   float(successes[i]),
+               "eval/act_nonfinite":  float(nonfinite[i])} for i in range(run.num_seeds)]
   panel = {"eval/avg_cum_reward": rewards.mean(),
            "eval/avg_length":     np.mean(lengths),
-           "eval/success_rate":   np.mean(successes)}
+           "eval/success_rate":   np.mean(successes),
+           "eval/act_nonfinite":  np.mean(nonfinite)}
   log.log_per_seed(per_seed, panel=panel)
+
+  # The counterpart to `rollout/act_nonfinite`, and said out loud rather than
+  # only plotted: a non-finite action is now clamped on both paths, so the run
+  # survives it, but every number this eval just produced came from an actor
+  # that had already diverged.
+  if any(f > 0 for f in nonfinite):
+    worst = int(np.argmax(nonfinite))
+    log.message(f"  WARNING: non-finite actions during eval -- seed {worst} "
+                f"{nonfinite[worst]:.3%} of action components, "
+                f"{sum(f > 0 for f in nonfinite)}/{run.num_seeds} seeds affected. "
+                f"They were clamped to 0; this eval's numbers are not meaningful.")
   for i, seed_best in enumerate(best):
     log.summary("best_reward", float(seed_best), seed_index=i)
   log.message(f"Eval done  @ env_step {log.get_step('env_steps')} "
@@ -297,14 +364,22 @@ def warmup(run: Run, envs, log) -> dict:
   jax.block_until_ready(actor.inference_fn()(probe, jax.random.PRNGKey(0)))
   out["time/warmup_compile_s"] = time.perf_counter() - t0
 
+  # Same reason as `num_params`, and worse: this is 11 blocking device
+  # round-trips (10.4 ms), and per iteration it was 35% of a single-seed
+  # HalfCheetah run. It is a property of the architecture, not of the weights,
+  # so one measurement at startup says everything the per-iteration one did.
+  out["model/inference_latency_ms"] = run.reference.measure_latency()
+
   if render_env is not None:
     t0 = time.perf_counter()
     render_env.reset(seed=run.base_seed)
     render_env.call("render")
     out["time/warmup_render_s"] = time.perf_counter() - t0
 
-  log.message("Warm-up: eval-shape compile {:.1f}s, first render {:.1f}s".format(
-    out["time/warmup_compile_s"], out.get("time/warmup_render_s", 0.0)))
+  log.message("Warm-up: eval-shape compile {:.1f}s, first render {:.1f}s, "
+              "inference {:.2f}ms".format(out["time/warmup_compile_s"],
+                                          out.get("time/warmup_render_s", 0.0),
+                                          out["model/inference_latency_ms"]))
   return out
 
 
@@ -352,26 +427,30 @@ def train(run: Run):
   ckpt_dir = os.path.abspath(os.path.join(cfg["run_dir"], "checkpoints") if cfg["run_dir"]
                              else os.path.join("checkpoints", name))
   os.makedirs(ckpt_dir, exist_ok=True)
+  # The run-level directory the objective sidecar lives in: the run's own dir
+  # under a sweep, else the standalone <model>/<env>/<timestamp>/ tree. This is
+  # the only place a finished run's result is readable without wandb.
+  objective_dir = os.path.abspath(cfg["run_dir"]) if cfg["run_dir"] else os.path.join("checkpoints", name)
   log.message(f"Checkpoints: {ckpt_dir}")
   if num_seeds > 1:
     log.message(f"{num_seeds} seeds vmapped in one process "
                 f"({num_seeds * run.num_envs} rollout envs, "
-                f"{run.reference.num_params() / 1e6:.2f}M params each)")
+                f"{run.num_params / 1e6:.2f}M params each)")
 
   warmup_stats = warmup(run, eval_envs, log)
 
   steps_per_iter = cfg["rollout_steps"] // run.num_envs
 
   if cfg["random_steps"] > 0:
-    run.env_stats["live"].update(
-      run.buffer.random_fill(run.rollout_env, n_steps=cfg["random_steps"] // run.num_envs,
-                             seed=run.base_seed))
+    run.buffer.random_fill(run.rollout_env, n_steps=cfg["random_steps"] // run.num_envs,
+                           seed=run.base_seed)
     log.message(f"Random-filled the buffer with {cfg['random_steps']} env steps before training")
 
   best = [float("-inf")] * num_seeds
   eval_every, next_eval = cfg["eval_every"], cfg["eval_every"]
   video_every, next_video = cfg["eval_video_every"], cfg["eval_video_every"]
   it = 0
+  chunk_seen = False
   run_started = time.perf_counter()
   # `rollout_steps` may be as small as `num_envs` (one env step per slot per
   # iteration), which is thousands of iterations per 100k env steps -- so the
@@ -394,8 +473,6 @@ def train(run: Run):
       log.log_per_seed([{f"rollout/{k}": v for k, v in seed.items()}
                         for seed in run.buffer.last_rollout_per_seed()],
                        panel={f"rollout/{k}": v for k, v in rollout_stats.items()})
-   
-      run.env_stats["live"].update(rollout_stats)
 
       grad_steps_this_iter = round(cfg["rollout_steps"] * cfg["utd_ratio"])
       narrate = (it == 0 or time.perf_counter() - last_narration > PROGRESS_INTERVAL_S)
@@ -413,7 +490,31 @@ def train(run: Run):
       epoch_start = last_report = time.perf_counter()
       progress_every = max(1, grad_steps_this_iter // 10)
 
-      for step in range(grad_steps_this_iter):
+      # Whole-iteration fast path. An iteration holding no tier-armed step is
+      # one `lax.scan` over its whole gradient-step count and one host->device
+      # transfer, instead of that many jit dispatches and transfers. Split at
+      # the iteration rather than at the armed step so `k` takes exactly one
+      # value for the run: a second chunk length is a second compile of the
+      # scan, and at DIME's ~60 s per compile that costs more than it saves.
+      # An iteration holds an armed step `grad_steps_this_iter / log_every` of
+      # the time -- 13% at the 32-step iteration `rollout_steps: 16` gives.
+      base = log.get_step("grad_steps")
+      armed_here = any((base + i) % cfg["log_every"] == 0
+                       or (base + i) % cfg["debug_every"] == 0
+                       for i in range(grad_steps_this_iter))
+
+      if not armed_here:
+        batches = run.buffer.sample_chunk(grad_steps_this_iter, cfg["batch_size"])
+        run.state = seeded_chunk(run.graphdef, run.state, batches,
+                                 grad_steps_this_iter, jnp.asarray(base, jnp.int32))
+        log.advance({"grad_steps": grad_steps_this_iter})
+        if not chunk_seen:
+          chunk_seen = True
+          jax.block_until_ready(run.state)
+          log.message(f"  first chunked iteration ({grad_steps_this_iter} grad steps, "
+                      f"incl. compile): {time.perf_counter() - epoch_start:.1f}s")
+
+      for step in (range(grad_steps_this_iter) if armed_here else ()):
         gstep = log.get_step("grad_steps")
         tiers = (tuple([PRIMARY] if gstep % cfg["log_every"] == 0 else [])
                  + tuple([DEBUG] if gstep % cfg["debug_every"] == 0 else []))
@@ -467,11 +568,14 @@ def train(run: Run):
         next_eval = (log.get_step("env_steps") // eval_every + 1) * eval_every
         if want_video:
           next_video = (log.get_step("env_steps") // video_every + 1) * video_every
+        _write_objective(objective_dir, model=run.model_name, env=run.env_name,
+                         seed=run.base_seed, num_seeds=run.num_seeds,
+                         env_steps=int(log.get_step("env_steps")), best=best, status="running")
     
       n_samples = max(1, grad_steps_this_iter * cfg["batch_size"] * num_seeds)
       iter_time = time.perf_counter() - iter_start
       elapsed   = max(1e-9, time.perf_counter() - run_started)
-      stats = {"model/num_params": run.reference.num_params(),
+      stats = {"model/num_params": run.num_params,
                "model/epoch_time_s": epoch_time,
                "model/eval_time_s": eval_time,
                "model/epoch_time_per_sample_ms": 1000 * epoch_time / n_samples,
@@ -484,8 +588,6 @@ def train(run: Run):
                "time/env_steps_per_hour": 3600.0 * log.get_step("env_steps") / elapsed,
                "eval/phase": PHASE_TRAIN,
                **eval_phases, **warmup_stats}
-      if num_seeds == 1:
-        stats["model/inference_latency_ms"] = run.reference.measure_latency()
       log.log(stats)
       it += 1
   except BaseException as exc:
@@ -502,6 +604,11 @@ def train(run: Run):
     if crash is not None:
       log.message(f"Run failed: {type(crash).__name__}: {crash}")
       log.summary("crash", f"{type(crash).__name__}: {crash}")
+
+    _write_objective(objective_dir, model=run.model_name, env=run.env_name,
+                     seed=run.base_seed, num_seeds=run.num_seeds,
+                     env_steps=int(log.get_step("env_steps")), best=best,
+                     status="failed" if crash is not None else "finished")
 
     close(run, eval_envs)
     log.finish()
@@ -536,3 +643,27 @@ def close(run: Run, eval_envs=()):
   for e in eval_envs:
     if e is not None:
       e.close()
+
+
+def _write_objective(objective_dir: str, *, model: str, env: str, seed: int,
+                     num_seeds: int, env_steps: int, best: list, status: str) -> str:
+  """The run's result as a small JSON sidecar in its own directory, so a sweep
+  or an HPO driver can rank finished runs without touching wandb.
+
+  `objective` is the mean best reward across seeds -- the same number
+  `best_reward` summarises per seed -- and `best` the per-seed values. Written
+  after every eval (status "running", so a live driver can watch it) and again
+  in the trainer's finally (status "finished" / "failed"). Non-finite entries
+  (no eval happened yet, or a crash before one) rank below any real reward, so
+  a consumer sorts by objective descending and treats -inf as "no result"."""
+  os.makedirs(objective_dir, exist_ok=True)
+  objective = float(np.mean([float(b) for b in best])) if best else float("-inf")
+  payload = {
+    "model": model, "env": env, "seed": seed, "num_seeds": num_seeds,
+    "env_steps": env_steps, "status": status,
+    "objective": objective, "best": [float(b) for b in best],
+  }
+  path = os.path.join(objective_dir, "objective.json")
+  with open(path, "w") as f:
+    json.dump(payload, f, indent=2)
+  return path

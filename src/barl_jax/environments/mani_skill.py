@@ -38,6 +38,11 @@ class ManiSkillEnvironment(Environment):
 
   use_async_vector_env = True
 
+  # reward is `normalized_dense`, in [0, 1] per step; horizon 50 vs DMC's 1000.
+  # Same derivation: twice the discounted bound (1-gamma^T)/(1-gamma) at gamma
+  # 0.99, symmetric.
+  stats = {"return_min": -79.0, "return_max": 79.0}
+
   def task_id(self) -> str:
     raise NotImplementedError
 
@@ -88,4 +93,6 @@ class PickSingleYCB(ManiSkillEnvironment):
 
 @register_environment
 class PegInsertionSide(ManiSkillEnvironment):
+  # Twice the discounted bound at its own horizon of 100.
+  stats = {"return_min": -126.79, "return_max": 126.79}
   def task_id(self): return "PegInsertionSide-v1"

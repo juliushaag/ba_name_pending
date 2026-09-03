@@ -1,26 +1,17 @@
 SDAC:
+  policy: MaxEntRLPolicy
   training:
     batch_size: 256
     utd_ratio: 2.0
 
   params:
     entropy_scale: -0.9
-
-    # K: softmax candidates in the soft denoising loss. 64 was unused capacity --
-    # sweep 2026-08-26_17-59-33 logged `actor/weight_ess` at a mean of 6.4
-    # (DogRun) and 17 (HumanoidRun), so the softmax was never spreading over more
-    # than a third of them, while K x batch = 16384 critic rows was a third of the
-    # step. 24 still covers the higher of the two with headroom.
-    num_candidates: 24
-    num_bon: 32          # N: best-of-N, for the played action and the bootstrap
-
-    softmax_temp: 0.25
-
-    explore_init: 0.1
-    explore_min: 1.0e-3
-    explore_max: 1.0
-    explore_raw_limit: 10.0   # clamp on the raw exploration-std parameter
-    explore_lr: 1.0e-2        # its own optimizer, separate from the actor's
+    policy_delay: 1
+    normalize_obs: true
+    # SDAC's Bellman target carries no entropy bonus in the reference: the
+    # dual trains purely off the actor's `extra_losses` (the exploration-noise
+    # objective), not off anything added to the critic's target.
+    entropy_in_target: false
 
   components:
     # SDAC's own reference (mahaitongdae/diffusion_policy_online_rl) sizes the

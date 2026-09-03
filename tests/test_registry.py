@@ -36,15 +36,6 @@ def test_constructs_from_its_baseline(name):
     assert isinstance(built(name), Component)
 
 
-@pytest.mark.parametrize("name", ALL)
-def test_baseline_kwargs_are_all_accepted(name):
-    """Same check model_config.validate() runs per policy slot, here per class:
-    no key in the baseline is a typo that the catch-all quietly absorbs."""
-    accepted, _ = model_config._accepted_kwargs(get_component(name))
-    unknown = sorted(set(tiny_kwargs(name)) - set(accepted))
-    assert not unknown, f"{name}: components.yaml keys no __init__ accepts: {unknown}"
-
-
 def test_components_yaml_entries_are_registered():
     """Every entry in config/components/ has to name a class the registry can
     resolve -- a typo's baseline kwargs would otherwise silently never apply."""

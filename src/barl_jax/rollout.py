@@ -267,8 +267,7 @@ class ReplayBuffer():
 
     self._rollout_state = dict(env=env, obs=obs)
 
-    # The per-slot sums stay off the return value -- random_fill() feeds that
-    # dict straight into EnvStats["live"], which wants scalars. A caller owning
-    # a subset of the slots reads them through last_rollout_per_seed() instead.
+    # The per-slot sums stay off the return value -- a caller owning a subset of
+    # the slots reads them through last_rollout_per_seed() instead.
     self._rollout_per_env = acc
     return summarize_rollout(acc)

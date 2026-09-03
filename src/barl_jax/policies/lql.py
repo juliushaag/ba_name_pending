@@ -3,16 +3,19 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from barl_jax.configs import ConfigMixin
+from barl_jax.hparam import Config, HParam
 from barl_jax.metrics import DEBUG
-from barl_jax.networks.critic import C51Critic, EnsembleCritic, HLGaussCritic
-from barl_jax.networks.flow import TimeEmbedding
+from barl_jax.networks.critic import C51Critic, EnsembleCritic, HLGaussCritic, Polyak
+from barl_jax.networks.flow import TIME_STYLES, TimeEmbedding
+from barl_jax.networks.mlp import MLP_STYLES
 
 from barl_jax.networks.registry import register_component
-from barl_jax.policy import Buffer, Policy, frozen, register_policy
+from barl_jax.policy import Buffer, HParamsOwner, Policy, frozen, register_policy
 from barl_jax.networks.schedule import Schedule
 
 
-class NoiseConditionedCritic:
+class NoiseConditionedCritic(HParamsOwner):
   """Mixin: makes any `QCriticBase` noise-conditioned, by widening the action it
   is built over with a learned embedding of the level index.
 
@@ -35,25 +38,36 @@ class NoiseConditionedCritic:
   copies it too: the bootstrap is conditioned on a level, and an embedding that
   tracked the live weights would leak straight back into the target's value."""
 
-  def __init__(self, env_stats, *args, smoothing_coef: float, time_dim: int,
-               time_embed: str, time_kwargs: dict, rngs: nnx.Rngs, **kwargs):
+  # Flips QCriticBase's marker: `loss` here is the wider noise-conditioned
+  # signature, which the RLPolicy template's `critic.loss(..., shift=...)` call
+  # cannot drive -- so the template refuses it and these critics stay under NCLQL.
+  noise_conditioned = True
 
-    self.time_dim       = int(time_dim)
-    self.smoothing_coef = float(smoothing_coef)
-    # `time_kwargs` used to stop here: the embedding was built with none of them,
-    # so its frequency ladder sat at TimeEmbedding's own Python defaults.
-    self.time_embed = TimeEmbedding(time_dim=self.time_dim, kind=time_embed,
-                                    rngs=rngs, **time_kwargs)
+  # The Fourier level coder (dime_am's FeatureProjector), shared by every NCLQL
+  # critic, selected by a style Config. The module itself lives under
+  # `self.encoder` -- nnx's static-attribute rule means the surface key
+  # `time_embed` (the kind string) cannot also hold a Module, so the two are
+  # named apart.
+  time_emb  = Config("fourier", style=TIME_STYLES)
+  smoothing_coef = HParam(1.0)
+
+  def __init__(self, env_stats, config: ConfigMixin, *args, rngs: nnx.Rngs, **kwargs):
+
+    self.resolve_hparams(config, env_stats=env_stats)
+    # The encoder module the `time_embed` kind selects -- see the class docstring
+    # for why it is not itself stored under that name.
+    self.encoder = TimeEmbedding(time_dim=self.time_dim, kind=self.time_embed,
+                                 rngs=rngs, **self.hparam("time_kwargs"))
 
     super().__init__(env_stats.derive(act_dim=env_stats["act_dim"] + self.time_dim),
-                     *args, rngs=rngs, **kwargs)
+                     config, *args, rngs=rngs, **kwargs)
 
     # The derived stats are for the *network's* input width; `action_dim` stays
     # the env's, as it means everywhere else.
     self.action_dim = env_stats["act_dim"]
 
   def target_modules(self) -> dict:
-    return {**super().target_modules(), "time_embed": self.time_embed}
+    return {**super().target_modules(), "encoder": self.encoder}
 
   def augment(self, act, level, target: bool = False):
     """`(a, level)` -> the action the inner critic was built over. `level` is
@@ -61,12 +75,12 @@ class NoiseConditionedCritic:
     if not isinstance(level, jax.Array):
       level = jnp.full((act.shape[0],), level, jnp.int32)
 
-    embed = self.time_embed_target if target and self.has_target else self.time_embed
+    embed = self.encoder_target if target and self.has_target else self.encoder
     return jnp.concatenate([act, embed(level.astype(jnp.float32)[:, None])], axis=-1)
 
   # ---- objective ----------------------------------------------------------
 
-  def noise_conditioned_loss(self, obs, action, next_obs, next_action, reward, term,
+  def loss(self, obs, action, next_obs, next_action, reward, term,
                              sigmas, key, losses: dict, shift=0.0) -> None:
     """`td_loss` at the clean level, plus a smoothing loss pulling every noisier
     level onto it -- one `losses["critic"]`, since both fit the same heads.
@@ -108,7 +122,7 @@ class NoiseConditionedCritic:
 
 
 @register_component
-class NCLQLCritic(NoiseConditionedCritic, EnsembleCritic):
+class NCLQLCritic(Polyak, NoiseConditionedCritic, EnsembleCritic):
   """The reference's critic (ku-dmlab/NCLQL): two scalar heads with a Polyak
   target, `min` over the heads for the bootstrap and `mean` for the Langevin
   score.
@@ -119,11 +133,20 @@ class NCLQLCritic(NoiseConditionedCritic, EnsembleCritic):
   chain climbs -- averages the heads by construction. The target net is the one
   genuine departure from the rest of this codebase, and it is NC-LQL's: with no
   actor, the bootstrap action is whatever annealed Langevin lands on in the
-  critic's own gradient field, so nothing else keeps it on-distribution."""
+  critic's own gradient field, so nothing else keeps it on-distribution.
+
+  The mish, unnormalized net (`net_style`) and the Fourier level coder
+  (`NoiseConditionedCritic`'s `time_emb`) are Config selections; the Polyak tau
+  is inherited geometry."""
+
+  kind = "critic"
+  net_style = Config("mish", style=MLP_STYLES)
+  rho                = HParam(1.0)
+  pessimistic_target = HParam(True)
 
 
 @register_component
-class NCLQLC51Critic(NoiseConditionedCritic, C51Critic):
+class NCLQLC51Critic(Polyak, NoiseConditionedCritic, C51Critic):
   """NC-LQL over a categorical return distribution instead of a scalar.
 
   The Langevin chain climbs E[Z] either way, so the algorithm is untouched; what
@@ -131,12 +154,21 @@ class NCLQLC51Critic(NoiseConditionedCritic, C51Critic):
   the return's own rather than the heads' disagreement. Note that the support is
   scaled by `reward_scale` for you -- see NCLQL.__init__."""
 
+  kind = "critic"
+  net_style = Config("mish", style=MLP_STYLES)
+  entropy_coef    = HParam(0.005)
+  rho             = HParam(1.0)
+  pessimistic_target = HParam(True)
+
 
 @register_component
-class NCLQLHLGaussCritic(NoiseConditionedCritic, HLGaussCritic):
+class NCLQLHLGaussCritic(Polyak, NoiseConditionedCritic, HLGaussCritic):
   """NC-LQL fitting its scalar Bellman target as a Gaussian-smoothed histogram
   (Farebrother et al., 2024) rather than by MSE -- the classification-as-
   regression half of C51's story without the distributional bootstrap."""
+
+  kind = "critic"
+  net_style = Config("mish", style=MLP_STYLES)
 
 
 @register_policy
@@ -164,26 +196,34 @@ class NCLQL(Policy):
   Index convention follows the paper -- level 0 == sigma_1 (coarsest),
   level L-1 == sigma_L (clean); annealing runs 0 -> L-1."""
 
+  SLOTS = ("critic", "sigmas")
+
+  # The annealed-Langevin sampler's knobs, each with its reference's default as
+  # the class default; a model YAML's `params:` overrides the ones that differ.
+  noise_levels    = HParam(10)
+  steps_per_level = HParam(2)
+
+  # The reference's `step_lr`: the level's step is step_size*(sigma_i/sigma_L)^2,
+  # the drift is half of that times `temperature`, and the injected noise is its
+  # square root. Tied to the ladder, so retune whenever `sigmas` moves.
+  step_size       = HParam(1.0e-4)
+  # The paper's `w`, a temperature on Q. It scales the drift whether or not the
+  # score is normalized -- normalization replaces the score's *direction*
+  # vector, not the step length.
+  temperature     = HParam(500.0)
+  normalize_score = HParam(True)
+  clip_actions    = HParam(True)
+  reward_scale    = HParam(5.0)
+  action_limit    = HParam(1.0)
+  init_scale      = HParam(1.0)
 
   def __init__(self, env: gym.Env, **kwargs):
     super().__init__(env, **kwargs)
 
     assert isinstance(env.action_space, gym.spaces.Box)
 
-    params = self.resolve_params()
-
-    self.steps_per_level = params["steps_per_level"]
-    self.noise_levels    = float(params["noise_levels"])
-    self.step_size       = float(params["step_size"])
-    self.temperature     = float(params["temperature"])
-    self.normalize_score = params["normalize_score"]
-    self.reward_scale    = float(params["reward_scale"])
-    self.clip_actions    = params["clip_actions"]
-    self.action_limit    = params["action_limit"]
-    self.init_scale      = params["init_scale"]
-
-
-    self.sigmas_sched: Schedule = self.build_component("sigmas", Schedule, steps=self.noise_levels)
+    self.sigmas_sched: Schedule = self.build_component(
+      "sigmas", Schedule, config_overrides={"steps": self.noise_levels})
 
     sigmas = self.sigmas_sched.ladder()
     self.sigmas = Buffer(sigmas)
@@ -255,8 +295,8 @@ class NCLQL(Policy):
     return a, score_norm
 
   def train_step(self, batch):
-    obs      = self.normalize_obs(batch["obs"])
-    next_obs = self.normalize_obs(batch["next_obs"])
+    obs      = self.normalize_observations(batch["obs"])
+    next_obs = self.normalize_observations(batch["next_obs"])
     action   = batch["act"]
     term     = batch["term"]
     reward   = batch["rew"] * self.reward_scale
@@ -267,7 +307,7 @@ class NCLQL(Policy):
     next_action, score_norm = self.sample(next_obs, keys[0])
     next_action = jax.lax.stop_gradient(next_action)
 
-    self.critic.noise_conditioned_loss(obs, action, next_obs, next_action, reward, term,
+    self.critic.loss(obs, action, next_obs, next_action, reward, term,
                                        self.sigmas[...], keys[1], losses)
 
     self.metrics.vec("action", next_action, limit=1.0)
@@ -276,7 +316,7 @@ class NCLQL(Policy):
     return losses
 
   def inference_step(self, observation, step_info=None, key=None):
-    obs = self.normalize_obs(observation)
+    obs = self.normalize_observations(observation)
     key = self.rngs.noise() if key is None else key
     action, _ = self.sample(obs, key)
     return action, {}

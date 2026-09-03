@@ -1,4 +1,5 @@
 NCLQL:
+  policy: NCLQL   # identity mapping today; a template shares this key across models
   training:
     batch_size: 256
     utd_ratio: 2.0
@@ -21,7 +22,7 @@ NCLQL:
     normalize_score: true
     clip_actions: true
 
-    reward_scale: 5.0
+    reward_scale: 1.0
 
     action_limit: 1.0
     init_scale: 1.0

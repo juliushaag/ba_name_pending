@@ -1,19 +1,17 @@
-"""Whole-tree config lint -- the gate that keeps `config/` the only place a
-tunable lives.
+"""Whole-tree config lint -- the gate that keeps defaults coupled to code and
+keeps the composed config an honest account of a run.
 
 model_config.validate() runs the per-model subset of these before every training
 run; this script is the whole-tree view, for CI and for editing config/ by hand.
-It fails on anything that would make a run's wandb config an incomplete account
-of what actually ran:
+It fails on anything that would make a run's wandb config incomplete:
 
-  * a registered component with a Python default or a positional tunable
-  * a `config/components/` entry naming no registered component, or missing `kind:`
-  * a size ladder whose entries declare different keys, or a component/slot
-    setting a key a ladder owns
-  * a slot of a sized kind with no `size:`
-  * an `extends:` path resolving to nothing, or a cycle
-  * a preset nothing references
-  * a run key read by the code but declared in no config/run/defaults.yaml
+  * a registered component without a `kind` (no size ladder to resolve against)
+  * a size ladder whose entries declare different keys, or a component declaring
+    a key a ladder owns
+  * a slot of a sized kind with no `size:`, or a stated `size:` that isn't a rung
+  * a model whose `policy:` names an unregistered class, or whose `components:`
+    disagree with that class's declared slots
+  * a run key read by the code but declared in no code declaration (barl_jax.run_config)
 
 Exit code is the number of problems, so it composes in a shell.
 
@@ -32,6 +30,7 @@ import barl_jax  # noqa: F401  -- populates the policy/component registries
 import barl_jax.model_config as model_config
 from barl_jax.config import INJECTED_KEYS, run_keys
 from barl_jax.networks.registry import available_components, get_component
+from barl_jax.policy import Policy
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -42,67 +41,74 @@ RUN_KEY_PATTERN = re.compile(r"""cfg\[["'](\w+)["']\]""")
 
 
 def component_problems() -> list[str]:
-  """Every registered component: no Python defaults, and an entry to resolve."""
+  """Every registered component: its class declares what makes it resolvable.
+  With config/components/*.yaml gone, the class IS the baseline -- `kind`
+  selects its size ladder (a sized component must name one), and a `size:` a
+  slot states must resolve to an actual rung."""
   problems = []
   tree = model_config.tree()
   for name in sorted(available_components()):
-    problems += [f"{name}: {p}" for p in model_config.no_default_problems(get_component(name))]
-    if name not in tree.components:
-      problems.append(f"{name} is registered but has no config/components/ entry, so every "
-                      f"kwarg it needs must be spelled out on each slot that names it")
+    cls = get_component(name)
+    if getattr(cls, "kind", None) is None:
+      problems.append(f"{name} declares no `kind` -- a slot's `size:` has no ladder to resolve against")
+  return problems
+
+
+def policy_classes_problems() -> list[str]:
+  """Every model block's `policy:` names a registered Policy class. A model
+  naming a missing class passes every YAML-only check and then fails at
+  `trainer.setup` on the compute node -- check the registry here, where the
+  error is still one message."""
+  tree = model_config.tree()
+  problems = []
+  for name in sorted(tree.available_models()):
+    policy_name, _ = tree.resolve_model_name(name)
+    class_name = tree.policy_class_name(policy_name)
+    if class_name not in Policy._classes:
+      problems.append(f"config/models/: {name}'s policy: names {class_name!r}, "
+                      f"which is not a registered Policy ({', '.join(sorted(Policy._classes))})")
   return problems
 
 
 def slot_problems() -> list[str]:
-  """Every slot of every model: a size where the kind has a ladder."""
+  """Every slot of every model: a size where the kind has a ladder, and a
+  `components:` block that disagrees with its policy class's SLOTS."""
   problems = []
   tree = model_config.tree()
   for name in sorted(tree.available_models()):
     policy_name, profile = tree.resolve_model_name(name)
-    for slot in tree.slots(policy_name):
+    slots = tree.slots(policy_name)
+
+    # The policy builds SLOTS; the model YAML declares `components:`. A slot
+    # declared but not built resolves silently into the snapshot and the wandb
+    # config with nothing behind it; a built slot not declared fails later at
+    # build_component -- both are worth saying here, where the model files sit.
+    class_name = tree.policy_class_name(policy_name)
+    policy_cls = Policy._classes.get(class_name)
+    if policy_cls is not None:
+      declared, expected = set(slots), set(policy_cls.SLOTS)
+      problems += [f"{policy_name}: YAML declares slot {s!r} that {class_name} does not "
+                   f"build (it builds {sorted(expected)})" for s in sorted(declared - expected)]
+      problems += [f"{policy_name}: {class_name} builds slot {s!r} but the YAML declares "
+                   f"none ({sorted(declared)})" for s in sorted(expected - declared)]
+
+    for slot in slots:
       try:
         cls_name = tree.slot_class(policy_name, slot)
       except KeyError as e:
         problems.append(str(e))
         continue
       kind = tree.component_kind(cls_name)
-      if tree.size_table(kind) and tree.slot_size(policy_name, slot, profile) is None:
+      table = tree.size_table(kind)
+      if not table:
+        continue
+      size = tree.slot_size(policy_name, slot, profile)
+      if size is None:
         problems.append(f"{policy_name}.{slot} [{cls_name}]: no `size:` -- every {kind} slot "
-                        f"must name one of {', '.join(sorted(tree.size_table(kind)))}")
-  return problems
-
-
-def unused_presets() -> list[str]:
-  """A preset nothing extends is either a typo at the reference site or dead
-  weight; either way it is not what the tree says it is."""
-  tree = model_config.tree()
-  referenced = set()
-
-  def walk(block):
-    for ref in (block or {}).get("extends") or []:
-      referenced.add(ref)
-      try:
-        walk(tree.preset(ref))
-      except (KeyError, ValueError):
-        pass
-
-  for entry in tree.components.values():
-    walk(entry if isinstance(entry, dict) else {})
-  for policy_name in tree.available_models():
-    for slot, slot_cfg in (tree.policy_cfg(policy_name).get("components") or {}).items():
-      walk(slot_cfg)
-      size = slot_cfg.get("size")
-      if size is not None:
-        referenced.add(f"sizes.{tree.component_kind(slot_cfg.get('class'))}.{size}")
-
-  problems = []
-  for stem, block in tree.presets.items():
-    if stem == model_config.SIZES:
-      continue   # a ladder's unused rungs are the point: they are what you switch to
-    for key in block:
-      if f"{stem}.{key}" not in referenced:
-        problems.append(f"config/presets/{stem}.yaml: {key!r} is referenced by no "
-                        f"`extends:` anywhere")
+                        f"must name one of {', '.join(sorted(table))}")
+      elif size not in table:
+        problems.append(f"{policy_name}.{slot} [{cls_name}]: `size: {size}` is not a {kind} "
+                        f"capacity ({', '.join(sorted(table))})")
   return problems
 
 
@@ -124,8 +130,8 @@ def undeclared_run_keys() -> list[str]:
 CHECKS = {
   "components":  component_problems,
   "structure":   model_config.structure_problems,
+  "policies":    policy_classes_problems,
   "slots":       slot_problems,
-  "presets":     unused_presets,
   "run_keys":    undeclared_run_keys,
 }
 
