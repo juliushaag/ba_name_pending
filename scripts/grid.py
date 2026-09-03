@@ -17,6 +17,7 @@ import itertools
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -178,8 +179,10 @@ class Run:
   def command(self, sweep_dir: str, run_dir: str = None) -> list[str]:
     """The one command that runs this. `run_dir` redirects the output somewhere
     other than beside the config -- node-local scratch, for a batch job."""
-    cmd = [sys.executable, os.path.join(SCRIPT_DIR, "online_learning.py"),
-           "--config", os.path.join(sweep_dir, self.config)]
+    uv = shutil.which("uv")
+    cmd = ([uv, "run", "python", os.path.join(SCRIPT_DIR, "online_learning.py")]
+           if uv else [sys.executable, os.path.join(SCRIPT_DIR, "online_learning.py")])
+    cmd += ["--config", os.path.join(sweep_dir, self.config)]
     if run_dir is not None:
       cmd += ["--run-dir", run_dir]
     return cmd

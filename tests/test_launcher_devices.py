@@ -17,6 +17,7 @@ SCRIPTS = pathlib.Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import executors  # noqa: E402
+import grid  # noqa: E402
 import submit  # noqa: E402
 
 
@@ -64,3 +65,9 @@ def test_run_refuses_to_start_without_an_accelerator(monkeypatch):
 
     monkeypatch.setenv("BARL_ALLOW_CPU", "1")
     online_learning.require_accelerator()
+
+
+def test_local_run_command_prefers_uv(monkeypatch):
+    monkeypatch.setattr(grid.shutil, "which", lambda name: "/tmp/uv" if name == "uv" else None)
+    run = grid.Run(index=0, tag="t", combo={}, dir="t", config="t/config.yaml")
+    assert run.command("/tmp/sweep")[:4] == ["/tmp/uv", "run", "python", str(SCRIPTS / "online_learning.py")]
