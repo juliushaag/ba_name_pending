@@ -12,7 +12,7 @@ import sys
 import pytest
 import yaml
 
-from barl_jax.configs import Config, ConfigMixin, _check_type, _format_type, deep_merge
+from barl_jax.config.toolkit import Config, ConfigMixin, _check_type, _format_type, deep_merge
 
 SCRIPTS = pathlib.Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS))

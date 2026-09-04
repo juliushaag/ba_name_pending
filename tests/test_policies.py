@@ -17,10 +17,10 @@ import numpy as np
 import pytest
 from flax import nnx
 
-from barl_jax.config_tree import ConfigTree
+from barl_jax.config.tree import ConfigTree
 from barl_jax.metrics import PRIMARY
 from barl_jax.policy import TRAINABLE, Policy
-from barl_jax.train import train_step
+from barl_jax.trainer import train_step
 
 from conftest import ACT_DIM, BATCH, OBS_DIM, make_env_stats
 
@@ -121,13 +121,12 @@ def test_rl_policy_gate_excludes_noise_conditioned_critics():
 def test_resolved_style_surface_is_the_surface_that_gets_built():
   policy = make("SDAC")
   resolved = ConfigTree().resolve_slot("SDAC", "actor", None)[1]
-  assert resolved["activation"].lower() == "mish"
   assert policy.actor.activation.lower() == resolved["activation"].lower()
-  assert policy.actor.field.net.act is jax.nn.mish
+  assert policy.actor.field.net.act is getattr(jax.nn, resolved["activation"].lower())
 
 
 def test_unknown_component_override_is_rejected_at_construction():
-  import barl_jax.model_config as model_config
+  import barl_jax.config.tree as model_config
 
   previous = model_config.get_overrides()
   try:
@@ -140,7 +139,7 @@ def test_unknown_component_override_is_rejected_at_construction():
 
 def test_duplicate_optimizer_keys_are_rejected(monkeypatch):
   import optax
-  from barl_jax.networks.actors.stochastic import StochasticActor
+  from barl_jax.actors.sac import StochasticActor
   from barl_jax.networks.critic import C51Critic
 
   duplicate = lambda self: {"shared": optax.identity()}

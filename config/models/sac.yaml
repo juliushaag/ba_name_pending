@@ -11,6 +11,6 @@ SAC:
     entropy_in_target: true
 
   components:
-    actor:   {class: StochasticActor,    size: medium}
-    critic:  {class: C51Critic,          size: xlarge}
+    actor:   {class: StochasticActor,    tier: medium}
+    critic:  {class: C51Critic,          tier: xlarge}
     entropy: {class: AutotuneRegulator}

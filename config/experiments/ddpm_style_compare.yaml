@@ -1,5 +1,5 @@
 # A run of the same DDPMActor (SDAC) on two MLP styles, switched by the
-# config-driven `net_style` selector -- a configuration value on the class,
+# config-driven `mlp_preset` selector -- a configuration value on the class,
 # not an inheritance choice. Structural Configs are varied with a grid/slot
 # override (`model.components.<slot>.<key>` sits above the class's Config
 # defaults), never with an HPO axis.
@@ -10,4 +10,4 @@
 axes:
   algo: [SDAC]
   env:  [HalfCheetah]
-  model.components.actor.net_style: [gelu, silu]
+  model.components.actor.mlp_preset: [gelu, silu]

@@ -41,6 +41,7 @@ class ActionChunkExecutor:
     self._slot_wasted = np.zeros(n_envs, np.int32)
     self.refills = 0
     self.wasted = 0
+    self._last_refilled = np.zeros(n_envs, bool)
 
   def restore(self, snapshot: dict | None) -> None:
     if not snapshot:
@@ -53,6 +54,7 @@ class ActionChunkExecutor:
     self._slot_wasted = np.array(snapshot.get("slot_wasted", self._slot_wasted), copy=True)
     self.refills = int(snapshot.get("refills", 0))
     self.wasted = int(snapshot.get("wasted", 0))
+    self._last_refilled = np.zeros(self.n_envs, bool)
 
   def snapshot(self) -> dict:
     return dict(
@@ -69,6 +71,7 @@ class ActionChunkExecutor:
   def current(self, obs, key, *, to_device, live=None) -> tuple[np.ndarray, dict]:
     live = np.ones(self.n_envs, bool) if live is None else np.asarray(live, dtype=bool)
     slots = np.flatnonzero(live & ~self._active)
+    self._last_refilled = np.zeros(self.n_envs, bool)
     if len(slots):
       chunk, extras = self._infer(to_device(obs[slots]), key)
       chunk = normalize_action_chunk(chunk, chunk_size=self.chunk_size,
@@ -76,10 +79,13 @@ class ActionChunkExecutor:
       self._chunks[slots] = chunk
       self._cursor[slots] = 0
       self._active[slots] = True
+      self._last_refilled[slots] = True
       self.refills += len(slots)
       self._slot_refills[slots] += 1
 
       extras = {k: np.asarray(v) for k, v in extras.items()}
+      for name in set(self._extras) - set(extras):
+        self._extras[name][slots] = 0
       for name, value in extras.items():
         if value.shape[0] != len(slots):
           raise ValueError(
@@ -92,11 +98,21 @@ class ActionChunkExecutor:
     action = np.where(live[:, None], action, 0.0)
     extras = {k: np.where(live.reshape(self.n_envs, *([1] * (v.ndim - 1))), v, 0)
               for k, v in self._extras.items()}
+    self._last_plan = self._chunks.copy()
     return action, extras
+
+  def plan(self) -> np.ndarray:
+    """The full plan each slot is currently executing, `(n_envs, chunk, dim)`.
+    Read after `current()` and before `advance()` it is the plan the returned
+    primitive came from -- what the buffer stores so the critic prices whole
+    plans rather than single steps."""
+    return np.array(self._last_plan if hasattr(self, "_last_plan") else self._chunks,
+                    copy=True)
 
   def advance(self, done) -> None:
     done = np.asarray(done, dtype=bool)
     live = ~done
+    finished = done | (live & self._active & (self._cursor == self.chunk_size - 1))
     tail = np.where(done & self._active, self.chunk_size - self._cursor - 1, 0)
     self.wasted += int(tail.sum())
     self._slot_wasted += tail
@@ -105,6 +121,10 @@ class ActionChunkExecutor:
     exhausted = live & (self._cursor >= self.chunk_size)
     self._active[done | exhausted] = False
     self._cursor[done | exhausted] = 0
+    return finished
+
+  def last_refilled(self) -> np.ndarray:
+    return np.array(self._last_refilled, copy=True)
 
   def slot_refills(self) -> np.ndarray:
     return np.array(self._slot_refills, copy=True)

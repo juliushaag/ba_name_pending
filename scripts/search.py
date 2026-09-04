@@ -7,7 +7,7 @@ An HPO trial is structurally the same thing as one grid combo -- the grid's
 materialization, snapshot freezing, the config check, the executor handoff and
 the run path are grid.py / submit.py / executors.py / online_learning.py's,
 untouched. That is where the search belongs rather than next to the trainer: a
-sampled trial has to pass the same `model_config.validate()` and snapshot gates
+sampled trial has to pass the same `config_tree.validate()` and snapshot gates
 a hand-written grid point does, or it was never a real configuration.
 
 An axis spec, one entry per axis in `axes:`:
@@ -17,7 +17,7 @@ An axis spec, one entry per axis in `axes:`:
     seed:  {type: categorical, values: [0, 1, 2]}         # optional base seed
     run.batch_size: {type: int, low: 64, high: 1024, log: true}
     run.utd_ratio:  {type: float, low: 0.5, high: 4.0}
-    model.components.critic.size: {type: categorical, values: [small, medium, large]}
+    model.components.critic.tier: {type: categorical, values: [low, medium, large]}
 
 A `run.*` value lands in the run entry and a `model.*` value in
 `model_overrides:`, exactly where grid.py puts them -- so a sampled point is
@@ -37,13 +37,13 @@ from pathlib import Path
 
 import yaml
 
-# configs.py loaded by path, the same way config_tree.py loads it: an absolute
-# `barl_jax.configs` import would trigger barl_jax/__init__ (jax, mujoco) in the
+# config/toolkit.py loaded by path, the same way config/tree.py loads it: an absolute
+# `barl_jax.config...` import would trigger barl_jax/__init__ (jax, mujoco) in the
 # launcher, which is exactly what the by-path loading exists to avoid. scripts/
 # runs on a login node that must not pay for -- or inherit device vars from --
 # the full package.
-_CONFIGS_PATH = Path(__file__).resolve().parent.parent / "src" / "barl_jax" / "configs.py"
-_spec = importlib.util.spec_from_file_location("barl_jax_search_configs", _CONFIGS_PATH)
+_CONFIGS_PATH = Path(__file__).resolve().parent.parent / "src" / "barl_jax" / "config" / "toolkit.py"
+_spec = importlib.util.spec_from_file_location("barl_jax_search_config_toolkit", _CONFIGS_PATH)
 _configs = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_configs)
 CONFIG_DIR = _configs.CONFIG_DIR
@@ -153,7 +153,7 @@ def check_searchability(spec: dict, *, tree=None) -> list[str]:
   not every value that happens to be configurable. Runs after a
   barl_jax import (hpo.py), since resolving a key needs the class registries."""
   import barl_jax  # noqa: F401 -- registries
-  from barl_jax.config_tree import ConfigTree
+  from barl_jax.config.tree import ConfigTree
   from barl_jax.networks.registry import get_component
   from barl_jax.policy import Policy
 
@@ -184,8 +184,8 @@ def check_searchability(spec: dict, *, tree=None) -> list[str]:
         if len(parts) == 2:
           continue
         slot, key = parts[1], parts[2]
-        if key == "size":
-          problems.append(f"{axis}: a slot's size is structural capacity, not a searchable HParam")
+        if key == "tier":
+          problems.append(f"{axis}: a slot's tier is structural capacity, not a searchable HParam")
           continue
         if slot not in cls.SLOTS:
           continue
@@ -197,7 +197,7 @@ def check_searchability(spec: dict, *, tree=None) -> list[str]:
                           f"not a searchable HParam")
         elif key not in getattr(comp, "_hparams", {}):
           # A style-surface key (activation, dtype, ...) is owned by the
-          # component's net_style/time_emb selector -- structural, not searchable.
+          # component's mlp_preset/time_emb selector -- structural, not searchable.
           owner = next((f"{n!s}" for n, d in getattr(comp, "_configs", {}).items()
                         if d.style is not None and key in d.style.get(d.default, {})),
                        None)

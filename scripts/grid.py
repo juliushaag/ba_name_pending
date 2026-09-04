@@ -31,19 +31,25 @@ REPO_ROOT  = os.path.dirname(SCRIPT_DIR)
 CONFIG_DIR = os.path.join(REPO_ROOT, "config")
 DEFAULT_BASE_CONFIG = os.path.join(CONFIG_DIR, "experiments", "online_learning.yaml")
 
-# config_tree.py / class resolution now needs the component (and policy) class
-# registry to serve class-declared HParam defaults -- which only exists once
-# barl_jax is imported. The old by-path, jax-free loading is gone with the
-# YAML defaults: a config is no longer resolvable without the code it
-# parameterizes. The launcher pays for jax on the CPU (JAX_PLATFORMS=cpu set
-# here), but never a GPU: the config check's child process pins its own
-# platforms and the executors' DEVICE_VARS stripping is unchanged.
+# Config modules are loaded by path so the launcher stays free of barl_jax's
+# heavyweight package import (jax, mujoco) until it actually needs the
+# registries to freeze a snapshot for a concrete run.
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("MUJOCO_GL", "egl")
 
-import barl_jax  # noqa: F401  -- imports every policy/component; populates registries
-from barl_jax.config_tree import ConfigTree  # noqa: E402
-from barl_jax.configs import CONFIG_DIR, resolve_includes  # noqa: E402
+_TOOLKIT_PATH = Path(REPO_ROOT) / "src" / "barl_jax" / "config" / "toolkit.py"
+_toolkit_spec = importlib.util.spec_from_file_location("barl_jax_grid_config_toolkit", _TOOLKIT_PATH)
+_toolkit = importlib.util.module_from_spec(_toolkit_spec)
+_toolkit_spec.loader.exec_module(_toolkit)
+
+_TREE_PATH = Path(REPO_ROOT) / "src" / "barl_jax" / "config" / "tree.py"
+_tree_spec = importlib.util.spec_from_file_location("barl_jax_grid_config_tree", _TREE_PATH)
+_tree = importlib.util.module_from_spec(_tree_spec)
+_tree_spec.loader.exec_module(_tree)
+
+CONFIG_DIR = _toolkit.CONFIG_DIR
+resolve_includes = _toolkit.resolve_includes
+ConfigTree = _tree.ConfigTree
 
 RESERVED_AXES = ("algo", "env", "seed")
 
@@ -145,7 +151,7 @@ def build_combos(axes: dict, exclude: list[dict]) -> list[dict]:
 
 def name_combos(combos: list[dict], axes: dict, num_seeds: int) -> list[str]:
   """One filesystem-safe tag per combo: algo_env, plus the seed count when there
-  is more than one, the base seed when that axis varies, and key=value for every
+  is declared, the base seed when that axis varies, and key=value for every
   *varying* non-reserved axis (a fixed --set value is the same in every run, so
   it only clutters the name -- it is recorded in the per-run YAML)."""
   varying = [k for k, v in axes.items() if k not in RESERVED_AXES and len(v) > 1]
@@ -160,8 +166,7 @@ def name_combos(combos: list[dict], axes: dict, num_seeds: int) -> list[str]:
     parts = [str(combo["algo"]), str(combo["env"])]
     if len(axes["seed"]) > 1:
       parts.append(f"base{combo['seed']}")
-    if num_seeds > 1:
-      parts.append(f"{num_seeds}seeds")
+    parts.append(f"{num_seeds}seeds")
     parts += [f"{short[k]}={combo[k]}" for k in varying]
     tags.append(re.sub(r"[^A-Za-z0-9.=_-]", "-", "_".join(parts)))
   return tags
@@ -206,6 +211,7 @@ def materialize(combos: list[dict], tags: list[str], *, defaults: dict, sweep_di
   carries a fully resolved `snapshot:` taken *under that run's own overrides*, so
   it replays exactly regardless of what config/ says later."""
   runs = []
+  import barl_jax  # noqa: F401 -- registries needed for snapshot_for()
   for index, (combo, tag) in enumerate(zip(combos, tags)):
     # `seed` is the base the run's `num_seeds` vmapped seeds count up from
     # (barl_jax.trainer.Run: base_seed + i), not one seed per process.
@@ -252,8 +258,8 @@ def write_sweep_yaml(sweep_dir: str, head: dict, runs: list[Run]) -> str:
 
 def describe(combos: list[dict], axes: dict, num_seeds: int) -> str:
   axis_desc = " x ".join(f"{len(v)} {k}" for k, v in axes.items() if len(v) > 1) or "1 point"
-  seed_desc = f", {num_seeds} seeds vmapped each" if num_seeds > 1 else ""
-  return f"{len(combos)} run(s) ({axis_desc}){seed_desc}"
+  return (f"{len(combos)} run(s) ({axis_desc}), "
+          f"{num_seeds} seed{'s' if num_seeds != 1 else ''} vmapped each")
 
 
 def sweep_command() -> str:

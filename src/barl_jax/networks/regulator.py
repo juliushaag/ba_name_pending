@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from barl_jax.configs import ConfigMixin
+from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.hparam import Config
 from barl_jax.networks.optim import adam, DualOptim
 from barl_jax.networks.registry import register_component
@@ -21,14 +21,16 @@ class AutotuneRegulator(DualOptim, Component, nnx.Module):
   the opposite of what this docstring claimed before.
 
   `target` is always the owning Policy's own computed value (SAC/AMDP/DIME/SDAC
-  all pass `target=self.action_dim * self.entropy_scale`), never a config/
-  tunable -- so it stays a real keyword argument and is not an HParam.
+  all pass `target=self.chunk_size * self.action_dim * self.entropy_scale` --
+  entropy is joint over the whole chunked plan, so the target scales with it
+  too), never a config/tunable -- so it stays a real keyword argument and is
+  not an HParam.
 
   The optimizer knobs come from the `DualOptim` mixin (a higher LR, unclipped)."""
 
   alpha_init   = Config(1.0)
 
-  # A dual has no size ladder -- `kind` exists so the resolver can tell a sized
+  # A dual has no tier ladder -- `kind` exists so the resolver can tell a sized
   # component from a non-sized one.
   kind = "dual"
 

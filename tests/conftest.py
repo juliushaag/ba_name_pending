@@ -1,7 +1,7 @@
 """Shared scaffolding for the component suite.
 
 Every registered component is built from its real `config/components/` entry
--- presets expanded and at the smallest size, exactly as a run's first layers
+-- presets expanded and at the smallest tier, exactly as a run's first layers
 resolve it -- narrowed by `TINY` -- so a required kwarg that gets renamed or dropped
 from that file fails here, while the whole suite still runs in seconds. `TINY`
 only replaces keys the entry already has, so it never injects a kwarg a class
@@ -37,9 +37,9 @@ import pytest
 from flax import nnx
 
 import barl_jax  # noqa: F401  -- import side effects populate the registry
-import barl_jax.model_config as model_config
-from barl_jax.configs import ConfigMixin
-from barl_jax.env_stats import EnvStats
+import barl_jax.config.tree as model_config
+from barl_jax.config.toolkit import ConfigMixin
+from barl_jax.env import EnvStats
 from barl_jax.networks.registry import available_components, get_component
 from barl_jax.networks.schedule import Schedule
 from barl_jax.networks.squash import Squash

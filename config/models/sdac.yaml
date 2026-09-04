@@ -9,15 +9,11 @@ SDAC:
     policy_delay: 1
     normalize_obs: true
     # SDAC's Bellman target carries no entropy bonus in the reference: the
-    # dual trains purely off the actor's `extra_losses` (the exploration-noise
-    # objective), not off anything added to the critic's target.
+    # dual trains purely off the actor's DSM loss (the exploration noise is
+    # its own term beside it), not off anything added to the critic's target.
     entropy_in_target: false
 
   components:
-    # SDAC's own reference (mahaitongdae/diffusion_policy_online_rl) sizes the
-    # actor 256x3 with Mish; the critic is deliberately left at the same `medium`
-    # every other policy here resolves, so an {algo x env} sweep is an algorithm
-    # comparison rather than an algorithm-and-critic one.
-    actor:   {class: DDPMActor, size: medium, num_steps: 20, activation: Mish}
-    critic:  {class: C51Critic,        size: xlarge}
+    actor:   {class: DDPMActor, tier: medium, num_steps: 20 }
+    critic:  {class: C51Critic, tier: xlarge}
     entropy: {class: AutotuneRegulator}

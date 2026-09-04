@@ -6,17 +6,17 @@ from barl_jax.hparam import Config
 from barl_jax.networks.norm import make_norm
 
 # ---------------------------------------------------------------------------
-# MLP_STYLES -- the named MLP surfaces a component *selects* from. A component
-# declares `net_style = Config("gelu", style=MLP_STYLES)` and gets the whole
+# MLP_PRESETS -- the named MLP surfaces a component *selects* from. A component
+# declares `mlp_preset = Config("gelu", style=MLP_PRESETS)` and gets the whole
 # surface (activation/norm/dtype/...) below its own declarations; switching the
-# style is a `--set model.components.<slot>.net_style=silu`, not inheritance.
+# style is a `--set model.components.<slot>.mlp_preset=silu`, not inheritance.
 # ---------------------------------------------------------------------------
 
 _NET_PLAIN = dict(activation="silu", norm="none", norm_stem=False, norm_input=False,
                   norm_after_act=True, dropout=0.0, final_activation=False,
                   residual=False, norm_kwargs={}, dtype="bfloat16")
 
-MLP_STYLES = {
+MLP_PRESETS = {
   "plain":    _NET_PLAIN,
   "silu":     _NET_PLAIN,
   "gelu":     {**_NET_PLAIN, "activation": "gelu"},
@@ -68,7 +68,7 @@ def Linear(in_features: int, out_features: int, *, rngs: nnx.Rngs,
 
 # The full MLP surface, restated as named parameters by every component that
 # builds one (see e.g. StochasticActor). Named rather than passed through a
-# **kwargs catch-all on purpose: model_config.validate() reports a kwarg no
+# **kwargs catch-all on purpose: config_tree.validate() reports a kwarg no
 # __init__ in the MRO accepts, and a catch-all would swallow every typo in a
 # `components:` block silently. Keep this list and those signatures in step.
 MLP_KWARGS = ("activation", "norm", "norm_input", "norm_stem", "norm_after_act", "dropout",

@@ -1,6 +1,6 @@
 """The config tree's guarantees, as tests rather than as convention.
 
-Three things this suite exists to hold: a size means one thing everywhere, no
+Three things this suite exists to hold: a tier means one thing everywhere, no
 tunable can hide in Python, and a saved run or checkpoint replays exactly no
 matter what `config/` says afterwards.
 """
@@ -11,9 +11,10 @@ import shutil
 import pytest
 from flax import nnx
 
-import barl_jax.model_config as model_config
+import barl_jax.config.tree as model_config
 from barl_jax.config import INJECTED_KEYS, load_config, run_keys
-from barl_jax.config_tree import CONFIG_DIR, TRAINING_KEYS, ConfigTree
+from barl_jax.config.toolkit import CONFIG_DIR
+from barl_jax.config.tree import TRAINING_KEYS, ConfigTree
 from barl_jax.networks.registry import available_components, get_component
 
 MODELS = sorted(ConfigTree().available_models())
@@ -43,61 +44,61 @@ def test_every_model_validates(name):
     assert not model_config.validate(name)
 
 
-# --- sizes ----------------------------------------------------------------
+# --- tiers ----------------------------------------------------------------
 
 def _ladder_kinds(tree) -> list[str]:
     from barl_jax.hparam import BUNDLES
-    return sorted({name.split(".")[1] for name in BUNDLES if name.startswith("sizes.")})
+    return sorted({name.split(".")[1] for name in BUNDLES if name.startswith("tiers.")})
 
 
-def test_a_size_means_the_same_keys_across_a_kind(tree):
-    """A ladder whose rungs set different keys would make a size comparison
+def test_a_tier_means_the_same_keys_across_a_kind(tree):
+    """A ladder whose rungs set different keys would make a tier comparison
     silently vary *which* knobs move, not just their values."""
     for kind in _ladder_kinds(tree):
-        table = tree.size_table(kind)
+        table = tree.tier_table(kind)
         shapes = {name: frozenset(entry) for name, entry in table.items()}
         assert len(set(shapes.values())) == 1, f"{kind}: {shapes}"
 
 
-def test_size_keys_are_owned_by_the_ladder_alone(tree):
-    """Nothing but the ladder may set a size key -- otherwise a component's own
-    default would shadow the size a slot asked for."""
+def test_tier_keys_are_owned_by_the_ladder_alone(tree):
+    """Nothing but the ladder may set a tier key -- otherwise a component's own
+    default would shadow the tier a slot asked for."""
     for name in sorted(available_components()):
         cls = get_component(name)
-        owned = set(tree.size_keys(tree.component_kind(name)))
+        owned = set(tree.tier_keys(tree.component_kind(name)))
         declared = set(getattr(cls, "_hparams", {}))
         assert not (owned & declared), f"{name} declares ladder-owned {sorted(owned & declared)}"
 
 
 @pytest.mark.parametrize("kind", ["critic", "actor"])
 def test_the_ladder_is_monotone_in_width(tree, kind):
-    """small < medium < large < xlarge, at one depth -- the property that makes
+    """low < medium < large < xlarge, at one depth -- the property that makes
     the ladder a capacity axis rather than an assortment of nets."""
-    table = tree.size_table(kind)
-    widths = [table[n]["latent_dim"] for n in ("small", "medium", "large", "xlarge")]
+    table = tree.tier_table(kind)
+    widths = [table[n]["latent_dim"] for n in ("low", "medium", "large", "xlarge")]
     assert widths == sorted(widths) and len(set(widths)) == len(widths)
-    assert len({table[n]["layers"] for n in table}) == 1, "a size ladder varies width, not depth"
+    assert len({table[n]["layers"] for n in table}) == 1, "a tier ladder varies width, not depth"
 
 
-def test_a_size_override_moves_exactly_the_ladder_keys(tree):
-    """What `--set model.components.critic.size=large` has to do, and no more."""
+def test_a_tier_override_moves_exactly_the_ladder_keys(tree):
+    """What `--set model.components.critic.tier=large` has to do, and no more."""
     from barl_jax import hparam
     base  = tree.resolved("SAC")
-    large = ConfigTree(overrides={"components.critic.size": "large"}).resolved("SAC")
+    large = ConfigTree(overrides={"components.critic.tier": "large"}).resolved("SAC")
 
     moved = {k for k in base if base[k] != large.get(k)}
-    expected = {f"components.critic.{k}" for k in tree.size_keys("critic")
-                if base[f"components.critic.{k}"] != hparam.ladder("critic", "large")[k]}
-    assert moved == expected | {"components.critic.size"}
-    assert large["components.critic.latent_dim"] == hparam.ladder("critic", "large")["latent_dim"]
+    expected = {f"components.critic.{k}" for k in tree.tier_keys("critic")
+                if base[f"components.critic.{k}"] != hparam.tier("critic", "large")[k]}
+    assert moved == expected | {"components.critic.tier"}
+    assert large["components.critic.latent_dim"] == hparam.tier("critic", "large")["latent_dim"]
 
 
 def test_large_is_the_same_net_whichever_critic_class(tree):
-    """The reason sizes are shared tables rather than per-class blocks."""
+    """The reason tiers are shared tables rather than per-class blocks."""
     sized = {}
     for cls_name in ("C51Critic", "HLGaussCritic", "EnsembleCritic"):
-        kwargs = tree.component_kwargs(cls_name, size="large")
-        sized[cls_name] = {k: kwargs[k] for k in tree.size_keys("critic")}
+        kwargs = tree.component_kwargs(cls_name, tier="large")
+        sized[cls_name] = {k: kwargs[k] for k in tree.tier_keys("critic")}
     assert len({tuple(sorted(v.items())) for v in sized.values()}) == 1, sized
 
 
@@ -135,21 +136,21 @@ def test_resolved_covers_every_declared_hparam(tree):
             comp = get_component(res[f"components.{slot}.class"])
             keys = {k[len(f"components.{slot}."):] for k in res
                     if k.startswith(f"components.{slot}.")
-                    and k not in (f"components.{slot}.class", f"components.{slot}.size")}
+                    and k not in (f"components.{slot}.class", f"components.{slot}.tier")}
             assert set(comp._hparams) | set(comp._configs) <= keys, \
                 f"{model}.{slot}: declared hparams missing from resolved()"
 
 
 def test_a_resolved_run_has_every_run_key():
     """The run side of the same guarantee: a resolved run dict carries a value
-    for every key in RUN_HPARAMS, so trainer's `cfg[...]` indexing and the
+    for every declared run key, so trainer's `cfg[...]` indexing and the
     wandb `run/*` block are complete by construction."""
     from barl_jax.config import load_config
-    from barl_jax.run_config import RUN_HPARAMS
+    from barl_jax.config import RUN_CONFIGS
     runs = load_config(str(CONFIG_DIR / "experiments" / "online_learning.yaml"))
     assert runs
     for run in runs:
-        assert set(RUN_HPARAMS) <= set(run), \
+        assert set(RUN_CONFIGS) <= set(run), \
             f"resolved run for {run['model']} on {run['env']} missing run keys"
 
 
@@ -158,15 +159,15 @@ def test_a_resolved_run_has_every_run_key():
 def test_a_snapshot_replays_through_an_edit_to_the_tree():
     """The guarantee that lets a finished sweep run be re-run months later: the
     snapshot serves resolved values, so editing the tree underneath it cannot
-    move them. Sizes now live in the code ladder (barl_jax.hparam), so "editing
+    move them. Tiers now live in the code ladder (barl_jax.hparam), so "editing
     the tree" means monkeypatching the registered ladder."""
     import barl_jax.hparam as hparam
 
     snapshot = ConfigTree().snapshot_for("SAC")
     original = ConfigTree(snapshot=snapshot).resolved("SAC")
 
-    rung = ConfigTree().policy_cfg("SAC")["components"]["critic"]["size"]
-    key = f"sizes.critic.{rung}"
+    rung = ConfigTree().policy_cfg("SAC")["components"]["critic"]["tier"]
+    key = f"tiers.critic.{rung}"
     saved = hparam.BUNDLES[key]
     try:
         hparam.BUNDLES[key] = {**saved, "latent_dim": 99, "layers": 7, "n_models": 5}
@@ -190,7 +191,7 @@ def test_a_stale_snapshot_overlays_missing_keys_instead_of_raising(tmp_path):
     dropped_param = next(k for k in resolved if k.startswith("params."))
     dropped_slot_kwarg = next(k for k in resolved
                               if k.startswith("components.actor.")
-                              and k not in ("components.actor.class", "components.actor.size"))
+                              and k not in ("components.actor.class", "components.actor.tier"))
     stale = dict(snapshot, resolved={k: v for k, v in resolved.items()
                                      if k not in (dropped_param, dropped_slot_kwarg)})
 
@@ -212,7 +213,7 @@ def test_a_stale_snapshot_overlays_missing_keys_instead_of_raising(tmp_path):
     # with the live tree, and confirm the replayed value is the recorded one.
     kept_slot_kwarg = next(k for k in resolved
                            if k.startswith("components.actor.")
-                           and k not in ("components.actor.class", "components.actor.size",
+                           and k not in ("components.actor.class", "components.actor.tier",
                                          dropped_slot_kwarg))
     kept_name = kept_slot_kwarg.split(".", 2)[2]
     mutated_value = "unmistakably-not-a-live-value"
@@ -240,7 +241,7 @@ def test_a_snapshot_resolves_what_the_live_tree_resolves(name):
 
 def test_a_profile_reached_through_an_alias_overrides_every_block(tmp_path):
     """The named-variant layer: an alias resolves to a (policy, profile) pair and
-    the profile may move a slot's `size:`, its kwargs, the policy's `params:` and
+    the profile may move a slot's `tier:`, its kwargs, the policy's `params:` and
     its `training:` -- while a run override still beats all of it. Exercised here
     because the tree ships no profiles of its own."""
     root = tmp_path / "config"
@@ -251,8 +252,8 @@ def test_a_profile_reached_through_an_alias_overrides_every_block(tmp_path):
     big:
       training: {batch_size: 1024}
       params:   {entropy_scale: -2.0}
-      critic:   {size: xlarge}
-      actor:    {size: large, lr: 1.0e-4}
+      critic:   {tier: xlarge}
+      actor:    {tier: large, lr: 1.0e-4}
 """)
     (root / "models" / "aliases.yaml").write_text(
         "aliases:\n  sac_big: {policy: SAC, profile: big}\n")
@@ -261,14 +262,14 @@ def test_a_profile_reached_through_an_alias_overrides_every_block(tmp_path):
     from barl_jax import hparam
     assert "sac_big" in tree.available_models()
     big = tree.resolved("sac_big")
-    assert big["components.critic.latent_dim"] == hparam.ladder("critic", "xlarge")["latent_dim"]
-    assert big["components.actor.size"] == "large"
-    assert big["components.actor.lr"] == 1.0e-4      # a profile kwarg beats the size preset
+    assert big["components.critic.latent_dim"] == hparam.tier("critic", "xlarge")["latent_dim"]
+    assert big["components.actor.tier"] == "large"
+    assert big["components.actor.lr"] == 1.0e-4      # a profile kwarg beats the tier preset
     assert big["params.entropy_scale"] == -2.0
     assert big["training.batch_size"] == 1024
 
-    overridden = ConfigTree(root, overrides={"components.critic.size": "small"}).resolved("sac_big")
-    assert overridden["components.critic.latent_dim"] == hparam.ladder("critic", "small")["latent_dim"]
+    overridden = ConfigTree(root, overrides={"components.critic.tier": "low"}).resolved("sac_big")
+    assert overridden["components.critic.latent_dim"] == hparam.tier("critic", "low")["latent_dim"]
 
     snapshot = tree.snapshot_for("sac_big")
     assert ConfigTree(root, snapshot=snapshot).resolved("sac_big") == big

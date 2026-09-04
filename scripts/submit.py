@@ -4,7 +4,7 @@
 
     uv run python scripts/submit.py --algos SAC DIME --envs HalfCheetah --seeds 5
     uv run python scripts/submit.py --algos SAC --envs HalfCheetah \
-        --set model.components.critic.size=large
+        --set model.components.critic.tier=large
     uv run python scripts/submit.py --grid config/experiments/sweep_grid.yaml --dry-run
     uv run python scripts/submit.py --algos SAC --envs HalfCheetah --executor local --validate
 
@@ -41,12 +41,12 @@ from executors import EXECUTORS, SWEEP_NAME_FORMAT, SWEEPS_DIR, resolve
 #: is on stdin; what it found comes back through the file named by argv[1],
 #: which import chatter on stdout cannot corrupt.
 CHECK_PROGRAM = """
-import json, sys
+import importlib, json, sys
 
 algos, envs = json.load(sys.stdin)
 
 import barl_jax  # noqa: F401  -- the import is what populates the registries
-from barl_jax import model_config
+model_config = importlib.import_module("barl_jax.config.tree")
 from barl_jax.env import Environment
 
 known_envs = set(Environment.available())
@@ -68,7 +68,7 @@ def check_config(algos: list[str], envs: list[str]) -> list[str]:
     """Everything an array of 40 tasks would otherwise discover 40 times, at the
     point where it is still one error message: unregistered env or algo names,
     and anything `model_config.validate()` rejects (an override that lands on no
-    slot, a kwarg no component accepts, a slot missing its `size:`).
+    slot, a kwarg no component accepts, a slot missing its `tier:`).
 
     Resolution only: no env is built, no weights are allocated, nothing touches
     a device."""
@@ -102,7 +102,7 @@ def parse_args():
         description=__doc__.split("\n\n")[0],
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Axes: algo/env/seed, plus model.<dotted path> (a model override, e.g. "
-               "model.components.critic.size) and run.<key> (a run-config key, e.g. "
+               "model.components.critic.tier) and run.<key> (a run-config key, e.g. "
                "run.utd_ratio). Seeds are not an axis -- --seeds N vmaps N of them inside "
                "each run, so `--algos SAC DIME --seeds 5` is 2 runs of 5 seeds, not 10 runs.")
 
@@ -114,7 +114,7 @@ def parse_args():
                            "declares one.")
     what.add_argument("--set", action="append", metavar="AXIS=VALUE", dest="sets",
                       help="Pin one axis to a single value across the sweep, e.g. "
-                           "--set model.components.critic.size=large --set run.batch_size=512. "
+                           "--set model.components.critic.tier=large --set run.batch_size=512. "
                            "Repeatable.")
     what.add_argument("--grid", default=None,
                       help="YAML sweep spec: {base: <experiment config>, axes: {name: [values]}, "

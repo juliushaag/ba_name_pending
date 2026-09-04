@@ -29,15 +29,15 @@ axes:
 
   # The capacity axis: one word per run, and `large` means the same net for
   # every critic class, so this stays a capacity comparison rather than an
-  # incidental-architecture one. See config/presets/sizes.yaml.
-  model.components.critic.size: [small, medium, large]
+  # incidental-architecture one.
+  model.components.critic.tier: [low, medium, large]
 
-  # model.components.actor.size: [small, medium, large]
+  # model.components.actor.tier: [low, medium, large]
   # model.components.critic.class: [C51Critic, HLGaussCritic, EnsembleCritic]
   # model.params.entropy_scale: [-1.0, -2.0]
   # run.utd_ratio: [0.5, 1.0]
 
 exclude: []
-  # Prune combinations out of the full product, e.g. a size that is only
+  # Prune combinations out of the full product, e.g. a tier that is only
   # interesting for one algorithm:
-  # - {algo: SAC, model.components.critic.size: small}
+  # - {algo: SAC, model.components.critic.tier: low}

@@ -1,8 +1,8 @@
 """The `Actor` contract, plus the algebraic identities the diffusion actors'
 callers depend on.
 
-Score-based actors deliberately return a raw, unsquashed terminal state -- the
-owning Policy squashes it -- so nothing here asserts a bounded action.
+Actors emit action plans `(B, chunk, dim)`, scored flat; the owning Policy
+squashes nothing further. `sample` returns the plan, not a primitive.
 """
 
 import jax
@@ -11,7 +11,7 @@ import pytest
 from flax import nnx
 
 from barl_jax.networks.registry import get_component
-from barl_jax.networks.actors.ddpm import DDPMActor
+from barl_jax.actors.sdac import DDPMActor
 from barl_jax.policy import TRAINABLE
 
 from conftest import ACT_DIM, ACTORS, BATCH, build, built, finite
@@ -27,12 +27,12 @@ SAMPLERS = [n for n in ACTORS if hasattr(get_component(n), "sample")]
 
 @pytest.mark.parametrize("name", SAMPLERS)
 def test_sample_contract(name, obs, key):
-    """One action per row, finite, and a pure function of the key it was given --
+    """One plan per row, finite, and a pure function of the key it was given --
     every draw takes an explicit key because there is no global RNG here."""
     a = built(name)
     action = a.sample(obs, key=key)
 
-    assert action.shape == (BATCH, ACT_DIM)
+    assert action.shape == (BATCH, a.chunk_size, ACT_DIM)
     assert finite(action)
     assert jnp.array_equal(action, a.sample(obs, key=key))
     assert not jnp.array_equal(action, a.sample(obs, key=jax.random.PRNGKey(7)))
@@ -54,8 +54,8 @@ def test_x0_from_eps_inverts_the_marginal(name):
     SDAC's candidate mechanism is exactly this identity, so it is worth pinning:
     reconstruct the x0 that each drawn eps implies from the same x_n."""
     a = built(name)
-    x0 = jax.random.normal(jax.random.PRNGKey(3), (BATCH, ACT_DIM))
-    eps = jax.random.normal(jax.random.PRNGKey(4), (BATCH, ACT_DIM))
+    x0 = jax.random.normal(jax.random.PRNGKey(3), (BATCH, a.plan_dim))
+    eps = jax.random.normal(jax.random.PRNGKey(4), (BATCH, a.plan_dim))
     n = jnp.ones((BATCH,), jnp.int32)
 
     g, nu = a.marginal_coef(n)
@@ -69,7 +69,7 @@ def test_eps_and_score_parameterizations_agree(name, obs):
     eps space; `DDPMActor` calls them renamings and one division, its score
     being -eps/sqrt(nu) over every ladder. This is that claim."""
     a = built(name)
-    x = jax.random.normal(jax.random.PRNGKey(5), (BATCH, ACT_DIM))
+    x = jax.random.normal(jax.random.PRNGKey(5), (BATCH, a.plan_dim))
     n = jnp.ones((BATCH,), jnp.int32)
 
     from_score = a.eps_from_score(a.predict_score(obs, x, n), n)
@@ -79,10 +79,10 @@ def test_eps_and_score_parameterizations_agree(name, obs):
 @pytest.mark.parametrize("name", DIFFUSION)
 def test_diffuse_and_eps_loss_shapes(name, obs, key):
     a = built(name)
-    x0 = jnp.tanh(jax.random.normal(jax.random.PRNGKey(6), (BATCH, ACT_DIM)))
+    x0 = jnp.tanh(jax.random.normal(jax.random.PRNGKey(6), (BATCH, a.plan_dim)))
     n = jnp.ones((BATCH,), jnp.int32)
 
-    assert a.diffuse(x0, n, key).shape == (BATCH, ACT_DIM)
+    assert a.diffuse(x0, n, key).shape == (BATCH, a.plan_dim)
     loss = a.eps_loss(obs, x0, n, key)
     assert loss.shape == () and finite(loss)
 
@@ -92,9 +92,9 @@ def test_stochastic_actor_log_prob_and_mode(obs, key):
     a = built("StochasticActor")
     action, x, dist = a.rsample(obs, key)
 
-    assert x.shape == (BATCH, ACT_DIM)
+    assert x.shape == (BATCH, a.plan_dim)
     assert jnp.all(jnp.abs(action) <= 1.0)
     assert jnp.all(jnp.abs(a.mode(obs)) <= 1.0)
 
-    lp = a.log_prob(dist, action)
+    lp = a.log_prob(dist, a._plan(action))
     assert lp.shape == (BATCH,) and finite(lp)

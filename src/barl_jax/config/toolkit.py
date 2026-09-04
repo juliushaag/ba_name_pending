@@ -4,10 +4,10 @@ exact key, the available alternatives and (for a type mismatch) what was
 expected vs. what was there.
 
 Ported from a sibling project's `core/configs.py` and adapted to this repo's
-fixed config root (`CONFIG_DIR`, see `config_tree.py`) instead of guessing it
+fixed config root (`CONFIG_DIR`, see `tree.py`) instead of guessing it
 from a config file's directory depth. Deliberately dependency-free (only
-`yaml`/`pathlib`/`re`/`typing`), the same discipline `config_tree.py` holds
-itself to, since it is the substrate `config_tree.py` builds its `$()`-include
+`yaml`/`pathlib`/`re`/`typing`), the same discipline `tree.py` holds
+itself to, since it is the substrate `tree.py` builds its `$()`-include
 / deep-merge / typed-access layering on top of -- this module knows nothing
 about that layering, only about YAML, includes and types.
 
@@ -16,7 +16,7 @@ about that layering, only about YAML, includes and types.
     key: $(relative/to/this/file.yaml)
 
 are resolved and deep-merged recursively wherever they appear in a loaded
-YAML tree, via `resolve_includes()` (`config_tree._load_yaml` routes every
+YAML tree, via `resolve_includes()` (`tree._load_yaml` routes every
 file it reads through this, so `$()` works anywhere under `config/`).
 """
 
@@ -29,32 +29,18 @@ from typing import Any, Dict, Optional, Type, TypeVar, Union, get_args, get_orig
 
 import yaml
 
-# `Optional[X]`/`Union[X, Y]` (typing) and `X | Y` (PEP 604) report different
-# origins for the same thing -- get_origin(int | None) is types.UnionType, not
-# typing.Union -- so both have to be recognized as "this is a union".
 _UNION_ORIGINS = (Union, types.UnionType)
 
 T = TypeVar("T")
 
-# Sentinel distinguishing "no default given" from `default=None`.
 _MISSING = object()
 
-CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
+CONFIG_DIR = Path(__file__).resolve().parents[3] / "config"
 
 INCLUDE_PATTERN = re.compile(r"\$\(([^)]+)\)")
 
 
-# ---------------------------------------------------------------------------
-# deep merge
-# ---------------------------------------------------------------------------
-
 def deep_merge(base: Dict, override: Dict) -> Dict:
-  """Deep merge two dicts; `override` wins, recursively, wherever both sides
-  have a dict at the same key. A list, or any other scalar, is replaced
-  wholesale rather than merged -- the same semantics `config_tree.py`'s
-  kwarg-layer merging needs (a `norm_kwargs` dict gains one overridden key
-  without restating the rest of it; a `layers` list does not partially
-  merge)."""
   result = dict(base)
   for key, value in override.items():
     if key in result and isinstance(result[key], dict) and isinstance(value, dict):
@@ -63,10 +49,6 @@ def deep_merge(base: Dict, override: Dict) -> Dict:
       result[key] = value
   return result
 
-
-# ---------------------------------------------------------------------------
-# $() include resolution
-# ---------------------------------------------------------------------------
 
 def _load_include(include_path: str, current_dir: Path, config_root: Path) -> Any:
   if include_path.startswith("/"):
@@ -85,10 +67,6 @@ def _load_include(include_path: str, current_dir: Path, config_root: Path) -> An
 
 
 def resolve_includes(data: Any, current_dir: Path, config_root: Path) -> Any:
-  """Recursively resolve `$()` references in a loaded YAML tree. A string
-  value that is *entirely* a `$(...)` reference is replaced by the included
-  file's (recursively resolved) content; everything else passes through
-  unchanged."""
   if isinstance(data, str):
     match = INCLUDE_PATTERN.fullmatch(data.strip())
     return _load_include(match.group(1), current_dir, config_root) if match else data
@@ -103,18 +81,11 @@ def resolve_includes(data: Any, current_dir: Path, config_root: Path) -> Any:
 
 
 def load_yaml_with_includes(path: str | Path, config_root: str | Path = CONFIG_DIR) -> Dict:
-  """A YAML file, `$()`-resolved. `config_root` anchors an absolute
-  `$(/...)` reference; a relative `$(...)` is always relative to the
-  including file."""
   path = Path(path).resolve()
   with open(path) as f:
     data = yaml.safe_load(f) or {}
   return resolve_includes(data, path.parent, Path(config_root).resolve())
 
-
-# ---------------------------------------------------------------------------
-# typed access
-# ---------------------------------------------------------------------------
 
 def _format_type(tp: Type) -> str:
   origin = get_origin(tp)
@@ -135,8 +106,6 @@ def _format_value(value: Any, max_len: int = 50) -> str:
 
 
 def _check_type(value: Any, expected_type: Type, key: str, section: str) -> None:
-  """Raises `TypeError` if `value` doesn't match `expected_type`. Supports
-  simple types, `list[X]`/`dict[K, V]`, and `Union`/`Optional`."""
   origin = get_origin(expected_type)
   full_key = f"{section}.{key}" if section else key
 
@@ -190,10 +159,7 @@ def _check_type(value: Any, expected_type: Type, key: str, section: str) -> None
 
 
 class ConfigMixin:
-  """Typed, dotted-path access into a section of a raw nested dict, with
-  errors that name the missing key, list what *was* available at that level,
-  and (for a type mismatch) show expected vs. actual. No defaults by design --
-  `get_optional()` exists for the rare case that genuinely wants one."""
+  """Typed, dotted-path access into a section of a raw nested dict."""
 
   def __init__(self, section: str = "", data: Optional[Dict] = None, config_path: Optional[str] = None):
     self._section = section
@@ -239,10 +205,6 @@ class ConfigMixin:
 
     if expected_type is not None:
       _check_type(current, expected_type, key, self._section)
-      # _check_type accepts an int where float is expected (YAML's own
-      # leniency: `3` and `3.0` should both satisfy a float-typed tunable) but
-      # doesn't itself convert -- do that here, so a caller asking for float
-      # always actually gets one back rather than occasionally an int.
       if expected_type is float and isinstance(current, int) and not isinstance(current, bool):
         self._consumed.add(parts[0])
         return current * 1.0  # type: ignore
@@ -250,7 +212,6 @@ class ConfigMixin:
     return current  # type: ignore
 
   def has(self, key: str) -> bool:
-    """Whether `key` is actually present in this layer (not a default)."""
     current = self._data
     for part in key.split("."):
       if not isinstance(current, dict) or part not in current:
@@ -259,11 +220,6 @@ class ConfigMixin:
     return True
 
   def resolve(self, key: str, decl, *, owner: str = None):
-    """The declaration resolution: `decl.default` unless `key` is in this layer.
-
-    `decl` is a `barl_jax.hparam.Config` (or `HParam`, which subclasses it); the
-    value is validated and coerced through it, so a wrong-typed YAML override
-    fails with the same message a `get(key, type)` would have produced."""
     from barl_jax.hparam import Config
     if not isinstance(decl, Config):
       raise TypeError(f"resolve() needs a Config/HParam for {key!r}, got {type(decl).__name__}")
@@ -271,14 +227,11 @@ class ConfigMixin:
       return decl.default
     value = self._data[key]
     self._consumed.add(key.split(".", 1)[0])
-    # Route through _check_type for the load-bearing error message, then through
-    # decl.coerce for the int->float case. `decl.type` may be None (untyped).
     if decl.type is not None:
       _check_type(value, decl.type, key, self._section)
     return decl.coerce(value)
 
   def unused_keys(self) -> set[str]:
-    """Top-level keys supplied by this layer that no consumer read."""
     return set(self._data) - self._consumed
 
   def assert_all_consumed(self, *, owner: str = None) -> None:

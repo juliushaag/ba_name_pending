@@ -88,15 +88,15 @@ def test_trial_materializes_like_a_grid_combo(tmp_path):
 
 def test_search_rejects_structural_config_axes():
   """A search axis must target a declared HParam; a non-search Config key (a
-  slot's `size`, an actor's `dtype`) is refused."""
+  slot's `tier`, an actor's `dtype`) is refused."""
   from search import check_searchability
   axes = dict(load_search(SPEC)["axes"])
   axes["model.components.actor.dtype"] = {"type": "categorical", "values": ["float32", "bfloat16"]}
-  axes["model.components.critic.size"] = {"type": "categorical", "values": ["medium", "large"]}
+  axes["model.components.critic.tier"] = {"type": "categorical", "values": ["medium", "large"]}
   problems = check_searchability({"axes": axes})
   assert problems, "expected the structural axes to be refused"
   covered = "\n".join(problems)
-  assert "net_style style" in covered and "size is structural" in covered
+  assert "mlp_preset style" in covered and "tier is structural" in covered
   # The demo spec itself is clean.
   assert not check_searchability(load_search(SPEC))
 
@@ -105,7 +105,8 @@ def test_search_rejects_structural_config_axes_for_alias_algos(tmp_path):
   """Alias algos resolve through aliases.yaml before their policy/component
   classes are checked, so the structural/HParam gate must hold for aliases too."""
   from search import check_searchability
-  from barl_jax.config_tree import CONFIG_DIR, ConfigTree
+  from barl_jax.config.toolkit import CONFIG_DIR
+  from barl_jax.config.tree import ConfigTree
 
   root = tmp_path / "config"
   root.mkdir()
@@ -119,7 +120,7 @@ def test_search_rejects_structural_config_axes_for_alias_algos(tmp_path):
     (root / "models" / "sac.yaml").read_text() + """
   profiles:
     big:
-      actor: {size: large}
+      actor: {tier: large}
 """)
   (root / "models" / "aliases.yaml").write_text(
     "aliases:\n  sac_big: {policy: SAC, profile: big}\n")
@@ -128,11 +129,11 @@ def test_search_rejects_structural_config_axes_for_alias_algos(tmp_path):
   spec = {"axes": {
     "algo": {"type": "categorical", "values": ["sac_big"]},
     "env": {"type": "categorical", "values": ["HalfCheetah"]},
-    "model.components.actor.size": {"type": "categorical", "values": ["medium", "large"]},
+    "model.components.actor.tier": {"type": "categorical", "values": ["medium", "large"]},
   }}
 
   problems = check_searchability(spec, tree=tree)
-  assert any("size is structural" in problem for problem in problems)
+  assert any("tier is structural" in problem for problem in problems)
 
 
 def test_objective_sidecar(tmp_path):

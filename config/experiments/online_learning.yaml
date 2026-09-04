@@ -14,7 +14,7 @@
 #     < the `runs:` entry itself (and any submit.py `run.` axis)
 #
 # A run entry (or `defaults:`) may also carry `model_overrides:`, a dotted-path
-# map layered over the model config -- `{components.critic.size: large,
+# map layered over the model config -- `{components.critic.tier: large,
 # params.entropy_scale: -2.0}`. Unlike every other key those merge key-wise
 # across the levels instead of replacing wholesale. submit.py's `model.*` and
 # `run.*` grid axes write exactly these.

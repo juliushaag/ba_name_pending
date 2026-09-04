@@ -63,7 +63,7 @@ class Logger():
     self._seeds = list(seeds)
     self._runs  = [
       wandb.init(project=log_name, group=group or run_name,
-                 name=f"{run_name}/s{seed}" if len(self._seeds) > 1 else run_name,
+                 name=f"{run_name}/s{seed}",
                  config={**(config or {}), "seed": seed}, tags=tags,
                  reinit="create_new",
                  settings=wandb.Settings(finish_timeout=finish_timeout,

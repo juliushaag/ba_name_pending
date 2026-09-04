@@ -5,11 +5,11 @@ import jax.numpy as jnp
 from barl_jax.networks.flow import TIME_STYLES
 from flax import nnx
 
-from barl_jax.configs import ConfigMixin
+from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.hparam import Config, HParam
 from barl_jax.networks import gaussian
 from barl_jax.networks.diffusion import TimeConditionedField, controlled_sde
-from barl_jax.networks.mlp import MLP, MLP_STYLES
+from barl_jax.networks.mlp import MLP, MLP_PRESETS
 from barl_jax.networks.optim import adam, ActorOptim
 from barl_jax.networks.registry import get_component, register_component
 from barl_jax.policy import Actor, Buffer, Critic, frozen
@@ -26,7 +26,7 @@ def clip_score(score, max_norm: float, percentile: float):
 class ScoreContinuousActor(Actor, ActorOptim):
   """AMDP's controlled-SDE actor. The net is `silu_fp32` (the chain accumulates
   a log-weight) and the ctrl time coder by default; both are `Config` selectors
-  you can switch with `net_style`/`time_emb` -- configuration, not inheritance.
+  you can switch with `mlp_preset`/`time_emb` -- configuration, not inheritance.
   Only the SDE and score-clipping knobs are this class's own HParams."""
 
   kind = "actor"
@@ -34,7 +34,7 @@ class ScoreContinuousActor(Actor, ActorOptim):
   # drawn at the control net's dtype -- in bf16 the noise driving the SDE
   # carries ~3 significant digits. AMDP went non-finite in bf16 on both DMC
   # envs (sweep 2026-08-27_13-23-15).
-  net_style = Config("silu_fp32", style=MLP_STYLES)
+  mlp_preset = Config("silu_fp32", style=MLP_PRESETS)
   time_emb  = Config("ctrl", style=TIME_STYLES)
   squash_cls = Config("ErfSquash")   # `erf_k` is derived from the noise schedule below
   sigma_min    = HParam(0.01)
@@ -55,11 +55,11 @@ class ScoreContinuousActor(Actor, ActorOptim):
     self._log_r    = math.log(self.sigma_max / self.sigma_min)
     self._int_base = float(self._raw_int(jnp.asarray(self.tau_min, jnp.float32)))
 
-    # latent_dim/layers are size-ladder-owned.
+    # latent_dim/layers are tier-ladder-owned.
     latent_dim, layers = config.get("latent_dim", int), config.get("layers", int)
 
     self.field = TimeConditionedField(
-      self.obs_dim, self.action_dim, latent_dim=latent_dim, layers=layers,
+      self.obs_dim, self.plan_dim, latent_dim=latent_dim, layers=layers,
       time_dim=self.time_dim, time_embed=self.time_embed, time_kwargs=self.hparam("time_kwargs"),
       activation=self.activation, norm=self.norm, norm_input=self.norm_input, norm_stem=self.norm_stem,
       norm_after_act=self.norm_after_act, dropout=self.dropout, final_activation=self.final_activation,
@@ -121,7 +121,7 @@ class ScoreContinuousActor(Actor, ActorOptim):
     return self.squash.derived()
 
   def prior_surprisal(self, X):
-    return gaussian.surprisal(X, self._terminal_var, self.action_dim)
+    return gaussian.surprisal(X, self._terminal_var, self.plan_dim)
 
   def control(self, obs, x, tau):
     """The control net's output, clipped the way dime_am's does it
@@ -152,7 +152,7 @@ class ScoreContinuousActor(Actor, ActorOptim):
               - jnp.sqrt(v) * (eps * u_tilde).sum(axis=-1, keepdims=True)
       return X + v * u_tilde + jnp.sqrt(v) * eps, log_w
 
-    X = jnp.zeros((B, self.action_dim), jnp.float32)
+    X = jnp.zeros((B, self.plan_dim), jnp.float32)
     X, log_w = controlled_sde(euler_step, X, self.max_steps, key,
                               aux=jnp.zeros((B, 1), jnp.float32))
 
@@ -162,16 +162,15 @@ class ScoreContinuousActor(Actor, ActorOptim):
       log_w = log_w + self.squash_correction(X)
       X = self.squash(X)
 
-    return X, log_w
+    return X.reshape(B, self.chunk_size, self.action_dim), log_w
 
   def loss(self, obs, critic: Critic, alpha, *, key=None):
-    """Returns the loss rather than writing it into a `losses` dict, because the
-    owning Policy runs it under `gated_loss` -- a branch has to hand its value
-    back, it cannot mutate a dict on one side and not the other."""
+    """The direct-score regression against the critic's action-gradient."""
     key = self.rngs.noise() if key is None else key
     rollout_key, noise_key = jax.random.split(key)
 
     X, _ = jax.lax.stop_gradient(self.generate_action(obs, squash=False, key=rollout_key))
+    X = X.reshape(X.shape[0], -1)
 
     X_t, tau = self.sample_noised(X, noise_key)
     u_tilde  = self.control(obs, X_t, tau[:, None])
@@ -193,7 +192,7 @@ class ScoreContinuousActor(Actor, ActorOptim):
     self.metrics.vec("u", u)
     self.metrics.scalar("score_clipped_frac", clipped_frac)
     critic.metrics.vec("score", x_score)
-    return loss
+    return {"actor": loss}
 
   def create_optimizer(self) -> dict:
     return {"actor": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}

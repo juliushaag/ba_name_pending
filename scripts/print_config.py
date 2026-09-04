@@ -6,7 +6,7 @@ import yaml
 os.environ.setdefault("MUJOCO_GL", "egl")
 
 import barl_jax  # noqa: F401  -- populates the policy/component registries
-import barl_jax.model_config as model_config
+import barl_jax.config.tree as model_config
 
 
 def print_model(name: str) -> None:
@@ -31,22 +31,22 @@ def print_model(name: str) -> None:
   print_block("params", cfg["params"])
   for slot, slot_cfg in cfg["components"].items():
     title = f"components.{slot}  [{slot_cfg['class']}]"
-    if slot_cfg.get("size"):
-      title += f"  size: {slot_cfg['size']}"
+    if slot_cfg.get("tier"):
+      title += f"  tier: {slot_cfg['tier']}"
     print_block(title, slot_cfg["kwargs"])
 
 
 if __name__ == "__main__":
   args = argparse.ArgumentParser(
     description="Print a model's fully resolved config -- presets < component baseline "
-                "< slot size < slot kwargs < profile < run overrides -- annotating every "
+                "< slot tier < slot kwargs < profile < run overrides -- annotating every "
                 "value with the layer it came from and what it shadows.")
   args.add_argument("models", nargs="*",
                     help="Policy class names and/or config/models/ aliases (default: all of them)")
   args.add_argument("--set", action="append", metavar="PATH=VALUE",
                     help="Preview under a dotted override, exactly as a run's model_overrides: "
                          "or a scripts/submit.py `model.` axis would apply it, e.g. "
-                         "--set components.critic.size=large. Repeatable.")
+                         "--set components.critic.tier=large. Repeatable.")
   args.add_argument("--json", action="store_true",
                     help="Print the flat resolved config as JSON instead -- exactly what a run "
                          "snapshots and logs to wandb.")

@@ -1,0 +1,21 @@
+# Chunked debug comparison: every shipped algorithm on DogRun, 100k env steps,
+# action chunking of 4, no rendered eval videos.
+#
+# Chunking needs no model change: at chunk_size 4 `Policy.action_chunk` repeats
+# each actor's single-action draw open-loop for 4 env steps (normalize asserts
+# the (B, 4, act_dim) contract; no actor natively predicts a plan yet).
+#
+# 30-minute cap is NOT in this file -- it comes from `--debug` at submit time:
+#   uv run python scripts/submit.py --grid config/experiments/dogrun_chunk4_debug_sweep.yaml --debug
+#
+# Dry run (no submission):
+#   uv run python scripts/submit.py --grid config/experiments/dogrun_chunk4_debug_sweep.yaml --dry-run
+
+base: config/experiments/dogrun_debug.yaml
+
+axes:
+  algo: [AMDP, DIME, SDAC, NCLQL, SAC]
+  env: [DogRun]
+  run.chunk_size: [8]
+
+exclude: []

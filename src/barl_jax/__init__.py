@@ -10,11 +10,10 @@ from barl_jax.env import Environment, register_environment
 
 # Imported purely for @register_component side effects -- config/models.yaml
 # resolves these by name, so an unused-import cleanup here would silently
-# break that. `networks.actors` is the load-bearing one: no module imports any
-# of its four files directly, so this import is the only thing that registers
-# StochasticActor / ScoreContinuousActor / DISActor / DDPMActor.
-import barl_jax.networks.critic
-import barl_jax.networks.actors
+# break that. `actors`/`critics` are the load-bearing ones: no module imports
+# each concrete file directly, so these package imports are what register them.
+import barl_jax.critics
+import barl_jax.actors
 import barl_jax.networks.squash
 import barl_jax.networks.regulator
 import barl_jax.networks.schedule

@@ -3,11 +3,11 @@ import math
 import jax
 import jax.numpy as jnp
 from barl_jax.networks.flow import TIME_STYLES
-from barl_jax.networks.mlp import MLP_STYLES
+from barl_jax.networks.mlp import MLP_PRESETS
 import optax
 from flax import nnx
 
-from barl_jax.configs import ConfigMixin
+from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.hparam import Config, HParam
 from barl_jax.networks.diffusion import TimeConditionedField, reverse_chain
 from barl_jax.networks.optim import adam, ActorOptim
@@ -49,8 +49,8 @@ class DDPMActor(Actor, ActorOptim):
   kind = "actor"
   # gelu over the plain net and a 20-frequency sinusoidal time coder, by
   # default -- both are Config selectors, so a gelu/silu run is a
-  # `net_style`/`--set` choice rather than an inheritance one.
-  net_style = Config("gelu", style=MLP_STYLES)
+  # `mlp_preset`/`--set` choice rather than an inheritance one.
+  mlp_preset = Config("gelu", style=MLP_PRESETS)
   time_emb  = Config("sin_20", style=TIME_STYLES)
   squash_cls = Config("TanhSquash")
   num_steps    = Config(20)
@@ -68,8 +68,8 @@ class DDPMActor(Actor, ActorOptim):
   # Best-of-N and softmax weighting for the soft-DSM loss (SDAC), and the
   # additive exploration noise on top of it -- all of it lives here rather
   # than on the owning Policy, since it is how *this* actor acts and is
-  # trained, not algorithm logic. See `best_of_n`/`generate_action`/
-  # `loss`/`extra_losses` below.
+  # trained, not algorithm logic. See `best_of_n`/`generate_action`/`loss`
+  # below.
   num_bon      = Config(8)
   num_candidates = Config(24)
   softmax_temp = HParam(0.25)
@@ -82,11 +82,11 @@ class DDPMActor(Actor, ActorOptim):
   def __init__(self, env_stats, config: ConfigMixin, *, rngs: nnx.Rngs, **kwargs):
     self.resolve_hparams(config, env_stats=env_stats)
 
-    # latent_dim/layers are size-ladder-owned.
+    # latent_dim/layers are tier-ladder-owned.
     latent_dim, layers = config.get("latent_dim", int), config.get("layers", int)
 
     self.field = TimeConditionedField(
-      self.obs_dim, self.action_dim, latent_dim=latent_dim, layers=layers,
+      self.obs_dim, self.plan_dim, latent_dim=latent_dim, layers=layers,
       time_dim=self.time_dim, time_embed=self.time_embed, time_kwargs=self.hparam("time_kwargs"),
       activation=self.activation, norm=self.norm, norm_input=self.norm_input, norm_stem=self.norm_stem,
       norm_after_act=self.norm_after_act, dropout=self.dropout, final_activation=self.final_activation,
@@ -104,7 +104,10 @@ class DDPMActor(Actor, ActorOptim):
     # part of how this actor plays an action, not algorithm-level state.
     lo, hi = self.explore_min, self.explore_max
     self.explore_raw = nnx.Param(jnp.full(
-      (self.action_dim,), _inv_sigmoid((self.explore_init - lo) / (hi - lo)), jnp.float32))
+      (self.plan_dim,), _inv_sigmoid((self.explore_init - lo) / (hi - lo)), jnp.float32))
+
+  def _plan(self, flat):
+    return flat.reshape(flat.shape[0], self.chunk_size, self.action_dim)
 
   @staticmethod
   def _build_ladder(ladder_cls: str, start: float, end: float,
@@ -144,7 +147,7 @@ class DDPMActor(Actor, ActorOptim):
     return jnp.sqrt(ab), 1.0 - ab
 
   def prior_sample(self, batch: int, key):
-    noise = jax.random.normal(key, (batch, self.action_dim), jnp.float32)
+    noise = jax.random.normal(key, (batch, self.plan_dim), jnp.float32)
     return self.prior_scale * noise if self.prior_scale != 1.0 else noise
 
   def diffuse(self, x0, n, key):
@@ -178,8 +181,8 @@ class DDPMActor(Actor, ActorOptim):
     """The plain DDPM regression onto the noise that produced x_n -- the
     unweighted baseline `actor_loss` below reweights. Draws its own eps rather
     than calling `diffuse`, which discards the draw the target needs. Reduction
-    is sum-over-action-dims then mean; the references mean over both, which is
-    this divided by `action_dim`."""
+    is sum-over-plan-dims then mean; the references mean over both, which is
+    this divided by `plan_dim`."""
     eps = jax.random.normal(key, x0.shape, x0.dtype)
     g, nu = self.marginal_coef(n)
     x_n = g * x0 + jnp.sqrt(nu) * eps
@@ -270,17 +273,20 @@ class DDPMActor(Actor, ActorOptim):
                                      -self.explore_raw_limit, self.explore_raw_limit)
 
   def generate_action(self, obs, *, critic: Critic = None, key=None):
-    """The played action: best-of-N, squashed, plus exploration noise. Also
-    what the owning Policy's Bellman target bootstraps from."""
+    """The played action plan: best-of-N, squashed, plus exploration noise.
+    Also what the owning Policy's Bellman target bootstraps from."""
     key = self.rngs.noise() if key is None else key
     k_bon, k_explore = jax.random.split(key)
     raw = self.best_of_n(obs, self.num_bon, critic=critic, key=k_bon)
-    return self.explore(self.squash(raw), k_explore), self.noise_entropy()
+    return self._plan(self.explore(self.squash(raw), k_explore)), self.noise_entropy()
 
   def loss(self, obs, critic: Critic, alpha, *, key=None):
-    """The soft-DSM objective: `policy_x0` (this actor's own best-of-N at
-    `obs`, not the caller's) is diffused forward and regressed onto its noise,
-    reweighted by a softmax over K freshly-decoded candidates' critic value.
+    """The soft-DSM objective plus the exploration-noise objective, sharing one
+    best-of-N draw: `policy_x0` (this actor's own best-of-N at `obs`, not the
+    caller's) is diffused forward and regressed onto its noise, reweighted by
+    a softmax over K freshly-decoded candidates' critic value -- and the same
+    draw, squashed and noised, prices the `explore_raw` update on its own
+    optimizer key (see `create_optimizer`/`param_labels`).
 
     This is a second best-of-N draw, independent of `generate_action`'s -- the
     two used to share one fused pass over `concat([tile(next_obs), tile(obs)])`
@@ -289,16 +295,16 @@ class DDPMActor(Actor, ActorOptim):
     chain and a second critic invocation for identical total FLOPs. See
     REFACTOR.md's fusion measurement before assuming this is free."""
     key = self.rngs.noise() if key is None else key
-    keys = jax.random.split(key, 4)
+    keys = jax.random.split(key, 5)
     policy_x0 = self.best_of_n(obs, self.num_bon, critic=critic, key=keys[0])
 
     B, K = obs.shape[0], self.num_candidates
     t   = jax.random.randint(keys[1], (B,), 1, self.num_steps + 1)
     x_t = jax.lax.stop_gradient(self.diffuse(policy_x0, t, keys[2]))
 
-    noise      = jax.random.normal(keys[3], (K, B, self.action_dim), x_t.dtype)
+    noise      = jax.random.normal(keys[3], (K, B, self.plan_dim), x_t.dtype)
     a0_raw     = jax.lax.stop_gradient(self.x0_from_eps(x_t[None], noise, t))
-    candidates = self.squash(a0_raw)                                          # (K, B, D)
+    candidates = self.squash(a0_raw)                                          # (K, B, P)
 
     qv = frozen(critic).value(
       jnp.broadcast_to(obs[None], (K, B, obs.shape[-1])).reshape(K * B, -1),
@@ -312,7 +318,7 @@ class DDPMActor(Actor, ActorOptim):
     # eps space rather than score space: the two are the same objective, since
     # score = -eps/sqrt(nu) makes the score loss's `dsm_weight` factor exactly
     # the nu that cancels. Stated as the reference states it, one less conversion.
-    eps_pred = self.predict_eps(obs, x_t, t)                             # (B, D)
+    eps_pred = self.predict_eps(obs, x_t, t)                             # (B, P)
     loss = (weight * (eps_pred[None] - noise) ** 2).sum(axis=-1).sum(axis=0).mean()
 
     self.metrics.scalar("q_scale", q_scale)
@@ -326,18 +332,9 @@ class DDPMActor(Actor, ActorOptim):
     self.metrics.scalar("cand_saturation", (jnp.abs(candidates) > 0.99).mean())
     self.metrics.vec("eps_pred", eps_pred)
     self.metrics.vec("eps_target", noise.reshape(-1, noise.shape[-1]))
-    return loss
 
-  def extra_losses(self, obs, critic: Critic, alpha, *, key=None):
-    """The exploration-noise objective: `explore_raw` trained to maximize the
-    critic's value at a noised best-of-N sample plus its own entropy, on its
-    own optimizer key (see `create_optimizer`/`param_labels`) -- untouched by
-    whatever the actor's own Adam/clip/LR is doing."""
-    key = self.rngs.noise() if key is None else key
-    keys = jax.random.split(key, 2)
-    policy_x0 = self.best_of_n(obs, self.num_bon, critic=critic, key=keys[0])
     a_bon   = self.squash(policy_x0)
-    a_noisy = a_bon + self.explore_std * jax.random.normal(keys[1], a_bon.shape, a_bon.dtype)
+    a_noisy = a_bon + self.explore_std * jax.random.normal(keys[4], a_bon.shape, a_bon.dtype)
     explore_loss = -(frozen(critic).value(obs, a_noisy).mean()
                      + jax.lax.stop_gradient(alpha) * self.noise_entropy())
     # Named "explore_noise_std", not "explore_std" -- a component's own
@@ -350,7 +347,7 @@ class DDPMActor(Actor, ActorOptim):
     # method is a plain attribute, unlike explore_std's property) but silently
     # breaks any later call to it in the same trace.
     self.metrics.scalar("noise_entropy_value", jax.lax.stop_gradient(self.noise_entropy()))
-    return {"explore": explore_loss}
+    return {"actor": loss, "explore": explore_loss}
 
   def create_optimizer(self) -> dict:
     return {"actor": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode),

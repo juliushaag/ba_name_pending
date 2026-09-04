@@ -7,7 +7,7 @@
 
 defaults:
   total_env_steps: 100000
-  num_seeds: 1
+  num_seeds: 3
   eval_video_every: null
 
 runs:

@@ -3,10 +3,10 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-from barl_jax.configs import ConfigMixin
+from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.hparam import Config, HParam
 from barl_jax.networks import gaussian
-from barl_jax.networks.mlp import MLP, MLP_STYLES
+from barl_jax.networks.mlp import MLP, MLP_PRESETS
 from barl_jax.networks.optim import adam, ActorOptim
 from barl_jax.networks.registry import get_component, register_component
 from barl_jax.policy import Actor, Buffer, Critic, frozen
@@ -20,14 +20,14 @@ class StochasticActor(Actor, ActorOptim):
 
   The shallow Gaussian policy has just a state-independent `log_std` plus the
   std bounds; the net is the `layer` style (a LayerNorm stem over silu) by
-  default -- switch it with `net_style` (a configuration value, not
+  default -- switch it with `mlp_preset` (a configuration value, not
   inheritance).
 
   `log_std` is a state-independent parameter rather than a network head --
   barl's deliberate deviation from canonical SAC, kept as-is."""
 
   kind = "actor"
-  net_style = Config("layer", style=MLP_STYLES)
+  mlp_preset = Config("layer", style=MLP_PRESETS)
   squash_cls = Config("TanhSquash")
   log_std_min  = Config(-20.0)
   log_std_max  = Config(2.0)
@@ -36,25 +36,30 @@ class StochasticActor(Actor, ActorOptim):
   def __init__(self, env_stats, config: ConfigMixin, *, rngs: nnx.Rngs, **kwargs):
     super().__init__(env_stats, config, **kwargs)
 
-    self.log_std = nnx.Param(jnp.zeros((self.action_dim,), jnp.float32))
+    self.log_std = nnx.Param(jnp.zeros((self.plan_dim,), jnp.float32))
     self.squash  = get_component(self.squash_cls)(env_stats, ConfigMixin())
 
     low, high = env_stats.get("act_low"), env_stats.get("act_high")
     scale = 1.0 if low is None else (np.asarray(high) - np.asarray(low)) / 2
+    scale = np.tile(np.asarray(scale, dtype=np.float32).reshape(-1),
+                    self.chunk_size).reshape(-1)
     self.log_act_scale = Buffer(jnp.log(jnp.asarray(scale, jnp.float32)))
 
-    # latent_dim/layers are size-ladder-owned (see size ladders in hparam.py).
+    # latent_dim/layers are tier-ladder-owned (see tier ladders in hparam.py).
     latent_dim, layers = config.get("latent_dim", int), config.get("layers", int)
 
-    self.net = MLP(self.obs_dim, self.action_dim, latent_dim, layers,
+    self.net = MLP(self.obs_dim, self.plan_dim, latent_dim, layers,
                    activation=self.activation, norm=self.norm, norm_input=self.norm_input,
                          norm_stem=self.norm_stem, norm_after_act=self.norm_after_act,
                    dropout=self.dropout, final_activation=self.final_activation,
                    residual=self.residual, dtype=self.dtype, rngs=rngs, **(self.hparam("norm_kwargs") or {}))
     self.rngs = rngs
 
+  def _plan(self, flat):
+    return flat.reshape(flat.shape[0], self.chunk_size, self.action_dim)
+
   def dist(self, s):
-    """(mean, std) of the pre-squash Normal."""
+    """(mean, std) of the pre-squash Normal, over the flat plan."""
     mean = self.net(s).astype(jnp.float32)
     std  = jnp.exp(jnp.clip(self.log_std[...], self.log_std_min, self.log_std_max))
     return mean, std
@@ -63,8 +68,9 @@ class StochasticActor(Actor, ActorOptim):
     """`action` is the squashed (canonical [-1, 1]) value; inverts the squash
     and applies the change-of-variables correction."""
     mean, std = dist
-    x = self.squash.inverse(jnp.clip(action, -self.log_prob_clip, self.log_prob_clip))
-    lp = gaussian.log_prob(x, mean, std) - self.squash.log_abs_det_jacobian(x, action)
+    flat = action.reshape(action.shape[0], -1)
+    x = self.squash.inverse(jnp.clip(flat, -self.log_prob_clip, self.log_prob_clip))
+    lp = gaussian.log_prob(x, mean, std) - self.squash.log_abs_det_jacobian(x, flat)
     return lp.sum(axis=-1)
 
   def rsample(self, s, key=None):
@@ -80,21 +86,25 @@ class StochasticActor(Actor, ActorOptim):
     density of an affine-transformed variable, not of `action` itself.
     `critic` is unused -- SAC's actor needs none to sample -- and accepted only
     to satisfy the shared `Actor.generate_action` contract."""
-    action, x, (mean, std) = self.rsample(s, key)
+    action_flat, x, (mean, std) = self.rsample(s, key)
 
     log_prob = (gaussian.log_prob(x, mean, std)
-                - self.squash.log_abs_det_jacobian(x, action)
+                - self.squash.log_abs_det_jacobian(x, action_flat)
                 - self.log_act_scale[...])
-    return action, -log_prob.sum(axis=-1, keepdims=True)
+    # Joint entropy of the whole plan, (B, 1) -- the same shape (and at
+    # chunk_size 1 the same value) as the single-action entropy was, so the
+    # Bellman shift and the dual read it unchanged.
+    entropy = -log_prob.sum(axis=-1, keepdims=True)
+    return self._plan(action_flat), entropy
 
   def sample(self, s, *, critic: Critic = None, key=None):
-    action, _, _ = self.rsample(s, key)
-    return action
+    action_flat, _, _ = self.rsample(s, key)
+    return self._plan(action_flat)
 
   def mode(self, s):
     """Deterministic (mean) action -- IQL trains via AWR but deploys this."""
     mean, _ = self.dist(s)
-    return self.squash(mean)
+    return self._plan(self.squash(mean))
 
   def loss(self, obs, critic: Critic, alpha, *, key=None):
     """SAC's reparameterized max-entropy objective, -(Q + alpha*H).
@@ -103,8 +113,8 @@ class StochasticActor(Actor, ActorOptim):
     leak was discarded by giving each optimizer only its own params; with one
     backward over the whole tree it has to be explicit."""
     action, entropy = self.generate_action(obs, key=key)
-    q = frozen(critic).value(obs, action)
-    return -(q + jax.lax.stop_gradient(alpha) * entropy).mean()
+    q = frozen(critic).value(obs, action.reshape(action.shape[0], -1))
+    return {"actor": -(q + jax.lax.stop_gradient(alpha) * entropy).mean()}
 
   def create_optimizer(self) -> dict:
     return {"actor": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}

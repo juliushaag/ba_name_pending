@@ -82,6 +82,11 @@ def test_bellman_contract(name, obs, act):
     moved = target_expectation(c, c.bellman_target(SMALL_REWARD + 0.02, live, boot))
     assert jnp.allclose(moved - base, 0.02, atol=1e-3)
 
+    one_step = target_expectation(c, c.bellman_target(jnp.zeros((BATCH,)), live, boot))
+    two_step = target_expectation(
+        c, c.bellman_target(jnp.zeros((BATCH,)), live, boot, horizon=jnp.full((BATCH,), 2)))
+    assert jnp.allclose(two_step, c.gamma * one_step, atol=0.05)
+
     # `bellman_target` and `regression_loss` live in different classes; this is
     # the coupling between them. `target_from_raw` is the same lift applied to
     # one of the critic's own predictions (NC-LQL's smoothing loss).

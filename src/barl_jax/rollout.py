@@ -1,13 +1,17 @@
 import math
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 from barl_jax.action_chunking import ActionChunkExecutor
-from barl_jax.policy import Policy, action_bounds_numpy, sanitize_action
+from barl_jax.policy import action_bounds_numpy, sanitize_action
 
 import gymnasium as gym
+
+if TYPE_CHECKING:
+  from barl_jax.policy import Policy
 
 
 class RandomPolicy:
@@ -18,10 +22,10 @@ class RandomPolicy:
   buffer with broad, uncorrelated coverage before training starts (SAC/TD3-
   style `random_steps`); never registered/selectable like a real Policy."""
 
-  def __init__(self, action_space: gym.Space, seed: int = None):
+  def __init__(self, action_space: gym.Space, seed: int = None, chunk_size: int = 1):
     self.action_space = action_space
     self.action_discrete = isinstance(action_space, gym.spaces.Discrete)
-    self.chunk_size = 1
+    self.chunk_size = int(chunk_size)
     self.action_dim = int(action_space.n) if self.action_discrete else int(np.prod(action_space.shape))
     self._rng = np.random.RandomState(seed)
     if not self.action_discrete:
@@ -33,11 +37,15 @@ class RandomPolicy:
   def inference_step(self, observation, step_info=None):
     batch = observation.shape[0]
     if self.action_discrete:
-      action = self._rng.randint(0, self.action_space.n, (batch, 1))
+      plan = self._rng.randint(0, self.action_space.n,
+                               (batch, self.chunk_size, 1)).astype(np.float32)
     else:
       # canonical [-1, 1] per dimension -- same convention every real actor outputs.
-      action = self._rng.uniform(-1.0, 1.0, (batch, *self.action_space.shape)).astype(np.float32)
-    return action[:, None, ...], {}
+      plan = self._rng.uniform(-1.0, 1.0,
+                               (batch, self.chunk_size, *self.action_space.shape)).astype(np.float32)
+    from barl_jax.action_chunking import normalize_action_chunk
+    return normalize_action_chunk(
+      plan, chunk_size=self.chunk_size, act_dim=self.action_dim, xp=np), {}
 
 def summarize_rollout(acc: dict, slots: slice = slice(None)) -> dict:
   """Per-sub-env-slot sums -> the reported rollout statistics, over `slots`.
@@ -129,6 +137,7 @@ class ReplayBuffer():
     """Append a batch of transitions, one row per sub-env slot. Every array must
     have the same leading length; each is stored under its keyword name and
     comes back out of `sample_numpy()` under that same name."""
+    slot_ids = row.pop("slot_ids", None)
     if self._fields is None:
       self._allocate(row)
     elif row.keys() != self._fields.keys():
@@ -165,16 +174,19 @@ class ReplayBuffer():
     idx = np.random.randint(0, self._size, size=batch_size)
     return {name: value[idx] for name, value in self._fields.items()}
 
-  def random_fill(self, env : gym.Env | gym.vector.VectorEnv, n_steps : int, seed : int = None):
+  def random_fill(self, env : gym.Env | gym.vector.VectorEnv, n_steps : int, seed : int = None,
+                  chunk_size: int = 1, discount: float = 1.0):
     """Seeds the buffer with `n_steps` of uniformly-random actions before
     training starts -- broader, less-correlated coverage than an untrained
     (but already-biased) policy's own actions would give. Just rollout()
     under a RandomPolicy stand-in, so every truncation rule there applies
     unchanged."""
     action_space = env.single_action_space if isinstance(env, gym.vector.VectorEnv) else env.action_space
-    return self.rollout(RandomPolicy(action_space, seed=seed), env, n_steps=n_steps, seed=seed)
+    return self.rollout(RandomPolicy(action_space, seed=seed, chunk_size=chunk_size),
+                        env, n_steps=n_steps, seed=seed, discount=discount)
 
-  def rollout(self, policy : Policy, env : gym.Env | gym.vector.VectorEnv, n_steps = 10_000, seed : int = None):
+  def rollout(self, policy: "Policy", env: gym.Env | gym.vector.VectorEnv, n_steps=10_000,
+              seed : int = None, discount: float = None):
     """A VectorEnv must use autoreset_mode=DISABLED -- finished sub-envs are
     reset explicitly here via `reset_mask`. `seed` only seeds the first reset;
     later resets deliberately stay unseeded (gymnasium envs carry their own RNG forward).
@@ -194,9 +206,11 @@ class ReplayBuffer():
       if not is_vec:
         obs = obs[None, ...]
       chunk_state = None
+      pending = None
     else:
       obs = state["obs"]
       chunk_state = state.get("chunk_state")
+      pending = state.get("pending")
 
     def to_device(o):
       return jnp.asarray(o, jnp.float32)
@@ -204,7 +218,10 @@ class ReplayBuffer():
     inference_fn = getattr(policy, "inference_fn", None)
     act = inference_fn() if inference_fn else (lambda o, _k: policy.inference_step(o))
     key = jax.random.PRNGKey(int(np.random.randint(0, 2 ** 31 - 1)))
-    chunks = ActionChunkExecutor(act, chunk_size=policy.chunk_size,
+    chunk_size = int(getattr(policy, "chunk_size", 1) or 1)
+    discount = float(getattr(getattr(policy, "critic", None), "gamma", 1.0)
+                     if discount is None else discount)
+    chunks = ActionChunkExecutor(act, chunk_size=chunk_size,
                                  act_dim=policy.action_dim, n_envs=n_envs)
     chunks.restore(chunk_state)
 
@@ -219,6 +236,29 @@ class ReplayBuffer():
                act_min=np.full(n_envs, np.inf), act_max=np.full(n_envs, -np.inf),
                act_nonfinite=zeros(), act_clipped=zeros())
 
+    if pending is None:
+      pending = dict(
+        active=np.zeros(n_envs, dtype=bool),
+        obs=np.zeros((n_envs, obs.reshape(n_envs, -1).shape[1]), dtype=np.float32),
+        act=np.zeros((n_envs, chunk_size * policy.action_dim), dtype=np.float32),
+        rew=np.zeros(n_envs, dtype=np.float32),
+        next_obs=np.zeros((n_envs, obs.reshape(n_envs, -1).shape[1]), dtype=np.float32),
+        term=np.zeros(n_envs, dtype=np.float32),
+        horizon=np.zeros(n_envs, dtype=np.int32),
+        extras={},
+      )
+    else:
+      pending = dict(
+        active=np.array(pending["active"], copy=True),
+        obs=np.array(pending["obs"], copy=True),
+        act=np.array(pending["act"], copy=True),
+        rew=np.array(pending["rew"], copy=True),
+        next_obs=np.array(pending["next_obs"], copy=True),
+        term=np.array(pending["term"], copy=True),
+        horizon=np.array(pending["horizon"], copy=True),
+        extras={k: np.array(v, copy=True) for k, v in pending.get("extras", {}).items()},
+      )
+
     for _ in range(n_steps):
 
       obs64 = obs.astype(np.float64).reshape(n_envs, -1)
@@ -228,6 +268,23 @@ class ReplayBuffer():
 
       key, subkey = jax.random.split(key)
       action_np, step_extras = chunks.current(obs, subkey, to_device=to_device)
+      plan_np = chunks.plan().reshape(n_envs, -1).astype(np.float32)
+      refilled = chunks.last_refilled()
+      if refilled.any():
+        obs_flat = obs.reshape(n_envs, -1).astype(np.float32)
+        pending["active"][refilled] = True
+        pending["obs"][refilled] = obs_flat[refilled]
+        pending["act"][refilled] = plan_np[refilled]
+        pending["rew"][refilled] = 0.0
+        pending["term"][refilled] = 0.0
+        pending["horizon"][refilled] = 0
+        for name in set(pending["extras"]) - set(step_extras):
+          pending["extras"][name][refilled] = 0
+        for name, value in step_extras.items():
+          value = np.asarray(value)
+          if name not in pending["extras"]:
+            pending["extras"][name] = np.zeros((n_envs, *value.shape[1:]), dtype=value.dtype)
+          pending["extras"][name][refilled] = value[refilled]
 
       act64 = action_np.astype(np.float64).reshape(n_envs, -1)
       acc["act_sum"]    += act64.sum(axis=1)
@@ -255,16 +312,28 @@ class ReplayBuffer():
       acc["n_rew"]      += 1
 
       done = term | trunc
-      chunks.advance(done)
+      pending["rew"] += (discount ** pending["horizon"]) * reward.astype(np.float32).reshape(n_envs)
+      pending["next_obs"] = next_obs.reshape(n_envs, -1).astype(np.float32)
+      pending["term"] = np.maximum(pending["term"], term.astype(np.float32).reshape(n_envs))
+      pending["horizon"] += pending["active"].astype(np.int32)
+      finished = chunks.advance(done)
 
-      self.add(obs=obs.reshape(n_envs, -1).astype(np.float32),
-               next_obs=next_obs.reshape(n_envs, -1).astype(np.float32),
-               act=action_np,
-               rew=reward.astype(np.float32).reshape(n_envs),
-               # Termination only: a time-limit truncation is not a terminal
-               # state and must keep its bootstrap.
-               term=term.astype(np.float32).reshape(n_envs),
-               **{name: value for name, value in step_extras.items()})
+      emit = np.flatnonzero(finished)
+      if len(emit):
+        self.add(
+          slot_ids=emit,
+          obs=pending["obs"][emit],
+          next_obs=pending["next_obs"][emit],
+          act=pending["act"][emit],
+          rew=pending["rew"][emit],
+          term=pending["term"][emit],
+          horizon=pending["horizon"][emit],
+          **{name: value[emit] for name, value in pending["extras"].items()},
+        )
+        pending["active"][emit] = False
+        pending["rew"][emit] = 0.0
+        pending["term"][emit] = 0.0
+        pending["horizon"][emit] = 0
 
       finished_idx = np.flatnonzero(done).tolist()
 
@@ -278,7 +347,18 @@ class ReplayBuffer():
         else:
           obs[0], _ = env.reset()
 
-    self._rollout_state = dict(env=env, obs=obs, chunk_state=chunks.snapshot())
+    self._rollout_state = dict(
+      env=env, obs=obs, chunk_state=chunks.snapshot(),
+      pending=dict(
+        active=np.array(pending["active"], copy=True),
+        obs=np.array(pending["obs"], copy=True),
+        act=np.array(pending["act"], copy=True),
+        rew=np.array(pending["rew"], copy=True),
+        next_obs=np.array(pending["next_obs"], copy=True),
+        term=np.array(pending["term"], copy=True),
+        horizon=np.array(pending["horizon"], copy=True),
+        extras={k: np.array(v, copy=True) for k, v in pending["extras"].items()},
+      ))
 
     # The per-slot sums stay off the return value -- a caller owning a subset of
     # the slots reads them through last_rollout_per_seed() instead.
@@ -287,3 +367,60 @@ class ReplayBuffer():
     acc["chunk_size"] = np.full(n_envs, float(policy.chunk_size), np.float64)
     self._rollout_per_env = acc
     return summarize_rollout(acc)
+
+
+class MultiSeedReplay(ReplayBuffer):
+  """One ReplayBuffer per seed behind a single rollout loop.
+
+  `num_seeds: 1` is not a separate path; it is the size-1 instance of the same
+  routing and sampling behavior the trainer uses at larger seed counts."""
+
+  def __init__(self, num_seeds: int, num_envs: int, max_transitions: int):
+    super().__init__(max_transitions)
+    self.num_seeds = num_seeds
+    self.num_envs  = num_envs
+    self.seeds = [ReplayBuffer(max_transitions) for _ in range(num_seeds)]
+
+  def add(self, **row) -> None:
+    slot_ids = row.pop("slot_ids", None)
+    if slot_ids is None:
+      for i, buffer in enumerate(self.seeds):
+        block = slice(i * self.num_envs, (i + 1) * self.num_envs)
+        buffer.add(**{name: value[block] for name, value in row.items()})
+      return
+
+    slot_ids = np.asarray(slot_ids)
+    for i, buffer in enumerate(self.seeds):
+      lo, hi = i * self.num_envs, (i + 1) * self.num_envs
+      mask = (slot_ids >= lo) & (slot_ids < hi)
+      if not np.any(mask):
+        continue
+      buffer.add(**{name: value[mask] for name, value in row.items()})
+
+  def last_rollout_per_seed(self) -> list[dict]:
+    acc = self._rollout_per_env
+    return [summarize_rollout(acc, slice(i * self.num_envs, (i + 1) * self.num_envs))
+            for i in range(self.num_seeds)]
+
+  @property
+  def n_transitions(self) -> int:
+    return sum(buffer.n_transitions for buffer in self.seeds)
+
+  def min_transitions(self) -> int:
+    return min(buffer.n_transitions for buffer in self.seeds)
+
+  def transitions_per_seed(self) -> list[int]:
+    return [buffer.n_transitions for buffer in self.seeds]
+
+  def sample(self, batch_size: int) -> dict:
+    return self.sample_chunk(1, batch_size, leading=False)
+
+  def sample_chunk(self, k: int, batch_size: int, *, leading: bool = True) -> dict:
+    per_step = [[buffer.sample_numpy(batch_size) for buffer in self.seeds]
+                for _ in range(k)]
+    stack_seeds = lambda step, key: np.stack([seed[key] for seed in step])
+    out = {key: np.stack([stack_seeds(step, key) for step in per_step])
+           for key in per_step[0][0]}
+    if not leading:
+      out = {key: value[0] for key, value in out.items()}
+    return jax.device_put(out)

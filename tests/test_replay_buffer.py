@@ -2,8 +2,8 @@ import gymnasium as gym
 import numpy as np
 import pytest
 
-from barl_jax.multiseed import MultiSeedReplay
-from barl_jax.rollout import RandomPolicy, ReplayBuffer
+from barl_jax.policy import StackedPolicy, stack, unstack
+from barl_jax.rollout import MultiSeedReplay, RandomPolicy, ReplayBuffer
 
 
 def _stacked_fixture(num_seeds: int):
@@ -12,7 +12,6 @@ def _stacked_fixture(num_seeds: int):
   build; the routing under test is the Policy-agnostic part."""
   from flax import nnx
   from barl_jax.env import Environment
-  from barl_jax.multiseed import stack
   from barl_jax.policy import TRAINABLE, Policy
 
   environment = Environment.make("HalfCheetah")
@@ -185,6 +184,7 @@ def test_rollout_next_obs_is_pre_reset():
   assert np.allclose(f["next_obs"][:, 0], f["obs"][:, 0] + 1)
   # slot 1 truncates at t == 5: its 5th transition keeps next_obs == 5, not 0.
   assert f["next_obs"][1::2][4, 0] == 5.0
+  assert np.all(f["horizon"] == 1)
 
 
 def test_rollout_term_excludes_truncation():
@@ -212,9 +212,16 @@ def test_rollout_executes_chunked_actions_and_discards_done_tail():
   ])
 
   buffer.rollout(policy, env, n_steps=5, seed=0)
-  acts = buffer._fields["act"][:buffer.n_transitions, 0]
-
-  assert np.allclose(acts, [0.0, 0.25, -0.25, -0.5, 0.75])
+  # One replay row per completed/cut-short chunk, not per primitive step.
+  assert buffer.n_transitions == 2
+  plans = buffer._fields["act"][:buffer.n_transitions]
+  assert plans.shape == (2, 3)
+  assert np.allclose(plans[0], [0.0, 0.25, 0.5])
+  assert np.allclose(plans[1], [-0.25, -0.5, -0.75])
+  assert np.allclose(buffer._fields["rew"][:buffer.n_transitions], [3.0, 3.0])
+  assert np.allclose(buffer._fields["next_obs"][:buffer.n_transitions, 0], [2.0, 2.0])
+  assert np.allclose(buffer._fields["term"][:buffer.n_transitions], [1.0, 1.0])
+  assert np.array_equal(buffer._fields["horizon"][:buffer.n_transitions], [2, 2])
 
 
 def test_eval_slot_blocks_map_to_seeds():
@@ -224,8 +231,6 @@ def test_eval_slot_blocks_map_to_seeds():
   eval curve if it ever changes."""
   import jax
   import jax.numpy as jnp
-  from barl_jax.multiseed import StackedPolicy, unstack
-
   num_seeds, per_run = 3, 4
   graphdef, state, reference, obs_dim = _stacked_fixture(num_seeds)
 

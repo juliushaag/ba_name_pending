@@ -14,16 +14,16 @@ Two explicit kinds of class attribute, and keeping them apart is the point:
 
 **Which net / which time embedding is a configuration value, not an inheritance
 choice.** The named styles live as plain dicts (`networks.mlp.py`'s
-`MLP_STYLES`, `networks.flow.py`'s `TIME_STYLES`): `name -> surface`. A
+`MLP_PRESETS`, `networks.flow.py`'s `TIME_STYLES`): `name -> surface`. A
 component *selects* one with a `Config` tagged with that dict:
 
     class DDPMActor(Actor, ActorOptim):
-        net_style = Config("gelu",   style=MLP_STYLES)    # MLP_STYLES["gelu"]
+        mlp_preset = Config("gelu",   style=MLP_PRESETS)    # MLP_PRESETS["gelu"]
         time_emb  = Config("sin_20", style=TIME_STYLES)   # TIME_STYLES["sin_20"]
 
-so switching `--set model.components.actor.net_style=silu` (or a grid axis)
+so switching `--set model.components.actor.mlp_preset=silu` (or a grid axis)
 changes the whole net, and the resolved config records the *choice* -- a style's
-surface keys are attributed as `style: MLP_STYLES.gelu`, never hidden as class
+surface keys are attributed as `style: MLP_PRESETS.gelu`, never hidden as class
 defaults. A component can still pin one key on top of a style (a per-slot
 `activation:` beats the style's), and a style's surface sits below the component
 own declarations and the slot's YAML.
@@ -41,8 +41,6 @@ from __future__ import annotations
 import operator
 import types
 from typing import Any, Optional
-
-from barl_jax.configs import deep_merge
 
 _MISSING = object()
 
@@ -63,7 +61,7 @@ class Config:
   """A non-search default: a value, its type inferred.
 
   `style` is the **style dict** this value selects from: a module-level
-  `name -> surface` table (`networks.mlp.py`'s `MLP_STYLES`,
+  `name -> surface` table (`networks.mlp.py`'s `MLP_PRESETS`,
   `networks.flow.py`'s `TIME_STYLES`). At resolution the chosen entry's whole
   surface is merged in below the component's own declarations, so the value is
   a configuration choice ("which MLP", "which time embedding") rather than an
@@ -109,7 +107,7 @@ class HParam(Config):
 
 
 # ---------------------------------------------------------------------------
-# size ladders -- the capacity tables a `size:` resolves against
+# tier ladders -- the capacity tables a `tier:` resolves against
 # ---------------------------------------------------------------------------
 
 BUNDLES: dict[str, dict] = {}
@@ -121,25 +119,25 @@ def register_bundle(path: str, kwargs: dict) -> None:
   BUNDLES[path] = dict(kwargs)
 
 
-def ladder(kind: str, name: str) -> dict:
-  """`sizes.<kind>.<name>` as a dict of kwargs."""
-  path = f"sizes.{kind}.{name}"
+def tier(kind: str, name: str) -> dict:
+  """`tiers.<kind>.<name>` as a dict of kwargs."""
+  path = f"tiers.{kind}.{name}"
   if path not in BUNDLES:
-    raise KeyError(f"no size {kind!r} x {name!r} -- registered: {sorted(BUNDLES)}")
+    raise KeyError(f"no tier {kind!r} x {name!r} -- registered: {sorted(BUNDLES)}")
   return BUNDLES[path]
 
 
-def register_ladder(kind: str, name: str, kwargs: dict) -> None:
-  register_bundle(f"sizes.{kind}.{name}", kwargs)
+def register_tier(kind: str, name: str, kwargs: dict) -> None:
+  register_bundle(f"tiers.{kind}.{name}", kwargs)
 
 
-def ladder_names(kind: str) -> list[str]:
-  prefix = f"sizes.{kind}."
+def tier_names(kind: str) -> list[str]:
+  prefix = f"tiers.{kind}."
   return sorted(k for k in BUNDLES if k.startswith(prefix))
 
 
-for _kind, _sizes in (("critic", {"small": 256, "medium": 512, "large": 1024, "xlarge": 2048}),
-                      ("actor", {"small": 256, "medium": 512, "large": 1024, "xlarge": 2048})):
-  for _name, _w in _sizes.items():
-    register_ladder(_kind, _name, {"latent_dim": _w, "layers": 1 if _kind == "critic" else 2,
-                                   **({"n_models": 2} if _kind == "critic" else {})})
+for _kind, _tiers in (("critic", {"low": 256, "medium": 512, "large": 1024, "xlarge": 2048}),
+                      ("actor", {"low": 256, "medium": 512, "large": 1024, "xlarge": 2048})):
+  for _name, _w in _tiers.items():
+    register_tier(_kind, _name, {"latent_dim": _w, "layers": 1 if _kind == "critic" else 2,
+                                 **({"n_models": 2} if _kind == "critic" else {})})

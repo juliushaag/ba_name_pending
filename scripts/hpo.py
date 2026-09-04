@@ -51,8 +51,7 @@ def trial_tag(trial: dict, index: int, num_seeds: int) -> str:
   index rather than by every varied value, which for a sampled point is all of
   them."""
   parts = [str(trial["algo"]), str(trial["env"])]
-  if num_seeds > 1:
-    parts.append(f"{num_seeds}seeds")
+  parts.append(f"{num_seeds}seeds")
   parts.append(f"t{index:03d}")
   return re.sub(r"[^A-Za-z0-9.=_-]", "-", "_".join(parts))
 
@@ -118,7 +117,7 @@ def main():
     for problem in searchable:
       print(f"  - {problem}")
     print("\n  A search is over explicit optimization knobs (HParam). Config keys "
-          "(activation, norm, dtype, size, lr, ...) are varied with --set or a grid axis, "
+          "(activation, norm, dtype, tier, lr, ...) are varied with --set or a grid axis, "
           "not per-trial.")
     raise SystemExit(1)
 
@@ -135,7 +134,7 @@ def main():
 
   print()
   print(f"Search:  {Path(args.search).name} ({len(trials)} trials, "
-        f"{num_seeds} seed{'s' if num_seeds > 1 else ''} each)")
+        f"{num_seeds} seed{'s' if num_seeds != 1 else ''} each)")
   print("Space:   " + ", ".join(f"{k}:{v['type']}" for k, v in spec["axes"].items()))
   if args.validate:
     print("Validate: one rollout chunk + one train step per distinct {algo x env}")

@@ -11,7 +11,7 @@ whether the dual is fed anything at all -- and none of those is an algorithm.
 algorithm becomes a `config/models/*.yaml` entry naming a `policy:`, an
 `actor:` class and a `critic:` class -- not a Python subclass -- which is what
 lets SAC, AMDP, DIME and SDAC (once its actor owns best-of-N and exploration,
-see `networks/actors`) share these two classes entirely."""
+see `actors`) share these two classes entirely."""
 
 import gymnasium as gym
 import jax
@@ -20,7 +20,7 @@ import jax.numpy as jnp
 from barl_jax.hparam import Config, HParam
 from barl_jax.networks.critic import QCriticBase
 from barl_jax.networks.regulator import AutotuneRegulator
-from barl_jax.policy import Actor, Policy, gated_loss, register_policy
+from barl_jax.policy import Actor, Policy, gated_losses, register_policy
 
 
 @register_policy
@@ -40,7 +40,9 @@ class RLPolicy(Policy):
 
     assert isinstance(env.action_space, gym.spaces.Box)
 
-    self.critic: QCriticBase = self.build_component("critic", QCriticBase)
+    chunked = self.env_stats.derive(act_dim=self.env_stats["chunked_act_dim"])
+    self.critic: QCriticBase = self.build_component("critic", QCriticBase,
+                                                    env_stats=chunked)
     # The build gate is QCriticBase, which a noise-conditioned critic satisfies
     # -- but its `loss` is a wider signature this template's one-backward
     # `critic.loss(..., shift=...)` call cannot drive. Refuse the pairing here
@@ -79,35 +81,38 @@ class RLPolicy(Policy):
     action   = batch["act"]
     reward   = batch["rew"]
     term     = batch["term"]
+    horizon  = batch.get("horizon")
 
     losses = {}
     alpha  = self.alpha()
 
     # Every draw this step descends from one key, split here: the bootstrap
-    # sample, the actor loss and its extra losses (SDAC's exploration term)
-    # must not share a stream, and a step's randomness should be readable off
-    # train_step rather than hidden in each component's `rngs`.
+    # sample and the actor losses must not share a stream, and a step's
+    # randomness should be readable off train_step rather than hidden in each
+    # component's `rngs`. keys[2] is retired -- the explore term shares the
+    # actor's stream now (one best-of-N) -- but the split stays 3-way so the
+    # other two streams are unchanged.
     keys = jax.random.split(self.rngs.noise(), 3)
 
     next_action, entropy = jax.lax.stop_gradient(
       self.actor.generate_action(next_obs, critic=self.critic, key=keys[0]))
+    next_action = next_action.reshape(next_action.shape[0], -1)
 
     self.critic.loss(obs, action, next_obs, next_action, reward, term,
-                     losses, shift=self.target_shift(alpha, entropy))
+                     losses, shift=self.target_shift(alpha, entropy), horizon=horizon)
 
     # Skipped outright on the steps `policy_delay` would mask the update on
-    # anyway -- the loss prices through a frozen critic and its target is
+    # anyway -- the losses price through a frozen critic and their targets are
     # stop_gradient'd, so nothing here reaches the critic's parameters and the
-    # skip is parameter-identical (see `gated_loss`).
-    losses["actor"] = gated_loss(
+    # skip is parameter-identical (see `gated_losses`).
+    losses.update(gated_losses(
       self, self.policy_delay,
       lambda actor, critic: actor.loss(obs, critic, alpha, key=keys[1]),
-      self.actor, self.critic)
-
-    losses.update(self.actor.extra_losses(obs, self.critic, alpha, key=keys[2]))
+      tuple(sorted(self.actor.create_optimizer())), self.actor, self.critic))
     self.dual_loss(entropy, losses)
 
-    self.actor.metrics.vec("action", next_action, limit=1.0)
+    self.actor.metrics.vec("action", next_action.reshape(
+      next_action.shape[0], self.actor.chunk_size, self.actor.action_dim), limit=1.0)
     self.actor.metrics.dist("entropy", entropy)
 
     return losses
@@ -123,7 +128,7 @@ class MaxEntRLPolicy(RLPolicy):
   resolve here. `entropy_in_target` is the one real behavioural fork: SDAC's
   Bellman target carries no entropy bonus (its `entropy` is a scalar over the
   exploration parameter, not the per-sample quantity the target wants), so it
-  sets this false and the dual trains purely off `extra_losses`."""
+  sets this false and the dual trains purely off the actor's DSM loss."""
 
   SLOTS = ("critic", "actor", "entropy")
   entropy_scale     = HParam(-1.0)
@@ -133,7 +138,8 @@ class MaxEntRLPolicy(RLPolicy):
     super().__init__(env, **kwargs)
 
     self.entropy: AutotuneRegulator = self.build_component(
-      "entropy", AutotuneRegulator, target=self.action_dim * self.entropy_scale)
+      "entropy", AutotuneRegulator,
+      target=self.chunk_size * self.action_dim * self.entropy_scale)
     assert set(self.optimizer_cadence()) <= set(self.create_optimizer()), (
       f"{self.model_name}: optimizer_cadence names a key create_optimizer() "
       f"doesn't -- build_optimizer's cadence.get(key, 1) would drop it silently.")

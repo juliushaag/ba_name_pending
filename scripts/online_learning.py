@@ -13,8 +13,9 @@ already left behind:
     uv run python scripts/online_learning.py --config sweeps/<ts>/<tag>/config.yaml
 
 `num_seeds` (config, or `--seeds`) runs N independently-initialized seeds as one
-vmapped process: one CUDA context, one compiled step, one set of envs. A seed run
-that way is bit-identical to the same seed run alone. The loop itself lives in
+vmapped process, with `num_seeds: 1` as the degenerate case: one CUDA context,
+one compiled step, one set of envs. A 1-seed run that way is bit-identical to the
+same seed run alone. The loop itself lives in
 barl_jax.trainer -- this file is the CLI around it.
 """
 
@@ -99,8 +100,8 @@ if __name__ == "__main__":
     if kwargs.run_dir is not None:
       cfg["run_dir"] = os.path.abspath(kwargs.run_dir)
     num_seeds = kwargs.seeds or cfg["num_seeds"]
-    seeds = f", {num_seeds} seeds vmapped" if num_seeds > 1 else ""
-    print(f"=== Run {i + 1}/{len(runs)}: {cfg['model']} on {cfg['env']}{seeds} ===")
+    print(f"=== Run {i + 1}/{len(runs)}: {cfg['model']} on {cfg['env']}, "
+          f"{num_seeds} seed{'s' if num_seeds != 1 else ''} vmapped ===")
 
     only_validate = bool(cfg["validate"])
     run = setup(cfg, num_seeds, validate_only=only_validate)

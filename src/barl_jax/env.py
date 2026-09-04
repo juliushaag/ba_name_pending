@@ -1,8 +1,44 @@
+import functools
 import multiprocessing as mp
 from abc import ABC, abstractmethod
 
-from barl_jax.env_stats import EnvStats
 import gymnasium as gym
+import numpy as np
+
+from barl_jax_env_worker import make_env
+
+
+class EnvStats(dict):
+
+  @classmethod
+  def from_env(cls, env: gym.Env, **declared) -> "EnvStats":
+    obs_space, act_space = env.observation_space, env.action_space
+    discrete = isinstance(act_space, gym.spaces.Discrete)
+
+    stats = cls(
+      obs_shape    = tuple(obs_space.shape),
+      obs_dim      = int(np.prod(obs_space.shape)),
+      obs_low      = np.asarray(obs_space.low,  dtype=np.float32),
+      obs_high     = np.asarray(obs_space.high, dtype=np.float32),
+      act_discrete = discrete,
+      act_dim      = int(act_space.n) if discrete else int(np.prod(act_space.shape)),
+      act_low      = None if discrete else np.asarray(act_space.low,  dtype=np.float32),
+      act_high     = None if discrete else np.asarray(act_space.high, dtype=np.float32),
+      max_episode_steps = None,
+      return_min   = None,
+      return_max   = None,
+    )
+    stats.update(declared)
+    return stats
+
+  def derive(self, **overrides) -> "EnvStats":
+    """Shallow copy with some keys replaced, for a component that feeds its
+    inner network something other than the raw env dims."""
+    return EnvStats({**self, **overrides})
+
+  def static(self) -> dict:
+    """Everything in this stats dict -- the run-config view, safe to log once."""
+    return dict(self)
 
 
 class Environment(ABC):
@@ -62,12 +98,19 @@ class Environment(ABC):
     # and forking a multithreaded parent is what python warns will "likely lead
     # to a deadlock" -- a worker can inherit a lock held by a thread that does
     # not exist on its side. forkserver's workers fork from a clean
-    # single-threaded server process instead, and unlike spawn they don't each
-    # re-import jax/mujoco, which at num_envs in the hundreds is the difference
-    # between seconds and minutes of startup.
+    # single-threaded server process instead.
     methods = mp.get_all_start_methods()
     context = "forkserver" if "forkserver" in methods else "spawn"
-    return gym.vector.AsyncVectorEnv([self.get_env for _ in range(num_envs)],
+    # Not `self.get_env` directly: a worker unpickling a bound method has to
+    # import this instance's class, and any name under `barl_jax.*` runs
+    # `barl_jax/__init__.py` first -- eagerly importing every policy/critic
+    # (jax) and ManiSkill (torch via sapien), none of which a plain
+    # env-stepping worker needs. `barl_jax_env_worker` lives outside the
+    # `barl_jax` package specifically so unpickling it never touches that --
+    # see its docstring for the measured cost this avoids.
+    module_name = type(self).__module__.rsplit(".", 1)[-1]
+    factory = functools.partial(make_env, module_name, type(self).__name__)
+    return gym.vector.AsyncVectorEnv([factory for _ in range(num_envs)],
                                      autoreset_mode=gym.vector.AutoresetMode.DISABLED,
                                      context=context)
 

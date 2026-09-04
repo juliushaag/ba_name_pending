@@ -8,7 +8,7 @@ that cannot be constructed from its own baseline at all.
 
 import pytest
 
-import barl_jax.model_config as model_config
+import barl_jax.config.tree as model_config
 from barl_jax.networks.registry import get_component
 from barl_jax.policy import Component
 

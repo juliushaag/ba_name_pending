@@ -22,15 +22,72 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 from flax import nnx
 
-import barl_jax.model_config as model_config
+import barl_jax.config.tree as model_config
 from barl_jax.env import Environment
 from barl_jax.logger import Logger
-from barl_jax.metrics import DEBUG, PRIMARY, to_host
-from barl_jax.multiseed import MultiSeedReplay, StackedPolicy, split_metrics, stack, unstack
-from barl_jax.policy import TRAINABLE, Policy, run_episodes
-from barl_jax.train import train_step
+from barl_jax.metrics import DEBUG, PRIMARY, DebugMetric, Metric, collect, recording, to_host
+from barl_jax.policy import TRAINABLE, Policy, StackedPolicy, gating, run_episodes, split_metrics, stack, unstack
+from barl_jax.rollout import MultiSeedReplay
+
+
+@partial(jax.jit, static_argnums=(0, 3))
+def train_step(graphdef, state, batch, tiers, grad_step=None):
+  """One jitted gradient step over one policy state."""
+  policy, opt = nnx.merge(graphdef, state)
+
+  def scalar_loss(policy):
+    policy.record_batch(batch)
+    losses = policy.train_step(batch)
+    return sum(losses.values()), losses
+
+  def loss_fn(policy):
+    total, losses = scalar_loss(policy)
+    sown, sown_debug = nnx.pop(policy, Metric, DebugMetric)
+    return total, (losses, sown, sown_debug)
+
+  with recording(*tiers), gating(grad_step):
+    policy.before_step()
+    (_, (losses, sown, sown_debug)), grads = nnx.value_and_grad(
+      loss_fn, argnums=nnx.DiffState(0, TRAINABLE), has_aux=True)(policy)
+
+  primary = collect(sown)
+  debug   = collect(sown_debug)
+
+  if tiers:
+    labels = dict(nnx.to_flat_state(policy.optimizer_labels()))
+    flat_grads = nnx.to_flat_state(grads)
+    for key in losses:
+      partition = [_raw(v).astype(jnp.float32) for path, v in flat_grads
+                   if labels.get(path) == key]
+      if PRIMARY in tiers:
+        primary[policy.metrics_key(key, "loss")] = losses[key]
+        primary[policy.metrics_key(key, "grad_norm")] = optax.tree.norm(partition)
+      if DEBUG in tiers and partition:
+        total   = sum(g.size for g in partition)
+        zeros   = sum((g == 0).sum() for g in partition)
+        nonfin  = sum((~jnp.isfinite(g)).sum() for g in partition)
+        gmax    = jnp.max(jnp.stack([jnp.abs(g).max() for g in partition]))
+        debug[policy.metrics_key(key, "grad_max")] = gmax
+        debug[policy.metrics_key(key, "grad_frac_zero")] = zeros / total
+        debug[policy.metrics_key(key, "grad_frac_nonfinite")] = nonfin / total
+
+  opt.update(policy, grads)
+  policy.after_step()
+
+  return nnx.state((policy, opt)), losses, (primary, _pack(primary)), (debug, _pack(debug))
+
+
+def _pack(metrics: dict):
+  if not metrics:
+    return jnp.zeros((0,))
+  return jnp.stack([jnp.asarray(metrics[k]) for k in sorted(metrics)])
+
+
+def _raw(v):
+  return v[...] if hasattr(v, "__getitem__") and not isinstance(v, jax.Array) else v
 
 # `grad_step` rides in at in_axes=None: it is the same number for every seed, and
 # a per-seed copy of it would batch the `policy_delay` predicate, which turns the
@@ -129,7 +186,11 @@ def setup(cfg: dict, num_seeds: int, *, validate_only: bool = False) -> Run:
   num_envs = 1 if validate_only else run.num_envs
   run.num_envs = num_envs
   run.rollout_env = run.environment.get_vector_env(num_seeds * num_envs)
-  run.buffer = MultiSeedReplay(num_seeds, num_envs, cfg["buffer_size"])
+  # A seed's buffer never receives more than total_env_steps transitions --
+  # preallocating past that just reserves address space (and, as training
+  # fills it in, real RAM) no run will ever use.
+  buffer_size = min(cfg["buffer_size"], cfg["total_env_steps"])
+  run.buffer = MultiSeedReplay(num_seeds, num_envs, buffer_size)
 
   checkpoint = cfg["checkpoint"]
   if checkpoint is None:
@@ -173,8 +234,8 @@ def setup(cfg: dict, num_seeds: int, *, validate_only: bool = False) -> Run:
 
 
 def _checkpoint_dir(run: Run, root: str, seed: int) -> str:
-  """A single-seed run keeps the flat layout; several seeds get one dir each."""
-  return root if run.num_seeds == 1 else os.path.join(root, f"seed{seed}")
+  """Every seed's checkpoints live under its own directory, including seed 0."""
+  return os.path.join(root, f"seed{seed}")
 
 
 def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
@@ -387,9 +448,7 @@ def warmup(run: Run, envs, log) -> dict:
 def train(run: Run):
   cfg, num_seeds = run.cfg, run.num_seeds
   now  = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-  name = f"{run.model_name.lower()}/{run.env_name.lower()}/{now}"
-  if num_seeds > 1:
-    name += f"_x{num_seeds}"
+  name = f"{run.model_name.lower()}/{run.env_name.lower()}/{now}_x{num_seeds}"
 
   # `eval_video_every: null` means never, so the render env is not built either
   # -- one fewer mujoco model resident, and no GL context to create at all.
@@ -401,9 +460,7 @@ def train(run: Run):
   eval_envs = (run.environment.get_vector_env(num_seeds * cfg["eval_runs"]),
                run.environment.get_vector_env(n_videos, asynchronous=False) if n_videos else None)
 
-  tags = [run.model_name, run.env_name, "online", "jax"]
-  if num_seeds > 1:
-    tags.append("multiseed")
+  tags = [run.model_name, run.env_name, "online", "jax", "multiseed"]
   if cfg["sweep_tag"]:
     tags.append(cfg["sweep_tag"])
 
@@ -433,10 +490,9 @@ def train(run: Run):
   # the only place a finished run's result is readable without wandb.
   objective_dir = os.path.abspath(cfg["run_dir"]) if cfg["run_dir"] else os.path.join("checkpoints", name)
   log.message(f"Checkpoints: {ckpt_dir}")
-  if num_seeds > 1:
-    log.message(f"{num_seeds} seeds vmapped in one process "
-                f"({num_seeds * run.num_envs} rollout envs, "
-                f"{run.num_params / 1e6:.2f}M params each)")
+  log.message(f"{num_seeds} seed{'s' if num_seeds != 1 else ''} vmapped in one process "
+              f"({num_seeds * run.num_envs} rollout envs, "
+              f"{run.num_params / 1e6:.2f}M params each)")
 
   warmup_stats = warmup(run, eval_envs, log)
 
@@ -444,7 +500,8 @@ def train(run: Run):
 
   if cfg["random_steps"] > 0:
     run.buffer.random_fill(run.rollout_env, n_steps=cfg["random_steps"] // run.num_envs,
-                           seed=run.base_seed)
+                           seed=run.base_seed, chunk_size=run.reference.chunk_size,
+                           discount=run.reference.critic.gamma)
     log.message(f"Random-filled the buffer with {cfg['random_steps']} env steps before training")
 
   best = [float("-inf")] * num_seeds

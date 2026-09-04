@@ -1,17 +1,17 @@
 """Whole-tree config lint -- the gate that keeps defaults coupled to code and
 keeps the composed config an honest account of a run.
 
-model_config.validate() runs the per-model subset of these before every training
+config_tree.validate() runs the per-model subset of these before every training
 run; this script is the whole-tree view, for CI and for editing config/ by hand.
 It fails on anything that would make a run's wandb config incomplete:
 
-  * a registered component without a `kind` (no size ladder to resolve against)
-  * a size ladder whose entries declare different keys, or a component declaring
+  * a registered component without a `kind` (no tier ladder to resolve against)
+  * a tier ladder whose entries declare different keys, or a component declaring
     a key a ladder owns
-  * a slot of a sized kind with no `size:`, or a stated `size:` that isn't a rung
+  * a slot of a tiered kind with no `tier:`, or a stated `tier:` that isn't a rung
   * a model whose `policy:` names an unregistered class, or whose `components:`
     disagree with that class's declared slots
-  * a run key read by the code but declared in no code declaration (barl_jax.run_config)
+  * a run key read by the code but declared in no code declaration (barl_jax.config)
 
 Exit code is the number of problems, so it composes in a shell.
 
@@ -27,7 +27,7 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import barl_jax  # noqa: F401  -- populates the policy/component registries
-import barl_jax.model_config as model_config
+import barl_jax.config.tree as model_config
 from barl_jax.config import INJECTED_KEYS, run_keys
 from barl_jax.networks.registry import available_components, get_component
 from barl_jax.policy import Policy
@@ -43,14 +43,14 @@ RUN_KEY_PATTERN = re.compile(r"""cfg\[["'](\w+)["']\]""")
 def component_problems() -> list[str]:
   """Every registered component: its class declares what makes it resolvable.
   With config/components/*.yaml gone, the class IS the baseline -- `kind`
-  selects its size ladder (a sized component must name one), and a `size:` a
+  selects its tier ladder (a tiered component must name one), and a `tier:` a
   slot states must resolve to an actual rung."""
   problems = []
   tree = model_config.tree()
   for name in sorted(available_components()):
     cls = get_component(name)
     if getattr(cls, "kind", None) is None:
-      problems.append(f"{name} declares no `kind` -- a slot's `size:` has no ladder to resolve against")
+      problems.append(f"{name} declares no `kind` -- a slot's `tier:` has no ladder to resolve against")
   return problems
 
 
@@ -71,7 +71,7 @@ def policy_classes_problems() -> list[str]:
 
 
 def slot_problems() -> list[str]:
-  """Every slot of every model: a size where the kind has a ladder, and a
+  """Every slot of every model: a tier where the kind has a ladder, and a
   `components:` block that disagrees with its policy class's SLOTS."""
   problems = []
   tree = model_config.tree()
@@ -99,15 +99,15 @@ def slot_problems() -> list[str]:
         problems.append(str(e))
         continue
       kind = tree.component_kind(cls_name)
-      table = tree.size_table(kind)
+      table = tree.tier_table(kind)
       if not table:
         continue
-      size = tree.slot_size(policy_name, slot, profile)
-      if size is None:
-        problems.append(f"{policy_name}.{slot} [{cls_name}]: no `size:` -- every {kind} slot "
+      tier = tree.slot_tier(policy_name, slot, profile)
+      if tier is None:
+        problems.append(f"{policy_name}.{slot} [{cls_name}]: no `tier:` -- every {kind} slot "
                         f"must name one of {', '.join(sorted(table))}")
-      elif size not in table:
-        problems.append(f"{policy_name}.{slot} [{cls_name}]: `size: {size}` is not a {kind} "
+      elif tier not in table:
+        problems.append(f"{policy_name}.{slot} [{cls_name}]: `tier: {tier}` is not a {kind} "
                         f"capacity ({', '.join(sorted(table))})")
   return problems
 

@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import pytest
 from flax import nnx
 
-import barl_jax.model_config as model_config
+import barl_jax.config.tree as model_config
 from barl_jax.env import Environment
 from barl_jax.environments.dm_control import DMControlEnvironment
 from barl_jax.networks.registry import get_component
