@@ -148,9 +148,9 @@ def _discrete_space_size(axes: dict) -> int | None:
 def check_searchability(spec: dict, *, tree=None) -> list[str]:
   """A search axis on `model.<slot>.<key>`/`model.params.<key>` must name a
   declared **HParam** (a searchable knob) of every algo the search varies.
-  Structural `Config` declarations -- how a net is put together, its capacity
-  (`size`), its dtype -- are deliberately not searchable: a hyperparameter
-  search is over algorithmic knobs, not over MLP structure. Runs after a
+  `Config` declarations -- structural or just deliberately non-searchable --
+  are refused: a hyperparameter search is over explicit optimization knobs,
+  not every value that happens to be configurable. Runs after a
   barl_jax import (hpo.py), since resolving a key needs the class registries."""
   import barl_jax  # noqa: F401 -- registries
   from barl_jax.config_tree import ConfigTree
@@ -176,7 +176,7 @@ def check_searchability(spec: dict, *, tree=None) -> list[str]:
       if rest.startswith("params."):
         key = rest[len("params."):]
         if key in getattr(cls, "_configs", {}):
-          problems.append(f"{axis}: '{key}' is a structural Config on {pn}, not a searchable HParam")
+          problems.append(f"{axis}: '{key}' is a non-search Config on {pn}, not a searchable HParam")
         elif key not in getattr(cls, "_hparams", {}):
           problems.append(f"{axis}: '{key}' is not a declared HParam of {pn}")
       elif rest.startswith("components."):
@@ -193,7 +193,7 @@ def check_searchability(spec: dict, *, tree=None) -> list[str]:
         # policy-class-keyed.
         comp = get_component(tree.slot_class(policy_name, slot))
         if key in getattr(comp, "_configs", {}):
-          problems.append(f"{axis}: '{key}' is a structural Config on {comp.__name__}, "
+          problems.append(f"{axis}: '{key}' is a non-search Config on {comp.__name__}, "
                           f"not a searchable HParam")
         elif key not in getattr(comp, "_hparams", {}):
           # A style-surface key (activation, dtype, ...) is owned by the

@@ -53,8 +53,8 @@ class DDPMActor(Actor, ActorOptim):
   net_style = Config("gelu", style=MLP_STYLES)
   time_emb  = Config("sin_20", style=TIME_STYLES)
   squash_cls = Config("TanhSquash")
-  num_steps    = HParam(20)
-  clip_denoised = HParam(True)
+  num_steps    = Config(20)
+  clip_denoised = Config(True)
   prior_scale  = HParam(0.5)
   # The noise ladder's *shape* is a Schedule named by class, with its endpoints
   # searchable; the selector and the kwargs dict are structural.
@@ -70,14 +70,14 @@ class DDPMActor(Actor, ActorOptim):
   # than on the owning Policy, since it is how *this* actor acts and is
   # trained, not algorithm logic. See `best_of_n`/`generate_action`/
   # `loss`/`extra_losses` below.
-  num_bon      = HParam(8)
-  num_candidates = HParam(24)
+  num_bon      = Config(8)
+  num_candidates = Config(24)
   softmax_temp = HParam(0.25)
   explore_init = HParam(0.1)
   explore_min  = HParam(1.0e-3)
   explore_max  = HParam(1.0)
-  explore_raw_limit = HParam(10.0)
-  explore_lr   = HParam(1.0e-2)   # its own optimizer, separate from the actor's
+  explore_raw_limit = Config(10.0)
+  explore_lr   = Config(1.0e-2)   # its own optimizer, separate from the actor's
 
   def __init__(self, env_stats, config: ConfigMixin, *, rngs: nnx.Rngs, **kwargs):
     self.resolve_hparams(config, env_stats=env_stats)
@@ -363,4 +363,3 @@ class DDPMActor(Actor, ActorOptim):
     slot's default key by `create_optimizer()`'s dict *insertion order*, which
     is not a distinction worth resting correctness on."""
     return "explore" if str(subpath[0]) == "explore_raw" else "actor"
-

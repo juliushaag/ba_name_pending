@@ -142,7 +142,7 @@ class NCLQLCritic(Polyak, NoiseConditionedCritic, EnsembleCritic):
   kind = "critic"
   net_style = Config("mish", style=MLP_STYLES)
   rho                = HParam(1.0)
-  pessimistic_target = HParam(True)
+  pessimistic_target = Config(True)
 
 
 @register_component
@@ -158,7 +158,7 @@ class NCLQLC51Critic(Polyak, NoiseConditionedCritic, C51Critic):
   net_style = Config("mish", style=MLP_STYLES)
   entropy_coef    = HParam(0.005)
   rho             = HParam(1.0)
-  pessimistic_target = HParam(True)
+  pessimistic_target = Config(True)
 
 
 @register_component
@@ -200,8 +200,8 @@ class NCLQL(Policy):
 
   # The annealed-Langevin sampler's knobs, each with its reference's default as
   # the class default; a model YAML's `params:` overrides the ones that differ.
-  noise_levels    = HParam(10)
-  steps_per_level = HParam(2)
+  noise_levels    = Config(10)
+  steps_per_level = Config(2)
 
   # The reference's `step_lr`: the level's step is step_size*(sigma_i/sigma_L)^2,
   # the drift is half of that times `temperature`, and the injected noise is its
@@ -211,11 +211,11 @@ class NCLQL(Policy):
   # score is normalized -- normalization replaces the score's *direction*
   # vector, not the step length.
   temperature     = HParam(500.0)
-  normalize_score = HParam(True)
-  clip_actions    = HParam(True)
+  normalize_score = Config(True)
+  clip_actions    = Config(True)
   reward_scale    = HParam(5.0)
-  action_limit    = HParam(1.0)
-  init_scale      = HParam(1.0)
+  action_limit    = Config(1.0)
+  init_scale      = Config(1.0)
 
   def __init__(self, env: gym.Env, **kwargs):
     super().__init__(env, **kwargs)
@@ -319,4 +319,4 @@ class NCLQL(Policy):
     obs = self.normalize_observations(observation)
     key = self.rngs.noise() if key is None else key
     action, _ = self.sample(obs, key)
-    return action, {}
+    return self.action_chunk(action), {}

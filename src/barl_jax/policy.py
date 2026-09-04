@@ -14,6 +14,7 @@ import optax
 import orbax.checkpoint as ocp
 from flax import nnx
 
+from barl_jax.action_chunking import ActionChunkExecutor, normalize_action_chunk
 from barl_jax.configs import ConfigMixin
 from barl_jax.env_stats import EnvStats
 from barl_jax.hparam import Config, HParam
@@ -58,6 +59,15 @@ def sanitize_action(action, xp=jnp):
   must not be pulled back onto the device to do this. Both modules implement
   `nan_to_num`/`clip` identically here."""
   return xp.clip(xp.nan_to_num(action, nan=0.0, posinf=1.0, neginf=-1.0), -1.0, 1.0)
+
+
+def action_bounds_numpy(action_space) -> tuple:
+  """Host-side `(scale, bias)` derived from the env's action space."""
+  if isinstance(action_space, gym.spaces.Discrete):
+    return None, None
+  low = np.asarray(action_space.low, dtype=np.float32)
+  high = np.asarray(action_space.high, dtype=np.float32)
+  return (high - low) / 2, (high + low) / 2
 
 
 def frozen(module):
@@ -289,10 +299,11 @@ class Component(HParamsOwner):
     # Both are overwritten by build_component with the real slot; the defaults
     # only keep a component constructed outside a Policy usable.
     self.slot       = type(self).__name__.lower()
-    # Every HParam class attribute becomes an instance attribute: the YAML
-    # layer's value if present, the declaration's default otherwise. A subclass
-    # that needed values before this ran (to build a nested module first) calls
-    # resolve_hparams itself and this re-sets the same values.
+    # Every declared Config/HParam class attribute becomes an instance
+    # attribute: the YAML layer's value if present, the declaration's default
+    # otherwise. A subclass that needed values before this ran (to build a
+    # nested module first) calls resolve_hparams itself and this re-sets the
+    # same values.
     if config is not None:
       self.resolve_hparams(config, env_stats=env_stats)
 
@@ -391,7 +402,8 @@ def _jitted_infer(graphdef, state, observation, key):
   cache survives across calls: repeated `nnx.split` of the same policy yields an
   equal-and-equally-hashing GraphDef, so a rollout or an eval wave rebinding its
   weights hits the cache instead of recompiling."""
-  return nnx.merge(graphdef, state).inference_step(observation, key=key)
+  action, extras = nnx.merge(graphdef, state).inference_step(observation, key=key)
+  return action, extras
 
 
 class Policy(HParamsOwner, nnx.Module, ABC):
@@ -414,6 +426,7 @@ class Policy(HParamsOwner, nnx.Module, ABC):
   # entry a stray parameter is a hard error rather than a silently untrained
   # one (torch's add_param_group had the same job, minus the check).
   policy_params: dict[str, str] = {}
+  chunk_size = Config(1)
 
   # ------------------------------------------------------------------
   # Registry
@@ -528,13 +541,16 @@ class Policy(HParamsOwner, nnx.Module, ABC):
     # Gradient steps taken, for algorithms whose update cadence is `step % k`.
     self.train_steps = Buffer(jnp.zeros((), jnp.int32))
 
-    # The Policy's own tunables declared as HParam class attributes are resolved
-    # here against the resolved `params:` layer (model YAML, profile and run
+    # The Policy's own declared params (Config/HParam) are resolved here against
+    # the resolved `params:` layer (model YAML, profile and run
     # overrides). Subclasses read them off `self` (self.policy_delay, ...) -- the
     # same contract components get from Component.__init__.
     params_config = ConfigMixin("", self.resolve_params(),
                                 config_path=f"{self.model_name}.params")
     self.resolve_hparams(params_config)
+    self._env_stats = _Static(stats.derive(
+      chunk_size=self.chunk_size,
+      chunked_act_dim=self.chunk_size * self.action_dim))
     # A replay may carry keys an older implementation consumed but today's no
     # longer does. Recorded values remain useful provenance and must not make an
     # otherwise loadable checkpoint fail; strict leftovers apply to live config.
@@ -808,6 +824,7 @@ class Policy(HParamsOwner, nnx.Module, ABC):
       "model":        self.model_name,
       "policy_class": type(self).__name__,
       "profile":      self._profile,
+      "kwargs":       self._raw_kwargs,
       "overrides":    self._overrides,
       # The whole config this policy was built from, frozen. Without it a
       # checkpoint silently reconstructs a *different* architecture the moment
@@ -821,7 +838,7 @@ class Policy(HParamsOwner, nnx.Module, ABC):
       json.dump(meta, f, indent=2)
 
   @staticmethod
-  def load(name: str, path: str, env: gym.Env, env_stats: EnvStats = None) -> "Policy":
+  def load(name: str, path: str, env: gym.Env, env_stats: EnvStats = None, **kwargs) -> "Policy":
     """`name` is a model name where the sidecar has one (`meta["model"]`) and
     falls back to the raw class name for a sidecar saved before that key
     existed -- `_class_for` resolves either through the same model-first path
@@ -845,7 +862,8 @@ class Policy(HParamsOwner, nnx.Module, ABC):
       model_config.set_snapshot(meta.get("snapshot"))
       model_config.set_overrides(meta.get("overrides"))
       # env_stats is a function of the env, so it is rebuilt rather than persisted.
-      policy = cls(env, profile=meta.get("profile"), env_stats=env_stats, model_name=name)
+      policy = cls(env, profile=meta.get("profile"), env_stats=env_stats,
+                   model_name=name, **{**meta.get("kwargs", {}), **kwargs})
     finally:
       model_config.set_snapshot(previous[0])
       model_config.set_overrides(previous[1])
@@ -856,10 +874,10 @@ class Policy(HParamsOwner, nnx.Module, ABC):
     return policy
 
   @staticmethod
-  def load_any(path: str, env: gym.Env, env_stats: EnvStats = None) -> "Policy":
+  def load_any(path: str, env: gym.Env, env_stats: EnvStats = None, **kwargs) -> "Policy":
     with open(os.path.join(os.path.abspath(path), "meta.json")) as f:
       meta = json.load(f)
-    return Policy.load(meta.get("model") or meta["policy_class"], path, env, env_stats)
+    return Policy.load(meta.get("model") or meta["policy_class"], path, env, env_stats, **kwargs)
 
   # ------------------------------------------------------------------
   # Observation normalisation
@@ -903,6 +921,10 @@ class Policy(HParamsOwner, nnx.Module, ABC):
     if self.action_discrete:
       return None, None
     return np.asarray(self.act_scale[...]), np.asarray(self.act_bias[...])
+
+  def action_chunk(self, action):
+    """Canonical runtime action shape, always `(batch, chunk_size, act_dim)`."""
+    return normalize_action_chunk(action, chunk_size=self.chunk_size, act_dim=self.action_dim, xp=jnp)
 
   # ------------------------------------------------------------------
   # Misc
@@ -1008,8 +1030,9 @@ class Policy(HParamsOwner, nnx.Module, ABC):
 
   @abstractmethod
   def inference_step(self, observation, step_info: Optional[dict] = None, key=None) -> tuple:
-    """Returns (action, extras) where extras is a dict of per-step named arrays
-    (e.g. entropy bounds) to log/persist."""
+    """Returns `(action_chunk, extras)` where `action_chunk` always has shape
+    `(batch, chunk_size, act_dim)` and `extras` is a dict of named arrays to
+    log/persist alongside the currently active chunk."""
     ...
 
   # ------------------------------------------------------------------
@@ -1066,9 +1089,9 @@ def run_episodes(actor, env: gym.Env, n: int, render: bool, **inference_kwargs) 
   stops recording -- autoreset_mode=DISABLED asserts rather than letting a
   finished slot be stepped again -- so a wave costs its longest episode.
 
-  `actor` is anything exposing `action_bounds_numpy()` and `inference_fn()`,
-  which is a Policy or a StackedPolicy -- the latter is how the trainer
-  evaluates every seed in one vmapped pass instead of one loop per seed."""
+  `actor` is anything exposing `inference_fn()`, usually a Policy or a
+  StackedPolicy -- the latter is how the trainer evaluates every seed in one
+  vmapped pass instead of one loop per seed."""
   if n <= 0:
     return []
 
@@ -1079,24 +1102,31 @@ def run_episodes(actor, env: gym.Env, n: int, render: bool, **inference_kwargs) 
     obs, _ = env.reset(**kwargs)
     return obs if is_vec else obs[None, ...]
 
-  act_scale_np, act_bias_np = actor.action_bounds_numpy()
   act = actor.inference_fn()
   key = jax.random.PRNGKey(0)
+  chunk_size = getattr(actor, "chunk_size", 1)
+  action_space = env.single_action_space if is_vec else env.action_space
+  act_scale_np, act_bias_np = action_bounds_numpy(action_space)
+  act_dim = getattr(actor, "action_dim",
+                    int(action_space.n) if isinstance(action_space, gym.spaces.Discrete)
+                    else int(np.prod(action_space.shape)))
 
   out = []
   while len(out) < n:
     wave = min(n_envs, n - len(out))
     obs  = reset()
+    chunks = ActionChunkExecutor(act, chunk_size=chunk_size, act_dim=act_dim, n_envs=n_envs)
     data = [dict(frames=[], rewards=[], terminated=False, success=False,
-                 act_nonfinite=0, n_act=0)
+                 act_nonfinite=0, n_act=0, chunk_size=chunk_size,
+                 chunk_refills=0, chunk_waste_frac=0.0)
             for _ in range(n_envs)]
     live = np.zeros(n_envs, dtype=bool)
     live[:wave] = True
 
     while live.any():
       key, subkey = jax.random.split(key)
-      action, _ = act(jnp.asarray(obs, dtype=jnp.float32), subkey)
-      action_np  = np.asarray(action)
+      action_np, _ = chunks.current(obs, subkey, to_device=lambda x: jnp.asarray(x, dtype=jnp.float32),
+                                    live=live)
       # Same failsafe the rollout applies (rollout.py). Without it a NaN action
       # reaches mj_step, which only warns and poisons qpos -- the eval returns
       # quietly wrong numbers and the next render() aborts the process inside
@@ -1113,6 +1143,9 @@ def run_episodes(actor, env: gym.Env, n: int, render: bool, **inference_kwargs) 
       frames = (env.call("render") if is_vec else [env.render()]) if render else None
 
       done = term | trunc
+      chunks.advance(done)
+      slot_refills = chunks.slot_refills()
+      slot_wasted = chunks.slot_wasted()
       for i in np.flatnonzero(live):
         data[i]["rewards"].append(reward[i])
         data[i]["act_nonfinite"] += int(nonfinite[i].sum())
@@ -1122,6 +1155,9 @@ def run_episodes(actor, env: gym.Env, n: int, render: bool, **inference_kwargs) 
         if done[i]:
           data[i]["terminated"] = bool(term[i])
           data[i]["success"] = episode_success(info, i, is_vec, bool(term[i]))
+          data[i]["chunk_refills"] = int(slot_refills[i])
+          executed = max(1, data[i]["chunk_refills"] * chunk_size)
+          data[i]["chunk_waste_frac"] = float(slot_wasted[i]) / executed
           live[i] = False
 
       if live.any() and done.any():

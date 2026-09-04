@@ -11,9 +11,9 @@
 #   float:       {type: float, low: ..., high: ..., log: true|false}
 #
 # **Only HParams are searchable.** hpo.py refuses a `model.*` axis that names a
-# structural Config (activation, norm, dtype, a slot's `size:`, ...) of the
-# resolved classes -- a hyperparameter search is over algorithmic knobs, and
-# structure is varied with `--set` or a grid `size:`/`net:` axis instead. Every
+# non-search Config (activation, norm, dtype, lr, a slot's `size:`, ...) of the
+# resolved classes -- a hyperparameter search is over explicit optimization knobs,
+# and everything else is varied with `--set` or a grid axis instead. Every
 # `model.*` axis below names a declared HParam of all the algos it searches.
 #
 # `algo` and `env` must be present and categorical. `base` is the experiment
@@ -34,7 +34,7 @@ axes:
   algo: {type: categorical, values: [SAC, DIME, AMDP]}
   env:  {type: categorical, values: [HalfCheetah, CheetahRun]}
 
-  # Run keys -- algorithmic experiment knobs, declared in barl_jax.run_config.
+  # Run keys -- ordinary run config, declared in barl_jax.run_config.
   # `num_envs` is absent on purpose -- it must stay equal to `rollout_steps`.
   run.batch_size:  {type: int,   low: 128, high: 1024, log: true}
   run.utd_ratio:   {type: float, low: 0.5, high: 4.0}
@@ -42,8 +42,7 @@ axes:
 
   # Model HParams: named <slot>.<key> against each resolved component class.
   # SAC/DIME/AMDP all share the MaxEntRLPolicy template but each has its own
-  # actor and the C51 critic -- the LR and the entropy temperature are HParams
-  # on all of them; a structural key (activation, dtype, size) would be refused.
-  model.components.actor.lr:  {type: float, low: 1.0e-4, high: 1.0e-3, log: true}
-  model.components.critic.lr: {type: float, low: 1.0e-4, high: 1.0e-3, log: true}
+  # actor and the C51 critic -- gamma and entropy_scale remain true HParams
+  # on all of them; a structural key (activation, dtype, lr, size) is refused.
+  model.components.critic.gamma: {type: float, low: 0.95, high: 0.999}
   model.params.entropy_scale: {type: float, low: -4.0, high: -0.5}

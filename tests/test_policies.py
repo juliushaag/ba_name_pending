@@ -58,6 +58,13 @@ def test_train_step_losses_match_the_optimizer_keys(name):
 
 
 @pytest.mark.parametrize("name", MODELS)
+def test_inference_returns_a_singleton_chunk_by_default(name):
+  policy = make(name)
+  act, _ = policy.inference_fn()(jnp.zeros((BATCH, OBS_DIM), jnp.float32), jax.random.PRNGKey(0))
+  assert act.shape == (BATCH, 1, ACT_DIM)
+
+
+@pytest.mark.parametrize("name", MODELS)
 def test_optimizer_labels_cover_every_trainable_leaf(name):
   policy = make(name)
   labels = policy.optimizer_labels()

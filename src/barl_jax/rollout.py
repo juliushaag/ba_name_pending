@@ -4,14 +4,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from barl_jax.policy import Policy, sanitize_action
+from barl_jax.action_chunking import ActionChunkExecutor
+from barl_jax.policy import Policy, action_bounds_numpy, sanitize_action
 
 import gymnasium as gym
 
 
 class RandomPolicy:
   """Duck-types just enough of Policy's rollout contract
-  (inference_step()/action_bounds_numpy()) to drive ReplayBuffer.rollout() with
+  (inference_step()) to drive ReplayBuffer.rollout() with
   actions sampled uniformly from the env's actual action space, instead of a
   trained policy -- used only by ReplayBuffer.random_fill() to seed the
   buffer with broad, uncorrelated coverage before training starts (SAC/TD3-
@@ -20,6 +21,8 @@ class RandomPolicy:
   def __init__(self, action_space: gym.Space, seed: int = None):
     self.action_space = action_space
     self.action_discrete = isinstance(action_space, gym.spaces.Discrete)
+    self.chunk_size = 1
+    self.action_dim = int(action_space.n) if self.action_discrete else int(np.prod(action_space.shape))
     self._rng = np.random.RandomState(seed)
     if not self.action_discrete:
       low  = np.asarray(action_space.low,  dtype=np.float32)
@@ -34,13 +37,7 @@ class RandomPolicy:
     else:
       # canonical [-1, 1] per dimension -- same convention every real actor outputs.
       action = self._rng.uniform(-1.0, 1.0, (batch, *self.action_space.shape)).astype(np.float32)
-    return action, {}
-
-  def action_bounds_numpy(self):
-    if self.action_discrete:
-      return None, None
-    return self.act_scale, self.act_bias
-
+    return action[:, None, ...], {}
 
 def summarize_rollout(acc: dict, slots: slice = slice(None)) -> dict:
   """Per-sub-env-slot sums -> the reported rollout statistics, over `slots`.
@@ -60,7 +57,7 @@ def summarize_rollout(acc: dict, slots: slice = slice(None)) -> dict:
   act_mean, act_std = mean_std("act")
   n_act = float(acc["n_act"][slots].sum())
   seen  = n_act > 0
-  return dict(
+  out = dict(
     avg_reward=rew_mean, reward_std=rew_std,
     obs_mean=obs_mean,   obs_std=obs_std,
     act_mean=act_mean,   act_std=act_std,
@@ -72,6 +69,17 @@ def summarize_rollout(acc: dict, slots: slice = slice(None)) -> dict:
     act_nonfinite=float(acc["act_nonfinite"][slots].sum()) / n_act if seen else 0.0,
     act_clipped=float(acc["act_clipped"][slots].sum()) / n_act if seen else 0.0,
   )
+  if "chunk_refills" in acc:
+    refills = float(acc["chunk_refills"][slots].sum())
+    wasted = float(acc["chunk_wasted"][slots].sum())
+    chunk_size = float(acc["chunk_size"][slots].max()) if refills else float("nan")
+    out.update(
+      chunk_size=chunk_size,
+      chunk_refills=refills,
+      chunk_refill_rate=refills / max(1.0, float(acc["n_rew"][slots].sum())),
+      chunk_waste_frac=wasted / max(1.0, refills * max(chunk_size, 1.0)),
+    )
+  return out
 
 
 class ReplayBuffer():
@@ -185,8 +193,10 @@ class ReplayBuffer():
       obs, _ = env.reset(seed=seed)
       if not is_vec:
         obs = obs[None, ...]
+      chunk_state = None
     else:
       obs = state["obs"]
+      chunk_state = state.get("chunk_state")
 
     def to_device(o):
       return jnp.asarray(o, jnp.float32)
@@ -194,8 +204,12 @@ class ReplayBuffer():
     inference_fn = getattr(policy, "inference_fn", None)
     act = inference_fn() if inference_fn else (lambda o, _k: policy.inference_step(o))
     key = jax.random.PRNGKey(int(np.random.randint(0, 2 ** 31 - 1)))
+    chunks = ActionChunkExecutor(act, chunk_size=policy.chunk_size,
+                                 act_dim=policy.action_dim, n_envs=n_envs)
+    chunks.restore(chunk_state)
 
-    act_scale_np, act_bias_np = policy.action_bounds_numpy()
+    action_space = env.single_action_space if is_vec else env.action_space
+    act_scale_np, act_bias_np = action_bounds_numpy(action_space)
 
    
     zeros = lambda: np.zeros(n_envs, dtype=np.float64)
@@ -213,9 +227,7 @@ class ReplayBuffer():
       acc["n_obs"]      += obs64.shape[1]
 
       key, subkey = jax.random.split(key)
-      action, step_extras = act(to_device(obs), subkey)
-      action_np = np.asarray(action)  # canonical [-1, 1] -- stored in the buffer as-is
-      step_extras = {k: np.asarray(v) for k, v in step_extras.items()}
+      action_np, step_extras = chunks.current(obs, subkey, to_device=to_device)
 
       act64 = action_np.astype(np.float64).reshape(n_envs, -1)
       acc["act_sum"]    += act64.sum(axis=1)
@@ -243,6 +255,7 @@ class ReplayBuffer():
       acc["n_rew"]      += 1
 
       done = term | trunc
+      chunks.advance(done)
 
       self.add(obs=obs.reshape(n_envs, -1).astype(np.float32),
                next_obs=next_obs.reshape(n_envs, -1).astype(np.float32),
@@ -265,9 +278,12 @@ class ReplayBuffer():
         else:
           obs[0], _ = env.reset()
 
-    self._rollout_state = dict(env=env, obs=obs)
+    self._rollout_state = dict(env=env, obs=obs, chunk_state=chunks.snapshot())
 
     # The per-slot sums stay off the return value -- a caller owning a subset of
     # the slots reads them through last_rollout_per_seed() instead.
+    acc["chunk_refills"] = chunks.slot_refills().astype(np.float64)
+    acc["chunk_wasted"] = chunks.slot_wasted().astype(np.float64)
+    acc["chunk_size"] = np.full(n_envs, float(policy.chunk_size), np.float64)
     self._rollout_per_env = acc
     return summarize_rollout(acc)

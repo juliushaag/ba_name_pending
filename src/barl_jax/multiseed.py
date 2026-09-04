@@ -69,6 +69,8 @@ class StackedPolicy:
     self._state    = state
     self.num_seeds = num_seeds
     self.num_envs  = num_envs
+    self.chunk_size = reference.chunk_size
+    self.action_dim = reference.action_dim
     self.action_discrete = reference.action_discrete
     self._bounds = reference.action_bounds_numpy()
 

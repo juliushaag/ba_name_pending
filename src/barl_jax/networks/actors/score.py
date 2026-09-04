@@ -41,8 +41,8 @@ class ScoreContinuousActor(Actor, ActorOptim):
   sigma_max    = HParam(2.0)
   tau_min      = HParam(0.0)
   tau_max      = HParam(1.0)
-  max_steps    = HParam(16)
-  out_clip     = HParam(10000.0)   # ctrl_net.py's `outer_clip`
+  max_steps    = Config(16)
+  out_clip     = Config(10000.0)   # ctrl_net.py's `outer_clip`
   # The critic's action-gradient can spike on an outlier sample; this is the
   # score-clipping intrinsic to how *this* actor's loss uses that gradient,
   # not an algorithm-level tunable.
@@ -197,5 +197,4 @@ class ScoreContinuousActor(Actor, ActorOptim):
 
   def create_optimizer(self) -> dict:
     return {"actor": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}
-
 

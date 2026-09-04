@@ -24,7 +24,7 @@ import jax.numpy as jnp
 from flax import nnx
 
 from barl_jax.configs import ConfigMixin
-from barl_jax.hparam import HParam, Config
+from barl_jax.hparam import Config
 from barl_jax.networks.registry import register_component
 from barl_jax.policy import Component
 

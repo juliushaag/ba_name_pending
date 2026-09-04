@@ -58,18 +58,18 @@ class DISActor(Actor, ActorOptim):
   squash_cls = Config("TanhSquash")
   # dime_am trains the sampler's nets with the critic's b1, not the actor's
   # usual 0.9 -- the one optimizer override this actor carries.
-  adam_b1      = HParam(0.5)
-  num_steps    = HParam(16)
+  adam_b1      = Config(0.5)
+  num_steps    = Config(16)
   prior_std    = HParam(2.5)   # a std, not a variance -- the reference's sampler.init_std
-  out_clip     = HParam(10000.0)   # PISGRADNet's `outer_clip`
+  out_clip     = Config(10000.0)   # PISGRADNet's `outer_clip`
   dt_init      = HParam(0.1)       # configs/base.yaml `dt`, shaped by the cosine schedule below
   dt_min       = HParam(0.001)     # configs/sampler/dt_schedule/cosine.yaml
-  dt_s         = HParam(0.008)
-  dt_pow       = HParam(2.0)
-  friction_init = HParam(1.0)      # configs/sampler/dis.yaml `friction`
-  per_dim_friction = HParam(True)
-  learn_dt     = HParam(True)
-  learn_friction = HParam(True)
+  dt_s         = Config(0.008)
+  dt_pow       = Config(2.0)
+  friction_init = Config(1.0)      # configs/sampler/dis.yaml `friction`
+  per_dim_friction = Config(True)
+  learn_dt     = Config(True)
+  learn_friction = Config(True)
 
   def __init__(self, env_stats, config: ConfigMixin, *, rngs: nnx.Rngs, **kwargs):
     self.resolve_hparams(config, env_stats=env_stats)
@@ -168,5 +168,4 @@ class DISActor(Actor, ActorOptim):
     return {"dt_0": float(jax.nn.softplus(self.dt_raw[...])[0] * self.dt_scale[...][0]),
             "dt_last": float(jax.nn.softplus(self.dt_raw[...])[0] * self.dt_scale[...][-1]),
             "prior_var": self.prior_std**2}
-
 

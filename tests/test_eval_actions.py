@@ -20,6 +20,8 @@ from barl_jax.policy import run_episodes
 
 ACT_DIM, OBS_DIM, EPISODE_LEN = 3, 4, 5
 ACT_SCALE, ACT_BIAS = 2.0, 0.5
+ACT_LOW = np.full(ACT_DIM, ACT_BIAS - ACT_SCALE, np.float32)
+ACT_HIGH = np.full(ACT_DIM, ACT_BIAS + ACT_SCALE, np.float32)
 
 
 class RecordingVectorEnv(gym.vector.VectorEnv):
@@ -29,8 +31,10 @@ class RecordingVectorEnv(gym.vector.VectorEnv):
 
     def __init__(self, num_envs):
         self.num_envs = num_envs
+        self.act_scale = np.float32(ACT_SCALE)
+        self.act_bias = np.float32(ACT_BIAS)
         self.single_observation_space = gym.spaces.Box(-np.inf, np.inf, (OBS_DIM,), np.float32)
-        self.single_action_space = gym.spaces.Box(-1.0, 1.0, (ACT_DIM,), np.float32)
+        self.single_action_space = gym.spaces.Box(ACT_LOW, ACT_HIGH, (ACT_DIM,), np.float32)
         self.seen = []
         self._t = np.zeros(num_envs, dtype=int)
 
@@ -57,14 +61,30 @@ class Actor:
 
     def __init__(self, actions):
         self._actions = np.asarray(actions, np.float32)
-
-    def action_bounds_numpy(self):
-        return np.float32(ACT_SCALE), np.float32(ACT_BIAS)
+        self.action_dim = ACT_DIM
+        self.chunk_size = 1
 
     def inference_fn(self):
         def infer(obs, key):
             return jax.numpy.asarray(
-                np.broadcast_to(self._actions, (obs.shape[0], ACT_DIM))), {}
+                np.broadcast_to(self._actions, (obs.shape[0], 1, ACT_DIM))), {}
+        return infer
+
+
+class ChunkActor:
+    """One scripted action chunk per refill, broadcast across the batch."""
+
+    def __init__(self, chunks):
+        self._chunks = [np.asarray(c, np.float32) for c in chunks]
+        self._i = 0
+        self.action_dim = ACT_DIM
+        self.chunk_size = len(self._chunks[0])
+
+    def inference_fn(self):
+        def infer(obs, key):
+            chunk = self._chunks[min(self._i, len(self._chunks) - 1)]
+            self._i += 1
+            return jax.numpy.asarray(np.broadcast_to(chunk, (obs.shape[0], *chunk.shape))), {}
         return infer
 
 
@@ -84,7 +104,8 @@ def test_what_reaches_the_env_is_finite_and_in_bounds(emitted):
     seen = np.concatenate(env.seen)
     assert seen.size > 0
     assert np.isfinite(seen).all()
-    assert (np.abs(seen - ACT_BIAS) <= ACT_SCALE + 1e-6).all()
+    assert (seen >= env.single_action_space.low - 1e-6).all()
+    assert (seen <= env.single_action_space.high + 1e-6).all()
 
 
 def test_nan_becomes_the_neutral_action_not_a_bound():
@@ -94,9 +115,9 @@ def test_nan_becomes_the_neutral_action_not_a_bound():
     run_episodes(Actor([np.nan, np.inf, -np.inf]), env, n=1, render=False)
 
     seen = np.concatenate(env.seen)
-    assert np.allclose(seen[:, 0], ACT_BIAS)
-    assert np.allclose(seen[:, 1], ACT_SCALE + ACT_BIAS)
-    assert np.allclose(seen[:, 2], -ACT_SCALE + ACT_BIAS)
+    assert np.allclose(seen[:, 0], env.act_bias)
+    assert np.allclose(seen[:, 1], env.act_scale + env.act_bias)
+    assert np.allclose(seen[:, 2], -env.act_scale + env.act_bias)
 
 
 def test_the_clamp_is_counted_not_hidden():
@@ -118,3 +139,19 @@ def test_a_finite_action_is_counted_as_clean():
 
     assert all(r["act_nonfinite"] == 0 for r in records)
     assert all(r["n_act"] == EPISODE_LEN * ACT_DIM for r in records)
+
+
+def test_eval_executes_chunked_actions_step_by_step():
+    env = RecordingVectorEnv(1)
+    chunks = [
+        [[0.0, 0.1, 0.2], [0.3, 0.4, 0.5], [0.6, 0.7, 0.8]],
+        [[-0.1, -0.2, -0.3], [-0.4, -0.5, -0.6], [-0.7, -0.8, -0.9]],
+    ]
+    records = run_episodes(ChunkActor(chunks), env, n=1, render=False)
+
+    seen = np.stack(env.seen)[:, 0]
+    expected = np.asarray(chunks[0][:3] + chunks[1][:2], np.float32) * env.act_scale + env.act_bias
+    assert np.allclose(seen, expected)
+    assert records[0]["chunk_size"] == 3
+    assert records[0]["chunk_refills"] == 2
+    assert records[0]["chunk_waste_frac"] == pytest.approx(1 / 6)

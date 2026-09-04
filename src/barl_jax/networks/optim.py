@@ -1,44 +1,44 @@
 import optax
 
-from barl_jax.hparam import HParam
+from barl_jax.hparam import Config
 
 
 # ---------------------------------------------------------------------------
 # Optimizer mixins -- the four optimizer knobs as class attributes, grouped by
 # role so every component that optimizes inherits exactly the one that fits it
 # (critic uses the critic's b1 and clip, actor the actor's, dual the dual's).
-# All four are HParams: learning rate and clip are exactly the values a
-# hyperparameter search varies.
+# These are ordinary config defaults. Searchability is opt-in through HParam,
+# not implied by "this number exists".
 # ---------------------------------------------------------------------------
 
 
 class OptimizerConfig:
-  lr            = HParam(3.0e-4, range=(1.0e-4, 1.0e-3))
-  adam_b1       = HParam(0.9)
-  grad_clip     = HParam(1.0)
-  grad_clip_mode = HParam("element", choices=("global_norm", "element", "none"))
+  lr            = Config(3.0e-4)
+  adam_b1       = Config(0.9)
+  grad_clip     = Config(1.0)
+  grad_clip_mode = Config("element")
 
 
 class CriticOptim(OptimizerConfig):
   """The critic's optimizer (dime_am's `optim.critic`): b1 0.5, global-norm
   clip -- the b1 the SAC-style critics train with."""
 
-  adam_b1         = HParam(0.5)
-  grad_clip_mode  = HParam("global_norm", choices=("global_norm", "element", "none"))
+  adam_b1         = Config(0.5)
+  grad_clip_mode  = Config("global_norm")
 
 
 class ActorOptim(OptimizerConfig):
   """The actors' optimizer (`optim.actor`): Adam with a per-element clip, which
   is what actually bounds what one outlier sample can contribute under Adam."""
 
-  grad_clip_mode = HParam("element", choices=("global_norm", "element", "none"))
+  grad_clip_mode = Config("element")
 
 
 class DualOptim(OptimizerConfig):
   """The entropy dual's optimizer (`optim.dual`): a higher LR, unclipped."""
 
-  lr            = HParam(1.0e-3)
-  grad_clip_mode = HParam("global_norm", choices=("global_norm", "element", "none"))
+  lr            = Config(1.0e-3)
+  grad_clip_mode = Config("global_norm")
 
 
 CLIP_MODES = ("global_norm", "element", "none")

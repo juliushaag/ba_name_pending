@@ -26,9 +26,9 @@ class CriticLossConfig:
   target net."""
 
   gamma             = HParam(0.99)
-  pessimistic_target = HParam(False)
+  pessimistic_target = Config(False)
   polyak_tau        = HParam(0.0)
-  target_delay      = HParam(1)
+  target_delay      = Config(1)
 
 
 class CriticDistConfig:
@@ -36,9 +36,9 @@ class CriticDistConfig:
   the support carries and the smoothing around it. All are HParams -- the return
   representation a sweep may vary."""
 
-  num_atoms          = HParam(101)
-  num_bins           = HParam(151)
-  sigma_to_bin_ratio = HParam(0.75)
+  num_atoms          = Config(101)
+  num_bins           = Config(151)
+  sigma_to_bin_ratio = Config(0.75)
   entropy_coef       = HParam(0.0)
   rho                = HParam(0.0)
 
@@ -275,7 +275,7 @@ class EnsembleCritic(QCriticBase):
   # CrossQ net: BatchRenorm over the shared [(s,a),(s',a')] forward.
   net_style = Config("crossq", style=MLP_STYLES)
   rho                = HParam(1.0)
-  pessimistic_target = HParam(True)
+  pessimistic_target = Config(True)
 
   def __init__(self, env_stats, config: ConfigMixin, *, rngs: nnx.Rngs, **kwargs):
     self.resolve_hparams(config, env_stats=env_stats)

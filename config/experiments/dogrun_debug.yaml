@@ -1,0 +1,14 @@
+# A lightweight base config for short DogRun comparisons across algorithms.
+#
+#   uv run python scripts/online_learning.py --config config/experiments/dogrun_debug.yaml
+#
+# This is still a real training run, just budget-limited: one seed, DogRun,
+# 100k env steps max, and no rendered eval videos.
+
+defaults:
+  total_env_steps: 100000
+  num_seeds: 1
+  eval_video_every: null
+
+runs:
+  - {model: SAC, env: DogRun}

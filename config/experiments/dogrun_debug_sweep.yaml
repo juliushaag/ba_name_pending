@@ -1,0 +1,16 @@
+# Sweep all shipped algorithms on DogRun against the short debug budget.
+#
+# Dry run:
+#   uv run python scripts/submit.py --grid config/experiments/dogrun_debug_sweep.yaml --dry-run
+#
+# Real debug sweep:
+#   uv run python scripts/submit.py --grid config/experiments/dogrun_debug_sweep.yaml --debug
+
+base: config/experiments/dogrun_debug.yaml
+
+axes:
+  algo: [SAC, AMDP, DIME, SDAC, NCLQL]
+  env: [DogRun]
+  seed: [0]
+
+exclude: []

@@ -78,18 +78,17 @@ def test_trial_materializes_like_a_grid_combo(tmp_path):
   # run.* -> run entry, model.* -> model_overrides (grid.materialize's split).
   for key in ("batch_size", "utd_ratio"):
     assert entry[key] == trial[f"run.{key}"]
-  for key in ("components.actor.lr", "params.entropy_scale"):
+  for key in ("components.critic.gamma", "params.entropy_scale"):
     assert entry["model_overrides"][key] == trial[f"model.{key}"]
   # The snapshot is resolved under this trial's own overrides.
   resolved = cfg["snapshot"]["resolved"]
-  assert resolved["components.actor.lr"] == trial["model.components.actor.lr"]
+  assert resolved["components.critic.gamma"] == trial["model.components.critic.gamma"]
   assert resolved["params.entropy_scale"] == trial["model.params.entropy_scale"]
 
 
 def test_search_rejects_structural_config_axes():
-  """A search axis must target a declared HParam; a structural Config key (a
-  slot's `size`, an actor's `dtype`) is refused -- search is over algorithmic
-  knobs, not over how the net is structured."""
+  """A search axis must target a declared HParam; a non-search Config key (a
+  slot's `size`, an actor's `dtype`) is refused."""
   from search import check_searchability
   axes = dict(load_search(SPEC)["axes"])
   axes["model.components.actor.dtype"] = {"type": "categorical", "values": ["float32", "bfloat16"]}

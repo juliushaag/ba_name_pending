@@ -29,9 +29,9 @@ class StochasticActor(Actor, ActorOptim):
   kind = "actor"
   net_style = Config("layer", style=MLP_STYLES)
   squash_cls = Config("TanhSquash")
-  log_std_min  = HParam(-20.0)
-  log_std_max  = HParam(2.0)
-  log_prob_clip = HParam(0.99)   # tanh atanh guard in log_prob
+  log_std_min  = Config(-20.0)
+  log_std_max  = Config(2.0)
+  log_prob_clip = Config(0.99)   # tanh atanh guard in log_prob
 
   def __init__(self, env_stats, config: ConfigMixin, *, rngs: nnx.Rngs, **kwargs):
     super().__init__(env_stats, config, **kwargs)
@@ -108,5 +108,4 @@ class StochasticActor(Actor, ActorOptim):
 
   def create_optimizer(self) -> dict:
     return {"actor": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}
-
 

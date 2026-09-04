@@ -7,9 +7,10 @@ Two explicit kinds of class attribute, and keeping them apart is the point:
   only class attributes a search axis may target (`lr`, `gamma`, `num_bon`,
   `utd_ratio`, ...).
 
-* **`Config`** -- a *structural default*. Just a value; the type is inferred.
-  How a net is put together is not a hyperparameter you sweep per-trial, so it
-  is declared as `Config`, not `HParam`, and a search axis onto it is rejected.
+* **`Config`** -- a *non-search default*. Just a value; the type is inferred.
+  This covers both structural choices and ordinary fixed knobs that should not
+  automatically become HPO axes, so it is declared as `Config`, not `HParam`,
+  and a search axis onto it is rejected.
 
 **Which net / which time embedding is a configuration value, not an inheritance
 choice.** The named styles live as plain dicts (`networks.mlp.py`'s
@@ -59,7 +60,7 @@ def infer_type(default) -> type:
 
 
 class Config:
-  """A structural default: a value, its type inferred. Not searchable.
+  """A non-search default: a value, its type inferred.
 
   `style` is the **style dict** this value selects from: a module-level
   `name -> surface` table (`networks.mlp.py`'s `MLP_STYLES`,

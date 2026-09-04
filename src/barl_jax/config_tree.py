@@ -2,7 +2,8 @@
 becomes a kwarg.
 
 Defaults now live **on the classes that use them** (see barl_jax/hparam.py:
-`HParam` for searchable algorithmic knobs, `Config` for structural defaults),
+`HParam` for searchable algorithmic knobs, `Config` for structural and
+ordinary non-search defaults),
 composed by inheritance from style mixins (networks/mlp.py, networks/flow.py,
 networks/optim.py, networks/critic.py). There is no named-bundle or `extends:`
 indirection and no config/presets or config/components YAML -- a component's
@@ -16,14 +17,14 @@ inclusion, deep merge, and the typed `ConfigMixin.get()` accessor.
 
 What merges what:
 
-    a component class             its inherited `Config` (structural) and
-                                  `HParam` (searchable) defaults, down the MRO
-    a policy class                its own `HParam` params
+    a component class             its inherited `Config` (structural / ordinary)
+                                  and `HParam` (searchable) defaults, down the MRO
+    a policy class                its own declared params
     barl_jax.hparam               the `sizes.<kind>.<name>` capacity ladders a
                                   slot's `size:` resolves against
     config/models/*.yaml          per-*policy* `components:`/`params:`/`training:`/`profiles:`
     an env class                  `stats`/`defaults` (return range, per-env overrides)
-    barl_jax.run_config           every run key's default (`RUN_HPARAMS`)
+    barl_jax.run_config           every run key's default (`RUN_CONFIGS`)
 
 Precedence for a component kwarg, lowest first:
 
@@ -36,7 +37,7 @@ Precedence for a component kwarg, lowest first:
 
 Explicit runtime kwargs passed by a Policy's build_component() call site are
 applied by policy.py above everything here. `params:` uses the same chain minus
-the structural rungs, with the policy class's own HParams as its lowest rung.
+the structural rungs, with the policy class's own declared params as its lowest rung.
 
 Every merge is recorded as a `(source, kwargs)` pair so explain() can attribute
 each resolved value to the layer that set it and list what it shadows.
@@ -72,6 +73,7 @@ resolve_includes = _configs.resolve_includes
 # silently do nothing.
 TRAINING_KEYS = frozenset({
   "rollout_steps",       # env steps per outer iteration
+  "chunk_size",          # primitive actions returned per inference call
   "batch_size",
   "utd_ratio",           # grad steps per env step (off-policy)
   "epochs_per_rollout",  # on-policy passes over the buffer
@@ -107,7 +109,7 @@ def _policy_cls(policy_name: str, tree=None):
 
 
 def _hparam_defaults(cls) -> dict:
-  """The class's declared HParam defaults as the base kwarg layer."""
+  """The class's declared HParam defaults as the searchable kwarg layer."""
   return {name: decl.default for name, decl in getattr(cls, "_hparams", {}).items()}
 
 
@@ -118,7 +120,7 @@ def _config_defaults(cls) -> dict:
 
 def _decl_layers(cls, chosen: dict = None) -> list[tuple[str, dict]]:
   """A component class's own declaration, as the base layers of its slot:
-  each style selector's *whole surface*, then the structural `Config` defaults
+  each style selector's *whole surface*, then the structural / ordinary `Config` defaults
   (selectors included, so the resolved config records the choice), then the
   searchable `HParam` defaults -- lowest precedence first, merged down the MRO.
 
@@ -216,7 +218,7 @@ class ConfigTree:
     self.presets    = _load_dir(root / "presets")
     self.components = _load_dir_merged(root / "components")
     self.models     = _load_dir_merged(root / "models")
-    # Run-key defaults are code-declared (barl_jax.run_config.RUN_HPARAMS);
+    # Run-key defaults are code-declared (barl_jax.run_config.RUN_CONFIGS);
     # config/run/defaults.yaml is an override layer that predates the move and
     # is read when present so an old tree still resolves identically.
     from barl_jax.run_config import run_defaults
@@ -414,9 +416,14 @@ class ConfigTree:
   # -- params / training ----------------------------------------------------
 
   def params_layers(self, policy_name: str, profile: str | None) -> list[tuple[str, dict]]:
-    # The policy class's declared HParam defaults are the base layer, so a
-    # param a model YAML never mentions still resolves -- with attribution.
-    layers = [("decl params", _hparam_defaults(_policy_cls(policy_name, self)))]
+    # The policy class's declared params are the base layers, so a param a
+    # model YAML never mentions still resolves -- with attribution.
+    cls = _policy_cls(policy_name, self)
+    layers = []
+    if getattr(cls, "_configs", {}):
+      layers.append(("decl params: configs", _config_defaults(cls)))
+    if getattr(cls, "_hparams", {}):
+      layers.append(("decl params: hparams", _hparam_defaults(cls)))
     layers += [(f"models: {policy_name}.params", dict(self.policy_cfg(policy_name).get("params", {})))]
     if profile:
       layers.append((f"models: {policy_name}.profiles.{profile}.params",

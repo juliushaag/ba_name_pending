@@ -134,7 +134,8 @@ def setup(cfg: dict, num_seeds: int, *, validate_only: bool = False) -> Run:
   checkpoint = cfg["checkpoint"]
   if checkpoint is None:
     policies = [Policy.make(run.model_name, run.env, env_stats=run.env_stats,
-                            seed=run.base_seed + i) for i in range(num_seeds)]
+                            seed=run.base_seed + i, chunk_size=cfg["chunk_size"])
+                for i in range(num_seeds)]
   elif num_seeds > 1:
     raise NotImplementedError(
       f"checkpoint={checkpoint!r}: a checkpoint holds one seed's state, so it cannot "
@@ -145,7 +146,7 @@ def setup(cfg: dict, num_seeds: int, *, validate_only: bool = False) -> Run:
     # load_any, not Policy.load(run.model_name, ...): the meta sidecar carries the
     # registered class name, so resuming under a `model:` alias resolves to the
     # policy class that was saved instead of missing from the registry.
-    policies = [Policy.load_any(checkpoint, run.env, run.env_stats)]
+    policies = [Policy.load_any(checkpoint, run.env, run.env_stats, chunk_size=cfg["chunk_size"])]
 
   if policies[0].on_policy:
     raise NotImplementedError(

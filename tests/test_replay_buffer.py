@@ -152,6 +152,21 @@ class _Counting(gym.Env):
             self.t == self.term_at, self.t == 5, {})
 
 
+class _ChunkedPolicy:
+  def __init__(self, chunks):
+    self._chunks = [np.asarray(c, np.float32) for c in chunks]
+    self._i = 0
+    self.chunk_size = len(self._chunks[0])
+    self.action_dim = self._chunks[0].shape[-1]
+
+  def inference_fn(self):
+    def infer(obs, key):
+      chunk = self._chunks[min(self._i, len(self._chunks) - 1)]
+      self._i += 1
+      return chunk[None, ...].repeat(obs.shape[0], axis=0), {}
+    return infer
+
+
 def _rollout_fields(term_at, n_steps=7):
   env = gym.vector.SyncVectorEnv(
     [lambda: _Counting(term_at), lambda: _Counting(99)],
@@ -185,6 +200,21 @@ def test_rollout_restarts_episode_after_boundary():
   f = _rollout_fields(term_at=3)
   assert f["obs"][0::2][3, 0] == 0.0     # after termination
   assert f["obs"][1::2][5, 0] == 0.0     # after truncation
+
+
+def test_rollout_executes_chunked_actions_and_discards_done_tail():
+  env = _Counting(term_at=2)
+  buffer = ReplayBuffer(100)
+  policy = _ChunkedPolicy([
+    [[0.0], [0.25], [0.5]],
+    [[-0.25], [-0.5], [-0.75]],
+    [[0.75], [0.5], [0.25]],
+  ])
+
+  buffer.rollout(policy, env, n_steps=5, seed=0)
+  acts = buffer._fields["act"][:buffer.n_transitions, 0]
+
+  assert np.allclose(acts, [0.0, 0.25, -0.25, -0.5, 0.75])
 
 
 def test_eval_slot_blocks_map_to_seeds():

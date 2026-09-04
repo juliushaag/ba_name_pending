@@ -17,7 +17,7 @@ import gymnasium as gym
 import jax
 import jax.numpy as jnp
 
-from barl_jax.hparam import HParam
+from barl_jax.hparam import Config, HParam
 from barl_jax.networks.critic import QCriticBase
 from barl_jax.networks.regulator import AutotuneRegulator
 from barl_jax.policy import Actor, Policy, gated_loss, register_policy
@@ -33,7 +33,7 @@ class RLPolicy(Policy):
 
   SLOTS = ("critic", "actor")
   policy_delay = HParam(1, descr="grad steps between actor/dual updates (critic steps every step)")
-  normalize_obs = HParam(True)
+  normalize_obs = Config(True)
 
   def __init__(self, env: gym.Env, **kwargs):
     super().__init__(env, **kwargs)
@@ -114,7 +114,7 @@ class RLPolicy(Policy):
 
   def inference_step(self, observation, step_info=None, key=None):
     obs = self._obs(observation)
-    return self.actor.sample(obs, critic=self.critic, key=key), {}
+    return self.action_chunk(self.actor.sample(obs, critic=self.critic, key=key)), {}
 
 
 @register_policy
@@ -127,7 +127,7 @@ class MaxEntRLPolicy(RLPolicy):
 
   SLOTS = ("critic", "actor", "entropy")
   entropy_scale     = HParam(-1.0)
-  entropy_in_target = HParam(True)
+  entropy_in_target = Config(True)
 
   def __init__(self, env: gym.Env, **kwargs):
     super().__init__(env, **kwargs)

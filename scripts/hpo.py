@@ -114,11 +114,11 @@ def main():
   spec = load_search(args.search)
   searchable = check_searchability(spec)
   if searchable:
-    print("\nRefusing to run -- a search axis targets structure, not a HParam:")
+    print("\nRefusing to run -- a search axis targets a non-search Config, not a HParam:")
     for problem in searchable:
       print(f"  - {problem}")
-    print("\n  A search is over algorithmic knobs (HParam). Structural Config keys "
-          "(activation, norm, dtype, size, ...) are varied with --set or a grid axis, "
+    print("\n  A search is over explicit optimization knobs (HParam). Config keys "
+          "(activation, norm, dtype, size, lr, ...) are varied with --set or a grid axis, "
           "not per-trial.")
     raise SystemExit(1)
 

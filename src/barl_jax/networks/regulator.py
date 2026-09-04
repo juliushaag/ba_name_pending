@@ -5,7 +5,7 @@ import jax.numpy as jnp
 from flax import nnx
 
 from barl_jax.configs import ConfigMixin
-from barl_jax.hparam import HParam
+from barl_jax.hparam import Config
 from barl_jax.networks.optim import adam, DualOptim
 from barl_jax.networks.registry import register_component
 from barl_jax.policy import Component
@@ -26,7 +26,7 @@ class AutotuneRegulator(DualOptim, Component, nnx.Module):
 
   The optimizer knobs come from the `DualOptim` mixin (a higher LR, unclipped)."""
 
-  alpha_init   = HParam(1.0)
+  alpha_init   = Config(1.0)
 
   # A dual has no size ladder -- `kind` exists so the resolver can tell a sized
   # component from a non-sized one.
@@ -37,8 +37,8 @@ class AutotuneRegulator(DualOptim, Component, nnx.Module):
   # alpha at a floor injects a constant entropy bonus into the Bellman target
   # that a near-zero-reward env cannot outvote. Declared as hparams, not dead
   # state, so a bound can be reinstated by an override without a code change.
-  min_alpha    = HParam(1.0e-7)
-  max_alpha    = HParam(500.0)
+  min_alpha    = Config(1.0e-7)
+  max_alpha    = Config(500.0)
 
   def __init__(self, env_stats=None, config=None, *, target: float,
                rngs: nnx.Rngs = None, **kwargs):
