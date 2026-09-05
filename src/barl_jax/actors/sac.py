@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-from barl_jax.components import Actor, Buffer, Critic, frozen
+from barl_jax.components import Actor, Buffer, Critic, PathwiseActorMixin
 from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.hparam import Config
 from barl_jax.networks import gaussian
@@ -13,7 +13,7 @@ from barl_jax.registration import get_component, register_component
 
 
 @register_component
-class StochasticActor(Actor, ActorOptim):
+class StochasticActor(PathwiseActorMixin, Actor, ActorOptim):
   """Diagonal-Normal MLP actor shared by SAC/PPO/IQL. `dist()` stays an
   unconstrained Normal; sample()/mode() squash it (the `squash_cls` Config
   selects which -- any no-arg Squash works generically here).
@@ -106,15 +106,9 @@ class StochasticActor(Actor, ActorOptim):
     mean, _ = self.dist(s)
     return self._plan(self.squash(mean))
 
-  def loss(self, obs, critic: Critic, alpha, *, key=None):
-    """SAC's reparameterized max-entropy objective, -(Q + alpha*H).
-
-    The actor improves against the critic but must not train it. In torch this
-    leak was discarded by giving each optimizer only its own params; with one
-    backward over the whole tree it has to be explicit."""
-    action, entropy = self.generate_action(obs, key=key)
-    q = frozen(critic).value(obs, action.reshape(action.shape[0], -1))
-    return {"actor": -(q + jax.lax.stop_gradient(alpha) * entropy).mean()}
+  # loss: PathwiseActorMixin's reparameterized max-entropy objective,
+  # -(Q + alpha*H) -- SAC's actor improves against the critic but must not
+  # train it (frozen(critic) inside the mixin), same as every actor here.
 
   def create_optimizer(self) -> dict:
     return {"actor": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}

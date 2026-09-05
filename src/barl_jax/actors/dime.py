@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from barl_jax.components import Actor, Buffer, Critic, frozen
+from barl_jax.components import Actor, Buffer, Critic, PathwiseActorMixin
 from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.hparam import Config, HParam
 from barl_jax.networks import gaussian
@@ -22,7 +22,7 @@ def _inv_softplus(x: float) -> float:
 
 
 @register_component
-class DISActor(Actor, ActorOptim):
+class DISActor(PathwiseActorMixin, Actor, ActorOptim):
   """The time-reversed diffusion sampler (DIS) DIME actually uses --
   `dime_am/diffusion/od/dis.py` plus `od_integrators.py`.
 
@@ -152,12 +152,8 @@ class DISActor(Actor, ActorOptim):
 
     return X.reshape(obs.shape[0], self.chunk_size, self.action_dim), entropy
 
-  def loss(self, obs, critic: Critic, alpha, *, key=None):
-    """DIME's path-KL objective, -(Q + alpha*entropy)."""
-    action, entropy = self.generate_action(obs, key=key)
-
-    q = frozen(critic).value(obs, action.reshape(action.shape[0], -1))
-    return {"actor": -(q + jax.lax.stop_gradient(alpha) * entropy).mean()}
+  # loss: PathwiseActorMixin's -(Q + alpha*entropy), applied to DIME's
+  # path-KL entropy estimate exactly like SAC's closed-form one.
 
   def create_optimizer(self) -> dict:
     return {"actor": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}

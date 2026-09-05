@@ -317,6 +317,27 @@ class Actor(ActionSampler):
     declares."""
 
 
+class PathwiseActorMixin:
+  """The pathwise max-entropy actor objective SAC's `StochasticActor` and
+  DIME's `DISActor` share once each supplies its own `generate_action`:
+  `-(Q + stop_gradient(alpha)*entropy)`, `Q` priced through a *frozen* critic
+  so the actor's gradient improves the action, never the critic. The two
+  samplers stay separate -- SAC's density-derived entropy and DIME's
+  path-density estimate are not interchangeable distributions -- only the
+  objective built on top of "an (action, entropy) pair and a critic" is
+  identical between them.
+
+  Mix in ahead of `Actor` in the MRO (`class X(PathwiseActorMixin, Actor,
+  ...)`) so this concrete `loss` satisfies `Actor.loss`'s abstract method.
+  Not for AMDP (score-regression) or SDAC (weighted-denoising/exploration),
+  whose objectives are not this one with a different sampler -- leave those
+  in their own actors."""
+
+  def loss(self, obs, critic: "Critic", alpha, *, key=None):
+    action, entropy = self.generate_action(obs, key=key)
+    q = frozen(critic).value(obs, action.reshape(action.shape[0], -1))
+    return {"actor": -(q + jax.lax.stop_gradient(alpha) * entropy).mean()}
+
 
 class Critic(Component, nnx.Module, ABC):
   """A network that can price (s,a) -- pure architecture; Bellman targets
