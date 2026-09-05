@@ -1,4 +1,4 @@
-"""barl_jax.exact_resume: the opt-in capture/restore mechanism, verified
+"""barl_jax.env.ExactResumeMixin: the opt-in capture/restore mechanism, verified
 against a concrete adapter for Pendulum-v1 (examples.cpu_quickstart's
 TinyPendulum) -- the actual acceptance bar the plan sets: uninterrupted
 stepping versus save/interrupt/restore/continue must produce identical
@@ -10,7 +10,7 @@ import pathlib
 
 import numpy as np
 
-from barl_jax.exact_resume import ExactResumeMixin
+from barl_jax.env import ExactResumeMixin
 
 
 def _load_tiny_pendulum():
