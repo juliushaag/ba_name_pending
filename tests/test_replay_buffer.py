@@ -4,7 +4,7 @@ import pytest
 
 from barl_jax.collection import Collector, RandomPolicy
 from barl_jax.multiseed import StackedPolicy, stack, unstack
-from barl_jax.rollout import MultiSeedReplay, ReplayBuffer
+from barl_jax.rollout import MultiSeedReplay, PrioritizedReplayBuffer, ReplayBuffer
 
 
 def _stacked_fixture(num_seeds: int):
@@ -197,6 +197,98 @@ def test_multiseed_sample_has_seed_axis():
   batch = ms.sample(8)
   assert batch["obs"].shape == (3, 8, 3)
   assert batch["rew"].shape == (3, 8)
+
+
+def test_multiseed_accepts_a_prioritized_buffer_class():
+  ms = MultiSeedReplay(num_seeds=2, num_envs=1, max_transitions=50, buffer_cls=PrioritizedReplayBuffer)
+  assert all(isinstance(b, PrioritizedReplayBuffer) for b in ms.seeds)
+
+
+# --- PrioritizedReplayBuffer -----------------------------------------------
+
+def test_new_rows_default_to_the_running_max_priority():
+  b = PrioritizedReplayBuffer(10)
+  b.add(**rows(3))
+  np.testing.assert_array_equal(b._priorities[:3], 1.0)  # nothing scored yet: seeds at 1.0
+  b.update_priorities(b._sample_ids(np.arange(3)), [5.0, 5.0, 5.0])
+  b.add(**rows(2, start=3))
+  np.testing.assert_allclose(b._priorities[3:5], 5.0, atol=1e-5)  # new rows seed at the new running max
+
+
+def test_sampling_distribution_favors_higher_priority_rows():
+  b = PrioritizedReplayBuffer(10)
+  b.add(**rows(10))
+  ids = b._sample_ids(np.arange(10))
+  errors = np.zeros(10)
+  errors[7] = 100.0  # one row scored far higher than the rest
+  b.update_priorities(ids, errors)
+
+  rng = np.random.default_rng(0)
+  b.rng = rng
+  batch = b.sample_prioritized(2000, alpha=1.0, beta=0.0)
+  counts = np.bincount(batch["rew"].astype(int), minlength=10)
+  assert counts[7] > counts.sum() * 0.8  # dominates the batch, not just "more often"
+
+
+def test_alpha_zero_is_uniform_like_plain_sample():
+  b = PrioritizedReplayBuffer(10)
+  b.add(**rows(10))
+  b.update_priorities(b._sample_ids(np.arange(10)), np.arange(1, 11) * 10.0)  # wildly different priorities
+
+  rng = np.random.default_rng(0)
+  b.rng = rng
+  batch = b.sample_prioritized(4000, alpha=0.0, beta=0.0)
+  counts = np.bincount(batch["rew"].astype(int), minlength=10)
+  assert counts.min() / counts.max() > 0.8  # alpha=0 ignores priority entirely
+
+
+def test_importance_weights_match_the_proportional_per_formula():
+  b = PrioritizedReplayBuffer(4)
+  b.add(**rows(4))
+  b.update_priorities(b._sample_ids(np.arange(4)), [1.0, 2.0, 3.0, 4.0])
+
+  rng = np.random.default_rng(0)
+  b.rng = rng
+  alpha, beta = 0.6, 0.4
+  batch = b.sample_prioritized(64, alpha=alpha, beta=beta)
+
+  live = b._priorities[:4] + b._eps
+  probs = live ** alpha
+  probs = probs / probs.sum()
+  expected_by_row = (4 * probs) ** (-beta)
+  expected_by_row = expected_by_row / expected_by_row.max()
+
+  row = batch["rew"].astype(int)
+  np.testing.assert_allclose(batch["weights"], expected_by_row[row], atol=1e-5)
+  assert np.isclose(batch["weights"].max(), 1.0)  # normalized so the batch's largest weight is 1
+
+
+def test_update_priorities_on_a_stale_id_is_a_documented_no_op():
+  """A sample_id from before its row was overwritten (a wrapped write, or a
+  later add() to the same index) must not silently rewrite the new row's
+  priority -- it is a stale update, dropped, not misapplied."""
+  b = PrioritizedReplayBuffer(4)
+  b.add(**rows(4))
+  stale_ids = b._sample_ids(np.arange(4))
+
+  b.add(**rows(2, start=4))  # wraps: overwrites ring indices 0 and 1
+  applied = b.update_priorities(stale_ids, [999.0, 999.0, 999.0, 999.0])
+
+  assert applied == 2  # only indices 2 and 3 (never overwritten) still match
+  assert b._priorities[0] != 999.0 and b._priorities[1] != 999.0
+  assert b._priorities[2] == pytest.approx(999.0 + b._eps)
+  assert b._priorities[3] == pytest.approx(999.0 + b._eps)
+
+
+def test_sample_ids_are_stable_across_reads_and_change_on_overwrite():
+  b = PrioritizedReplayBuffer(4)
+  b.add(**rows(4))
+  before = b._sample_ids(np.array([0]))[0]
+  assert b._sample_ids(np.array([0]))[0] == before  # stable while unchanged
+
+  b.add(**rows(1, start=4))  # overwrites ring index 0
+  after = b._sample_ids(np.array([0]))[0]
+  assert after != before
 
 
 class _Counting(gym.Env):
