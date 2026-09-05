@@ -1,9 +1,11 @@
 """Stacked state and batched inference across independent seeds."""
 from functools import partial
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+
 
 def stack(pairs):
   """[(policy, optimizer), ...] -> (graphdef, stacked state)."""

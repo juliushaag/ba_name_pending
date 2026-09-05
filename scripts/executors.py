@@ -29,8 +29,8 @@ A finished sweep is the same shape whichever backend produced it.
 
 import csv
 import os
-import shlex
 import queue
+import shlex
 import shutil
 import subprocess
 import sys

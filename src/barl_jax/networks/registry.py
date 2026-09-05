@@ -15,7 +15,7 @@ def register_component(cls: type) -> type:
 
 
 def get_component(name: str) -> type:
-  from barl_jax.registration import load_builtins, import_type
+  from barl_jax.registration import import_type, load_builtins
   load_builtins("components")
   if ":" in name:
     return import_type(name)

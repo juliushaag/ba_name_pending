@@ -1,6 +1,6 @@
 """Immutable construction specifications, independent of active config state."""
-from dataclasses import dataclass
 import json
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)

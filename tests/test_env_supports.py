@@ -14,14 +14,11 @@ import math
 
 import jax.numpy as jnp
 import pytest
-from flax import nnx
+from conftest import build, make_env_stats
 
 import barl_jax.config.tree as model_config
 from barl_jax.env import Environment
 from barl_jax.environments.dm_control import DMControlEnvironment
-from barl_jax.networks.registry import get_component
-
-from conftest import build, make_env_stats
 
 GAMMA = model_config.ConfigTree().component_kwargs("C51Critic")["gamma"]
 DM_HORIZON = 1000                      # every suite task; see DMControlEnvironment's docstring

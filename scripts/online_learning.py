@@ -48,9 +48,9 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"wandb\..
 import jax
 
 from barl_jax.config.run import load_config
+from barl_jax.config.toolkit import CONFIG_DIR
 from barl_jax.trainer import setup, train, validate
 
-from barl_jax.config.toolkit import CONFIG_DIR
 DEFAULT_CONFIG = str(CONFIG_DIR / "experiments" / "online_learning.yaml")
 
 

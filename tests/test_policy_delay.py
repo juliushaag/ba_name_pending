@@ -18,14 +18,13 @@ import jax.extend
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from conftest import ACT_DIM, BATCH, OBS_DIM, make_env_stats
 from flax import nnx
 
-from barl_jax.metrics import DEBUG, PRIMARY, recording
 from barl_jax.components import TRAINABLE, gated_loss, update_due
+from barl_jax.metrics import DEBUG, PRIMARY, recording
 from barl_jax.policy import Policy
 from barl_jax.trainer import train_step
-
-from conftest import ACT_DIM, BATCH, OBS_DIM, make_env_stats
 
 DELAYED = ["AMDP", "DIME"]
 

@@ -1,6 +1,6 @@
 import time
-from functools import partial
 from abc import ABC, abstractmethod
+from functools import partial
 from typing import Optional
 
 import gymnasium as gym
@@ -9,17 +9,21 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-from barl_jax.action_chunking import ActionChunkExecutor, normalize_action_chunk
+from barl_jax.action_chunking import normalize_action_chunk
+from barl_jax.components import (
+  TRAINABLE,
+  Buffer,
+  Component,
+  HParamsOwner,
+  _Static,
+  sanitize_action,
+)
 from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.env import EnvStats
-from barl_jax.hparam import Config, HParam
+from barl_jax.hparam import Config
 from barl_jax.metrics import Recorder
 from barl_jax.optimization import OptimizerMixin
 
-
-from barl_jax.components import (
-  Buffer, Component, HParamsOwner, TRAINABLE, _Static, sanitize_action,
-)
 
 @partial(jax.jit, static_argnums=(0,))
 def _jitted_infer(graphdef, state, observation, key):
@@ -72,7 +76,7 @@ class Policy(OptimizerMixin, HParamsOwner, nnx.Module, ABC):
 
   @staticmethod
   def class_for(name):
-    from barl_jax.registration import load_builtins, import_type
+    from barl_jax.registration import import_type, load_builtins
     load_builtins("policies")
     cls = import_type(name) if ":" in name else Policy._classes[name]
     if not issubclass(cls, Policy):
@@ -93,8 +97,8 @@ class Policy(OptimizerMixin, HParamsOwner, nnx.Module, ABC):
 
   def __init__(self, env: gym.Env, profile: str = None, env_stats: EnvStats = None,
                rngs: nnx.Rngs = None, seed: int = 0, model_name: str = None, spec=None, **kwargs):
-    from barl_jax.config.tree import ConfigTree
     from barl_jax.config.model import ModelSpec
+    from barl_jax.config.tree import ConfigTree
 
     # The `model:` string this Policy was built from -- distinct from
     # `type(self).__name__` once one class backs several models (RLPolicy /

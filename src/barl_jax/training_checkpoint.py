@@ -1,13 +1,12 @@
 """Training-state resume at an iteration boundary, restarting environment episodes."""
 
-from barl_jax.checkpoints import save_policy
 import json
 from pathlib import Path
 
 import numpy as np
 import orbax.checkpoint as ocp
 
-from barl_jax.checkpoints import checkpoint_directory
+from barl_jax.checkpoints import checkpoint_directory, save_policy
 from barl_jax.multiseed import unstack
 
 VERSION = 1

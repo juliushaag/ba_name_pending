@@ -3,8 +3,10 @@ import gymnasium as gym
 import jax
 import jax.numpy as jnp
 import numpy as np
+
 from barl_jax.action_chunking import ActionChunkExecutor
 from barl_jax.components import action_bounds_numpy, sanitize_action
+
 
 def episode_success(info, i: int, is_vec: bool, terminated: bool) -> bool:
   """Did the episode that just ended on slot `i` succeed?

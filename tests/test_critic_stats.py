@@ -9,19 +9,15 @@ than a recorded value, so the tolerances are derived, not tuned.
 Nothing here trains anything: every law below is exact at initialization.
 """
 
-from barl_jax.objectives import td_loss, noise_td_loss
-
 import jax.numpy as jnp
 import pytest
+from conftest import BATCH, CRITICS, build, built, critic_action, finite, target_expectation
 
-from barl_jax.critics import (C51Critic, EnsembleCritic, HLGaussCritic,
-                                      categorical_projection)
+from barl_jax.critics import C51Critic, EnsembleCritic, HLGaussCritic, categorical_projection
 from barl_jax.metrics import DEBUG, PRIMARY, DebugMetric, Metric, collect, recording
 from barl_jax.networks.registry import get_component
+from barl_jax.objectives import noise_td_loss, td_loss
 from barl_jax.policies.lql import NoiseConditionedCritic
-
-from conftest import (BATCH, CRITICS, build, built, critic_action, finite,
-                      target_expectation)
 
 _sub = lambda base: [n for n in CRITICS if issubclass(get_component(n), base)]
 

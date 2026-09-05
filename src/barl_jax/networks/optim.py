@@ -2,7 +2,6 @@ import optax
 
 from barl_jax.hparam import Config
 
-
 # ---------------------------------------------------------------------------
 # Optimizer mixins -- the four optimizer knobs as class attributes, grouped by
 # role so every component that optimizes inherits exactly the one that fits it

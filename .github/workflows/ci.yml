@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Deliberately does not `uv sync` the root workspace: that pulls jax[cuda13]
+# and every simulator (dm-control, mani-skill, humanoid-bench, ...), which is
+# neither available nor needed on a CPU runner. Each job installs only the
+# standalone `src/barl_jax` library plus what it specifically needs, the way
+# an external user of the library would.
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with: {python-version: "3.11"}
+      # `uv run` would sync the whole root project (jax[cuda13], every
+      # simulator) before running anything -- installing ruff standalone
+      # avoids that entirely.
+      - run: uv pip install --python 3.11 --system ruff==0.16.3
+      - run: ruff check .
+
+  config-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with: {python-version: "3.11"}
+      - run: uv pip install --python 3.11 --system -e src/barl_jax pyyaml
+      - run: JAX_PLATFORMS=cpu MUJOCO_GL=egl python scripts/lint_config.py
+
+  cpu-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with: {python-version: "3.11"}
+      # jax==0.10.0 is pinned (matches uv.lock): a couple of the vmap-vs-per-slot
+      # equality tests compare at atol=1e-5, tight enough that jaxlib 0.10.2's
+      # CPU kernels round differently and fail spuriously -- see uv.lock for
+      # the version this repo actually develops against.
+      - run: uv pip install --python 3.11 --system -e "src/barl_jax[mujoco]" "jax==0.10.0" imageio pytest pytest-xdist
+      - run: JAX_PLATFORMS=cpu MUJOCO_GL=egl pytest tests/ -q
+
+  wheel-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with: {python-version: "3.11"}
+      # scripts/wheel_smoke.py only shells out to `uv build`/`uv venv`/`uv pip
+      # install` itself -- run with the system interpreter so this step, too,
+      # never triggers a root-project `uv sync`.
+      - run: python3 scripts/wheel_smoke.py

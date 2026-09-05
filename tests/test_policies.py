@@ -15,15 +15,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from conftest import ACT_DIM, BATCH, OBS_DIM, make_env_stats
 from flax import nnx
 
+from barl_jax.components import TRAINABLE
 from barl_jax.config.tree import ConfigTree
 from barl_jax.metrics import PRIMARY
-from barl_jax.components import TRAINABLE
 from barl_jax.policy import Policy
 from barl_jax.trainer import train_step
-
-from conftest import ACT_DIM, BATCH, OBS_DIM, make_env_stats
 
 MODELS = sorted(ConfigTree().available_models())
 
@@ -127,6 +126,7 @@ def test_unknown_component_override_is_rejected_at_construction():
 
 def test_duplicate_optimizer_keys_are_rejected(monkeypatch):
   import optax
+
   from barl_jax.actors.sac import StochasticActor
   from barl_jax.critics import C51Critic
 

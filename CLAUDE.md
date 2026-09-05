@@ -20,3 +20,20 @@ when its declaration kind changes.
 
 Comments should explain non-obvious invariants or numerical/shape constraints.
 Prefer clear identifiers and short comments over historical implementation essays.
+
+## Active implementation handoff
+
+Read [docs/CLAUDE_IMPLEMENTATION_PLAN.md](docs/CLAUDE_IMPLEMENTATION_PLAN.md)
+before continuing the QOL backlog. It defines the repo's direction, ownership map,
+numerical and lifecycle invariants, implementation phases, and acceptance checks.
+The QOL draft was reverted; earlier uncommitted refactors must be preserved.
+
+This is a development-stage repository: update callers together and remove obsolete
+APIs instead of adding compatibility shims. Prefer fewer concepts and shared behavior
+over more wrappers. The requested outcome is a net reduction in production code;
+measure it separately from tests/docs and never trade correctness for line counts.
+Keep algorithm changes explicit, especially normalization, gradient isolation,
+action chunking, evaluation RNG ownership, and checkpoint continuation semantics.
+
+The handoff also specifies policy-independent action executors (Default, Best-of-N,
+Mean-of-N). Keep action selection separate from job executors and algorithm losses.

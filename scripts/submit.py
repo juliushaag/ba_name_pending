@@ -31,11 +31,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-import yaml
-
 import grid
+import yaml
 from executors import EXECUTORS, SWEEP_NAME_FORMAT, SWEEPS_DIR, resolve
-
 
 #: The check itself, run as a program in a child process. Everything it needs
 #: is on stdin; what it found comes back through the file named by argv[1],
@@ -195,7 +193,7 @@ def main():
     # ---- what we're about to do -------------------------------------------
     print()
     print(f"Sweep:    {grid.describe(combos, axes, num_seeds)}")
-    print(f"Axes:     " + ", ".join(f"{k}={v}" for k, v in axes.items()))
+    print("Axes:     " + ", ".join(f"{k}={v}" for k, v in axes.items()))
     if exclude:
         print(f"Exclude:  {exclude}")
     print(f"Executor: {executor.name}" + (" (auto)" if args.executor == "auto" else ""))
@@ -203,7 +201,7 @@ def main():
     if args.debug:
         print(f"Debug:    {executor.describe_debug()}")
     if args.validate:
-        print(f"Validate: one rollout chunk + one train step per run, nothing logged")
+        print("Validate: one rollout chunk + one train step per run, nothing logged")
     print(f"Dir:      {sweep_dir}")
     print()
     for index, tag in enumerate(tags):

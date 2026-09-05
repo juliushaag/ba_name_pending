@@ -13,14 +13,13 @@ import os
 import random
 import sys
 
-import pytest
-
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 
 import grid
 from search import load_search, sample_trial, sample_trials
 
 from barl_jax.config.toolkit import CONFIG_DIR
+
 SPEC = str(CONFIG_DIR / "search" / "demo.yaml")
 
 
@@ -105,6 +104,7 @@ def test_search_rejects_structural_config_axes_for_alias_algos(tmp_path):
   """Alias algos resolve through aliases.yaml before their policy/component
   classes are checked, so the structural/HParam gate must hold for aliases too."""
   from search import check_searchability
+
   from barl_jax.config.toolkit import CONFIG_DIR
   from barl_jax.config.tree import ConfigTree
 

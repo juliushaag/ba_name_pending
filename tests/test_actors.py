@@ -8,13 +8,12 @@ squashes nothing further. `sample` returns the plan, not a primitive.
 import jax
 import jax.numpy as jnp
 import pytest
+from conftest import ACT_DIM, ACTORS, BATCH, build, built, finite
 from flax import nnx
 
-from barl_jax.networks.registry import get_component
 from barl_jax.actors.sdac import DDPMActor
 from barl_jax.components import TRAINABLE
-
-from conftest import ACT_DIM, ACTORS, BATCH, build, built, finite
+from barl_jax.networks.registry import get_component
 
 DIFFUSION = [n for n in ACTORS if issubclass(get_component(n), DDPMActor)]
 

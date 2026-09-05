@@ -1,6 +1,6 @@
 """Learning objectives over critic prediction and regression primitives."""
 import jax
-import jax.numpy as jnp
+
 
 def td_loss(critic, obs, action, next_obs, next_action, reward, term,
             losses: dict, shift=0.0, horizon=None) -> None:

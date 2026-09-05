@@ -2,7 +2,6 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from barl_jax.hparam import Config
 from barl_jax.networks.norm import make_norm
 
 # ---------------------------------------------------------------------------

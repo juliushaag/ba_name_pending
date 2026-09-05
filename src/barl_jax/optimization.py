@@ -2,6 +2,7 @@
 import jax.numpy as jnp
 import optax
 from flax import nnx
+
 from barl_jax.components import TRAINABLE
 
 

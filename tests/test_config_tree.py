@@ -9,7 +9,6 @@ import json
 import shutil
 
 import pytest
-from flax import nnx
 
 import barl_jax.config.tree as model_config
 from barl_jax.config.run import INJECTED_KEYS, load_config, run_keys
@@ -145,8 +144,7 @@ def test_a_resolved_run_has_every_run_key():
     """The run side of the same guarantee: a resolved run dict carries a value
     for every declared run key, so trainer's `cfg[...]` indexing and the
     wandb `run/*` block are complete by construction."""
-    from barl_jax.config.run import load_config
-    from barl_jax.config.run import RUN_CONFIGS
+    from barl_jax.config.run import RUN_CONFIGS, load_config
     runs = load_config(str(CONFIG_DIR / "experiments" / "online_learning.yaml"))
     assert runs
     for run in runs:

@@ -71,6 +71,7 @@ override-dependencies = [
 dev = [
     "pytest>=9.1.1",
     "pytest-xdist>=3.8.0",
+    "ruff>=0.16.3",
 ]
 
 
@@ -79,3 +80,16 @@ testpaths = ["tests"]
 # -n 4 is the sweet spot measured on this box: XLA's own compilation is already
 # multi-threaded, so more workers just duplicate imports. Use `-n 0` to debug.
 addopts = "-n 4"
+
+[tool.ruff]
+# Only first-party code: the submodule and installed/generated trees are not
+# ours to fix and are excluded by default (.venv, .git, egg-info) or here.
+extend-exclude = ["third_party", "wandb", "sweeps", "checkpoints", "logs"]
+line-length = 100
+indent-width = 2
+
+[tool.ruff.lint]
+# Deliberately small: syntax errors, pyflakes (unused/undefined names) and
+# import sorting. Style/format rules come later, once these are clean and
+# staying clean is enforced in CI.
+select = ["E9", "F", "I"]

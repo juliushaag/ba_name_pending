@@ -6,4 +6,4 @@
 # The concrete actors are grouped here by owning algorithm: sac.py =
 # StochasticActor, amdp.py = ScoreContinuousActor + clip_score, dime.py =
 # DISActor + _inv_softplus, sdac.py = DDPMActor + alpha_bar_from_betas.
-from barl_jax.actors import sac, amdp, dime, sdac  # noqa: F401
+from barl_jax.actors import amdp, dime, sac, sdac  # noqa: F401

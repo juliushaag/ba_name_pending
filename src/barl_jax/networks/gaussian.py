@@ -11,7 +11,6 @@ import math
 
 import jax.numpy as jnp
 
-
 LOG_SQRT_2PI = 0.5 * math.log(2 * math.pi)
 
 

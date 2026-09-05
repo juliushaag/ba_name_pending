@@ -12,7 +12,6 @@ its run entry). Since the axes are just overrides, no config file is ever edited
 to run a sweep.
 """
 
-import importlib.util
 import itertools
 import os
 import re
@@ -32,6 +31,7 @@ REPO_ROOT  = os.path.dirname(SCRIPT_DIR)
 
 from barl_jax.config.toolkit import CONFIG_DIR, resolve_includes
 from barl_jax.config.tree import ConfigTree
+
 DEFAULT_BASE_CONFIG = str(CONFIG_DIR / "experiments" / "online_learning.yaml")
 
 RESERVED_AXES = ("algo", "env", "seed")

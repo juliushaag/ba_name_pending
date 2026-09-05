@@ -2,9 +2,9 @@ import gymnasium as gym
 import numpy as np
 import pytest
 
+from barl_jax.collection import Collector, RandomPolicy
 from barl_jax.multiseed import StackedPolicy, stack, unstack
 from barl_jax.rollout import MultiSeedReplay, ReplayBuffer
-from barl_jax.collection import Collector, RandomPolicy
 
 
 def _stacked_fixture(num_seeds: int):
@@ -12,8 +12,9 @@ def _stacked_fixture(num_seeds: int):
   trainer stacks them. SAC because it is the cheapest registered policy to
   build; the routing under test is the Policy-agnostic part."""
   from flax import nnx
-  from barl_jax.env import Environment
+
   from barl_jax.components import TRAINABLE
+  from barl_jax.env import Environment
   from barl_jax.policy import Policy
 
   environment = Environment.make("HalfCheetah")

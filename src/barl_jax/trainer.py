@@ -11,16 +11,13 @@ an enclosing jit the step is dispatched op-by-op and costs ~4x more at N=1 and
 ~2x at N=10.
 """
 
-from barl_jax.checkpoints import load_policy
-from barl_jax.checkpoints import save_policy
-
-from contextlib import ExitStack
 import datetime
 import hashlib
 import json
 import os
 import subprocess
 import time
+from contextlib import ExitStack
 from functools import partial
 
 import jax
@@ -30,15 +27,21 @@ import optax
 from flax import nnx
 
 import barl_jax.config.tree as model_config
-from barl_jax.env import Environment
-from barl_jax.metrics import DEBUG, PRIMARY, DebugMetric, Metric, collect, recording, to_host
-from barl_jax.components import TRAINABLE, gating
-from barl_jax.policy import Policy
-from barl_jax.multiseed import StackedPolicy, split_metrics, stack, unstack
-from barl_jax.evaluation import run_episodes
-from barl_jax.rollout import MultiSeedReplay
+from barl_jax.checkpoints import load_policy, save_policy
 from barl_jax.collection import Collector
-from barl_jax.training_checkpoint import read_training, restore_training, save_training, validate_resume
+from barl_jax.components import TRAINABLE, gating
+from barl_jax.env import Environment
+from barl_jax.evaluation import run_episodes
+from barl_jax.metrics import DEBUG, PRIMARY, DebugMetric, Metric, collect, recording, to_host
+from barl_jax.multiseed import StackedPolicy, split_metrics, stack, unstack
+from barl_jax.policy import Policy
+from barl_jax.rollout import MultiSeedReplay
+from barl_jax.training_checkpoint import (
+  read_training,
+  restore_training,
+  save_training,
+  validate_resume,
+)
 
 
 @partial(jax.jit, static_argnums=(0, 3))

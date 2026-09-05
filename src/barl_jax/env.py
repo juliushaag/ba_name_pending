@@ -1,10 +1,8 @@
-import functools
 import multiprocessing as mp
 from abc import ABC, abstractmethod
 
 import gymnasium as gym
 import numpy as np
-
 
 
 class EnvStats(dict):
@@ -111,7 +109,7 @@ class Environment(ABC):
 
   @staticmethod
   def class_for(name: str):
-    from barl_jax.registration import load_builtins, import_type
+    from barl_jax.registration import import_type, load_builtins
     load_builtins("environments")
     cls = import_type(name) if ":" in name else Environment._classes[name]
     if not issubclass(cls, Environment):

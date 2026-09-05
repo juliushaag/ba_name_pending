@@ -20,7 +20,35 @@ compatibility constraints declared in the root `pyproject.toml`.
 
 ```bash
 uv build src/barl_jax
+uv run python scripts/wheel_smoke.py   # builds + installs that wheel into a throwaway
+                                        # venv and smoke-tests it outside the repo
 ```
+
+`uv run ruff check .` lints the first-party tree (`third_party/`, `wandb/`, `sweeps/`
+and `checkpoints/` are excluded); the rule set is deliberately small for now
+(syntax errors, pyflakes, import sorting -- see `[tool.ruff]` in `pyproject.toml`).
+
+`scripts/fastcheck.py` is the fast edit/check loop for config, registry and
+launcher changes -- config lint plus the cheap boundary tests, without paying
+for the full training-loop suite:
+
+```bash
+JAX_PLATFORMS=cpu uv run python scripts/fastcheck.py
+```
+
+`scripts/doctor.py` reports installed versions, optional simulator availability,
+and submodule readiness; `--probes` additionally runs the JAX backend and EGL
+render checks (each in its own subprocess, so a native crash is a reported
+failure rather than a dead process), and `--json` gives machine-readable output:
+
+```bash
+uv run python scripts/doctor.py --probes
+```
+
+CI (`.github/workflows/ci.yml`) runs `ruff check`, `scripts/lint_config.py`, the
+CPU test suite, and `scripts/wheel_smoke.py`, all against the standalone
+`src/barl_jax` install rather than the root workspace's CUDA/simulator
+dependencies.
 
 ## Running experiments
 

@@ -1,7 +1,7 @@
 """Replay storage and independently seeded sampling."""
 import jax
 import numpy as np
-import gymnasium as gym
+
 
 class ReplayBuffer():
   """A flat ring buffer of single transitions: one preallocated array per field,
@@ -47,7 +47,7 @@ class ReplayBuffer():
     """Append a batch of transitions, one row per sub-env slot. Every array must
     have the same leading length; each is stored under its keyword name and
     comes back out of `sample_numpy()` under that same name."""
-    slot_ids = row.pop("slot_ids", None)
+    row.pop("slot_ids", None)
     if self._fields is None:
       self._allocate(row)
     elif row.keys() != self._fields.keys():

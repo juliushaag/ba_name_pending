@@ -30,12 +30,8 @@ drop-in replacement of that function rather than a change to anything else
 here. Random search is the only baseline that needs no tuning itself.
 """
 
-import importlib.util
 import math
 import random
-from pathlib import Path
-
-import yaml
 
 from barl_jax.config.toolkit import CONFIG_DIR, load_yaml_with_includes
 
@@ -154,7 +150,6 @@ def check_searchability(spec: dict, *, tree=None) -> list[str]:
     if not axis.startswith("model."):
       continue
     rest = axis[len("model."):]
-    name = rest.rpartition(".")[2]
     for algo in algos:
       policy_name, _profile = tree.resolve_model_name(algo)
       if not tree.policy_cfg(policy_name):

@@ -4,10 +4,10 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from barl_jax.components import Buffer
 from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.hparam import HParam
 from barl_jax.networks.registry import register_component
-from barl_jax.components import Buffer
 
 from .base import CategoricalCriticBase, ConcatQ, categorical_projection
 

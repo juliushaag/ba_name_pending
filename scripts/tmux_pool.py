@@ -29,12 +29,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
+from executors import read_manifest
+from grid import detect_gpus
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
-
-from executors import read_manifest
-from grid import detect_gpus
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 

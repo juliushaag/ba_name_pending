@@ -1,8 +1,4 @@
-from barl_jax.checkpoints import load_policy
-from barl_jax.checkpoints import save_policy
 import json
-import os
-from pathlib import Path
 import subprocess
 import sys
 
@@ -13,14 +9,15 @@ import numpy as np
 import pytest
 from flax import nnx
 
-from barl_jax.components import HParamsOwner, TRAINABLE
 import barl_jax.config.tree as model_config
+from barl_jax import trainer
+from barl_jax.checkpoints import load_policy, save_policy
+from barl_jax.components import HParamsOwner
 from barl_jax.config.model import ModelSpec
 from barl_jax.config.tree import ConfigTree
 from barl_jax.env import Environment
 from barl_jax.hparam import Config, HParam
 from barl_jax.policy import Policy
-from barl_jax import trainer
 from barl_jax.training_checkpoint import save_training
 
 

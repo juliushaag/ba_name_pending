@@ -38,9 +38,7 @@ a selectable default.
 the MRO and resolve them at construction -- see HParamsOwner in policy.py."""
 from __future__ import annotations
 
-import operator
-import types
-from typing import Any, Optional
+from typing import Any
 
 _MISSING = object()
 

@@ -1,15 +1,14 @@
-import math
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from barl_jax.components import TARGET_SUFFIX, Buffer, Critic, frozen
 from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.hparam import Config, HParam
 from barl_jax.networks.ensemble import Ensemble
 from barl_jax.networks.mlp import MLP, MLP_PRESETS
-from barl_jax.networks.optim import adam, CriticOptim
-from barl_jax.components import TARGET_SUFFIX, Buffer, Critic, frozen
+from barl_jax.networks.optim import CriticOptim, adam
 
 
 class CriticLossConfig:

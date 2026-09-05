@@ -23,7 +23,6 @@ Two things differ from the MuJoCo/DMC families and are load-bearing:
 
 import gymnasium as gym
 
-
 from barl_jax.env import Environment, register_environment
 
 

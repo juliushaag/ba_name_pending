@@ -1,15 +1,18 @@
 """Component contracts and NNX state utilities."""
-from contextlib import contextmanager
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
+
 import gymnasium as gym
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
+
 from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.env import EnvStats
 from barl_jax.hparam import Config, HParam
 from barl_jax.metrics import Recorder, armed
+
 
 class Buffer(nnx.Variable):
   """Non-trainable state: normalization statistics, action bounds, target-net

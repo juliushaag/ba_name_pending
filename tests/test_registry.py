@@ -7,12 +7,11 @@ that cannot be constructed from its own baseline at all.
 """
 
 import pytest
+from conftest import ACTORS, ALL, CRITICS, SCHEDULES, SQUASHES, built
 
 import barl_jax.config.tree as model_config
-from barl_jax.networks.registry import get_component
 from barl_jax.components import Component
-
-from conftest import ALL, CRITICS, ACTORS, SCHEDULES, SQUASHES, built, tiny_kwargs
+from barl_jax.networks.registry import get_component
 
 # components.yaml entries with no class in the registry. Both are leftovers from
 # the torch port; listed so a *new* one still fails this test.

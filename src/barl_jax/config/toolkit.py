@@ -22,10 +22,10 @@ file it reads through this, so `$()` works anywhere under `config/`).
 
 from __future__ import annotations
 
-import re
 import os
-from importlib.resources import files
+import re
 import types
+from importlib.resources import files
 from pathlib import Path
 from typing import Any, Dict, Optional, Type, TypeVar, Union, get_args, get_origin
 

@@ -17,11 +17,11 @@ import gymnasium as gym
 import jax
 import jax.numpy as jnp
 
-from barl_jax.objectives import td_loss
-from barl_jax.hparam import Config, HParam
-from barl_jax.critics import QCriticBase
-from barl_jax.networks.regulator import AutotuneRegulator
 from barl_jax.components import Actor, gated_losses
+from barl_jax.critics import QCriticBase
+from barl_jax.hparam import Config, HParam
+from barl_jax.networks.regulator import AutotuneRegulator
+from barl_jax.objectives import td_loss
 from barl_jax.policy import Policy, register_policy
 
 

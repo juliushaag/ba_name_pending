@@ -7,14 +7,12 @@ affordable to be exhaustive.
 
 import jax
 import jax.numpy as jnp
-import optax
 import pytest
+from conftest import SCHEDULES, SQUASHES, build, built, finite
 from flax import nnx
 
 from barl_jax.critics import categorical_projection
 from barl_jax.networks.optim import CLIP_MODES, adam, grad_clip_transform
-
-from conftest import SCHEDULES, SQUASHES, build, built, finite
 
 # ----------------------------------------------------------------------
 # Squash

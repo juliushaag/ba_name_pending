@@ -8,19 +8,16 @@ Grouped a few assertions to a test on purpose: an eager `Ensemble` forward costs
 real time, so each test re-uses one `raw()` rather than paying for its own.
 """
 
-from barl_jax.objectives import td_loss, noise_td_loss
-
 import jax
 import jax.numpy as jnp
 import pytest
+from conftest import BATCH, CRITICS, build, built, critic_action, finite, target_expectation
 from flax import nnx
 
-from barl_jax.networks.registry import get_component
-from barl_jax.policies.lql import NoiseConditionedCritic
 from barl_jax.components import TRAINABLE, frozen
-
-from conftest import (BATCH, CRITICS, build, built, critic_action, finite,
-                      target_expectation)
+from barl_jax.networks.registry import get_component
+from barl_jax.objectives import noise_td_loss, td_loss
+from barl_jax.policies.lql import NoiseConditionedCritic
 
 # `NoiseConditionedCritic.loss` overrides `QCriticBase.loss` with a different
 # signature -- it takes the sigma ladder and a key, because TD at the clean level

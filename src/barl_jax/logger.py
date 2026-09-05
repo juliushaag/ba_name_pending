@@ -1,14 +1,14 @@
-from contextlib import ExitStack
 import time
 from collections import defaultdict
+from contextlib import ExitStack
 
 import numpy as np
-import wandb
-
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
+
+import wandb
 
 
 def _to_scalar(v):

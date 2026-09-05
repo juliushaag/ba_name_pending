@@ -36,14 +36,12 @@ import json
 import os
 import random
 import re
-import sys
 from pathlib import Path
 
 import grid
+import yaml
 from executors import EXECUTORS, SWEEP_NAME_FORMAT, SWEEPS_DIR, resolve
 from search import check_searchability, load_search, sample_trials
-
-import yaml
 
 
 def trial_tag(trial: dict, index: int, num_seeds: int) -> str:

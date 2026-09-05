@@ -3,14 +3,17 @@ becomes a kwarg.
 """
 
 import os
-from pathlib import Path
 from copy import deepcopy
+from pathlib import Path
 
 import yaml
 
-from barl_jax.config.toolkit import (CONFIG_DIR, ConfigMixin, _format_value,
-                                     deep_merge, resolve_includes)
 from barl_jax.config.run import run_defaults
+from barl_jax.config.toolkit import (
+  CONFIG_DIR,
+  deep_merge,
+  resolve_includes,
+)
 from barl_jax.registration import load_builtins
 
 TRAINING_KEYS = frozenset({

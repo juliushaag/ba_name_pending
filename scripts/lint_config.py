@@ -46,7 +46,6 @@ def component_problems() -> list[str]:
   selects its tier ladder (a tiered component must name one), and a `tier:` a
   slot states must resolve to an actual rung."""
   problems = []
-  tree = model_config.ConfigTree()
   for name in sorted(available_components()):
     cls = get_component(name)
     if getattr(cls, "kind", None) is None:

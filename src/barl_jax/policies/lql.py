@@ -3,18 +3,15 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from barl_jax.objectives import noise_td_loss
-from barl_jax.hparam import Config, HParam
+from barl_jax.components import Buffer, frozen
 from barl_jax.critics.nclql import (
-  NCLQLC51Critic,
-  NCLQLCritic,
-  NCLQLHLGaussCritic,
   NoiseConditionedCritic,
 )
+from barl_jax.hparam import Config, HParam
 from barl_jax.metrics import DEBUG
-from barl_jax.components import Buffer, frozen
-from barl_jax.policy import Policy, register_policy
 from barl_jax.networks.schedule import Schedule
+from barl_jax.objectives import noise_td_loss
+from barl_jax.policy import Policy, register_policy
 
 
 @register_policy

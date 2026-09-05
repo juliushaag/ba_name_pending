@@ -4,7 +4,6 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from barl_jax.hparam import Config
 from barl_jax.components import Buffer
 
 # ---------------------------------------------------------------------------
@@ -68,7 +67,7 @@ class TimeEmbedding(nnx.Module):
                freq_min: float, freq_max: float, hidden: int,
                concat_input: bool, spacing: str, rngs: nnx.Rngs):
 
-    from barl_jax.networks.mlp import Linear   # circular at module import time
+    from barl_jax.networks.mlp import Linear  # circular at module import time
 
     assert kind in ("sin", "fourier", "learned"), \
       f"{kind} not in available time embeddings ('sin', 'fourier', 'learned')"
