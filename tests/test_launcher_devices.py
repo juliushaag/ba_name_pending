@@ -18,7 +18,6 @@ sys.path.insert(0, str(SCRIPTS))
 
 import executors  # noqa: E402
 import grid  # noqa: E402
-import submit  # noqa: E402
 
 
 def load_script(name: str):
@@ -35,7 +34,7 @@ def test_check_config_leaves_no_device_var_behind(monkeypatch):
     for var in executors.DEVICE_VARS:
         monkeypatch.delenv(var, raising=False)
 
-    assert submit.check_config(["SAC"], ["HalfCheetah"]) == []
+    assert grid.check_config(["SAC"], ["HalfCheetah"]) == []
     assert not [var for var in executors.DEVICE_VARS if var in os.environ]
 
 

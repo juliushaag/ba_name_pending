@@ -29,8 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
-from executors import read_manifest
-from grid import detect_gpus
+from executors import detect_gpus, read_manifest
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table

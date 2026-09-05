@@ -24,75 +24,10 @@ on the cluster as it does here.
 
 import argparse
 import datetime
-import json
-import os
-import subprocess
-import sys
-import tempfile
 from pathlib import Path
 
 import grid
-import yaml
 from executors import EXECUTORS, SWEEP_NAME_FORMAT, SWEEPS_DIR, resolve
-
-#: The check itself, run as a program in a child process. Everything it needs
-#: is on stdin; what it found comes back through the file named by argv[1],
-#: which import chatter on stdout cannot corrupt.
-CHECK_PROGRAM = """
-import importlib, json, sys
-
-algos, envs = json.load(sys.stdin)
-
-import barl_jax  # noqa: F401  -- the import is what populates the registries
-model_config = importlib.import_module("barl_jax.config.tree")
-from barl_jax.env import Environment
-
-known_envs = set(Environment.available())
-problems = [f"{env!r} is not a registered environment"
-            for env in envs if env not in known_envs]
-
-for algo in algos:
-    try:
-        problems += [f"{algo}: {p}" for p in model_config.validate(algo, model_config.ConfigTree())]
-    except Exception as exc:  # an unresolvable name raises rather than reporting
-        problems.append(f"{algo}: {type(exc).__name__}: {exc}")
-
-with open(sys.argv[1], "w") as out:
-    json.dump(problems, out)
-"""
-
-
-def check_config(algos: list[str], envs: list[str]) -> list[str]:
-    """Everything an array of 40 tasks would otherwise discover 40 times, at the
-    point where it is still one error message: unregistered env or algo names,
-    and anything `model_config.validate()` rejects (an override that lands on no
-    slot, a kwarg no component accepts, a slot missing its `tier:`).
-
-    Resolution only: no env is built, no weights are allocated, nothing touches
-    a device."""
-    # In a child process, and that is the whole point. The check wants
-    # JAX_PLATFORMS=cpu -- a login node has no GPU to spend -- while every
-    # executor hands *this* process's environment to the runs (LocalExecutor's
-    # `env=`, sbatch's `--export=ALL`, tmux's `-e`). A JAX_PLATFORMS=cpu left in
-    # os.environ here does not just slow the check down: it trains every run of
-    # the sweep on the CPU, ~160x slower per gradient step and indistinguishable
-    # from a hang. Setting it only in the child is what makes that unleakable,
-    # for this variable and any other the check ever needs -- and it keeps jax
-    # and mujoco out of the launcher process entirely.
-    env = {**os.environ, "MUJOCO_GL": "egl", "JAX_PLATFORMS": "cpu"}
-
-    with tempfile.TemporaryDirectory() as tmp:
-        found = os.path.join(tmp, "problems.json")
-        proc = subprocess.run([sys.executable, "-c", CHECK_PROGRAM, found],
-                              input=json.dumps([list(algos), list(envs)]),
-                              text=True, capture_output=True, env=env)
-
-        if proc.returncode != 0 or not os.path.exists(found):
-            tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-5:]
-            return ["the config check could not run:", *(f"  {line}" for line in tail)]
-
-        with open(found) as f:
-            return json.load(f)
 
 
 def parse_args():
@@ -217,7 +152,7 @@ def main():
         print("\nSkipping the config check (--skip-check).")
     else:
         print("\nChecking model configs ...", flush=True)
-        problems = check_config(sorted({c["algo"] for c in combos}),
+        problems = grid.check_config(sorted({c["algo"] for c in combos}),
                                 sorted({c["env"] for c in combos}))
         if problems:
             print("\nRefusing to submit -- unusable config:")
@@ -228,23 +163,12 @@ def main():
 
     # ---- expand the grid onto disk ----------------------------------------
     base_config_path = args.config or base or grid.DEFAULT_BASE_CONFIG
-    with open(base_config_path) as f:
-        defaults = dict((yaml.safe_load(f) or {}).get("defaults") or {})
-
-    if args.validate:
-        defaults["validate"] = True
-    # Threaded through `defaults` so every run of the sweep is one filter in wandb.
-    defaults["sweep_tag"] = sweep_name
-
-    sweep_dir.mkdir(parents=True, exist_ok=True)
-    runs = grid.materialize(combos, tags, defaults=defaults, sweep_dir=str(sweep_dir),
-                            num_seeds=args.seeds)
-
-    head = {"sweep_tag": sweep_name, "created": sweep_name, "command": grid.sweep_command(),
-            "base_config": os.path.abspath(base_config_path), "executor": executor.name,
-            "seeds": num_seeds, "validate": bool(args.validate), "debug": bool(args.debug),
-            "axes": {k: list(v) for k, v in axes.items()}, "exclude": exclude or None}
-    grid.write_sweep_yaml(str(sweep_dir), head, runs)
+    runs, head = grid.prepare_sweep(
+        combos, tags, base_config_path=base_config_path, sweep_dir=str(sweep_dir),
+        num_seeds=args.seeds, validate=args.validate, sweep_name=sweep_name,
+        executor_name=executor.name, seeds=num_seeds,
+        head_extra={"validate": bool(args.validate), "debug": bool(args.debug),
+                   "axes": {k: list(v) for k, v in axes.items()}, "exclude": exclude or None})
 
     # ---- hand off ----------------------------------------------------------
     report = executor.submit(runs, sweep_name, sweep_dir,

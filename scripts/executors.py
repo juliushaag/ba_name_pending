@@ -39,11 +39,33 @@ import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-from grid import Run, detect_gpus, emit
+from grid import Run
 
 SWEEPS_DIR = Path("sweeps")
 MANIFEST_NAME = "experiments.csv"
 SWEEP_NAME_FORMAT = "%Y-%m-%d_%H-%M-%S"
+
+# Workers write to the same terminal, so multi-line output is emitted under
+# this. Lives here rather than in grid.py: grid.py only ever builds the run
+# list, it never prints progress or shells out to nvidia-smi -- executors.py
+# (LocalExecutor's worker threads) and tmux_pool.py are the only two callers.
+PRINT_LOCK = threading.Lock()
+
+
+def emit(text: str) -> None:
+    with PRINT_LOCK:
+        print(text, flush=True)
+
+
+def detect_gpus() -> list[str]:
+    """Every GPU nvidia-smi reports, as CUDA_VISIBLE_DEVICES values. Empty on a
+    box with no nvidia-smi, which the local executor reads as "one run at a time"."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+                             capture_output=True, text=True, check=True).stdout
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
 
 DEBUG_TIME_LABEL = "00:30:00"
 DEBUG_SECONDS = 30 * 60

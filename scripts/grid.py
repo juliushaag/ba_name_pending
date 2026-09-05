@@ -13,13 +13,14 @@ to run a sweep.
 """
 
 import itertools
+import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
-import threading
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -36,30 +37,77 @@ DEFAULT_BASE_CONFIG = str(CONFIG_DIR / "experiments" / "online_learning.yaml")
 
 RESERVED_AXES = ("algo", "env", "seed")
 
-# Workers write to the same terminal, so multi-line output is emitted under this.
-PRINT_LOCK = threading.Lock()
-
-
-def emit(text: str) -> None:
-  with PRINT_LOCK:
-    print(text, flush=True)
-
-
-def detect_gpus() -> list[str]:
-  """Every GPU nvidia-smi reports, as CUDA_VISIBLE_DEVICES values. Empty on a
-  box with no nvidia-smi, which the local executor reads as "one run at a time"."""
-  try:
-    out = subprocess.run(["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-                         capture_output=True, text=True, check=True).stdout
-  except (FileNotFoundError, subprocess.CalledProcessError):
-    return []
-  return [line.strip() for line in out.splitlines() if line.strip()]
-
 
 def default_num_seeds() -> int:
   """`num_seeds` from config/run/defaults.yaml -- the single place the seed count
   is declared. submit.py's `--seeds` overrides it; nothing else has an opinion."""
   return int(ConfigTree(CONFIG_DIR).run["num_seeds"])
+
+
+# ---------------------------------------------------------------------------
+# config check -- reusable across submit.py's grid sweeps and hpo.py's search
+# sweeps, since both materialize the same kind of run and want the same
+# preflight before submitting it.
+# ---------------------------------------------------------------------------
+
+#: The check itself, run as a program in a child process. Everything it needs
+#: is on stdin; what it found comes back through the file named by argv[1],
+#: which import chatter on stdout cannot corrupt.
+CHECK_PROGRAM = """
+import importlib, json, sys
+
+algos, envs = json.load(sys.stdin)
+
+import barl_jax  # noqa: F401  -- the import is what populates the registries
+model_config = importlib.import_module("barl_jax.config.tree")
+from barl_jax.env import Environment
+
+known_envs = set(Environment.available())
+problems = [f"{env!r} is not a registered environment"
+            for env in envs if env not in known_envs]
+
+for algo in algos:
+    try:
+        problems += [f"{algo}: {p}" for p in model_config.validate(algo, model_config.ConfigTree())]
+    except Exception as exc:  # an unresolvable name raises rather than reporting
+        problems.append(f"{algo}: {type(exc).__name__}: {exc}")
+
+with open(sys.argv[1], "w") as out:
+    json.dump(problems, out)
+"""
+
+
+def check_config(algos: list[str], envs: list[str]) -> list[str]:
+  """Everything an array of 40 tasks would otherwise discover 40 times, at the
+  point where it is still one error message: unregistered env or algo names,
+  and anything `model_config.validate()` rejects (an override that lands on no
+  slot, a kwarg no component accepts, a slot missing its `tier:`).
+
+  Resolution only: no env is built, no weights are allocated, nothing touches
+  a device."""
+  # In a child process, and that is the whole point. The check wants
+  # JAX_PLATFORMS=cpu -- a login node has no GPU to spend -- while every
+  # executor hands *this* process's environment to the runs (LocalExecutor's
+  # `env=`, sbatch's `--export=ALL`, tmux's `-e`). A JAX_PLATFORMS=cpu left in
+  # os.environ here does not just slow the check down: it trains every run of
+  # the sweep on the CPU, ~160x slower per gradient step and indistinguishable
+  # from a hang. Setting it only in the child is what makes that unleakable,
+  # for this variable and any other the check ever needs -- and it keeps jax
+  # and mujoco out of the launcher process entirely.
+  env = {**os.environ, "MUJOCO_GL": "egl", "JAX_PLATFORMS": "cpu"}
+
+  with tempfile.TemporaryDirectory() as tmp:
+    found = os.path.join(tmp, "problems.json")
+    proc = subprocess.run([sys.executable, "-c", CHECK_PROGRAM, found],
+                          input=json.dumps([list(algos), list(envs)]),
+                          text=True, capture_output=True, env=env)
+
+    if proc.returncode != 0 or not os.path.exists(found):
+      tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-5:]
+      return ["the config check could not run:", *(f"  {line}" for line in tail)]
+
+    with open(found) as f:
+      return json.load(f)
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +270,38 @@ def materialize(combos: list[dict], tags: list[str], *, defaults: dict, sweep_di
     runs.append(Run(index=index, tag=tag, combo=combo,
                     dir=tag, config=os.path.join(tag, "config.yaml")))
   return runs
+
+
+def prepare_sweep(combos: list[dict], tags: list[str], *, base_config_path: str,
+                  sweep_dir: str, num_seeds: int | None, validate: bool,
+                  sweep_name: str, executor_name: str, seeds: int,
+                  head_extra: dict) -> tuple[list[Run], dict]:
+  """The launch preparation submit.py's grid sweeps and hpo.py's search sweeps
+  share once each has its own combos/tags: load the base config's `defaults:`,
+  apply the two launch-time overrides every caller makes (`--validate`
+  collapses every run to the smoke-test path; `sweep_tag` is stamped in so
+  every run of this sweep is one filter in wandb), materialize every run's
+  `config.yaml`, and publish `sweep.yaml`.
+
+  `head_extra` carries whatever only the caller knows about the sweep it
+  built -- a grid's `axes`/`exclude`/`debug`, or a search's `kind`/`sampler`/
+  `n_trials`/`objective` -- passed through untouched rather than guessed at
+  here, so a grid sweep's manifest and a search sweep's stay explicitly
+  different shapes instead of one merged, lowest-common-denominator one."""
+  with open(base_config_path) as f:
+    defaults = dict((yaml.safe_load(f) or {}).get("defaults") or {})
+  if validate:
+    defaults["validate"] = True
+  defaults["sweep_tag"] = sweep_name
+
+  os.makedirs(sweep_dir, exist_ok=True)
+  runs = materialize(combos, tags, defaults=defaults, sweep_dir=sweep_dir, num_seeds=num_seeds)
+
+  head = {"sweep_tag": sweep_name, "created": sweep_name, "command": sweep_command(),
+         "base_config": os.path.abspath(base_config_path), "executor": executor_name,
+         "seeds": seeds, **head_extra}
+  write_sweep_yaml(sweep_dir, head, runs)
+  return runs, head
 
 
 def write_sweep_yaml(sweep_dir: str, head: dict, runs: list[Run]) -> str:

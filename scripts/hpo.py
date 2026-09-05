@@ -32,13 +32,11 @@ the materialize/submit below per wave.
 
 import argparse
 import datetime
-import os
 import random
 import re
 from pathlib import Path
 
 import grid
-import yaml
 from executors import EXECUTORS, SWEEP_NAME_FORMAT, SWEEPS_DIR, resolve
 from search import check_searchability, load_search, sample_trials
 
@@ -151,10 +149,9 @@ def main():
     return
 
   if not args.skip_check:
-    from submit import check_config
     print("\nChecking model configs ...", flush=True)
-    problems = check_config(sorted({t["algo"] for t in trials}),
-                            sorted({t["env"] for t in trials}))
+    problems = grid.check_config(sorted({t["algo"] for t in trials}),
+                                 sorted({t["env"] for t in trials}))
     if problems:
       print("\nRefusing to submit -- unusable config:")
       for problem in problems:
@@ -163,30 +160,19 @@ def main():
     print("  OK")
 
   base_config_path = spec.get("base") or grid.DEFAULT_BASE_CONFIG
-  with open(base_config_path) as f:
-    defaults = dict((yaml.safe_load(f) or {}).get("defaults") or {})
-  if args.validate:
-    defaults["validate"] = True
-
   sweep_name = datetime.datetime.now().strftime(SWEEP_NAME_FORMAT)
   sweep_dir = Path(args.sweep_dir or (SWEEPS_DIR / sweep_name)).absolute()
-
   tags = [trial_tag(t, i, num_seeds) for i, t in enumerate(trials)]
-  defaults["sweep_tag"] = sweep_name
-  sweep_dir.mkdir(parents=True, exist_ok=True)
-  runs = grid.materialize(trials, tags, defaults=defaults, sweep_dir=str(sweep_dir),
-                          num_seeds=args.seeds or spec.get("seeds_per_trial"))
-
-  head = {
-    "sweep_tag": sweep_name, "created": sweep_name, "command": grid.sweep_command(),
-    "kind": "search", "search": str(Path(args.search).resolve()),
-    "sampler": spec.get("sampler", "random"), "n_trials": len(trials),
-    "seeds": num_seeds, "objective": spec.get("objective", "eval/avg_cum_reward"),
-    "base_config": os.path.abspath(base_config_path), "executor": resolve(args.executor).name,
-  }
-  grid.write_sweep_yaml(str(sweep_dir), head, runs)
-
   executor = resolve(args.executor)
+
+  runs, head = grid.prepare_sweep(
+    trials, tags, base_config_path=base_config_path, sweep_dir=str(sweep_dir),
+    num_seeds=args.seeds or spec.get("seeds_per_trial"), validate=args.validate,
+    sweep_name=sweep_name, executor_name=executor.name, seeds=num_seeds,
+    head_extra={"kind": "search", "search": str(Path(args.search).resolve()),
+               "sampler": spec.get("sampler", "random"), "n_trials": len(trials),
+               "objective": spec.get("objective", "eval/avg_cum_reward")})
+
   max_parallel = args.max_parallel or executor.default_parallelism
   print(f"\nDir:      {sweep_dir}")
   print(f"Executor: {executor.name} (parallel {max_parallel})")

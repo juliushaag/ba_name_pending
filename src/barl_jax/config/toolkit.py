@@ -89,6 +89,22 @@ def load_yaml_with_includes(path: str | Path, config_root: str | Path = CONFIG_D
   return resolve_includes(data, path.parent, Path(config_root).resolve())
 
 
+def parse_set_overrides(assignments: list[str] | None) -> Dict[str, Any]:
+  """`["components.critic.tier=large", ...]` (a repeated `--set PATH=VALUE`
+  flag) -> `{"components.critic.tier": "large", ...}`, the dotted-override
+  dict both `print_config.py` and `config_diff.py` resolve a model against.
+  Each value is parsed as YAML scalar/collection syntax, so `--set
+  params.lr=1e-4` and `--set params.normalize_obs=false` land as a float and
+  a bool, not the literal strings."""
+  overrides: Dict[str, Any] = {}
+  for assignment in assignments or []:
+    path, sep, value = assignment.partition("=")
+    if not sep:
+      raise SystemExit(f"--set {assignment!r} is not of the form path=value")
+    overrides[path.strip()] = yaml.safe_load(value)
+  return overrides
+
+
 def _format_type(tp: Type) -> str:
   origin = get_origin(tp)
   if origin is None:

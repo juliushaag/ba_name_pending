@@ -22,6 +22,7 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 
 import barl_jax  # noqa: F401 -- populates the policy/component registries
 import barl_jax.config.tree as model_config
+from barl_jax.config.toolkit import parse_set_overrides
 
 _MISSING = object()
 
@@ -101,13 +102,7 @@ if __name__ == "__main__":
   args.add_argument("--json", action="store_true")
   kwargs = args.parse_args()
 
-  overrides = {}
-  for assignment in kwargs.set or []:
-    path, sep, value = assignment.partition("=")
-    if not sep:
-      raise SystemExit(f"--set {assignment!r} is not of the form path=value")
-    import yaml
-    overrides[path.strip()] = yaml.safe_load(value)
+  overrides = parse_set_overrides(kwargs.set)
 
   old = _read_snapshot(kwargs.against)
   config = model_config.ConfigTree(overrides=overrides)
