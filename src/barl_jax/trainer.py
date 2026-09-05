@@ -14,6 +14,7 @@ an enclosing jit the step is dispatched op-by-op and costs ~4x more at N=1 and
 import datetime
 import hashlib
 import json
+import math
 import os
 import subprocess
 import time
@@ -30,11 +31,13 @@ import barl_jax.config.tree as model_config
 from barl_jax.checkpoints import load_policy, save_policy
 from barl_jax.collection import Collector
 from barl_jax.components import TRAINABLE, gating
+from barl_jax.config.run import validate_run
 from barl_jax.env import Environment
 from barl_jax.evaluation import run_episodes
 from barl_jax.metrics import DEBUG, PRIMARY, DebugMetric, Metric, collect, recording, to_host
 from barl_jax.multiseed import StackedPolicy, split_metrics, stack, unstack
 from barl_jax.policy import Policy
+from barl_jax.result import presentable, write_json_atomic
 from barl_jax.rollout import MultiSeedReplay
 from barl_jax.training_checkpoint import (
   read_training,
@@ -202,11 +205,15 @@ def setup(cfg: dict, num_seeds: int, *, validate_only: bool = False) -> Run:
 
 def _setup(run, *, validate_only):
   cfg, num_seeds = run.cfg, run.num_seeds
+
+  run_problems = validate_run(cfg, num_seeds=num_seeds)
+  if run_problems:
+    raise ValueError(f"{run.model_name} on {run.env_name}: invalid run config, refusing to start:\n  "
+                     + "\n  ".join(run_problems))
+
   enable_compilation_cache(cfg["compile_cache_dir"])
 
   mode = cfg.get("checkpoint_mode", "weights")
-  if mode not in ("weights", "resume"):
-    raise ValueError("checkpoint_mode must be weights or resume")
   resume_meta = None
   if mode == "resume":
     if cfg["checkpoint"] is None:
@@ -403,8 +410,9 @@ def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
 # ----------------------------------------------------------------------
 
 
-def wandb_config(run: Run) -> dict:
-  """Everything that determines this run, flattened for the wandb config panel.
+def run_config_snapshot(run: Run) -> dict:
+  """Everything that determines this run, flattened for the logger's config
+  panel (wandb's, or whatever a future local equivalent shows).
 
   Assembled from the resolved config rather than from any YAML layer, so what the
   panel shows *is* what ran: `model/*` carries every component kwarg including the
@@ -509,7 +517,7 @@ def train(run: Run):
 
 
 def _train(run: Run):
-  from barl_jax.logger import Logger
+  from barl_jax.logger import make_logger
   cfg, num_seeds = run.cfg, run.num_seeds
   now  = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
   name = f"{run.model_name.lower()}/{run.env_name.lower()}/{now}_x{num_seeds}"
@@ -528,10 +536,22 @@ def _train(run: Run):
   if cfg["sweep_tag"]:
     tags.append(cfg["sweep_tag"])
 
-  log = Logger(
-    "BA-RL", run_name=name, step_keys={"env_steps", "grad_steps"}, tags=tags,
-    config=wandb_config(run), group=name,
-    finish_timeout=cfg["wandb_finish_timeout"],
+  # A sweep hands every run its own directory (scripts/grid.py) and its
+  # weights belong next to the config and log that produced them. A standalone
+  # run has no such directory, and keeps the global checkpoints/ tree keyed by
+  # the same <model>/<env>/<timestamp> the wandb run is named after.
+  ckpt_dir = os.path.abspath(os.path.join(cfg["run_dir"], "checkpoints") if cfg["run_dir"]
+                             else os.path.join("checkpoints", name))
+  os.makedirs(ckpt_dir, exist_ok=True)
+  # The run-level directory the objective sidecar lives in: the run's own dir
+  # under a sweep, else the standalone <model>/<env>/<timestamp>/ tree. This is
+  # the only place a finished run's result is readable without wandb.
+  objective_dir = os.path.abspath(cfg["run_dir"]) if cfg["run_dir"] else os.path.join("checkpoints", name)
+
+  log = make_logger(
+    cfg.get("logger", "wandb"), name, step_keys={"env_steps", "grad_steps"}, tags=tags,
+    config=run_config_snapshot(run), group=name,
+    finish_timeout=cfg["wandb_finish_timeout"], run_dir=objective_dir,
     seeds=[run.base_seed + i for i in range(num_seeds)]
   )
 
@@ -544,17 +564,6 @@ def _train(run: Run):
   for ns in [*run.reference.components, run.reference.algo_name(), "batch", "buffer"]:
     log.register(f"{ns}/*", "grad_steps")
 
-  # A sweep hands every run its own directory (scripts/grid.py) and its
-  # weights belong next to the config and log that produced them. A standalone
-  # run has no such directory, and keeps the global checkpoints/ tree keyed by
-  # the same <model>/<env>/<timestamp> the wandb run is named after.
-  ckpt_dir = os.path.abspath(os.path.join(cfg["run_dir"], "checkpoints") if cfg["run_dir"]
-                             else os.path.join("checkpoints", name))
-  os.makedirs(ckpt_dir, exist_ok=True)
-  # The run-level directory the objective sidecar lives in: the run's own dir
-  # under a sweep, else the standalone <model>/<env>/<timestamp>/ tree. This is
-  # the only place a finished run's result is readable without wandb.
-  objective_dir = os.path.abspath(cfg["run_dir"]) if cfg["run_dir"] else os.path.join("checkpoints", name)
   log.message(f"Checkpoints: {ckpt_dir}")
   log.message(f"{num_seeds} seed{'s' if num_seeds != 1 else ''} vmapped in one process "
               f"({num_seeds * run.num_envs} rollout envs, "
@@ -788,17 +797,22 @@ def _write_objective(objective_dir: str, *, model: str, env: str, seed: int,
   `objective` is the mean best reward across seeds -- the same number
   `best_reward` summarises per seed -- and `best` the per-seed values. Written
   after every eval (status "running", so a live driver can watch it) and again
-  in the trainer's finally (status "finished" / "failed"). Non-finite entries
-  (no eval happened yet, or a crash before one) rank below any real reward, so
-  a consumer sorts by objective descending and treats -inf as "no result"."""
-  os.makedirs(objective_dir, exist_ok=True)
-  objective = float(np.mean([float(b) for b in best])) if best else float("-inf")
+  in the trainer's finally (status "finished" / "failed").
+
+  Strict presentation JSON (barl_jax.result): a seed with no eval yet is still
+  `-inf` in `best` (evaluate()'s own "beat the previous best" comparison needs
+  the real sentinel), but here that becomes `null` plus `objective_reason`, so
+  a driver reading the file with any JSON parser sees "no result" rather than
+  a value it has to know to special-case."""
+  finite_best = [float(b) for b in best if math.isfinite(b)]
+  objective = float(np.mean(finite_best)) if finite_best else None
+  reason = None if finite_best else "no evaluation has completed for any seed yet"
   payload = {
     "model": model, "env": env, "seed": seed, "num_seeds": num_seeds,
     "env_steps": env_steps, "status": status,
-    "objective": objective, "best": [float(b) for b in best],
+    "objective": objective, "objective_reason": reason,
+    "best": [presentable(float(b)) for b in best],
   }
   path = os.path.join(objective_dir, "objective.json")
-  with open(path, "w") as f:
-    json.dump(payload, f, indent=2)
+  write_json_atomic(path, payload)
   return path

@@ -137,8 +137,9 @@ def test_search_rejects_structural_config_axes_for_alias_algos(tmp_path):
 
 
 def test_objective_sidecar(tmp_path):
-  """trainer._write_objective writes a rankable JSON beside the run, and ranks
-  non-finite below any real reward."""
+  """trainer._write_objective writes a rankable, strict-JSON sidecar: a real
+  reward as a plain float, and "no evaluation yet" as `null` plus a reason --
+  never a non-finite float, which plain `json.loads` elsewhere cannot parse."""
   from barl_jax import trainer
 
   path = trainer._write_objective(
@@ -147,10 +148,14 @@ def test_objective_sidecar(tmp_path):
   with open(path) as f:
     data = json.load(f)
   assert data["objective"] == 42.0
+  assert data["objective_reason"] is None
   assert data["status"] == "finished"
 
   bad = trainer._write_objective(
     str(tmp_path / "other"), model="SAC", env="HalfCheetah", seed=1, num_seeds=1,
     env_steps=0, best=[float("-inf")], status="failed")
   with open(bad) as f:
-    assert json.load(f)["objective"] == float("-inf")
+    data = json.load(f)
+  assert data["objective"] is None
+  assert data["objective_reason"]
+  assert data["best"] == [None]

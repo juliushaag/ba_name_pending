@@ -246,12 +246,12 @@ def test_warmup_failure_closes_logger_and_all_environments(tmp_path, monkeypatch
   import barl_jax.logger as logging
   family = ToyFamily()
   loggers = []
-  def logger(*args, **kwargs):
+  def logger(kind, *args, **kwargs):
     instance = MemoryLogger(*args, **kwargs)
     loggers.append(instance)
     return instance
   monkeypatch.setattr(Environment, "make", lambda name: family)
-  monkeypatch.setattr(logging, "Logger", logger)
+  monkeypatch.setattr(logging, "make_logger", logger)
   def fail(*args):
     raise RuntimeError("warmup failed")
   monkeypatch.setattr(trainer, "warmup", fail)
@@ -266,7 +266,7 @@ def test_complete_training_writes_resumable_state(tmp_path, monkeypatch):
   import barl_jax.logger as logging
   family = ToyFamily()
   monkeypatch.setattr(Environment, "make", lambda name: family)
-  monkeypatch.setattr(logging, "Logger", MemoryLogger)
+  monkeypatch.setattr(logging, "make_logger", lambda kind, *a, **kw: MemoryLogger(*a, **kw))
   monkeypatch.setattr(trainer, "warmup", lambda *args: {})
   cfg = {**run_config(tmp_path), "total_env_steps": 2, "buffer_size": 2}
   run = trainer.setup(cfg, 1)
@@ -278,6 +278,32 @@ def test_complete_training_writes_resumable_state(tmp_path, monkeypatch):
   with trainer.setup({**cfg, "checkpoint": str(path), "checkpoint_mode": "resume"}, 1) as restored:
     assert restored.progress["env_steps"] == 2
     assert restored.progress["grad_steps"] == 4
+
+
+@pytest.mark.parametrize("kind", ["local", "none"])
+def test_training_runs_without_wandb(tmp_path, monkeypatch, kind):
+  """`logger: local`/`logger: none` are real barl_jax.logger sinks, not test
+  fakes -- neither one imports or touches wandb, so both are the acceptance
+  case for "a training smoke run works without W&B installed"."""
+  family = ToyFamily()
+  monkeypatch.setattr(Environment, "make", lambda name: family)
+  monkeypatch.setattr(trainer, "warmup", lambda *args: {})
+  cfg = {**run_config(tmp_path), "logger": kind, "total_env_steps": 2, "buffer_size": 2,
+         "eval_every": 1, "eval_runs": 1}
+  run = trainer.setup(cfg, 1)
+  trainer.train(run)
+
+  result = json.loads((tmp_path / "objective.json").read_text())
+  assert result["status"] == "finished"
+  assert all(env.closed for env in family.created)
+
+  if kind == "local":
+    lines = (tmp_path / "metrics.jsonl").read_text().strip().splitlines()
+    assert lines
+    for line in lines:
+      json.loads(line)  # every row is strict JSON, parseable with no special-casing
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert "best_reward" in summary["per_seed"]["0"]
 
 
 def test_unversioned_checkpoints_are_rejected(tmp_path):

@@ -65,6 +65,21 @@ uv run python scripts/online_learning.py --config sweeps/<submission>/<run>/conf
 The training CLI requires an accelerator. Set `BARL_ALLOW_CPU=1` for intentional
 CPU smoke tests. Rendering uses EGL by default in the training CLI.
 
+Every run config is preflight-checked (`barl_jax.config.run.validate_run`, plus
+`barl_jax.config.tree.validate` for the model half) before an environment, a
+policy, or a JAX device buffer is allocated -- an invalid `total_env_steps`,
+`checkpoint_mode`, `lr_decay`, etc. fails immediately with the offending key,
+value and violated rule, not partway through setup.
+
+`logger:` selects the reporting sink -- `wandb` (default), `local` (the same
+live terminal panel, with metrics/summary written as strict JSON under the
+run directory instead of shipped to wandb), or `none` (step bookkeeping only,
+for a training smoke test with no reporting backend at all). Only `wandb`
+imports the `wandb` package. A run's `objective.json` (`trainer._write_objective`,
+read by `scripts/hpo.py --report`) is strict JSON too: a seed with no
+completed evaluation is `null` there, not a non-finite float, with
+`objective_reason` saying why.
+
 Defaults live in `src/barl_jax/defaults/` and ship inside the library wheel.
 Set `BARL_CONFIG_DIR` before importing config tools, or pass an explicit root to
 `ConfigTree`/`load_config`, to use another configuration directory.

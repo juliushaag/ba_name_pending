@@ -126,7 +126,7 @@ def test_resolved_covers_every_declared_hparam(tree):
     from barl_jax.policy import Policy
     for model in tree.available_models():
         policy_name = tree.policy_class_name(model)
-        cls = Policy._classes[policy_name]
+        cls = Policy.class_for(policy_name)
         res = tree.resolved(model)
         params = {k[len("params."):] for k in res if k.startswith("params.")}
         assert set(cls._hparams) | set(cls._configs) <= params, \

@@ -71,12 +71,14 @@ def report(sweep_dir: str) -> None:
     print(f"No objective.json found under {root} -- runs write it into their own "
           f"directory on every eval (see trainer._write_objective).")
     return
-  # Non-finite objectives (no eval yet, or a crash before one) rank last.
-  rows.sort(key=lambda r: r[1]["objective"], reverse=True)
+  # `objective: null` (no eval yet, or a crash before one -- see
+  # objective_reason) ranks last, same as the old -inf sentinel did.
+  rows.sort(key=lambda r: r[1]["objective"] if r[1]["objective"] is not None else float("-inf"),
+           reverse=True)
   print(f"{'rank':>4}  {'objective':>10}  {'status':<9}  tag")
   for i, (tag, data) in enumerate(rows):
     obj = data["objective"]
-    obj_s = f"{obj:10.3f}" if obj != float("-inf") else f"{'-inf':>10}"
+    obj_s = f"{obj:10.3f}" if obj is not None else f"{'n/a':>10}"
     print(f"{i + 1:>4}  {obj_s}  {data['status']:<9}  {tag}")
 
 
