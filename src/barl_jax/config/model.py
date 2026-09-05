@@ -26,6 +26,6 @@ class ModelSpec:
     return json.loads(self.payload)
 
   def component(self, slot):
-    from barl_jax.networks.registry import get_component
+    from barl_jax.registration import get_component
     name, kwargs = self.data()["slots"][slot]
     return get_component(name), kwargs

@@ -16,7 +16,7 @@ from conftest import BATCH, CRITICS, build, built, critic_action, finite, target
 from barl_jax.critics import C51Critic, EnsembleCritic, HLGaussCritic, categorical_projection
 from barl_jax.critics.nclql import NoiseConditionedCritic
 from barl_jax.metrics import DEBUG, PRIMARY, DebugMetric, Metric, collect, recording
-from barl_jax.networks.registry import get_component
+from barl_jax.registration import get_component
 
 _sub = lambda base: [n for n in CRITICS if issubclass(get_component(n), base)]
 

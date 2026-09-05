@@ -14,7 +14,7 @@ import barl_jax.config.tree as model_config
 from barl_jax.config.run import INJECTED_KEYS, load_config, run_keys
 from barl_jax.config.toolkit import CONFIG_DIR
 from barl_jax.config.tree import TRAINING_KEYS, ConfigTree
-from barl_jax.networks.registry import available_components, get_component
+from barl_jax.registration import available_components, get_component
 
 MODELS = sorted(ConfigTree().available_models())
 

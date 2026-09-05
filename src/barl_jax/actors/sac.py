@@ -9,7 +9,7 @@ from barl_jax.hparam import Config
 from barl_jax.networks import gaussian
 from barl_jax.networks.mlp import MLP, MLP_PRESETS
 from barl_jax.networks.optim import ActorOptim, adam
-from barl_jax.networks.registry import get_component, register_component
+from barl_jax.registration import get_component, register_component
 
 
 @register_component

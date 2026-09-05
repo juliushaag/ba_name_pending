@@ -7,7 +7,7 @@ from flax import nnx
 
 from barl_jax.components import Component
 from barl_jax.config.toolkit import ConfigMixin
-from barl_jax.networks.registry import register_component
+from barl_jax.registration import register_component
 
 
 class Squash(Component, nnx.Module, ABC):

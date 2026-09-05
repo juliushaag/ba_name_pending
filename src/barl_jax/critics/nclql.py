@@ -7,7 +7,7 @@ from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.hparam import Config, HParam
 from barl_jax.networks.flow import TIME_STYLES, TimeEmbedding
 from barl_jax.networks.mlp import MLP_PRESETS
-from barl_jax.networks.registry import register_component
+from barl_jax.registration import register_component
 
 from .base import Polyak
 from .categorical import C51Critic, HLGaussCritic

@@ -7,7 +7,7 @@ from flax import nnx
 from barl_jax.components import Component
 from barl_jax.hparam import Config
 from barl_jax.networks.optim import DualOptim, adam
-from barl_jax.networks.registry import register_component
+from barl_jax.registration import register_component
 
 
 @register_component

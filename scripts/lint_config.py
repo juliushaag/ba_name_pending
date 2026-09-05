@@ -29,8 +29,8 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 import barl_jax  # noqa: F401  -- populates the policy/component registries
 import barl_jax.config.tree as model_config
 from barl_jax.config.run import INJECTED_KEYS, run_keys
-from barl_jax.networks.registry import available_components, get_component
 from barl_jax.policy import Policy
+from barl_jax.registration import available_components, get_component
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 

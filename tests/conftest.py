@@ -41,9 +41,9 @@ import barl_jax.config.tree as model_config
 from barl_jax.components import Actor, Critic
 from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.env import EnvStats
-from barl_jax.networks.registry import available_components, get_component
 from barl_jax.networks.schedule import Schedule
 from barl_jax.networks.squash import Squash
+from barl_jax.registration import available_components, get_component
 
 OBS_DIM, ACT_DIM, BATCH = 5, 3, 4
 RETURN_MIN, RETURN_MAX = -10.0, 10.0

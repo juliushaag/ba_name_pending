@@ -31,7 +31,7 @@ TIERS = "tiers"
 
 
 def _component_cls(cls_name: str):
-  from barl_jax.networks.registry import get_component
+  from barl_jax.registration import get_component
   return get_component(cls_name)
 
 
@@ -394,7 +394,7 @@ def _nest(flat: dict) -> dict:
 
 
 def unknown_component_defaults(policy_name: str = None, *, config) -> list[str]:
-  from barl_jax.networks.registry import available_components
+  from barl_jax.registration import available_components
   known = set(available_components())
   t = config
   candidates = dict(t.components)

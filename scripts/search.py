@@ -140,8 +140,8 @@ def check_searchability(spec: dict, *, tree=None) -> list[str]:
   barl_jax import (hpo.py), since resolving a key needs the class registries."""
   import barl_jax  # noqa: F401 -- registries
   from barl_jax.config.tree import ConfigTree
-  from barl_jax.networks.registry import get_component
   from barl_jax.policy import Policy
+  from barl_jax.registration import get_component
 
   axes, algos = spec.get("axes") or {}, (spec.get("axes") or {}).get("algo", {}).get("values") or []
   problems = []

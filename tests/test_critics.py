@@ -16,7 +16,7 @@ from flax import nnx
 
 from barl_jax.components import TRAINABLE, frozen
 from barl_jax.critics.nclql import NoiseConditionedCritic
-from barl_jax.networks.registry import get_component
+from barl_jax.registration import get_component
 
 # `NoiseConditionedCritic.noise_td_loss` takes a sigma ladder and a key
 # in addition to the plain TD inputs, because TD at the clean level

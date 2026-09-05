@@ -13,7 +13,7 @@ from flax import nnx
 
 from barl_jax.actors.sdac import DDPMActor
 from barl_jax.components import TRAINABLE
-from barl_jax.networks.registry import get_component
+from barl_jax.registration import get_component
 
 DIFFUSION = [n for n in ACTORS if issubclass(get_component(n), DDPMActor)]
 

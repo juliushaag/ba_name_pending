@@ -40,7 +40,7 @@ import gymnasium as gym
 import barl_jax  # noqa: F401 -- populates the policy/component registries
 from barl_jax.config.tree import ConfigTree
 from barl_jax.config.toolkit import CONFIG_DIR
-from barl_jax.networks.registry import available_components
+from barl_jax.registration import available_components
 from barl_jax.policy import Policy
 from barl_jax.env import EnvStats
 

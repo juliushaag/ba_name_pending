@@ -105,3 +105,41 @@ def import_type(path):
   if not isinstance(value, type):
     raise TypeError(f"{path!r} does not name a class")
   return value
+
+
+# ---------------------------------------------------------------------------
+# Component registry -- concrete Actor/Critic/Squash/Schedule/Regulator
+# classes, so config/models.yaml can name one (`class: HLGaussCritic`)
+# instead of a Python import path. Same shape as Policy._classes/
+# Environment._classes (policy.py, env.py), kept here rather than under
+# `networks/` since it is not itself a network and is looked up the same
+# way policies and environments are, through this module's own
+# load_builtins/resolve_named/available_names.
+# ---------------------------------------------------------------------------
+
+_COMPONENT_REGISTRY: dict[str, type] = {}
+
+
+def register_component(cls: type) -> type:
+  name = cls.__name__
+  if name in _COMPONENT_REGISTRY:
+    raise ValueError(f"Component {name} already registered")
+  _COMPONENT_REGISTRY[name] = cls
+  return cls
+
+
+def get_component(name: str) -> type:
+  load_builtins("components")
+  if ":" in name:
+    return import_type(name)
+  from barl_jax.components import Component
+  cls = resolve_named("components", name, _COMPONENT_REGISTRY, Component)
+  if cls is None:
+    raise KeyError(f"{name} not in registered components: "
+                   f"{available_names('components', _COMPONENT_REGISTRY)}")
+  return cls
+
+
+def available_components() -> list[str]:
+  load_builtins("components")
+  return available_names("components", _COMPONENT_REGISTRY)

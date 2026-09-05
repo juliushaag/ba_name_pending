@@ -110,7 +110,7 @@ def test_available_names_lists_plugins_without_loading_them(monkeypatch):
 
 
 def test_get_component_resolves_a_plugin_by_name(monkeypatch):
-  from barl_jax.networks.registry import get_component
+  from barl_jax.registration import get_component
   monkeypatch.setattr(registration._metadata, "entry_points",
                       lambda *, group: [ep("PluginComponent", "test_plugins:FakePlugin")]
                       if group == "barl_jax.components" else [])
@@ -120,7 +120,7 @@ def test_get_component_resolves_a_plugin_by_name(monkeypatch):
 def test_module_class_path_bypasses_plugin_discovery_entirely(monkeypatch):
   """module:Class stays a direct, explicit path -- unaffected by whatever
   plugins are or are not installed."""
-  from barl_jax.networks.registry import get_component
+  from barl_jax.registration import get_component
   def fail(*, group):
     raise AssertionError("module:Class must not trigger plugin discovery")
   monkeypatch.setattr(registration._metadata, "entry_points", fail)

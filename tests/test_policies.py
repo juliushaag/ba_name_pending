@@ -128,7 +128,7 @@ def test_metric_keys_are_pinned(name):
 
 
 def test_critics_declare_supported_objectives():
-  from barl_jax.networks.registry import get_component
+  from barl_jax.registration import get_component
   assert get_component("C51Critic").learning_objective == "td"
   for name in ("NCLQLCritic", "NCLQLC51Critic", "NCLQLHLGaussCritic"):
     assert get_component(name).learning_objective == "noise_td"
