@@ -111,6 +111,18 @@ as `trainer.setup()` has a constructed reference policy. `collection_mode`/
 behavior-policy change, so resume rejects a mismatch); `eval_mode`/
 `eval_candidates` may change across a resume.
 
+### Evaluation RNG
+
+Each `evaluate()` call owns an `eval_seed` (`barl_jax.seeding.derive_seed(base_seed,
+"eval", eval_count)`, logged at eval start) independent of every training RNG
+stream (policy, collector, replay) -- evaluation never perturbs a training
+trajectory, and running the same config from the same seed reproduces the same
+eval episodes at the same iteration. `run_episodes()` derives both the
+policy's action key and every wave's `env.reset(seed=...)` from that one
+seed; a later wave (or a mid-wave slot refill) never replays an earlier one's
+episode. `eval_count` is not restored on resume, consistent with resume's
+existing "environment episodes restart" semantics.
+
 ## Extending the framework
 
 - `components.py` defines actors, critics, configuration declarations and NNX

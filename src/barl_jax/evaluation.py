@@ -6,6 +6,7 @@ import numpy as np
 
 from barl_jax.action_chunking import ActionChunkExecutor
 from barl_jax.components import action_bounds_numpy, sanitize_action
+from barl_jax.seeding import derive_seed
 
 
 def episode_success(info, i: int, is_vec: bool, terminated: bool) -> bool:
@@ -31,7 +32,8 @@ def episode_success(info, i: int, is_vec: bool, terminated: bool) -> bool:
   return bool(np.asarray(value)[i])
 
 
-def run_episodes(actor, env: gym.Env, n: int, render: bool, **inference_kwargs) -> list[dict]:
+def run_episodes(actor, env: gym.Env, n: int, render: bool, *, seed: int = 0,
+                 **inference_kwargs) -> list[dict]:
   """`n` complete episodes, in parallel waves of `num_envs` if `env` is a
   VectorEnv. A slot that finishes before the rest of its wave is reset and
   stops recording -- autoreset_mode=DISABLED asserts rather than letting a
@@ -39,19 +41,27 @@ def run_episodes(actor, env: gym.Env, n: int, render: bool, **inference_kwargs) 
 
   `actor` is anything exposing `inference_fn()`, usually a Policy or a
   StackedPolicy -- the latter is how the trainer evaluates every seed in one
-  vmapped pass instead of one loop per seed."""
+  vmapped pass instead of one loop per seed.
+
+  `seed` owns both RNG streams this function uses -- the policy's own action
+  key and each wave's `env.reset(seed=...)` -- independent of whatever
+  training RNG state exists elsewhere (the caller's own; this function never
+  reads it). The caller derives `seed` from something stable (run seed +
+  evaluation identity, see `barl_jax.seeding.derive_seed`) so repeated calls
+  with the same `seed` see the same episodes; each wave within one call still
+  gets its own derived sub-seed, so wave 2 does not replay wave 1."""
   if n <= 0:
     return []
 
   is_vec = isinstance(env, gym.vector.VectorEnv)
   n_envs = env.num_envs if is_vec else 1
 
-  def reset(**kwargs):
-    obs, _ = env.reset(**kwargs)
+  def reset(wave: int):
+    obs, _ = env.reset(seed=derive_seed(seed, "wave", wave))
     return obs if is_vec else obs[None, ...]
 
   act = actor.inference_fn()
-  key = jax.random.PRNGKey(0)
+  key = jax.random.PRNGKey(seed)
   chunk_size = getattr(actor, "chunk_size", 1)
   action_space = env.single_action_space if is_vec else env.action_space
   act_scale_np, act_bias_np = action_bounds_numpy(action_space)
@@ -60,9 +70,11 @@ def run_episodes(actor, env: gym.Env, n: int, render: bool, **inference_kwargs) 
                     else int(np.prod(action_space.shape)))
 
   out = []
+  wave_index = 0
   while len(out) < n:
     wave = min(n_envs, n - len(out))
-    obs  = reset()
+    obs  = reset(wave_index)
+    refill_index = 0
     chunks = ActionChunkExecutor(act, chunk_size=chunk_size, act_dim=act_dim, n_envs=n_envs)
     data = [dict(frames=[], rewards=[], terminated=False, success=False,
                  act_nonfinite=0, n_act=0, chunk_size=chunk_size,
@@ -109,8 +121,18 @@ def run_episodes(actor, env: gym.Env, n: int, render: bool, **inference_kwargs) 
           live[i] = False
 
       if live.any() and done.any():
-        obs = reset(options={"reset_mask": done}) if is_vec else reset()
+        # Unreachable for a single (non-vector) env: `live[0]` already went
+        # False above the one time `done[0]` can fire, so this only ever
+        # actually executes for a VectorEnv's `reset_mask` partial reset.
+        reset_seed = derive_seed(seed, "wave", wave_index, "refill", refill_index)
+        if is_vec:
+          obs, _ = env.reset(seed=reset_seed, options={"reset_mask": done})
+        else:
+          obs, _ = env.reset(seed=reset_seed)
+          obs = obs[None, ...]
+        refill_index += 1
 
+    wave_index += 1
     out += data[:wave]
 
   return out

@@ -40,6 +40,7 @@ from barl_jax.multiseed import StackedPolicy, split_metrics, stack, unstack
 from barl_jax.policy import Policy
 from barl_jax.result import presentable, write_json_atomic
 from barl_jax.rollout import MultiSeedReplay
+from barl_jax.seeding import derive_seed
 from barl_jax.training_checkpoint import (
   read_training,
   restore_training,
@@ -183,6 +184,10 @@ class Run:
     self.base_seed = cfg["seed"]
     self.num_envs = cfg["num_envs"]
     self.progress = {}
+    # Evaluation's own identity axis, independent of env_steps/grad_steps --
+    # see evaluate()'s eval_seed. Not restored on resume, consistent with
+    # resume's existing "environment episodes restart" semantics.
+    self.eval_count = 0
 
   def own(self, resource):
     self.resources.callback(resource.close)
@@ -323,12 +328,20 @@ def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
   eval_env, render_env = envs
   rewards, lengths, successes, nonfinite = [], [], [], []
 
+  # Stable per-evaluation identity, independent of training RNG (this reads
+  # no policy/collector/replay RNG state, so eval never perturbs a training
+  # trajectory) -- same run seed and eval_count always reproduce the same
+  # episodes; a later eval_count never replays an earlier one's.
+  eval_seed = derive_seed(run.base_seed, "eval", run.eval_count)
+  run.eval_count += 1
+
   # Entry/exit are logged because an eval is the one phase that can stall for
   # tens of minutes with nothing on stdout, and telling "stalled" from "running
   # normally, just slow" after the fact otherwise means reading a stack trace.
   started = time.perf_counter()
   log.message(f"Eval start @ env_step {log.get_step('env_steps')} "
-              f"(every {cfg['eval_every']}), {run.num_seeds} seeds x {cfg['eval_runs']} episodes")
+              f"(every {cfg['eval_every']}), {run.num_seeds} seeds x {cfg['eval_runs']} episodes, "
+              f"eval_seed={eval_seed}")
 
   # Every seed's episodes in one vmapped pass, the same way the rollout collects
   # them: `eval_env` is `num_seeds * eval_runs` wide and slot j belongs to seed
@@ -346,7 +359,7 @@ def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
   # which is exactly where sweep 2026-08-26_17-59-33's DIME/DogRun task left off.
   log.log({}, quiet={"eval/phase": PHASE_EVAL_WAVE})
   t0 = time.perf_counter()
-  all_runs = run_episodes(actor, eval_env, run.num_seeds * per_run, render=False)
+  all_runs = run_episodes(actor, eval_env, run.num_seeds * per_run, render=False, seed=eval_seed)
   wave_s = time.perf_counter() - t0
 
   log.log({}, quiet={"eval/phase": PHASE_EVAL_CKPT})
@@ -379,7 +392,8 @@ def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
     log.log({}, quiet={"eval/phase": PHASE_EVAL_VIDEO})
     t0 = time.perf_counter()
     policy, _ = unstack(run.graphdef, run.state, 0)
-    for v, r in enumerate(run_episodes(policy, render_env, n_videos, render=True)):
+    video_seed = derive_seed(run.base_seed, "eval-video", run.eval_count - 1)
+    for v, r in enumerate(run_episodes(policy, render_env, n_videos, render=True, seed=video_seed)):
       log.log_video(f"eval/video_{v}", r["frames"])
     video_s = time.perf_counter() - t0
 
