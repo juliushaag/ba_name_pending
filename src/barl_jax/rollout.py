@@ -46,18 +46,52 @@ class ReplayBuffer():
   def add(self, **row) -> None:
     """Append a batch of transitions, one row per sub-env slot. Every array must
     have the same leading length; each is stored under its keyword name and
-    comes back out of `sample_numpy()` under that same name."""
+    comes back out of `sample_numpy()` under that same name.
+
+    Validates the whole batch -- field set, per-field leading length, dtype,
+    and per-row (trailing) shape -- before writing anything. Fields are
+    written one at a time below, so validating field N after fields 0..N-1
+    already landed would leave those rows in the buffer with only some of
+    their fields updated for that logical transition, at an index `_write`/
+    `_size` had not yet advanced past -- a corruption invisible until the
+    stale field is later sampled. A rejected batch instead leaves the buffer
+    exactly as it was."""
     row.pop("slot_ids", None)
-    if self._fields is None:
+    first_write = self._fields is None
+    if first_write:
       self._allocate(row)
-    elif row.keys() != self._fields.keys():
+
+    if row.keys() != self._fields.keys():
       raise KeyError(
         f"transition fields changed mid-run: buffer holds {sorted(self._fields)}, "
         f"got {sorted(row)} -- a ring buffer cannot backfill the rows already written")
 
-    n = len(next(iter(row.values())))
+    lengths = {name: len(value) for name, value in row.items()}
+    if len(set(lengths.values())) > 1:
+      raise ValueError(f"transition fields disagree on batch length: {lengths} -- "
+                       f"every field in one add() call is one row per sub-env slot")
+    n = next(iter(lengths.values()))
+
     if n > self.max_transitions:
       raise ValueError(f"{n} rows at once exceeds the buffer's {self.max_transitions}")
+
+    # A field allocated from a shorter-lived dtype/shape than a later call
+    # supplies would otherwise cast (dtype) or raise mid-write (shape) --
+    # neither of which is "reject the batch, buffer unchanged". Skipped on
+    # the very first call: _allocate() just took this row's own dtype/shape
+    # as the buffer's, so it trivially matches.
+    if not first_write:
+      for name, value in row.items():
+        expected = self._fields[name]
+        if value.dtype != expected.dtype:
+          raise TypeError(f"{name}: dtype {value.dtype} does not match the buffer's "
+                          f"{expected.dtype} -- cast explicitly if this is intended")
+        if value.shape[1:] != expected.shape[1:]:
+          raise ValueError(f"{name}: per-row shape {value.shape[1:]} does not match "
+                           f"the buffer's {expected.shape[1:]}")
+
+    if n == 0:
+      return
 
     # One wrapped index array rather than two slice assignments: n is num_envs
     # per step, so this is a handful of rows and the fancy index costs less than

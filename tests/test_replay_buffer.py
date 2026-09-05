@@ -110,6 +110,72 @@ def test_oversized_batch_raises():
     b.add(**rows(5))
 
 
+def test_zero_length_batch_is_a_no_op():
+  b = ReplayBuffer(10)
+  b.add(**rows(3))
+  before = {k: v.copy() for k, v in b._fields.items()}
+  b.add(**rows(0))
+  assert b.n_transitions == 3
+  for k, v in b._fields.items():
+    np.testing.assert_array_equal(v, before[k])
+
+
+def test_mismatched_field_lengths_are_rejected_and_change_nothing():
+  b = ReplayBuffer(10)
+  b.add(**rows(3))
+  before = {k: v.copy() for k, v in b._fields.items()}
+  bad = rows(3)
+  bad["rew"] = bad["rew"][:2]  # one field shorter than the rest
+  with pytest.raises(ValueError, match="disagree on batch length"):
+    b.add(**bad)
+  assert b.n_transitions == 3
+  for k, v in b._fields.items():
+    np.testing.assert_array_equal(v, before[k])
+
+
+def test_dtype_mismatch_is_rejected_and_changes_nothing():
+  b = ReplayBuffer(10)
+  b.add(**rows(3))
+  before = {k: v.copy() for k, v in b._fields.items()}
+  bad = rows(2)
+  bad["rew"] = bad["rew"].astype(np.float64)
+  with pytest.raises(TypeError, match="dtype"):
+    b.add(**bad)
+  assert b.n_transitions == 3
+  for k, v in b._fields.items():
+    np.testing.assert_array_equal(v, before[k])
+
+
+def test_per_row_shape_mismatch_is_rejected_and_changes_nothing():
+  b = ReplayBuffer(10)
+  b.add(**rows(3, dim=3))
+  before = {k: v.copy() for k, v in b._fields.items()}
+  bad = rows(2, dim=5)  # obs/next_obs now have the wrong trailing width
+  with pytest.raises(ValueError, match="per-row shape"):
+    b.add(**bad)
+  assert b.n_transitions == 3
+  for k, v in b._fields.items():
+    np.testing.assert_array_equal(v, before[k])
+
+
+def test_a_wraparound_write_is_atomic_when_a_later_field_is_invalid():
+  """The failure has to be caught before any field is written -- not partway
+  through the per-field loop -- or a row already in the buffer at a wrapped
+  index would end up with some fields from the rejected batch and some from
+  whatever was there before."""
+  b = ReplayBuffer(10)
+  b.add(**rows(7))
+  before = {k: v.copy() for k, v in b._fields.items()}
+  bad = rows(6, start=7)          # would wrap 3 rows past the end
+  bad["term"] = bad["term"].astype(np.int32)  # dtype mismatch on the LAST field
+  with pytest.raises(TypeError):
+    b.add(**bad)
+  assert b.n_transitions == 7
+  assert b._write == 7
+  for k, v in b._fields.items():
+    np.testing.assert_array_equal(v, before[k])
+
+
 def test_multiseed_routes_slots_to_seeds():
   """Slot j belongs to seed j // num_envs -- each seed must see only its own
   block, which is what keeps the seeds independent rather than merely
