@@ -6,10 +6,98 @@ from flax import nnx
 
 from barl_jax.components import Buffer
 from barl_jax.config.toolkit import ConfigMixin
-from barl_jax.hparam import HParam
+from barl_jax.hparam import Config, HParam
+from barl_jax.networks.mlp import MLP_PRESETS
 from barl_jax.networks.registry import register_component
 
-from .base import CategoricalCriticBase, ConcatQ, categorical_projection
+from .base import ConcatQ, QCriticBase, n_step_discount
+
+
+class CriticDistConfig:
+  num_atoms          = Config(101)
+  num_bins           = Config(151)
+  sigma_to_bin_ratio = Config(0.75)
+  entropy_coef       = HParam(0.0)
+  rho                = HParam(0.0)
+
+
+class CategoricalCriticBase(QCriticBase, CriticDistConfig):
+  mlp_preset = Config("crossq", style=MLP_PRESETS)
+
+  def __init__(self, env_stats, config: ConfigMixin, q_function, support, **kwargs):
+    super().__init__(env_stats, config, q_function, **kwargs)
+
+    self.support = Buffer(support)
+    self.n_models = config.get("n_models", int)
+
+  def probs(self, raw):
+    return jax.nn.softmax(raw.astype(jnp.float32), axis=-1)
+
+  def expectation_from_raw(self, raw):
+    return (self.probs(raw) * self.support[...]).sum(axis=-1, keepdims=True)
+
+  def reduce_value(self, raw):
+    exp = self.expectation_from_raw(raw).astype(jnp.float32)
+    std = jnp.sqrt(jnp.maximum(exp.var(axis=0), 1e-8))
+    return exp.mean(axis=0) - self.rho * std
+
+  def target_from_raw(self, raw):
+    return jax.lax.stop_gradient(self.probs(raw).mean(axis=0))
+
+  def regression_loss(self, raw, target):
+    logp = jax.nn.log_softmax(raw.astype(jnp.float32), axis=-1)
+    tgt  = jax.lax.stop_gradient(target).astype(jnp.float32)
+
+    reduce = lambda x: x.sum(axis=-1).mean(axis=-1).sum()
+
+    loss = reduce(-(tgt * logp))
+    if self.entropy_coef:
+      loss += self.entropy_coef * reduce(jnp.exp(logp) * logp)
+    return loss
+
+  def record(self, raw, target) -> None:
+    tgt     = jax.lax.stop_gradient(target).astype(jnp.float32)
+    support = self.support[...]
+    probs   = self.probs(raw)
+    exp     = (probs * support).sum(axis=-1, keepdims=True)
+
+    self.metrics.dist("critic", exp.mean(axis=0))
+    self.metrics.dist("q_target", (tgt * support).sum(axis=-1, keepdims=True))
+    self.metrics.ensemble("ensemble", exp, gap=self.pessimism_gap(raw))
+
+    var = (probs * (support - exp) ** 2).sum(axis=-1)
+    self.metrics.dist("return_std", jnp.sqrt(var).mean(axis=0))
+
+
+def categorical_projection(next_probs, atoms, chunk_return, terminated, horizon, gamma,
+                           v_min, v_max, entropy_bonus=0.0):
+  """Builds the transformed support `chunk_return + bootstrap_discount*(atoms +
+  entropy_bonus)` explicitly, then projects `next_probs` onto the fixed atom
+  grid by linear interpolation -- the categorical distribution is never
+  collapsed to its scalar expectation before projecting. Same discount as
+  `QCriticBase.bellman_target` (`n_step_discount`), a different target
+  representation."""
+  num_atoms = atoms.shape[0]
+  delta_z   = (v_max - v_min) / (num_atoms - 1)
+
+  chunk_return = chunk_return.reshape(-1, 1)
+  discount = n_step_discount(gamma, horizon, terminated, chunk_return.dtype)
+  tz = jnp.clip(chunk_return + discount * (atoms.reshape(1, -1) + entropy_bonus),
+                v_min, v_max)
+
+  b = (tz - v_min) / delta_z
+  l = jnp.clip(jnp.floor(b), 0, num_atoms - 1).astype(jnp.int32)
+  u = jnp.clip(jnp.ceil(b),  0, num_atoms - 1).astype(jnp.int32)
+
+  on_atom = (l == u)
+  m_l = jnp.where(on_atom, next_probs, next_probs * (u.astype(b.dtype) - b))
+  m_u = jnp.where(on_atom, 0.0,        next_probs * (b - l.astype(b.dtype)))
+
+  proj = jnp.zeros_like(next_probs)
+  batch_idx = jnp.arange(next_probs.shape[-2])[:, None]
+  proj = proj.at[..., batch_idx, l].add(m_l)
+  proj = proj.at[..., batch_idx, u].add(m_u)
+  return proj
 
 
 @register_component
