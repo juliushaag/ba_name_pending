@@ -1,4 +1,11 @@
-"""Versioned policy checkpoints and reconstruction from saved model specifications."""
+"""Versioned policy checkpoints and reconstruction from saved model specifications.
+
+`save_policy`/`load_policy` are the only two operations that actually construct
+or restore learning state (an nnx `Policy`, an orbax array tree); `policy_spec`
+reads a checkpoint's `meta.json` and rebuilds its `ModelSpec` from nothing but
+that JSON, so callers that only want metadata (`checkpoint_info.py`, config
+diffing) can import this module and call it without pulling in jax/flax/orbax
+at all -- those imports live inside the two functions that need them."""
 import json
 import os
 import shutil
@@ -6,9 +13,6 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-
-import orbax.checkpoint as ocp
-from flax import nnx
 
 from barl_jax.config.model import ModelSpec
 from barl_jax.config.tree import ConfigTree
@@ -41,6 +45,9 @@ def checkpoint_directory(path):
 
 
 def save_policy(policy, path):
+  import orbax.checkpoint as ocp
+  from flax import nnx
+
   meta = {
     "format_version": POLICY_VERSION,
     "model": policy.model_name,
@@ -72,6 +79,9 @@ def policy_spec(path, name=None):
 
 
 def load_policy(path, env, env_stats=None, name=None, **kwargs):
+  import orbax.checkpoint as ocp
+  from flax import nnx
+
   from barl_jax.policy import Policy
   path = Path(path).absolute()
   spec, meta = policy_spec(path, name)

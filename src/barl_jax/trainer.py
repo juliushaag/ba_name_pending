@@ -12,8 +12,6 @@ an enclosing jit the step is dispatched op-by-op and costs ~4x more at N=1 and
 """
 
 import datetime
-import hashlib
-import json
 import math
 import os
 import subprocess
@@ -29,6 +27,7 @@ import barl_jax.config.tree as model_config
 from barl_jax.checkpoints import load_policy, save_policy
 from barl_jax.collection import Collector
 from barl_jax.components import TRAINABLE
+from barl_jax.config.model import experiment_fingerprint
 from barl_jax.config.run import validate_run
 from barl_jax.env import Environment
 from barl_jax.evaluation import run_episodes
@@ -361,7 +360,8 @@ def run_config_snapshot(run: Run) -> dict:
     "env/obs_space": str(run.env.observation_space),
     "env/act_space": str(run.env.action_space),
     "env/async_vector_env": run.environment.use_async_vector_env,
-    "meta/git_sha": _git_sha(), "meta/config_hash": _config_hash(resolved, cfg),
+    "meta/git_sha": _git_sha(),
+    "meta/config_hash": experiment_fingerprint(resolved, cfg),
     "snapshot": snapshot,
   })
   return config
@@ -380,15 +380,6 @@ def _git_sha() -> str:
     return sha.stdout.strip() + ("-dirty" if dirty.stdout.strip() else "")
   except Exception:
     return "unknown"
-
-
-def _config_hash(resolved: dict, cfg: dict) -> str:
-  """Stable digest of everything that defines this run except the seed, so
-  "same config, different seed" is one group in wandb."""
-  payload = {**{f"model.{k}": v for k, v in resolved.items()},
-             **{f"run.{k}": v for k, v in cfg.items()
-                if k not in ("seed", "num_seeds", "run_dir", "sweep_tag", "snapshot", "checkpoint")}}
-  return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:12]
 
 
 def warmup(run: Run, envs, log) -> dict:

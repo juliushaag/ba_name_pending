@@ -34,10 +34,8 @@ def _read_snapshot(path: str) -> dict:
     data = json.loads(p.read_text())
     return data.get("resolved", data)
   if (p / "pointer.json").exists():
-    from barl_jax.training_checkpoint import _generation_dir
-    gen = json.loads((p / "pointer.json").read_text())["generation"]
-    training = json.loads((_generation_dir(p, gen) / "training.json").read_text())
-    snapshot = (training.get("config") or {}).get("snapshot") or {}
+    from barl_jax.training_checkpoint import read_training
+    snapshot = (read_training(p).get("config") or {}).get("snapshot") or {}
     return snapshot.get("resolved", {})
   if (p / "meta.json").exists():
     meta = json.loads((p / "meta.json").read_text())

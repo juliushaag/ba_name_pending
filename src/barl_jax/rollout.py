@@ -125,6 +125,32 @@ class ReplayBuffer():
     idx = self.rng.integers(0, self._size, size=batch_size)
     return {name: value[idx] for name, value in self._fields.items()}
 
+  def snapshot(self) -> dict:
+    """Everything needed to exactly restore this buffer: physical ring
+    contents (truncated to `_size`, in on-disk field-array form -- a training
+    checkpoint's job is to store and publish this, never to read or write the
+    ring layout itself), the write cursor, and the sampling RNG's state."""
+    fields = self._fields or {}
+    return {
+      "fields": {name: value[:self._size] for name, value in fields.items()},
+      "size": self._size,
+      "write": self._write,
+      "rng": self.rng.bit_generator.state,
+    }
+
+  def restore(self, snapshot: dict) -> None:
+    """Inverse of `snapshot()`. `snapshot["fields"]` may be empty (a buffer
+    that was never written to when the snapshot was taken) -- restoring
+    stays a no-op on the ring contents in that case, matching `_allocate`'s
+    own lazy-on-first-write behavior."""
+    fields = snapshot["fields"]
+    if fields:
+      self._allocate(fields)
+      for name, values in fields.items():
+        self._fields[name][:len(values)] = values
+    self._size, self._write = snapshot["size"], snapshot["write"]
+    self.rng.bit_generator.state = snapshot["rng"]
+
 
 class PrioritizedReplayBuffer(ReplayBuffer):
   """Proportional prioritized sampling (Schaul, Quan, Antonoglou & Silver
@@ -183,6 +209,25 @@ class PrioritizedReplayBuffer(ReplayBuffer):
     batch["sample_ids"] = self._sample_ids(idx)
     batch["weights"] = weights.astype(np.float32)
     return batch
+
+  def snapshot(self) -> dict:
+    """`ReplayBuffer.snapshot()` plus the priority/generation arrays and the
+    running max priority -- restoring only the ring contents would silently
+    reset every row to the seed priority and break `sample_ids` continuity.
+    Truncated to `_size` for the same reason the ring fields are: everything
+    past it has never been written."""
+    base = super().snapshot()
+    base["priorities"] = self._priorities[:self._size].copy()
+    base["generation"] = self._generation[:self._size].copy()
+    base["max_priority"] = self._max_priority
+    return base
+
+  def restore(self, snapshot: dict) -> None:
+    super().restore(snapshot)
+    priorities, generation = snapshot["priorities"], snapshot["generation"]
+    self._priorities[:len(priorities)] = priorities
+    self._generation[:len(generation)] = generation
+    self._max_priority = snapshot["max_priority"]
 
   def update_priorities(self, sample_ids, td_errors) -> int:
     """Sets each row's priority to `|td_error| + eps`. Returns how many of

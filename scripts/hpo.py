@@ -32,7 +32,6 @@ the materialize/submit below per wave.
 
 import argparse
 import datetime
-import json
 import os
 import random
 import re
@@ -42,6 +41,8 @@ import grid
 import yaml
 from executors import EXECUTORS, SWEEP_NAME_FORMAT, SWEEPS_DIR, resolve
 from search import check_searchability, load_search, sample_trials
+
+from barl_jax.result import read_json
 
 
 def trial_tag(trial: dict, index: int, num_seeds: int) -> str:
@@ -61,11 +62,13 @@ def report(sweep_dir: str) -> None:
     raise SystemExit(f"{root}: not a directory")
   rows = []
   for run_dir in sorted(root.iterdir()):
-    obj_path = run_dir / "objective.json"
-    if not obj_path.exists():
+    # A missing objective.json (no eval yet) and a malformed one (a crash mid-
+    # write, or a corrupted run directory) both mean "no valid result" and are
+    # skipped the same way -- read_json returns None for either rather than
+    # raising, which would otherwise fail the whole ranking over one bad run.
+    data = read_json(run_dir / "objective.json")
+    if data is None:
       continue
-    with open(obj_path) as f:
-      data = json.load(f)
     rows.append((run_dir.name, data))
   if not rows:
     print(f"No objective.json found under {root} -- runs write it into their own "

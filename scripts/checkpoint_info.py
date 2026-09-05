@@ -15,21 +15,15 @@ Handles both kinds this repo writes:
 """
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
+from barl_jax.config.model import model_fingerprint  # noqa: E402 -- after the JAX_PLATFORMS default
+
 _GEN_PATTERN = "gen-"
-
-
-def _config_hash(payload: dict) -> str:
-  """Same recipe as trainer._config_hash, applied to whatever config this
-  checkpoint actually recorded -- comparable across checkpoints, not a
-  substitute for a full config diff (see scripts/config_diff.py)."""
-  return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:12]
 
 
 def _array_stats(tree) -> tuple[int, int]:
@@ -70,7 +64,7 @@ def inspect_policy(path: Path) -> dict:
   }
   snapshot = meta.get("snapshot") or {}
   if "resolved" in snapshot:
-    info["config_hash"] = _config_hash(snapshot["resolved"])
+    info["config_hash"] = model_fingerprint(snapshot["resolved"])
   info.update(_shape_summary(path / "state"))
   return info
 
@@ -100,7 +94,7 @@ def inspect_training(path: Path) -> dict:
   cfg = training.get("config") or {}
   resolved = (cfg.get("snapshot") or {}).get("resolved")
   if resolved is not None:
-    info["config_hash"] = _config_hash(resolved)
+    info["config_hash"] = model_fingerprint(resolved)
   for i in range(training.get("num_seeds") or 0):
     seed_dir = gen_dir / f"seed{i}"
     if (seed_dir / "meta.json").exists():

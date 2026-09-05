@@ -16,11 +16,15 @@ import shutil
 from pathlib import Path
 
 import numpy as np
-import orbax.checkpoint as ocp
 
-from barl_jax.checkpoints import checkpoint_directory, save_policy
-from barl_jax.multiseed import unstack
+from barl_jax.checkpoints import checkpoint_directory
 from barl_jax.result import write_json_atomic
+
+# `read_training`/`validate_resume` are pure metadata readers -- json and
+# pathlib only, so a caller that just wants a resume root's generation/config
+# (checkpoint_info.py) never pulls in jax/flax/orbax. `save_training`/
+# `restore_training` actually construct or restore learning state and import
+# orbax and multiseed.unstack locally, where that state is built.
 
 # v2: the replay row field carrying the accumulated discounted return was
 # renamed rew -> chunk_return (docs/ALGORITHM_MAP.md). A v1 checkpoint's
@@ -73,7 +77,41 @@ def _prune_generations(root: Path, *, keep: int, published: int) -> None:
     shutil.rmtree(_generation_dir(root, gen), ignore_errors=True)
 
 
+# A buffer's `snapshot()` (rollout.py) mixes ring-sized arrays (the fields
+# themselves, and a PrioritizedReplayBuffer's priority/generation arrays) with
+# small JSON-safe scalars (size, write, rng state, max priority). This module
+# owns splitting that apart for storage -- arrays into the .npz, scalars into
+# training.json -- not what any of those entries mean; that stays the
+# buffer's own contract.
+def _snapshot_to_npz(snapshot: dict) -> tuple[dict, dict]:
+  arrays = dict(snapshot["fields"])
+  meta = {}
+  for key, value in snapshot.items():
+    if key == "fields":
+      continue
+    if isinstance(value, np.ndarray):
+      arrays[f"_{key}"] = value
+    else:
+      meta[key] = value
+  return arrays, meta
+
+
+def _npz_to_snapshot(archive, meta: dict) -> dict:
+  fields, extra = {}, {}
+  for key in archive.files:
+    if key.startswith("_"):
+      extra[key[1:]] = archive[key]
+    else:
+      fields[key] = archive[key]
+  return {**meta, "fields": fields, **extra}
+
+
 def save_training(run, root, progress, *, keep: int = 2) -> None:
+  import orbax.checkpoint as ocp
+
+  from barl_jax.checkpoints import save_policy
+  from barl_jax.multiseed import unstack
+
   root = Path(root).absolute()
   root.mkdir(parents=True, exist_ok=True)
   existing = _existing_generations(root)
@@ -89,11 +127,9 @@ def save_training(run, root, progress, *, keep: int = 2) -> None:
       ckpt.save(destination / "training_state", run.state)
     replay = []
     for i, buffer in enumerate(run.buffer.seeds):
-      fields = buffer._fields or {}
-      np.savez(destination / f"replay{i}.npz",
-               **{k: v[:buffer._size] for k, v in fields.items()})
-      replay.append({"size": buffer._size, "write": buffer._write,
-                     "rng": buffer.rng.bit_generator.state})
+      arrays, meta = _snapshot_to_npz(buffer.snapshot())
+      np.savez(destination / f"replay{i}.npz", **arrays)
+      replay.append(meta)
     meta = {
       "format_version": VERSION,
       "config": {**run.cfg, "snapshot": run.reference._snapshot},
@@ -158,6 +194,10 @@ def validate_resume(cfg, num_seeds, meta):
 
 
 def restore_training(run, meta) -> None:
+  import orbax.checkpoint as ocp
+
+  from barl_jax.multiseed import unstack
+
   path = Path(meta["_dir"])
   if run.buffer.max_transitions != meta["capacity"]:
     raise ValueError("Resume requires the saved replay capacity")
@@ -165,13 +205,7 @@ def restore_training(run, meta) -> None:
     run.state = ckpt.restore(path / "training_state", run.state)
   for i, (buffer, saved) in enumerate(zip(run.buffer.seeds, meta["replay"])):
     with np.load(path / f"replay{i}.npz", allow_pickle=False) as archive:
-      fields = {key: archive[key] for key in archive.files}
-    if fields:
-      buffer._allocate(fields)
-      for key, values in fields.items():
-        buffer._fields[key][:len(values)] = values
-    buffer._size, buffer._write = saved["size"], saved["write"]
-    buffer.rng.bit_generator.state = saved["rng"]
+      buffer.restore(_npz_to_snapshot(archive, saved))
   run.collector.rng.bit_generator.state = meta["collector_rng"]
   run.progress = meta["progress"]
   run.reference, _ = unstack(run.graphdef, run.state, 0)
