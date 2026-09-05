@@ -159,6 +159,15 @@ component and environment classes can be selected with `module:Class` paths.
 Async environments pickle their bound factory, preserving instance settings;
 the factory and its class must be importable in the worker process.
 
+Three ways to name a Policy/Environment/component implementation, tried in
+order: a built-in name; an installed plugin -- an entry point under
+`barl_jax.policies`/`barl_jax.environments`/`barl_jax.components` in another
+distribution's `pyproject.toml` (`[project.entry-points."barl_jax.policies"]`),
+discovered once per process and loaded only when actually selected; or
+`module:Class`, unaffected by what plugins are installed. A name shared by a
+built-in and a plugin, or by two plugins, is a deterministic error at lookup
+time, not a silent precedence rule.
+
 `scripts/scaffold.py env <ClassName> --gym-id <id>` generates a new
 `Environment` subclass (selected via the external `module:Class` path, no
 registry edit) and smoke-tests it in a temp copy. `scripts/scaffold.py

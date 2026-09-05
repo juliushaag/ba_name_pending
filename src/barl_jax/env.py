@@ -109,18 +109,24 @@ class Environment(ABC):
 
   @staticmethod
   def class_for(name: str):
-    from barl_jax.registration import import_type, load_builtins
+    from barl_jax.registration import available_names, import_type, load_builtins, resolve_named
     load_builtins("environments")
-    cls = import_type(name) if ":" in name else Environment._classes[name]
+    if ":" in name:
+      cls = import_type(name)
+    else:
+      cls = resolve_named("environments", name, Environment._classes, Environment)
+      if cls is None:
+        raise KeyError(f"{name!r} is not a registered Environment or plugin "
+                       f"({', '.join(available_names('environments', Environment._classes))})")
     if not issubclass(cls, Environment):
       raise TypeError(f"{name!r} must implement Environment")
     return cls
 
   @staticmethod
   def available() -> list[str]:
-    from barl_jax.registration import load_builtins
+    from barl_jax.registration import available_names, load_builtins
     load_builtins("environments")
-    return list(Environment._classes.keys())
+    return available_names("environments", Environment._classes)
 
 
   def get_env_stats(self, env: gym.Env) -> EnvStats:

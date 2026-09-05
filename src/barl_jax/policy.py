@@ -89,9 +89,15 @@ class Policy(OptimizerMixin, HParamsOwner, nnx.Module, ABC):
 
   @staticmethod
   def class_for(name):
-    from barl_jax.registration import import_type, load_builtins
+    from barl_jax.registration import available_names, import_type, load_builtins, resolve_named
     load_builtins("policies")
-    cls = import_type(name) if ":" in name else Policy._classes[name]
+    if ":" in name:
+      cls = import_type(name)
+    else:
+      cls = resolve_named("policies", name, Policy._classes, Policy)
+      if cls is None:
+        raise KeyError(f"{name!r} is not a registered Policy or plugin "
+                       f"({', '.join(available_names('policies', Policy._classes))})")
     if not issubclass(cls, Policy):
       raise TypeError(f"{name!r} must implement Policy")
     return cls
