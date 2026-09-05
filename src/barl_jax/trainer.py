@@ -255,7 +255,7 @@ def _setup(run, *, validate_only):
   elif not os.path.exists(checkpoint):
     raise FileNotFoundError(f"checkpoint={checkpoint!r}: no such directory")
   elif resume_meta is not None:
-    policies = [load_policy(os.path.join(checkpoint, f"seed{i}"), run.env, run.env_stats)
+    policies = [load_policy(os.path.join(resume_meta["_dir"], f"seed{i}"), run.env, run.env_stats)
                 for i in range(num_seeds)]
   else:
     policies = [load_policy(checkpoint, run.env, run.env_stats) for _ in range(num_seeds)]
@@ -288,7 +288,7 @@ def _setup(run, *, validate_only):
   # `rollout_steps: 1` it was 6% of a single-seed run to recompute it per
   # iteration. Measured once here and logged from the cache.
   if resume_meta is not None:
-    restore_training(run, checkpoint, resume_meta)
+    restore_training(run, resume_meta)
   run.num_params = run.reference.num_params()
   return run
 
@@ -588,6 +588,11 @@ def _train(run: Run):
   next_eval = (log.get_step("env_steps") // eval_every + 1) * eval_every
   if video_every is not None:
     next_video = (log.get_step("env_steps") // video_every + 1) * video_every
+  # Resume persistence is its own cadence -- independent of eval_every, since
+  # the replay dump it carries is what makes a save expensive, not the eval.
+  resume_dir = os.path.join(ckpt_dir, "resume")
+  resume_every = cfg["resume_every"]
+  next_resume = (log.get_step("env_steps") // resume_every + 1) * resume_every
   it = run.progress.get("iteration", 0)
   chunk_seen = False
   run_started = time.perf_counter()
@@ -734,8 +739,9 @@ def _train(run: Run):
       run.progress = {"env_steps": int(log.get_step("env_steps")),
                       "grad_steps": int(log.get_step("grad_steps")),
                       "iteration": it, "best": list(best)}
-      if eval_time > 0:
-        save_training(run, os.path.join(ckpt_dir, "resume"), run.progress)
+      if log.get_step("env_steps") >= next_resume:
+        save_training(run, resume_dir, run.progress, keep=cfg["resume_keep"])
+        next_resume = (log.get_step("env_steps") // resume_every + 1) * resume_every
   except BaseException as exc:
     crash = exc
     raise
@@ -747,8 +753,10 @@ def _train(run: Run):
     except Exception as save_error:
       log.message(f"Could not write the final checkpoint: {save_error!r}")
 
+    # Clean completion always gets a resume save, off-cadence or not: the run
+    # is done, so this is the last chance and it costs nothing to take it.
     if crash is None:
-      save_training(run, os.path.join(ckpt_dir, "resume"), run.progress)
+      save_training(run, resume_dir, run.progress, keep=cfg["resume_keep"])
 
     if crash is not None:
       log.message(f"Run failed: {type(crash).__name__}: {crash}")

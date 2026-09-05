@@ -33,6 +33,11 @@ RUN_CONFIGS: dict[str, Config] = {
   "debug_every": Config(1000),
   "wandb_finish_timeout": Config(300),
   "compile_cache_dir": Config("~/.cache/barl_jax/jax"),
+  # Resume persistence is its own cadence, independent of eval_every: the
+  # replay dump it carries can be gigabytes, so it should not fire more often
+  # than a run actually needs recoverability -- see training_checkpoint.py.
+  "resume_every": Config(50_000),
+  "resume_keep": Config(2),
 }
 
 INJECTED_KEYS = frozenset({
@@ -51,14 +56,14 @@ def run_defaults() -> dict:
 # iteration, so these must be >= 1 rather than merely >= 0.
 _POSITIVE_INT_KEYS = ("total_env_steps", "rollout_steps", "num_envs", "chunk_size",
                       "buffer_size", "batch_size", "eval_every", "eval_runs",
-                      "log_every", "debug_every")
+                      "log_every", "debug_every", "resume_keep")
 # Explicitly allowed to be zero -- see each key's own comment in RUN_CONFIGS'
 # consumers (e.g. random_steps: 0 skips the warmup fill; lr_warmup_steps: 0 is
 # no warmup).
 _NONNEGATIVE_INT_KEYS = ("random_steps", "lr_warmup_steps", "wandb_finish_timeout")
 # `None` means "never" for these (see trainer.py's `_train`); a stated value
 # still goes through the same >= 1 rule as the always-on cadence keys above.
-_POSITIVE_OR_NONE_INT_KEYS = ("eval_video_every",)
+_POSITIVE_OR_NONE_INT_KEYS = ("eval_video_every", "resume_every")
 _NONNEGATIVE_OR_NONE_INT_KEYS = ("eval_videos",)
 
 LOGGER_KINDS = ("wandb", "local", "none")

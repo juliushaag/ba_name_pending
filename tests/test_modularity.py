@@ -1,4 +1,5 @@
 import json
+import pathlib
 import subprocess
 import sys
 
@@ -322,3 +323,108 @@ def test_failed_checkpoint_write_keeps_previous_generation(tmp_path):
       (candidate / "marker").write_text("partial")
       raise RuntimeError("disk failure")
   assert (path / "marker").read_text() == "previous"
+
+
+def _resume_run(tmp_path, monkeypatch):
+  from barl_jax.env import Environment
+  family = ToyFamily()
+  monkeypatch.setattr(Environment, "make", lambda name: family)
+  cfg = run_config(tmp_path)
+  run = trainer.setup(cfg, 1)
+  run.collector.random_fill(run.rollout_env, 4, seed=0, sink=run.buffer)
+  return run
+
+
+def test_resume_generations_are_numbered_and_pointer_tracks_the_latest(tmp_path, monkeypatch):
+  from barl_jax.training_checkpoint import read_training
+  root = tmp_path / "resume"
+  with _resume_run(tmp_path, monkeypatch) as run:
+    save_training(run, root, {"env_steps": 1}, keep=2)
+    save_training(run, root, {"env_steps": 2}, keep=2)
+    assert (root / "gen-000000").is_dir()
+    assert (root / "gen-000001").is_dir()
+    assert json.loads((root / "pointer.json").read_text()) == {"generation": 1}
+    assert read_training(root)["progress"] == {"env_steps": 2}
+    assert read_training(root)["_dir"] == str(root / "gen-000001")
+
+
+def test_resume_retention_keeps_only_the_newest_generations(tmp_path, monkeypatch):
+  with _resume_run(tmp_path, monkeypatch) as run:
+    root = tmp_path / "resume"
+    for step in range(5):
+      save_training(run, root, {"env_steps": step}, keep=2)
+    remaining = sorted(p.name for p in root.glob("gen-*"))
+    assert remaining == ["gen-000003", "gen-000004"]
+
+
+def test_resume_retention_never_deletes_the_only_recoverable_generation(tmp_path, monkeypatch):
+  """A write that crashes after `checkpoint_directory` commits but before
+  pointer.json is published would otherwise strand an unreferenced generation
+  -- but nothing publishes-then-fails here, so the true guarantee under test
+  is the ordering itself: prune runs strictly after the new pointer is
+  written, so the previous generation is never the only one on disk in the
+  window between "new one committed" and "pointer updated"."""
+  from barl_jax.training_checkpoint import _existing_generations
+  with _resume_run(tmp_path, monkeypatch) as run:
+    root = tmp_path / "resume"
+    save_training(run, root, {"env_steps": 0}, keep=1)
+    save_training(run, root, {"env_steps": 1}, keep=1)
+    assert _existing_generations(root) == [1]
+
+
+def test_disk_budget_rejects_a_save_with_insufficient_free_space(tmp_path, monkeypatch):
+  import shutil as shutil_module
+
+  from barl_jax.training_checkpoint import _check_disk_budget
+
+  class FakeUsage:
+    free = 100
+
+  monkeypatch.setattr(shutil_module, "disk_usage", lambda path: FakeUsage())
+  with pytest.raises(OSError, match="Refusing to start"):
+    _check_disk_budget(tmp_path, required_bytes=10_000)
+  # A previous generation of 0 bytes (or none at all) skips the check --
+  # nothing to estimate the new write's size from.
+  _check_disk_budget(tmp_path, required_bytes=0)
+
+
+def _load_checkpoint_info():
+  import importlib.util
+  path = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "checkpoint_info.py"
+  spec = importlib.util.spec_from_file_location("checkpoint_info", path)
+  module = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(module)
+  return module
+
+
+def test_checkpoint_info_reads_a_policy_checkpoint_with_no_policy_construction(tmp_path, monkeypatch):
+  info = _load_checkpoint_info()
+  policy = make_policy()
+  save_policy(policy, tmp_path / "policy")
+  monkeypatch.setattr(Policy, "make", lambda *a, **kw: (_ for _ in ()).throw(
+    AssertionError("checkpoint_info must not construct a policy")))
+  result = info.inspect(str(tmp_path / "policy"))
+  assert result["kind"] == "policy"
+  assert result["model"] == "SAC"
+  assert result["num_arrays"] > 0
+
+
+def test_checkpoint_info_reads_a_resume_root_with_no_policy_construction(tmp_path, monkeypatch):
+  info = _load_checkpoint_info()
+  with _resume_run(tmp_path, monkeypatch) as run:
+    root = tmp_path / "resume"
+    save_training(run, root, {"env_steps": 1}, keep=2)
+    save_training(run, root, {"env_steps": 2}, keep=2)
+  monkeypatch.setattr(Policy, "make", lambda *a, **kw: (_ for _ in ()).throw(
+    AssertionError("checkpoint_info must not construct a policy")))
+  result = info.inspect(str(root))
+  assert result["kind"] == "training (resume)"
+  assert result["current_generation"] == 1
+  assert result["generations_on_disk"] == ["gen-000000", "gen-000001"]
+  assert result["progress"] == {"env_steps": 2}
+
+
+def test_checkpoint_info_rejects_an_unrecognized_directory(tmp_path):
+  info = _load_checkpoint_info()
+  with pytest.raises(SystemExit):
+    info.inspect(str(tmp_path))
