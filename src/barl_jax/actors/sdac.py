@@ -9,9 +9,9 @@ from barl_jax.components import Actor, Buffer, Critic, frozen
 from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.hparam import Config, HParam
 from barl_jax.networks.diffusion import TimeConditionedField, reverse_chain
-from barl_jax.networks.flow import TIME_STYLES
 from barl_jax.networks.mlp import MLP_PRESETS
 from barl_jax.networks.schedule import Schedule
+from barl_jax.networks.time_embedding import TIME_STYLES
 from barl_jax.optimization import ActorOptim, adam
 from barl_jax.registration import get_component, register_component
 

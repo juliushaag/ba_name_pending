@@ -14,7 +14,7 @@ Two explicit kinds of class attribute, and keeping them apart is the point:
 
 **Which net / which time embedding is a configuration value, not an inheritance
 choice.** The named styles live as plain dicts (`networks.mlp.py`'s
-`MLP_PRESETS`, `networks.flow.py`'s `TIME_STYLES`): `name -> surface`. A
+`MLP_PRESETS`, `networks.time_embedding.py`'s `TIME_STYLES`): `name -> surface`. A
 component *selects* one with a `Config` tagged with that dict:
 
     class DDPMActor(Actor, ActorOptim):
@@ -60,7 +60,7 @@ class Config:
 
   `style` is the **style dict** this value selects from: a module-level
   `name -> surface` table (`networks.mlp.py`'s `MLP_PRESETS`,
-  `networks.flow.py`'s `TIME_STYLES`). At resolution the chosen entry's whole
+  `networks.time_embedding.py`'s `TIME_STYLES`). At resolution the chosen entry's whole
   surface is merged in below the component's own declarations, so the value is
   a configuration choice ("which MLP", "which time embedding") rather than an
   inheritance decision."""

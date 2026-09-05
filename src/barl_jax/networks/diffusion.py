@@ -13,8 +13,8 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from barl_jax.networks.flow import TimeEmbedding
 from barl_jax.networks.mlp import MLP
+from barl_jax.networks.time_embedding import TimeEmbedding
 
 
 class TimeConditionedField(nnx.Module):
