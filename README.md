@@ -159,6 +159,23 @@ component and environment classes can be selected with `module:Class` paths.
 Async environments pickle their bound factory, preserving instance settings;
 the factory and its class must be importable in the worker process.
 
+`scripts/scaffold.py env <ClassName> --gym-id <id>` generates a new
+`Environment` subclass (selected via the external `module:Class` path, no
+registry edit) and smoke-tests it in a temp copy. `scripts/scaffold.py
+algorithm <Name> --actor <ActorClass> --critic <CriticClass>` generates a
+`config/models/<name>.yaml`-shaped file combining existing actor/critic
+classes on the shared `MaxEntRLPolicy` template (how SAC/AMDP/DIME/SDAC are
+each already just a model YAML entry) and smoke-tests it against the Policy
+contract (`train_step` losses match `create_optimizer()`'s keys and are
+finite; `inference_step`'s shape is right) in a disposable copy of the
+packaged defaults. Both refuse to overwrite an existing file.
+
+`scripts/benchmark.py` measures fresh-process import latency, async
+vector-env worker RSS, collection throughput, and compiled gradient
+throughput, reporting device/library versions and every shape/count needed
+to judge whether a number is comparable to another run. No hard thresholds --
+compare two of its own `--json` outputs on the same machine.
+
 For independent in-process experiments, pass configuration explicitly:
 
 ```python

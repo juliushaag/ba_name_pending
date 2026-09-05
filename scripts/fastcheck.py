@@ -32,6 +32,7 @@ BOUNDARY_TESTS = [
   "tests/test_config_diff.py",
   "tests/test_execution.py",
   "tests/test_eval_seeding.py",
+  "tests/test_scaffold.py",
 ]
 
 
