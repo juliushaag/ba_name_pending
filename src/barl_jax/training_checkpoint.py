@@ -133,6 +133,11 @@ def validate_resume(cfg, num_seeds, meta):
              "log_every", "debug_every", "eval_every", "eval_runs", "eval_videos",
              "eval_video_every", "compile_cache_dir", "wandb_finish_timeout",
              "logger", "resume_every", "resume_keep",
+             # Evaluation strategy may change across a resume (recorded in
+             # each eval's own results); collection strategy is a training
+             # config and is deliberately NOT in this set -- changing it
+             # changes the behavior policy that produced the replay buffer.
+             "eval_mode", "eval_candidates",
              "snapshot", "model_overrides"}
   changed = [key for key, value in meta["config"].items()
              if key not in mutable and cfg.get(key) != value]

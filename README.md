@@ -84,6 +84,33 @@ Defaults live in `src/barl_jax/defaults/` and ship inside the library wheel.
 Set `BARL_CONFIG_DIR` before importing config tools, or pass an explicit root to
 `ConfigTree`/`load_config`, to use another configuration directory.
 
+### Action selection at inference time
+
+`collection_mode`/`collection_candidates` and `eval_mode`/`eval_candidates`
+choose, independently, how an action is selected at each inference call --
+policy-independent (`barl_jax/execution.py` never branches on SAC/AMDP/DIME/
+SDAC/NCLQL):
+
+- `default` (the default; `num_candidates` must be 1) -- one unchanged
+  inference call, bit-identical to not passing an execution spec at all.
+- `mean` -- samples `num_candidates` action plans and averages them
+  elementwise. Continuous (box) action spaces only; can land between modes
+  of a multimodal policy, so treat it as a research strategy, not an
+  automatic improvement.
+- `bon` (Best-of-N) -- samples `num_candidates` plans and keeps the
+  highest-scoring one under the policy's own critic (`Policy.score`,
+  `Policy.supports_bon` -- SAC/AMDP/DIME/SDAC via `RLPolicy`; NCLQL has none
+  and is rejected at preflight with an actionable message, same as any
+  algorithm without a scorer).
+
+Both are validated before any resource is allocated: an unknown mode or bad
+candidate count in `barl_jax.config.run.validate_run`, and the
+capability/action-space checks (`execution.validate_execution_spec`) as soon
+as `trainer.setup()` has a constructed reference policy. `collection_mode`/
+`collection_candidates` are part of the training config (changing them is a
+behavior-policy change, so resume rejects a mismatch); `eval_mode`/
+`eval_candidates` may change across a resume.
+
 ## Extending the framework
 
 - `components.py` defines actors, critics, configuration declarations and NNX

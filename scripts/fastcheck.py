@@ -30,6 +30,7 @@ BOUNDARY_TESTS = [
   "tests/test_launcher_devices.py",
   "tests/test_run_validate.py",
   "tests/test_config_diff.py",
+  "tests/test_execution.py",
 ]
 
 

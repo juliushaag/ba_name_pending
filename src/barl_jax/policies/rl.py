@@ -121,6 +121,20 @@ class RLPolicy(Policy):
     obs = self._obs(observation)
     return self.action_chunk(self.actor.sample(obs, critic=self.critic, key=key)), {}
 
+  # ---- Best-of-N scoring (barl_jax.execution) -------------------------
+
+  supports_bon = True
+
+  def score(self, observation, action_chunk):
+    """`critic.value()` at the online critic -- the same reduction (mean or
+    pessimistic, per `pessimistic_target`) `train_step`'s own Bellman target
+    uses, not a separately chosen expectation. Flattens the action plan the
+    same way `train_step` flattens `next_action` before handing it to the
+    critic."""
+    obs = self._obs(observation)
+    flat_action = action_chunk.reshape(action_chunk.shape[0], -1)
+    return self.critic.value(obs, flat_action)
+
 
 @register_policy
 class MaxEntRLPolicy(RLPolicy):

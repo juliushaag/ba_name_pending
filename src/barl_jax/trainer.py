@@ -34,6 +34,7 @@ from barl_jax.components import TRAINABLE, gating
 from barl_jax.config.run import validate_run
 from barl_jax.env import Environment
 from barl_jax.evaluation import run_episodes
+from barl_jax.execution import ExecutionSpec, validate_execution_spec
 from barl_jax.metrics import DEBUG, PRIMARY, DebugMetric, Metric, collect, recording, to_host
 from barl_jax.multiseed import StackedPolicy, split_metrics, stack, unstack
 from barl_jax.policy import Policy
@@ -290,6 +291,15 @@ def _setup(run, *, validate_only):
   if resume_meta is not None:
     restore_training(run, resume_meta)
   run.num_params = run.reference.num_params()
+
+  run.collection_spec = ExecutionSpec(mode=cfg["collection_mode"], num_candidates=cfg["collection_candidates"])
+  run.eval_spec = ExecutionSpec(mode=cfg["eval_mode"], num_candidates=cfg["eval_candidates"])
+  spec_problems = [f"{label}: {p}" for label, spec in
+                   (("collection", run.collection_spec), ("eval", run.eval_spec))
+                   for p in validate_execution_spec(spec, policy=run.reference)]
+  if spec_problems:
+    raise ValueError(f"{run.model_name}: invalid execution spec, refusing to start:\n  "
+                     + "\n  ".join(spec_problems))
   return run
 
 
@@ -327,7 +337,8 @@ def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
   # in full -- 29.7 s of a 39 s eval at 3 seeds.
   per_run  = cfg["eval_runs"]
   n_videos = per_run if cfg["eval_videos"] is None else min(cfg["eval_videos"], per_run)
-  actor = StackedPolicy(run.graphdef, run.state, run.num_seeds, per_run, run.reference)
+  actor = StackedPolicy(run.graphdef, run.state, run.num_seeds, per_run, run.reference,
+                        execution_spec=run.eval_spec)
 
   # `eval/phase` is the one thing that reaches wandb *during* an eval, and it is
   # here because a killed run uploads no term.err: without it "died before the
@@ -487,7 +498,8 @@ def warmup(run: Run, envs, log) -> dict:
   out = {}
 
   t0 = time.perf_counter()
-  actor = StackedPolicy(run.graphdef, run.state, run.num_seeds, cfg["eval_runs"], run.reference)
+  actor = StackedPolicy(run.graphdef, run.state, run.num_seeds, cfg["eval_runs"], run.reference,
+                        execution_spec=run.eval_spec)
   probe = jnp.zeros((run.num_seeds * cfg["eval_runs"], run.env_stats["obs_dim"]), jnp.float32)
   jax.block_until_ready(actor.inference_fn()(probe, jax.random.PRNGKey(0)))
   out["time/warmup_compile_s"] = time.perf_counter() - t0
@@ -608,7 +620,8 @@ def _train(run: Run):
   try:
     while log.get_step("env_steps") < cfg["total_env_steps"]:
       iter_start = time.perf_counter()
-      actor = StackedPolicy(run.graphdef, run.state, num_seeds, run.num_envs, run.reference)
+      actor = StackedPolicy(run.graphdef, run.state, num_seeds, run.num_envs, run.reference,
+                            execution_spec=run.collection_spec)
       rollout_stats = run.collector.collect(actor, env=run.rollout_env, n_steps=steps_per_iter,
                                          seed=run.base_seed + int(run.progress.get("env_steps", 0))
                                          if run.collector.state is None else None,
@@ -779,7 +792,8 @@ def _validate(run: Run):
   """Cheap smoke test for `--validate` sweeps: one rollout chunk + one
   train_step + optimizer step, no eval/checkpointing/wandb logging."""
   cfg = run.cfg
-  actor = StackedPolicy(run.graphdef, run.state, run.num_seeds, run.num_envs, run.reference)
+  actor = StackedPolicy(run.graphdef, run.state, run.num_seeds, run.num_envs, run.reference,
+                        execution_spec=run.collection_spec)
   run.collector.collect(actor, env=run.rollout_env, n_steps=cfg["batch_size"],
                      seed=run.base_seed, discount=actor.discount, sink=run.buffer)
 

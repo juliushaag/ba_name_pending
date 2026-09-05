@@ -38,6 +38,13 @@ RUN_CONFIGS: dict[str, Config] = {
   # than a run actually needs recoverability -- see training_checkpoint.py.
   "resume_every": Config(50_000),
   "resume_keep": Config(2),
+  # Policy-independent action selection at inference time -- see execution.py.
+  # Collection and evaluation choose independently: changing evaluation's
+  # strategy does not touch the behavior policy collection actually used.
+  "collection_mode": Config("default"),
+  "collection_candidates": Config(1),
+  "eval_mode": Config("default"),
+  "eval_candidates": Config(1),
 }
 
 INJECTED_KEYS = frozenset({
@@ -150,6 +157,21 @@ def validate_run(cfg: dict, *, num_seeds: int = None) -> list[str]:
       and num_envs >= 1 and rollout_steps < num_envs):
     fail("rollout_steps", rollout_steps, f"must be >= num_envs ({num_envs}), "
         "or every iteration collects zero env steps and training never advances")
+
+  # Syntax only -- an unknown mode or a bad candidate count. Capability
+  # checks (mode='bon' needs a scorer, mode='mean' needs continuous actions)
+  # need a constructed policy and run at the start of trainer._setup, in
+  # execution.validate_execution_spec.
+  from barl_jax.execution import MODES
+  for mode_key, n_key in (("collection_mode", "collection_candidates"),
+                          ("eval_mode", "eval_candidates")):
+    mode, n = cfg.get(mode_key), cfg.get(n_key)
+    if mode is not None and mode not in MODES:
+      fail(mode_key, mode, f"must be one of {MODES}")
+    if n is not None and (not isinstance(n, int) or isinstance(n, bool) or n < 1):
+      fail(n_key, n, "must be a positive int")
+    elif mode == "default" and isinstance(n, int) and n != 1:
+      fail(n_key, n, "must be 1 when mode is 'default'")
 
   return problems
 

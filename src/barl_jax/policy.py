@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
+import barl_jax.execution as execution
 from barl_jax.action_chunking import normalize_action_chunk
 from barl_jax.components import (
   TRAINABLE,
@@ -33,6 +34,18 @@ def _jitted_infer(graphdef, state, observation, key):
   weights hits the cache instead of recompiling."""
   action, extras = nnx.merge(graphdef, state).inference_step(observation, key=key)
   return action, extras
+
+
+@partial(jax.jit, static_argnums=(0, 1))
+def _jitted_infer_exec(graphdef, spec, state, observation, key):
+  """`_jitted_infer`'s counterpart for `spec.mode in ('bon', 'mean')`. Kept
+  separate rather than folded into `_jitted_infer` so the plain default path
+  (every caller that never touches execution.py) keeps its own jit cache,
+  unperturbed by `spec` becoming part of the trace."""
+  policy = nnx.merge(graphdef, state)
+  infer_step = lambda obs, key: policy.inference_step(obs, key=key)
+  score_fn = policy.score if spec.mode == "bon" else None
+  return execution.act(infer_step, score_fn, observation, key, spec)
 
 
 class Policy(OptimizerMixin, HParamsOwner, nnx.Module, ABC):
@@ -427,16 +440,22 @@ class Policy(OptimizerMixin, HParamsOwner, nnx.Module, ABC):
   # function pure and lets the parameter state be captured once per rollout
   # instead of round-tripped every step.
 
-  def inference_fn(self):
+  def inference_fn(self, spec: "execution.ExecutionSpec" = None):
     """A pure, jitted `(observation, key) -> (action, extras)` pinned to this
     policy's *current* weights. Rebuild it after training (the rollout loop
     does, once per iteration); it deliberately does not see later updates.
-    One compile per batch shape.
+    One compile per batch shape (and, when `spec` selects `bon`/`mean`, per
+    `spec` -- mode and candidate count are static jit args, see
+    `barl_jax.execution.ExecutionSpec`).
 
     The key is an argument rather than drawn from the module's own `nnx.Rngs`:
     that keeps the traced function pure, lets the parameter state be captured
     once per rollout instead of round-tripped every step, and leaves the caller
     holding the one piece of state that actually has to advance.
+
+    `spec=None` (or `ExecutionSpec()`, its default) is the original code path
+    -- unchanged, and sharing `_jitted_infer`'s compile cache with every other
+    caller that has not opted into an execution strategy.
 
     Must be called from eager (non-jitted) context -- it temporarily mutates
     the module to set `use_running_average=True` on BatchNorm/BatchRenorm layers
@@ -450,7 +469,24 @@ class Policy(OptimizerMixin, HParamsOwner, nnx.Module, ABC):
     clone.eval()
     graphdef, state = nnx.split(clone)
 
-    return partial(_jitted_infer, graphdef, state)
+    if spec is None or spec.mode == "default":
+      return partial(_jitted_infer, graphdef, state)
+    return partial(_jitted_infer_exec, graphdef, spec, state)
+
+  # ------------------------------------------------------------------
+  # Best-of-N scoring (optional capability -- see execution.py)
+  # ------------------------------------------------------------------
+
+  #: Whether `score()` is a real critic-backed scorer. False by default;
+  #: `RLPolicy` (SAC/AMDP/DIME/SDAC) sets this True. Checked eagerly by
+  #: `execution.validate_execution_spec` before `mode='bon'` is ever traced.
+  supports_bon = False
+
+  def score(self, observation, action_chunk):
+    """`(observation, action_chunk) -> score`, one scalar per batch row,
+    pinned to this policy's *current* weights (same lifecycle as
+    `inference_fn`). Only meaningful when `supports_bon` is True."""
+    raise NotImplementedError(f"{type(self).__name__} does not support Best-of-N scoring")
 
   def measure_latency(self, n: int = 10) -> float:
     """Rough per-epoch regression signal, not a rigorous benchmark."""
