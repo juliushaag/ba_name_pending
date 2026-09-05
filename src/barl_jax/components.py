@@ -1,6 +1,5 @@
 """Component contracts and NNX state utilities."""
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
 
 import gymnasium as gym
 import jax
@@ -11,7 +10,7 @@ from flax import nnx
 from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.env import EnvStats
 from barl_jax.hparam import Config, HParam
-from barl_jax.metrics import Recorder, armed
+from barl_jax.metrics import Recorder
 
 
 class Buffer(nnx.Variable):
@@ -83,72 +82,6 @@ def frozen(module):
   view = jax.lax.stop_gradient(module)
   view.eval()
   return view
-
-
-_GRAD_STEP = None
-
-
-@contextmanager
-def gating(step):
-  """Publishes the gradient-step index for `update_due` for the duration.
-
-  It has to arrive from outside the policy state, because the trainer vmaps the
-  step over seeds: a predicate read from `policy.train_steps` is *batched*, and
-  `jax.vmap` lowers a `lax.cond` on a batched predicate to a `select` -- both
-  branches executed, the loser discarded. Every seed takes the same gradient
-  step at the same time, so the counter is genuinely shared and passing it in
-  with `in_axes=None` keeps the branch a branch."""
-  global _GRAD_STEP
-  previous = _GRAD_STEP
-  _GRAD_STEP = step
-  try:
-    yield
-  finally:
-    _GRAD_STEP = previous
-
-
-def update_due(policy, every: int):
-  """Whether the optimizer key gated at `every` actually updates this gradient
-  step -- the same predicate `build_optimizer`'s `conditionally_mask` uses, so a
-  loss guarded by this is skipped exactly when its update would be discarded.
-
-  Returns a python `True` (not a traced one) when the step is ungated or when a
-  metric tier is armed -- see `gated_loss` for why that distinction matters."""
-  if every <= 1 or armed():
-    return True
-  step = policy.train_steps[...] if _GRAD_STEP is None else _GRAD_STEP
-  return (step + 1) % every == 0
-
-
-def gated_loss(policy, every: int, fn, *modules):
-  """`fn(*modules) -> scalar`, evaluated only on the gradient steps where the
-  optimizer key gated at `every` actually updates -- zero on the rest, which is
-  parameter-identical as long as `fn` carries no gradient into an ungated key
-  (both callers price through `frozen`).
-
-  The python `if` is load-bearing: `lax.cond` traces *both* branches whatever
-  the predicate, so a metric a gated loss records would be missing from the
-  skip branch and the two pytrees would not match. On a logged step the guard is
-  python-`True`, `fn` runs unbranched and every metric is real; on an unlogged
-  one nothing is recorded at all, so both branches agree."""
-  due = update_due(policy, every)
-  if due is True:
-    return fn(*modules)
-  return nnx.cond(due, fn, lambda *_: jnp.zeros(()), *modules)
-
-
-def gated_losses(policy, every: int, fn, keys, *modules):
-  """Dict version of `gated_loss`: `fn(*modules) -> {key: scalar}`, one entry
-  per optimizer key the actor trains.
-
-  `keys` is the static key set `fn` returns -- the skip branch hands back zeros
-  under the same keys, which the optimizer's `conditionally_mask` would have
-  discarded anyway. Same trace-time rule as `gated_loss`: on a logged step the
-  guard is python-`True` and `fn` runs unbranched with every metric real."""
-  due = update_due(policy, every)
-  if due is True:
-    return fn(*modules)
-  return nnx.cond(due, fn, lambda *_: {k: jnp.zeros(()) for k in keys}, *modules)
 
 
 class _Static:

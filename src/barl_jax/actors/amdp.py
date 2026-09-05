@@ -11,7 +11,7 @@ from barl_jax.networks import gaussian
 from barl_jax.networks.diffusion import TimeConditionedField, controlled_sde
 from barl_jax.networks.flow import TIME_STYLES
 from barl_jax.networks.mlp import MLP_PRESETS
-from barl_jax.networks.optim import ActorOptim, adam
+from barl_jax.optimization import ActorOptim, adam
 from barl_jax.registration import get_component, register_component
 
 

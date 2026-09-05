@@ -19,24 +19,23 @@ import os
 import subprocess
 import time
 from contextlib import ExitStack
-from functools import partial
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 from flax import nnx
 
 import barl_jax.config.tree as model_config
 from barl_jax.checkpoints import load_policy, save_policy
 from barl_jax.collection import Collector
-from barl_jax.components import TRAINABLE, gating
+from barl_jax.components import TRAINABLE
 from barl_jax.config.run import validate_run
 from barl_jax.env import Environment
 from barl_jax.evaluation import run_episodes
 from barl_jax.execution import ExecutionSpec, validate_execution_spec
-from barl_jax.metrics import DEBUG, PRIMARY, DebugMetric, Metric, collect, recording, to_host
+from barl_jax.metrics import DEBUG, PRIMARY, to_host
 from barl_jax.multiseed import StackedPolicy, split_metrics, stack, unstack
+from barl_jax.optimization import seeded_chunk, seeded_step
 from barl_jax.policy import Policy
 from barl_jax.result import presentable, write_json_atomic
 from barl_jax.rollout import MultiSeedReplay
@@ -47,106 +46,6 @@ from barl_jax.training_checkpoint import (
   save_training,
   validate_resume,
 )
-
-
-@partial(jax.jit, static_argnums=(0, 3))
-def train_step(graphdef, state, batch, tiers, grad_step=None):
-  """One jitted gradient step over one policy state."""
-  policy, opt = nnx.merge(graphdef, state)
-
-  def scalar_loss(policy):
-    policy.record_batch(batch)
-    losses = policy.train_step(batch)
-    expected = set(policy.create_optimizer())
-    if set(losses) != expected:
-      raise ValueError(f"Loss keys {sorted(losses)} differ from optimizer keys {sorted(expected)}")
-    return sum(losses.values()), losses
-
-  def loss_fn(policy):
-    total, losses = scalar_loss(policy)
-    sown, sown_debug = nnx.pop(policy, Metric, DebugMetric)
-    return total, (losses, sown, sown_debug)
-
-  with recording(*tiers), gating(grad_step):
-    policy.update_observation_stats(batch["obs"])
-    policy.before_step()
-    (_, (losses, sown, sown_debug)), grads = nnx.value_and_grad(
-      loss_fn, argnums=nnx.DiffState(0, TRAINABLE), has_aux=True)(policy)
-
-  primary = collect(sown)
-  debug   = collect(sown_debug)
-
-  if tiers:
-    labels = dict(nnx.to_flat_state(policy.optimizer_labels()))
-    flat_grads = nnx.to_flat_state(grads)
-    for key in losses:
-      partition = [_raw(v).astype(jnp.float32) for path, v in flat_grads
-                   if labels.get(path) == key]
-      if PRIMARY in tiers:
-        primary[policy.metrics_key(key, "loss")] = losses[key]
-        primary[policy.metrics_key(key, "grad_norm")] = optax.tree.norm(partition)
-      if DEBUG in tiers and partition:
-        total   = sum(g.size for g in partition)
-        zeros   = sum((g == 0).sum() for g in partition)
-        nonfin  = sum((~jnp.isfinite(g)).sum() for g in partition)
-        gmax    = jnp.max(jnp.stack([jnp.abs(g).max() for g in partition]))
-        debug[policy.metrics_key(key, "grad_max")] = gmax
-        debug[policy.metrics_key(key, "grad_frac_zero")] = zeros / total
-        debug[policy.metrics_key(key, "grad_frac_nonfinite")] = nonfin / total
-
-  opt.update(policy, grads)
-  policy.after_step()
-
-  return nnx.state((policy, opt)), losses, (primary, _pack(primary)), (debug, _pack(debug))
-
-
-def _pack(metrics: dict):
-  if not metrics:
-    return jnp.zeros((0,))
-  return jnp.stack([jnp.asarray(metrics[k]) for k in sorted(metrics)])
-
-
-def _raw(v):
-  return v[...] if hasattr(v, "__getitem__") and not isinstance(v, jax.Array) else v
-
-# `grad_step` rides in at in_axes=None: it is the same number for every seed, and
-# a per-seed copy of it would batch the `policy_delay` predicate, which turns the
-# lax.cond guarding a delayed actor loss into a select over both branches.
-seeded_step = jax.jit(jax.vmap(train_step, in_axes=(None, 0, 0, None, None)),
-                      static_argnums=(0, 3), donate_argnums=(1,))
-
-
-@partial(jax.jit, static_argnums=(0, 3), donate_argnums=(1,))
-def seeded_chunk(graphdef, state, batches, k, grad_step):
-  """`k` gradient steps in one dispatch, over a `(k, num_seeds, batch, ...)` chunk.
-
-  The same update as `k` calls of `seeded_step` with no metric tier armed: the
-  same states in the same order, the same per-step `grad_step` feeding the
-  `policy_delay` gate, and the same batches (see `sample_chunk`). What it drops
-  is the Python between them -- ~1.6 ms of jit dispatch plus a `device_put` per
-  step, which for AMDP is 1.38x of the step and for DIME 1.22x.
-
-  The same update, but **not bit-identical**: XLA schedules the fused scan
-  differently from a standalone jit, and float addition does not associate. In
-  float32 that is 1e-11 on two leaves after one step; in the bfloat16 the nets
-  actually use, 2.5e-5, because bfloat16 carries 8 mantissa bits. It is
-  reassociation and not a second algorithm -- but a run does not replay a
-  pre-chunking run step for step.
-
-  Tier-armed steps do not come through here. They return metrics, and `tiers`
-  is static, so an armed step inside the scan would be a second compiled shape
-  per position it could occupy; the caller runs those iterations step-by-step
-  instead. `k` likewise stays the iteration's whole gradient-step count -- one
-  value for the life of a run, hence one compile."""
-  def body(carry, batch):
-    state, step = carry
-    state, _, _, _ = jax.vmap(train_step, in_axes=(None, 0, 0, None, None))(
-      graphdef, state, batch, (), step)
-    return (state, step + 1), None
-
-  (state, _), _ = jax.lax.scan(body, (state, grad_step), batches, length=k)
-  return state
-
 
 # Longest the training loop stays silent before saying it is still alive.
 PROGRESS_INTERVAL_S = 300

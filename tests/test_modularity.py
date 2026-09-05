@@ -11,7 +11,7 @@ import pytest
 from flax import nnx
 
 import barl_jax.config.tree as model_config
-from barl_jax import trainer
+from barl_jax import optimization, trainer
 from barl_jax.checkpoints import load_policy, save_policy
 from barl_jax.components import HParamsOwner
 from barl_jax.config.model import ModelSpec
@@ -205,18 +205,18 @@ def test_training_resume_restores_next_update_and_replay_rng(tmp_path, monkeypat
   with trainer.setup(cfg, 1) as original:
     original.collector.random_fill(original.rollout_env, 8, seed=0, sink=original.buffer)
     batch = original.buffer.sample(4)
-    original.state, *_ = trainer.seeded_step(original.graphdef, original.state, batch, (), jnp.asarray(0))
+    original.state, *_ = optimization.seeded_step(original.graphdef, original.state, batch, (), jnp.asarray(0))
     progress = {"env_steps": 8, "grad_steps": 1, "iteration": 1, "best": [1.]}
     save_training(original, tmp_path / "resume", progress)
     expected_batch = original.buffer.sample(4)
-    expected_state, *_ = trainer.seeded_step(original.graphdef, original.state, expected_batch, (), jnp.asarray(1))
+    expected_state, *_ = optimization.seeded_step(original.graphdef, original.state, expected_batch, (), jnp.asarray(1))
     resume_cfg = {**cfg, "checkpoint": str(tmp_path / "resume"), "checkpoint_mode": "resume"}
     with trainer.setup(resume_cfg, 1) as restored:
       assert restored.progress == progress
       actual_batch = restored.buffer.sample(4)
       for key in actual_batch:
         np.testing.assert_array_equal(actual_batch[key], expected_batch[key])
-      actual_state, *_ = trainer.seeded_step(restored.graphdef, restored.state, actual_batch, (), jnp.asarray(1))
+      actual_state, *_ = optimization.seeded_step(restored.graphdef, restored.state, actual_batch, (), jnp.asarray(1))
       for a, b in zip(jax.tree.leaves(actual_state), jax.tree.leaves(expected_state)):
         if jax.dtypes.issubdtype(a.dtype, jax.dtypes.prng_key):
           a, b = jax.random.key_data(a), jax.random.key_data(b)

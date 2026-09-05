@@ -21,8 +21,8 @@ from flax import nnx
 from barl_jax.components import TRAINABLE
 from barl_jax.config.tree import ConfigTree
 from barl_jax.metrics import PRIMARY
+from barl_jax.optimization import train_step
 from barl_jax.policy import Policy
-from barl_jax.trainer import train_step
 
 MODELS = sorted(ConfigTree().available_models())
 

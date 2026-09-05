@@ -8,7 +8,7 @@ from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.hparam import Config, HParam
 from barl_jax.networks.ensemble import Ensemble
 from barl_jax.networks.mlp import MLP
-from barl_jax.networks.optim import CriticOptim, adam
+from barl_jax.optimization import CriticOptim, adam
 
 
 class CriticLossConfig:

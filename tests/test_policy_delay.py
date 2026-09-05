@@ -6,7 +6,7 @@ critic steps every gradient step. This repo implemented that at the *optimizer*
 three steps and two thirds of the result was thrown away -- for DIME that is a
 16-deep differentiated sampling chain, the dominant term in its step.
 
-`gated_loss` skips the loss itself. These pin the two properties that makes
+`gated_losses` skips the loss itself. These pin the two properties that makes
 sound: the gate agrees with the optimizer's own predicate, and the branch is
 only taken when nothing is being recorded (`lax.cond` traces both branches, so a
 metric on one side and not the other is a pytree mismatch, not a silent zero).
@@ -21,10 +21,10 @@ import pytest
 from conftest import ACT_DIM, BATCH, OBS_DIM, make_env_stats
 from flax import nnx
 
-from barl_jax.components import TRAINABLE, gated_loss, update_due
+from barl_jax.components import TRAINABLE
 from barl_jax.metrics import DEBUG, PRIMARY, recording
+from barl_jax.optimization import gated_losses, train_step, update_due
 from barl_jax.policy import Policy
-from barl_jax.trainer import train_step
 
 DELAYED = ["AMDP", "DIME"]
 
@@ -67,17 +67,17 @@ def test_update_due_is_python_true_while_a_tier_is_armed():
         assert update_due(policy, 3) is True
 
 
-def test_gated_loss_returns_zero_off_cadence_and_the_value_on():
+def test_gated_losses_returns_zero_off_cadence_and_the_value_on():
     policy = make("AMDP")
     called = []
 
     def fn(module):
         called.append(True)
-        return jnp.asarray(2.5)
+        return {"actor": jnp.asarray(2.5)}
 
     for step, due in [(0, False), (1, False), (2, True)]:
         policy.train_steps[...] = jnp.asarray(step, jnp.int32)
-        value = float(gated_loss(policy, 3, fn, policy.critic))
+        value = float(gated_losses(policy, 3, fn, ("actor",), policy.critic)["actor"])
         assert value == pytest.approx(2.5 if due else 0.0)
 
 

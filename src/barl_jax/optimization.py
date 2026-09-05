@@ -1,12 +1,48 @@
-"""Optimizer ownership, partitioning, and schedules."""
+"""Optimizer ownership, partitioning, gradient steps, and schedules."""
+from contextlib import contextmanager
+from functools import partial
+
+import jax
 import jax.numpy as jnp
 import optax
 from flax import nnx
 
 from barl_jax.components import TRAINABLE
+from barl_jax.hparam import Config
+from barl_jax.metrics import DEBUG, PRIMARY, DebugMetric, Metric, armed, collect, recording
 
 
 class OptimizerMixin:
+  # Parameters a Policy owns directly rather than through a slot, mapped to
+  # the optimizer key that trains them: `{"log_std": "explore"}`. Without an
+  # entry a stray parameter is a hard error rather than a silently untrained
+  # one (torch's add_param_group had the same job, minus the check).
+  policy_params: dict[str, str] = {}
+
+  def optimizer_slots(self) -> dict[str, str]:
+    """Optimizer key -> owning component slot, by asking each slot which keys
+    it creates. Keys owned by no component map to this algorithm's own
+    namespace. Building the transforms is free -- optax allocates no state
+    until init()."""
+    cache = self._optimizer_slots_cache.value
+    if cache["value"] is None:
+      owners = {}
+      for slot, component in self.components.items():
+        for key in component.create_optimizer():
+          owners[key] = slot
+      cache["value"] = owners
+    return cache["value"]
+
+  def metrics_key(self, optimizer_key: str, field: str) -> str:
+    """`critic/loss` when the slot owns one optimizer key, `actor/loss/flow`
+    when it owns several -- so the common case stays flat."""
+    owners = self.optimizer_slots()
+    if optimizer_key not in owners:  # no component owns it -- always name it
+      return f"{self.algo_name()}/{field}/{optimizer_key}"
+    slot   = owners[optimizer_key]
+    shared = sum(1 for o in owners.values() if o == slot) > 1
+    return f"{slot}/{field}/{optimizer_key}" if shared else f"{slot}/{field}"
+
   def create_optimizer(self) -> dict:
     """Optimizer key -> optax transform, unioned over every slot. A Policy with
     a tunable of its own (an exploration std owned by no component) overrides
@@ -73,7 +109,7 @@ class OptimizerMixin:
     loop's clip_grad_norm_(params_of_key_k, ...) did, in one backward pass
     instead of one per key.
 
-    The clip itself lives in the component (networks/optim.adam, spent from
+    The clip itself lives in the component (optimization.adam, spent from
     config/presets/optim.yaml), not here: `global_norm` and `element` are
     different operations rather than two strengths of one, and which of them a
     net wants is a property of that net's gradients."""
@@ -126,4 +162,242 @@ class OptimizerMixin:
       decayed = decay_fn(progress)
       return jnp.where(step < warmup_steps, warm, decayed) if warmup_steps > 0 else decayed
     return schedule
+
+
+# ---------------------------------------------------------------------------
+# Gradient-step gating -- the mechanism behind TD3-shaped `policy_delay`: a
+# loss guarded by `gated_losses` is skipped on exactly the steps the optimizer
+# itself would have masked (see `build_optimizer`'s `conditionally_mask`), so
+# the skip is parameter-identical rather than a second, cheaper approximation.
+# ---------------------------------------------------------------------------
+
+_GRAD_STEP = None
+
+
+@contextmanager
+def gating(step):
+  """Publishes the gradient-step index for `update_due` for the duration.
+
+  It has to arrive from outside the policy state, because the trainer vmaps the
+  step over seeds: a predicate read from `policy.train_steps` is *batched*, and
+  `jax.vmap` lowers a `lax.cond` on a batched predicate to a `select` -- both
+  branches executed, the loser discarded. Every seed takes the same gradient
+  step at the same time, so the counter is genuinely shared and passing it in
+  with `in_axes=None` keeps the branch a branch."""
+  global _GRAD_STEP
+  previous = _GRAD_STEP
+  _GRAD_STEP = step
+  try:
+    yield
+  finally:
+    _GRAD_STEP = previous
+
+
+def update_due(policy, every: int):
+  """Whether the optimizer key gated at `every` actually updates this gradient
+  step -- the same predicate `build_optimizer`'s `conditionally_mask` uses, so a
+  loss guarded by this is skipped exactly when its update would be discarded.
+
+  Returns a python `True` (not a traced one) when the step is ungated or when a
+  metric tier is armed -- see `gated_losses` for why that distinction matters."""
+  if every <= 1 or armed():
+    return True
+  step = policy.train_steps[...] if _GRAD_STEP is None else _GRAD_STEP
+  return (step + 1) % every == 0
+
+
+def gated_losses(policy, every: int, fn, keys, *modules):
+  """Dict version of the gate: `fn(*modules) -> {key: scalar}`, one entry per
+  optimizer key the actor trains.
+
+  `keys` is the static key set `fn` returns -- the skip branch hands back zeros
+  under the same keys, which the optimizer's `conditionally_mask` would have
+  discarded anyway. The python `if` is load-bearing: `lax.cond` traces *both*
+  branches whatever the predicate, so a metric a gated loss records would be
+  missing from the skip branch and the two pytrees would not match. On a logged
+  step the guard is python-`True`, `fn` runs unbranched and every metric is
+  real; on an unlogged one nothing is recorded at all, so both branches agree."""
+  due = update_due(policy, every)
+  if due is True:
+    return fn(*modules)
+  return nnx.cond(due, fn, lambda *_: {k: jnp.zeros(()) for k in keys}, *modules)
+
+
+# ---------------------------------------------------------------------------
+# Optimizer role configurations -- the four optimizer knobs as class
+# attributes, grouped by role so every component that optimizes inherits
+# exactly the one that fits it (critic uses the critic's b1 and clip, actor
+# the actor's, dual the dual's). These are ordinary config defaults.
+# Searchability is opt-in through HParam, not implied by "this number exists".
+# ---------------------------------------------------------------------------
+
+
+class OptimizerConfig:
+  lr            = Config(3.0e-4)
+  adam_b1       = Config(0.9)
+  grad_clip     = Config(1.0)
+  grad_clip_mode = Config("element")
+
+
+class CriticOptim(OptimizerConfig):
+  """The critic's optimizer (dime_am's `optim.critic`): b1 0.5, global-norm
+  clip -- the b1 the SAC-style critics train with."""
+
+  adam_b1         = Config(0.5)
+  grad_clip_mode  = Config("global_norm")
+
+
+class ActorOptim(OptimizerConfig):
+  """The actors' optimizer (`optim.actor`): Adam with a per-element clip, which
+  is what actually bounds what one outlier sample can contribute under Adam."""
+
+  grad_clip_mode = Config("element")
+
+
+class DualOptim(OptimizerConfig):
+  """The entropy dual's optimizer (`optim.dual`): a higher LR, unclipped."""
+
+  lr            = Config(1.0e-3)
+  grad_clip_mode = Config("global_norm")
+
+
+CLIP_MODES = ("global_norm", "element", "none")
+
+
+def grad_clip_transform(grad_clip: float, grad_clip_mode: str):
+  """The clip a component puts ahead of its Adam.
+
+  The two modes are different operations, not two strengths of one, which is why
+  this is a component's choice and not a run-level number. `global_norm`
+  rescales the whole gradient to `grad_clip` and so preserves its direction
+  exactly -- and since Adam normalizes per coordinate anyway, that leaves an
+  outlier sample free to set the update's direction while the length it removed
+  never mattered. `element` bounds each coordinate at +-`grad_clip`, which is
+  what actually attenuates one sample's contribution. dime_am clips its control
+  net the element-wise way (`cont_time_policy.py`: `chain(zero_nans(), clip(1.0),
+  adam(lr))`) and leaves critic and dual unclipped."""
+  if grad_clip_mode not in CLIP_MODES:
+    raise KeyError(f"grad_clip_mode {grad_clip_mode!r} is not one of {', '.join(CLIP_MODES)}")
+
+  return {"global_norm": lambda: optax.clip_by_global_norm(float(grad_clip)),
+          "element":     lambda: optax.clip(float(grad_clip)),
+          "none":        optax.identity}[grad_clip_mode]()
+
+
+def adam(lr: float, adam_b1: float, grad_clip: float, grad_clip_mode: str):
+  """This component's optimizer: NaN guard, its own gradient clip, then Adam.
+
+  `zero_nans` goes first so an infinity cannot drag a global norm to inf and
+  scale the whole update to nothing. It hides nothing that was being reported:
+  the `*/grad_frac_nonfinite` metric is taken from the raw gradient."""
+  return optax.chain(optax.zero_nans(),
+                     grad_clip_transform(grad_clip, grad_clip_mode),
+                     optax.adam(float(lr), b1=float(adam_b1)))
+
+
+# ---------------------------------------------------------------------------
+# The jitted gradient step -- computes gradients, applies optimizers, and
+# batches updates. Trainer owns experiment I/O (rollout, eval, checkpointing,
+# logging); this module owns the numerics of one step and the N-seed/K-chunk
+# dispatch shapes built on top of it.
+# ---------------------------------------------------------------------------
+
+
+@partial(jax.jit, static_argnums=(0, 3))
+def train_step(graphdef, state, batch, tiers, grad_step=None):
+  """One jitted gradient step over one policy state."""
+  policy, opt = nnx.merge(graphdef, state)
+
+  def scalar_loss(policy):
+    policy.record_batch(batch)
+    losses = policy.train_step(batch)
+    expected = set(policy.create_optimizer())
+    if set(losses) != expected:
+      raise ValueError(f"Loss keys {sorted(losses)} differ from optimizer keys {sorted(expected)}")
+    return sum(losses.values()), losses
+
+  def loss_fn(policy):
+    total, losses = scalar_loss(policy)
+    sown, sown_debug = nnx.pop(policy, Metric, DebugMetric)
+    return total, (losses, sown, sown_debug)
+
+  with recording(*tiers), gating(grad_step):
+    policy.update_observation_stats(batch["obs"])
+    policy.before_step()
+    (_, (losses, sown, sown_debug)), grads = nnx.value_and_grad(
+      loss_fn, argnums=nnx.DiffState(0, TRAINABLE), has_aux=True)(policy)
+
+  primary = collect(sown)
+  debug   = collect(sown_debug)
+
+  if tiers:
+    labels = dict(nnx.to_flat_state(policy.optimizer_labels()))
+    flat_grads = nnx.to_flat_state(grads)
+    for key in losses:
+      partition = [_raw(v).astype(jnp.float32) for path, v in flat_grads
+                   if labels.get(path) == key]
+      if PRIMARY in tiers:
+        primary[policy.metrics_key(key, "loss")] = losses[key]
+        primary[policy.metrics_key(key, "grad_norm")] = optax.tree.norm(partition)
+      if DEBUG in tiers and partition:
+        total   = sum(g.size for g in partition)
+        zeros   = sum((g == 0).sum() for g in partition)
+        nonfin  = sum((~jnp.isfinite(g)).sum() for g in partition)
+        gmax    = jnp.max(jnp.stack([jnp.abs(g).max() for g in partition]))
+        debug[policy.metrics_key(key, "grad_max")] = gmax
+        debug[policy.metrics_key(key, "grad_frac_zero")] = zeros / total
+        debug[policy.metrics_key(key, "grad_frac_nonfinite")] = nonfin / total
+
+  opt.update(policy, grads)
+  policy.after_step()
+
+  return nnx.state((policy, opt)), losses, (primary, _pack(primary)), (debug, _pack(debug))
+
+
+def _pack(metrics: dict):
+  if not metrics:
+    return jnp.zeros((0,))
+  return jnp.stack([jnp.asarray(metrics[k]) for k in sorted(metrics)])
+
+
+def _raw(v):
+  return v[...] if hasattr(v, "__getitem__") and not isinstance(v, jax.Array) else v
+
+# `grad_step` rides in at in_axes=None: it is the same number for every seed, and
+# a per-seed copy of it would batch the `policy_delay` predicate, which turns the
+# lax.cond guarding a delayed actor loss into a select over both branches.
+seeded_step = jax.jit(jax.vmap(train_step, in_axes=(None, 0, 0, None, None)),
+                      static_argnums=(0, 3), donate_argnums=(1,))
+
+
+@partial(jax.jit, static_argnums=(0, 3), donate_argnums=(1,))
+def seeded_chunk(graphdef, state, batches, k, grad_step):
+  """`k` gradient steps in one dispatch, over a `(k, num_seeds, batch, ...)` chunk.
+
+  The same update as `k` calls of `seeded_step` with no metric tier armed: the
+  same states in the same order, the same per-step `grad_step` feeding the
+  `policy_delay` gate, and the same batches (see `sample_chunk`). What it drops
+  is the Python between them -- ~1.6 ms of jit dispatch plus a `device_put` per
+  step, which for AMDP is 1.38x of the step and for DIME 1.22x.
+
+  The same update, but **not bit-identical**: XLA schedules the fused scan
+  differently from a standalone jit, and float addition does not associate. In
+  float32 that is 1e-11 on two leaves after one step; in the bfloat16 the nets
+  actually use, 2.5e-5, because bfloat16 carries 8 mantissa bits. It is
+  reassociation and not a second algorithm -- but a run does not replay a
+  pre-chunking run step for step.
+
+  Tier-armed steps do not come through here. They return metrics, and `tiers`
+  is static, so an armed step inside the scan would be a second compiled shape
+  per position it could occupy; the caller runs those iterations step-by-step
+  instead. `k` likewise stays the iteration's whole gradient-step count -- one
+  value for the life of a run, hence one compile."""
+  def body(carry, batch):
+    state, step = carry
+    state, _, _, _ = jax.vmap(train_step, in_axes=(None, 0, 0, None, None))(
+      graphdef, state, batch, (), step)
+    return (state, step + 1), None
+
+  (state, _), _ = jax.lax.scan(body, (state, grad_step), batches, length=k)
+  return state
 

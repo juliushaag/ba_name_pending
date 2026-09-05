@@ -84,9 +84,9 @@ def _throughput(model: str, env_name: str, *, num_seeds: int, num_envs: int, bat
   from barl_jax.components import TRAINABLE
   from barl_jax.env import Environment
   from barl_jax.multiseed import StackedPolicy, stack
+  from barl_jax.optimization import seeded_step
   from barl_jax.policy import Policy
   from barl_jax.rollout import MultiSeedReplay
-  from barl_jax.trainer import seeded_step
 
   environment = Environment.make(env_name)
   env = environment.get_env()

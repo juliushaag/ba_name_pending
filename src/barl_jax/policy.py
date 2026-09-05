@@ -64,11 +64,6 @@ class Policy(OptimizerMixin, HParamsOwner, nnx.Module, ABC):
   SLOTS: tuple[str, ...] = ()
   SLOT_OBJECTIVES: dict[str, str] = {}
 
-  # Parameters the Policy owns directly rather than through a slot, mapped to
-  # the optimizer key that trains them: `{"log_std": "explore"}`. Without an
-  # entry a stray parameter is a hard error rather than a silently untrained
-  # one (torch's add_param_group had the same job, minus the check).
-  policy_params: dict[str, str] = {}
   chunk_size = Config(1)
   normalize_obs = Config(True)
 
@@ -293,30 +288,6 @@ class Policy(OptimizerMixin, HParamsOwner, nnx.Module, ABC):
     name = self.model_name.lower()
     return name[:-len("policy")] if name.endswith("policy") and len(name) > len("policy") else name
 
-  def optimizer_slots(self) -> dict[str, str]:
-    """Optimizer key -> owning component slot, by asking each slot which keys
-    it creates. Keys owned by no component map to this algorithm's own
-    namespace. Building the transforms is free -- optax allocates no state
-    until init()."""
-    cache = self._optimizer_slots_cache.value
-    if cache["value"] is None:
-      owners = {}
-      for slot, component in self.components.items():
-        for key in component.create_optimizer():
-          owners[key] = slot
-      cache["value"] = owners
-    return cache["value"]
-
-  def metrics_key(self, optimizer_key: str, field: str) -> str:
-    """`critic/loss` when the slot owns one optimizer key, `actor/loss/flow`
-    when it owns several -- so the common case stays flat."""
-    owners = self.optimizer_slots()
-    if optimizer_key not in owners:  # no component owns it -- always name it
-      return f"{self.algo_name()}/{field}/{optimizer_key}"
-    slot   = owners[optimizer_key]
-    shared = sum(1 for o in owners.values() if o == slot) > 1
-    return f"{slot}/{field}/{optimizer_key}" if shared else f"{slot}/{field}"
-
   def record_batch(self, batch: dict):
     """The `batch/*` family -- what every algorithm trains against, recorded
     once here rather than restated by each train_step."""
@@ -351,10 +322,6 @@ class Policy(OptimizerMixin, HParamsOwner, nnx.Module, ABC):
     self.train_steps[...] += 1
     for component in self.components.values():
       component.after_step()
-
-  # ------------------------------------------------------------------
-  # Optimizers
-  # ------------------------------------------------------------------
 
   # ------------------------------------------------------------------
   # Checkpointing
