@@ -55,3 +55,16 @@ jobs:
       # install` itself -- run with the system interpreter so this step, too,
       # never triggers a root-project `uv sync`.
       - run: python3 scripts/wheel_smoke.py
+
+  cpu-example:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with: {python-version: "3.11"}
+      # examples/cpu_quickstart.py only needs the standalone library plus
+      # base gymnasium (Pendulum-v1 is classic_control -- ships in gymnasium
+      # itself, no mujoco/box2d extra) -- the whole point being that this
+      # runs with none of the root workspace's CUDA/simulator dependencies.
+      - run: uv pip install --python 3.11 --system -e src/barl_jax
+      - run: timeout 120 python3 -m examples.cpu_quickstart

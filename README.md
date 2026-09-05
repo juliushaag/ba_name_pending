@@ -46,9 +46,23 @@ uv run python scripts/doctor.py --probes
 ```
 
 CI (`.github/workflows/ci.yml`) runs `ruff check`, `scripts/lint_config.py`, the
-CPU test suite, and `scripts/wheel_smoke.py`, all against the standalone
-`src/barl_jax` install rather than the root workspace's CUDA/simulator
-dependencies.
+CPU test suite, `scripts/wheel_smoke.py`, and `examples/cpu_quickstart.py`, all
+against the standalone `src/barl_jax` install rather than the root workspace's
+CUDA/simulator dependencies.
+
+`examples/cpu_quickstart.py` is a complete round trip on CPU only, no
+accelerator, W&B account, simulator download, or render dependency: a tiny
+environment (gymnasium's own `Pendulum-v1`, selected via the external
+`module:Class` path rather than the central registry), a real policy,
+collector, replay, training steps, a policy checkpoint save/load, and a
+training resume that verifies the restored optimizer/policy state and replay
+contents are bit-identical to the original run's. ~15-20s end to end on a
+laptop CPU (first-compile cost is reported separately from warm steps in its
+own output; recompute before repeating that number elsewhere).
+
+```bash
+BARL_ALLOW_CPU=1 uv run python -m examples.cpu_quickstart
+```
 
 ## Running experiments
 
