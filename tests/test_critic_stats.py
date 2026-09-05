@@ -14,10 +14,9 @@ import pytest
 from conftest import BATCH, CRITICS, build, built, critic_action, finite, target_expectation
 
 from barl_jax.critics import C51Critic, EnsembleCritic, HLGaussCritic, categorical_projection
+from barl_jax.critics.nclql import NoiseConditionedCritic
 from barl_jax.metrics import DEBUG, PRIMARY, DebugMetric, Metric, collect, recording
 from barl_jax.networks.registry import get_component
-from barl_jax.objectives import noise_td_loss, td_loss
-from barl_jax.policies.lql import NoiseConditionedCritic
 
 _sub = lambda base: [n for n in CRITICS if issubclass(get_component(n), base)]
 
@@ -25,6 +24,8 @@ CATEGORICAL = _sub(C51Critic)          # bootstraps and transports a distributio
 HISTOGRAM = _sub(HLGaussCritic)        # bootstraps a scalar, discretizes at the end
 SCALAR = _sub(EnsembleCritic)
 NOISE_CONDITIONED = _sub(NoiseConditionedCritic)
+
+ONE = jnp.ones((1,))
 
 
 def moments(support, d):
@@ -62,7 +63,7 @@ def test_categorical_target_transports_the_spread(name, half_width):
     c = built(name)
     boot, boot_mean, boot_std = two_point(c, half_width)
 
-    target = c.bellman_target(jnp.zeros((1,)), jnp.zeros((1,)), boot)
+    target = c.bellman_target(jnp.zeros((1,)), jnp.zeros((1,)), ONE, boot)
     mean, std = moments(c.support[...], target)
 
     assert float(mean[0]) == pytest.approx(c.gamma * boot_mean, abs=1e-3)
@@ -77,7 +78,7 @@ def test_histogram_target_discards_the_spread(name, boot_value):
     nothing else. Pinned to the same constant whatever the bootstrap was, which
     is the whole difference from the test above."""
     c = built(name)
-    target = c.bellman_target(jnp.zeros((1,)), jnp.zeros((1,)),
+    target = c.bellman_target(jnp.zeros((1,)), jnp.zeros((1,)), ONE,
                               jnp.full((1, 1), boot_value))
     mean, std = moments(c.support[...], target)
 
@@ -93,7 +94,7 @@ def test_histogram_of_a_scalar_is_a_discretized_gaussian(name, value):
     has that scalar as its mean and a variance of exactly sigma^2 plus the
     discretization's own bin^2/12 -- independent of where on the support it is."""
     c = built(name)
-    hist = c.bellman_target(jnp.array([value]), jnp.ones((1,)), jnp.zeros((1, 1)))
+    hist = c.bellman_target(jnp.array([value]), jnp.ones((1,)), ONE, jnp.zeros((1, 1)))
     mean, std = moments(c.support[...], hist)
 
     assert float(hist.sum()) == pytest.approx(1.0, abs=1e-5)
@@ -144,8 +145,23 @@ NO_TERM = jnp.zeros((1,))
 
 def _project(reward, probs=None, gamma=1.0):
     probs = jnp.zeros((1, 1, 11)).at[0, 0, 5].set(1.0) if probs is None else probs
-    return categorical_projection(probs, ATOMS, jnp.array([reward]), NO_TERM,
-                                  gamma, 0.0, -1.0, 1.0)
+    return categorical_projection(probs, ATOMS, jnp.array([reward]), NO_TERM, ONE,
+                                  gamma, -1.0, 1.0)
+
+
+def test_categorical_projection_matches_scalar_discount():
+    """The directive's worked example (K=3, rewards=[1,2,3], gamma=0.5, next
+    value=8 -> chunk_return=2.75, td_target=3.75) at the categorical layer: a
+    degenerate one-atom point mass at 8.0 (nearest representable atom) projects
+    to a distribution whose mean matches the scalar target exactly, proving the
+    categorical and scalar paths agree on the discount without the categorical
+    path ever collapsing its distribution before projecting."""
+    atoms = jnp.linspace(-10.0, 10.0, 21)     # spacing 1.0, so 8.0 is exactly an atom
+    next_probs = jnp.zeros((1, 1, 21)).at[0, 0, 18].set(1.0)   # point mass at atom value 8.0
+    proj = categorical_projection(next_probs, atoms, jnp.array([2.75]), jnp.array([0.0]),
+                                  jnp.array([3]), 0.5, -10.0, 10.0)
+    mean, _ = moments(atoms, proj)
+    assert float(mean[0, 0]) == pytest.approx(3.75, abs=1e-5)
 
 
 def test_projection_leaves_an_on_atom_point_mass_alone():
@@ -190,7 +206,7 @@ def test_the_two_pessimism_axes_are_independent(name, obs, act):
         c = build(name, **over)
         raw = c.raw(obs, critic_action(c, act))
         return (c, c.reduce_value(raw), c.mean_expectation(raw),
-                c.bellman_target(jnp.zeros((BATCH,)), jnp.zeros((BATCH,)),
+                c.bellman_target(jnp.zeros((BATCH,)), jnp.zeros((BATCH,)), jnp.ones((BATCH,)),
                                  c.bootstrap_from_raw(raw)))
 
     c, price, mean_exp, off = priced(rho=1.0, pessimistic_target=False)
@@ -214,7 +230,7 @@ def test_pessimistic_target_transports_the_lower_heads_distribution():
     support = c.support[...]
     boot = jnp.concatenate([_one_head(11, 8), _one_head(11, 2)], axis=0)   # E = +0.6, -0.6
 
-    target = c.bellman_target(jnp.zeros((1,)), NO_TERM, boot)
+    target = c.bellman_target(jnp.zeros((1,)), NO_TERM, ONE, boot)
     assert float(moments(support, target)[0][0]) == pytest.approx(c.gamma * -0.6, abs=1e-4)
 
 
@@ -222,7 +238,7 @@ def test_averaging_target_takes_both_heads():
     c = build("C51Critic", pessimistic_target=False, num_atoms=11, v_min=-1.0, v_max=1.0)
     boot = jnp.concatenate([_one_head(11, 8), _one_head(11, 2)], axis=0)
 
-    target = c.bellman_target(jnp.zeros((1,)), NO_TERM, boot)
+    target = c.bellman_target(jnp.zeros((1,)), NO_TERM, ONE, boot)
     assert float(moments(c.support[...], target)[0][0]) == pytest.approx(0.0, abs=1e-4)
 
 
@@ -267,8 +283,8 @@ def test_smoothing_coefficient_is_actually_wired_in(name, obs, act, key):
     def loss_at(coef):
         c.smoothing_coef = coef
         losses = {}
-        noise_td_loss(c, obs, act, obs[::-1], act, jnp.zeros((BATCH,)),
-                                 jnp.zeros((BATCH,)), sigmas, key, losses)
+        c.noise_td_loss(obs, act, obs[::-1], act, jnp.zeros((BATCH,)),
+                                 jnp.zeros((BATCH,)), jnp.ones((BATCH,)), sigmas, key, losses)
         assert set(losses) == {"critic"}
         return losses["critic"]
 
@@ -288,7 +304,7 @@ def drain(name, obs, act) -> dict:
     c = build(name)
     a = critic_action(c, act)
     with recording(PRIMARY, DEBUG):
-        td_loss(c, obs, a, obs[::-1], a, jnp.zeros((BATCH,)), jnp.zeros((BATCH,)), {})
+        c.td_loss(obs, a, obs[::-1], a, jnp.zeros((BATCH,)), jnp.zeros((BATCH,)), jnp.ones((BATCH,)), {})
         sown, sown_debug = nnx.pop(c, Metric, DebugMetric)
     return {**collect(sown), **collect(sown_debug)}
 

@@ -44,13 +44,13 @@ class C51Critic(CategoricalCriticBase):
   def bootstrap_from_raw(self, next_raw):
     return jax.lax.stop_gradient(self.probs(next_raw))
 
-  def bellman_target(self, reward, term, bootstrap, shift=0.0, horizon=None):
+  def bellman_target(self, chunk_return, terminated, horizon, bootstrap, entropy_bonus=0.0):
     if self.pessimistic_target:
       exp = (bootstrap * self.support[...]).sum(axis=-1, keepdims=True)
       bootstrap = jnp.take_along_axis(bootstrap, jnp.argmin(exp, axis=0, keepdims=True), axis=0)
-    projected = categorical_projection(bootstrap, self.support[...], reward, term,
-                                       self.gamma, shift, self.v_min, self.v_max,
-                                       horizon=horizon)
+    projected = categorical_projection(bootstrap, self.support[...], chunk_return, terminated,
+                                       horizon, self.gamma, self.v_min, self.v_max,
+                                       entropy_bonus=entropy_bonus)
     return projected.mean(axis=0)
 
 
@@ -92,6 +92,6 @@ class HLGaussCritic(CategoricalCriticBase):
     mass  = cdf[:, 1:] - cdf[:, :-1]
     return mass / jnp.maximum(mass.sum(axis=-1, keepdims=True), 1e-8)
 
-  def bellman_target(self, reward, term, bootstrap, shift=0.0, horizon=None):
+  def bellman_target(self, chunk_return, terminated, horizon, bootstrap, entropy_bonus=0.0):
     return self._to_histogram(
-      super().bellman_target(reward, term, bootstrap, shift, horizon=horizon))
+      super().bellman_target(chunk_return, terminated, horizon, bootstrap, entropy_bonus))

@@ -21,14 +21,13 @@ from barl_jax.components import Actor, gated_losses
 from barl_jax.critics import QCriticBase
 from barl_jax.hparam import Config, HParam
 from barl_jax.networks.regulator import AutotuneRegulator
-from barl_jax.objectives import td_loss
 from barl_jax.policy import Policy, register_policy
 
 
 @register_policy
 class RLPolicy(Policy):
-  """Actor + critic, no entropy dual -- `alpha`/`target_shift`/`dual_loss` are
-  the three seams `MaxEntRLPolicy` fills in. On its own this is TD3-shaped:
+  """Actor + critic, no entropy dual -- `alpha`/`target_entropy_bonus`/`dual_loss`
+  are the three seams `MaxEntRLPolicy` fills in. On its own this is TD3-shaped:
   nothing in this repo's config points a model at `RLPolicy` directly, but it
   is the layout every actor-critic algorithm here shares, and an actor that
   adds no entropy term to its own objective needs no dual at all."""
@@ -63,7 +62,7 @@ class RLPolicy(Policy):
   def alpha(self):
     return jnp.asarray(1.0)
 
-  def target_shift(self, alpha, entropy):
+  def target_entropy_bonus(self, alpha, entropy):
     return 0.0
 
   def dual_loss(self, entropy, losses) -> None:
@@ -76,12 +75,12 @@ class RLPolicy(Policy):
     return self.critic.gamma
 
   def train_step(self, batch):
-    obs      = self._obs(batch["obs"])
-    next_obs = self._obs(batch["next_obs"])
-    action   = batch["act"]
-    reward   = batch["rew"]
-    term     = batch["term"]
-    horizon  = batch.get("horizon")
+    obs          = self._obs(batch["obs"])
+    next_obs     = self._obs(batch["next_obs"])
+    action       = batch["act"]
+    chunk_return = batch["chunk_return"]
+    terminated   = batch["term"]
+    horizon      = batch["horizon"]
 
     losses = {}
     alpha  = self.alpha()
@@ -98,8 +97,8 @@ class RLPolicy(Policy):
       self.actor.generate_action(next_obs, critic=self.critic, key=keys[0]))
     next_action = next_action.reshape(next_action.shape[0], -1)
 
-    td_loss(self.critic, obs, action, next_obs, next_action, reward, term,
-                     losses, shift=self.target_shift(alpha, entropy), horizon=horizon)
+    self.critic.td_loss(obs, action, next_obs, next_action, chunk_return, terminated, horizon,
+                        losses, entropy_bonus=self.target_entropy_bonus(alpha, entropy))
 
     # Skipped outright on the steps `policy_delay` would mask the update on
     # anyway -- the losses price through a frozen critic and their targets are
@@ -164,7 +163,7 @@ class MaxEntRLPolicy(RLPolicy):
   def alpha(self):
     return self.entropy.value()
 
-  def target_shift(self, alpha, entropy):
+  def target_entropy_bonus(self, alpha, entropy):
     if not self.entropy_in_target:
       return 0.0
     return jax.lax.stop_gradient(alpha * entropy)

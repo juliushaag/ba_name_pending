@@ -22,7 +22,12 @@ from barl_jax.checkpoints import checkpoint_directory, save_policy
 from barl_jax.multiseed import unstack
 from barl_jax.result import write_json_atomic
 
-VERSION = 1
+# v2: the replay row field carrying the accumulated discounted return was
+# renamed rew -> chunk_return (docs/ALGORITHM_MAP.md). A v1 checkpoint's
+# replay .npz has no chunk_return field, so restore_training would silently
+# leave the buffer empty rather than actually resuming it -- rejected below
+# instead, with no shim that reinterprets the old field name.
+VERSION = 2
 
 _GEN_PREFIX = "gen-"
 _GEN_WIDTH = 6
@@ -121,7 +126,11 @@ def read_training(root) -> dict:
                      f"but {gen_dir} is missing or incomplete")
   meta = json.loads(meta_path.read_text())
   if meta.get("format_version") != VERSION:
-    raise ValueError(f"Unsupported training checkpoint version {meta.get('format_version')}")
+    raise ValueError(
+      f"Unsupported training checkpoint version {meta.get('format_version')} (expected "
+      f"{VERSION}). Format version 2 renamed the replay's accumulated-return field "
+      f"rew -> chunk_return; a version-1 checkpoint's replay contents cannot be "
+      f"reinterpreted under the new name and must be rejected, not guessed at.")
   meta["_dir"] = str(gen_dir)
   return meta
 

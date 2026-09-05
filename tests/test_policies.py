@@ -41,7 +41,8 @@ def batch():
   f = lambda *s: jnp.asarray(rng.normal(size=s), jnp.float32)
   return {"obs": f(BATCH, OBS_DIM), "next_obs": f(BATCH, OBS_DIM),
           "act": jnp.clip(f(BATCH, ACT_DIM), -1, 1),
-          "rew": f(BATCH), "term": jnp.zeros((BATCH,), jnp.float32)}
+          "chunk_return": f(BATCH), "term": jnp.zeros((BATCH,), jnp.float32),
+          "horizon": jnp.ones((BATCH,), jnp.int32)}
 
 
 @pytest.mark.parametrize("name", MODELS)
@@ -55,6 +56,28 @@ def test_train_step_losses_match_the_optimizer_keys(name):
     state, losses, _, _ = train_step(graphdef, state, data, ())
     assert set(losses) == set(policy.create_optimizer())
     assert all(np.isfinite(np.asarray(v)) for v in losses.values())
+
+
+@pytest.mark.parametrize("name", MODELS)
+def test_actor_loss_gradient_does_not_reach_the_critic(name):
+  """`frozen(critic)` inside every actor's `loss()` has to actually stop the
+  gradient, not just read the current price -- if it leaked, the actor's own
+  objective would also be training the critic's heads on whatever the actor
+  happens to sample, silently changing what the critic regresses to. NCLQL
+  has no Actor slot (no seam this applies to)."""
+  policy = make(name)
+  if not hasattr(policy, "actor"):
+    pytest.skip(f"{name} has no Actor slot")
+  data = batch()
+
+  def actor_loss(critic):
+    losses = policy.actor.loss(data["obs"], critic, policy.alpha(), key=jax.random.PRNGKey(0))
+    return sum(losses.values())
+
+  grads = nnx.grad(actor_loss, argnums=nnx.DiffState(0, TRAINABLE))(policy.critic)
+  leaves = jax.tree.leaves(nnx.state(grads))
+  assert leaves and all(bool(jnp.all(g == 0)) for g in leaves), \
+    "actor.loss's gradient reached a critic param it should have been frozen from"
 
 
 @pytest.mark.parametrize("name", MODELS)

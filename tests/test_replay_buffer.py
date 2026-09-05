@@ -379,10 +379,25 @@ def test_rollout_executes_chunked_actions_and_discards_done_tail():
   assert plans.shape == (2, 3)
   assert np.allclose(plans[0], [0.0, 0.25, 0.5])
   assert np.allclose(plans[1], [-0.25, -0.5, -0.75])
-  assert np.allclose(buffer._fields["rew"][:buffer.n_transitions], [3.0, 3.0])
+  assert np.allclose(buffer._fields["chunk_return"][:buffer.n_transitions], [3.0, 3.0])
   assert np.allclose(buffer._fields["next_obs"][:buffer.n_transitions, 0], [2.0, 2.0])
   assert np.allclose(buffer._fields["term"][:buffer.n_transitions], [1.0, 1.0])
   assert np.array_equal(buffer._fields["horizon"][:buffer.n_transitions], [2, 2])
+
+
+def test_collector_chunk_return_matches_hand_computed_discount():
+  """The directive's own worked example at the collector layer: `_Counting`'s
+  reward is `t`, i.e. exactly [1,2,3] over 3 steps; gamma=0.5 ->
+  chunk_return = 1 + 0.5*2 + 0.25*3 = 2.75. The objective layer's half of the
+  same example is
+  tests/test_critics.py::test_bellman_target_matches_hand_computed_chunk_return."""
+  env = _Counting(term_at=99)   # never terminates within 3 steps
+  buffer = ReplayBuffer(100)
+  policy = _ChunkedPolicy([[[0.0], [0.0], [0.0]]])
+  Collector().collect(policy, env, n_steps=3, seed=0, discount=0.5, sink=buffer)
+  assert buffer.n_transitions == 1
+  assert buffer._fields["chunk_return"][0] == pytest.approx(2.75, abs=1e-6)
+  assert buffer._fields["horizon"][0] == 3
 
 
 def test_eval_slot_blocks_map_to_seeds():

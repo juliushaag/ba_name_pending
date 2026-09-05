@@ -15,12 +15,11 @@ from conftest import BATCH, CRITICS, build, built, critic_action, finite, target
 from flax import nnx
 
 from barl_jax.components import TRAINABLE, frozen
+from barl_jax.critics.nclql import NoiseConditionedCritic
 from barl_jax.networks.registry import get_component
-from barl_jax.objectives import noise_td_loss, td_loss
-from barl_jax.policies.lql import NoiseConditionedCritic
 
-# `NoiseConditionedCritic.loss` overrides `QCriticBase.loss` with a different
-# signature -- it takes the sigma ladder and a key, because TD at the clean level
+# `NoiseConditionedCritic.noise_td_loss` takes a sigma ladder and a key
+# in addition to the plain TD inputs, because TD at the clean level
 # plus smoothing of the noisier ones is one loss over two forwards. So the shared
 # contract below is the plain one, and the noise-conditioned critics get the same
 # assertions through their own entry point.
@@ -62,36 +61,94 @@ def test_frozen_pricing_is_repeatable(name, obs, act):
     assert jnp.array_equal(frozen(c).value(obs, a), frozen(c).value(obs, a))
 
 
+ONE = jnp.ones((BATCH,))
+
+
 @pytest.mark.parametrize("name", CRITICS)
 def test_bellman_contract(name, obs, act):
     """The target's expectation, in whatever representation the class returns it."""
-    c = built(name)
+    c = build(name)
     a = critic_action(c, act)
     raw = c.raw(obs, a)
     boot = c.bootstrap_from_raw(raw)
     live, done = jnp.zeros((BATCH,)), jnp.ones((BATCH,))
 
-    # term=1 cuts the bootstrap -- catches an inverted `term` or a discount
+    # terminated=1 cuts the bootstrap -- catches an inverted flag or a discount
     # applied on the wrong side of it.
-    terminal = c.bellman_target(REWARD, done, boot)
+    terminal = c.bellman_target(REWARD, done, ONE, boot)
     assert jnp.allclose(target_expectation(c, terminal), REWARD, atol=0.05)
 
-    # Shifting every reward by d shifts E[target] by d on the non-terminal branch.
-    base = target_expectation(c, c.bellman_target(SMALL_REWARD, live, boot))
-    moved = target_expectation(c, c.bellman_target(SMALL_REWARD + 0.02, live, boot))
+    # Shifting every chunk_return by d shifts E[target] by d on the non-terminal branch.
+    base = target_expectation(c, c.bellman_target(SMALL_REWARD, live, ONE, boot))
+    moved = target_expectation(c, c.bellman_target(SMALL_REWARD + 0.02, live, ONE, boot))
     assert jnp.allclose(moved - base, 0.02, atol=1e-3)
 
-    one_step = target_expectation(c, c.bellman_target(jnp.zeros((BATCH,)), live, boot))
+    one_step = target_expectation(c, c.bellman_target(jnp.zeros((BATCH,)), live, ONE, boot))
     two_step = target_expectation(
-        c, c.bellman_target(jnp.zeros((BATCH,)), live, boot, horizon=jnp.full((BATCH,), 2)))
+        c, c.bellman_target(jnp.zeros((BATCH,)), live, jnp.full((BATCH,), 2), boot))
     assert jnp.allclose(two_step, c.gamma * one_step, atol=0.05)
 
     # `bellman_target` and `regression_loss` live in different classes; this is
     # the coupling between them. `target_from_raw` is the same lift applied to
     # one of the critic's own predictions (NC-LQL's smoothing loss).
-    for target in (c.bellman_target(REWARD, live, boot), c.target_from_raw(raw)):
+    for target in (c.bellman_target(REWARD, live, ONE, boot), c.target_from_raw(raw)):
         loss = c.regression_loss(raw, target)
         assert loss.shape == () and finite(loss)
+
+
+@pytest.mark.parametrize("name", [n for n in CRITICS if not issubclass(get_component(n), NoiseConditionedCritic)])
+def test_bellman_target_matches_hand_computed_chunk_return(name):
+    """The directive's own worked example: K=3, rewards=[1,2,3], gamma=0.5,
+    nonterminal next value=8 -> chunk_return=2.75, td_target=3.75. chunk_return
+    is an *input* here (the collector's own accumulation is checked separately,
+    in tests/test_replay_buffer.py); this is the objective layer's half."""
+    c = build(name)
+    if hasattr(c, "support"):
+        pytest.skip("categorical critics build the transformed support instead -- see "
+                    "test_categorical_projection_matches_scalar_discount in test_critic_stats.py")
+    c.gamma = 0.5
+    target = c.bellman_target(jnp.array([2.75]), jnp.array([0.0]), jnp.array([3]),
+                              jnp.array([[8.0]]))
+    assert jnp.allclose(target, jnp.array([[3.75]]), atol=1e-5)
+
+
+@pytest.mark.parametrize("name", [n for n in CRITICS if not issubclass(get_component(n), NoiseConditionedCritic)])
+def test_bellman_target_k1_matches_one_step(name):
+    """K=1 is an explicit value flowing through the ordinary path, not a
+    fallback for an omitted horizon."""
+    c = build(name)
+    if hasattr(c, "support"):
+        pytest.skip("categorical: see test_categorical_projection_matches_scalar_discount")
+    c.gamma = 0.5
+    target = c.bellman_target(jnp.array([1.0]), jnp.array([0.0]), jnp.array([1]), jnp.array([[8.0]]))
+    assert jnp.allclose(target, jnp.array([[1.0 + 0.5 * 8.0]]), atol=1e-5)
+
+
+@pytest.mark.parametrize("name", [n for n in CRITICS if not issubclass(get_component(n), NoiseConditionedCritic)])
+def test_bellman_target_terminated_drops_bootstrap(name):
+    """terminated=1 must zero the bootstrap contribution regardless of its
+    value -- bootstrap is deliberately large here to make a sign/mask bug
+    visible rather than accidentally passing at a small value."""
+    c = build(name)
+    if hasattr(c, "support"):
+        pytest.skip("categorical: see test_categorical_projection_matches_scalar_discount")
+    c.gamma = 0.5
+    target = c.bellman_target(jnp.array([2.0]), jnp.array([1.0]), jnp.array([2]), jnp.array([[100.0]]))
+    assert jnp.allclose(target, jnp.array([[2.0]]), atol=1e-5)
+
+
+@pytest.mark.parametrize("name", [n for n in CRITICS if not issubclass(get_component(n), NoiseConditionedCritic)])
+def test_entropy_bonus_sign_and_discount(name):
+    """entropy_bonus enters exactly like the bootstrap: added before the
+    n-step discount, so its contribution to the target is discount*entropy_bonus."""
+    c = build(name)
+    if hasattr(c, "support"):
+        pytest.skip("categorical: see test_categorical_projection_matches_scalar_discount")
+    c.gamma = 0.5
+    with_bonus = c.bellman_target(jnp.array([0.0]), jnp.array([0.0]), jnp.array([2]),
+                                  jnp.array([[0.0]]), entropy_bonus=jnp.array([[1.0]]))
+    without = c.bellman_target(jnp.array([0.0]), jnp.array([0.0]), jnp.array([2]), jnp.array([[0.0]]))
+    assert jnp.allclose(with_bonus - without, 0.25, atol=1e-5)  # gamma**2 == 0.25
 
 
 @pytest.mark.parametrize("name", PLAIN)
@@ -102,7 +159,7 @@ def test_loss_is_differentiable(name, obs, act):
 
     def loss_fn(critic):
         losses = {}
-        td_loss(critic, obs, a, obs[::-1], a, REWARD, jnp.zeros((BATCH,)), losses)
+        critic.td_loss(obs, a, obs[::-1], a, REWARD, jnp.zeros((BATCH,)), ONE, losses)
         assert set(losses) == {"critic"}
         return losses["critic"]
 
@@ -124,7 +181,7 @@ def test_noise_conditioned_loss_is_differentiable(name, obs, act):
 
     def loss_fn(critic):
         losses = {}
-        noise_td_loss(critic, obs, act, obs[::-1], act, REWARD, jnp.zeros((BATCH,)),
+        critic.noise_td_loss(obs, act, obs[::-1], act, REWARD, jnp.zeros((BATCH,)), ONE,
                     sigmas, jax.random.PRNGKey(0), losses)
         assert set(losses) == {"critic"}
         return losses["critic"]

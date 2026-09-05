@@ -166,7 +166,7 @@ class Collector:
         active=np.zeros(n_envs, dtype=bool),
         obs=np.zeros((n_envs, obs.reshape(n_envs, -1).shape[1]), dtype=np.float32),
         act=np.zeros((n_envs, chunk_size * policy.action_dim), dtype=np.float32),
-        rew=np.zeros(n_envs, dtype=np.float32),
+        chunk_return=np.zeros(n_envs, dtype=np.float32),
         next_obs=np.zeros((n_envs, obs.reshape(n_envs, -1).shape[1]), dtype=np.float32),
         term=np.zeros(n_envs, dtype=np.float32),
         horizon=np.zeros(n_envs, dtype=np.int32),
@@ -177,7 +177,7 @@ class Collector:
         active=np.array(pending["active"], copy=True),
         obs=np.array(pending["obs"], copy=True),
         act=np.array(pending["act"], copy=True),
-        rew=np.array(pending["rew"], copy=True),
+        chunk_return=np.array(pending["chunk_return"], copy=True),
         next_obs=np.array(pending["next_obs"], copy=True),
         term=np.array(pending["term"], copy=True),
         horizon=np.array(pending["horizon"], copy=True),
@@ -200,7 +200,7 @@ class Collector:
         pending["active"][refilled] = True
         pending["obs"][refilled] = obs_flat[refilled]
         pending["act"][refilled] = plan_np[refilled]
-        pending["rew"][refilled] = 0.0
+        pending["chunk_return"][refilled] = 0.0
         pending["term"][refilled] = 0.0
         pending["horizon"][refilled] = 0
         for name in set(pending["extras"]) - set(step_extras):
@@ -237,7 +237,7 @@ class Collector:
       acc["n_rew"]      += 1
 
       done = term | trunc
-      pending["rew"] += (discount ** pending["horizon"]) * reward.astype(np.float32).reshape(n_envs)
+      pending["chunk_return"] += (discount ** pending["horizon"]) * reward.astype(np.float32).reshape(n_envs)
       pending["next_obs"] = next_obs.reshape(n_envs, -1).astype(np.float32)
       pending["term"] = np.maximum(pending["term"], term.astype(np.float32).reshape(n_envs))
       pending["horizon"] += pending["active"].astype(np.int32)
@@ -250,13 +250,13 @@ class Collector:
           obs=pending["obs"][emit],
           next_obs=pending["next_obs"][emit],
           act=pending["act"][emit],
-          rew=pending["rew"][emit],
+          chunk_return=pending["chunk_return"][emit],
           term=pending["term"][emit],
           horizon=pending["horizon"][emit],
           **{name: value[emit] for name, value in pending["extras"].items()},
         )
         pending["active"][emit] = False
-        pending["rew"][emit] = 0.0
+        pending["chunk_return"][emit] = 0.0
         pending["term"][emit] = 0.0
         pending["horizon"][emit] = 0
 
@@ -278,7 +278,7 @@ class Collector:
         active=np.array(pending["active"], copy=True),
         obs=np.array(pending["obs"], copy=True),
         act=np.array(pending["act"], copy=True),
-        rew=np.array(pending["rew"], copy=True),
+        chunk_return=np.array(pending["chunk_return"], copy=True),
         next_obs=np.array(pending["next_obs"], copy=True),
         term=np.array(pending["term"], copy=True),
         horizon=np.array(pending["horizon"], copy=True),

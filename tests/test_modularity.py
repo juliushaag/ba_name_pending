@@ -224,6 +224,33 @@ def test_training_resume_restores_next_update_and_replay_rng(tmp_path, monkeypat
       assert restored.collector.state is None
 
 
+def test_resume_rejects_an_incompatible_checkpoint_version(tmp_path, monkeypatch):
+  """An old-format resume checkpoint must fail loudly at read_training, before
+  trainer.setup ever touches the run's own state -- not be silently reinterpreted
+  under the new replay field name."""
+  import barl_jax.training_checkpoint as training_checkpoint
+
+  family = ToyFamily()
+  monkeypatch.setattr(Environment, "make", lambda name: family)
+  cfg = run_config(tmp_path)
+  with trainer.setup(cfg, 1) as original:
+    original.collector.random_fill(original.rollout_env, 8, seed=0, sink=original.buffer)
+    save_training(original, tmp_path / "resume", {"env_steps": 8, "grad_steps": 0,
+                                                   "iteration": 0, "best": [1.]})
+
+  # Downgrade the just-written generation's own format_version, as if it had
+  # been written by the pre-rename code.
+  gen_dir = training_checkpoint._generation_dir(tmp_path / "resume", 0)
+  meta_path = gen_dir / "training.json"
+  meta = json.loads(meta_path.read_text())
+  meta["format_version"] = 1
+  meta_path.write_text(json.dumps(meta))
+
+  resume_cfg = {**cfg, "checkpoint": str(tmp_path / "resume"), "checkpoint_mode": "resume"}
+  with pytest.raises(ValueError, match="Unsupported training checkpoint version"):
+    trainer.setup(resume_cfg, 1)
+
+
 class MemoryLogger:
   def __init__(self, *args, step_keys, **kwargs):
     self.steps = dict.fromkeys(step_keys, 0)

@@ -30,6 +30,23 @@ class Polyak:
   polyak_tau = HParam(0.005)
 
 
+def n_step_discount(gamma, horizon, terminated, dtype):
+  """bootstrap_discount = (1 - terminated) * gamma**horizon, broadcast to (B, 1).
+
+  The one piece of arithmetic `QCriticBase.bellman_target` and
+  `categorical_projection` share -- everything downstream of it (what the
+  discount multiplies into: a scalar bootstrap vs. a per-atom support) is
+  representation-specific and stays at each call site.
+
+  `horizon` is required: the executed plan length h, with no implicit
+  fallback to 1. A chunk transition's horizon must always be known by the
+  time it reaches this function -- K=1 is passed explicitly, not inferred
+  from an absent argument."""
+  horizon = jnp.asarray(horizon, dtype).reshape(-1, 1)
+  terminated = terminated.reshape(-1, 1).astype(dtype)
+  return (1.0 - terminated) * jnp.power(jnp.asarray(gamma, dtype), horizon)
+
+
 class QCriticBase(CriticLossConfig, CriticOptim, Critic):
   learning_objective = "td"
 
@@ -119,15 +136,30 @@ class QCriticBase(CriticLossConfig, CriticOptim, Critic):
     reduce = self.reduce_value if self.pessimistic_target else self.mean_expectation
     return jax.lax.stop_gradient(reduce(next_raw))
 
-  def bellman_target(self, reward, term, bootstrap, shift=0.0, horizon=None):
-    reward = reward.reshape(-1, 1)
-    term   = term.reshape(-1, 1).astype(reward.dtype)
-    if horizon is None:
-      horizon = jnp.ones_like(reward)
+  def td_loss(self, obs, action, next_obs, next_action, chunk_return, terminated, horizon,
+              losses: dict, entropy_bonus=0.0) -> None:
+    """chunk_return: (B,) accumulated discounted return over the executed
+    horizon (already gamma-weighted per primitive step by the collector --
+    this applies exactly one more discount, from t+h to t+0, to the
+    bootstrap). terminated: (B,) true-termination flag (never truncation).
+    horizon: (B,) executed plan length h, required. entropy_bonus: (B,1) or
+    0.0, alpha*next_chunk_entropy added to the bootstrap before discounting;
+    0.0 for variants with no target entropy (TD3-shaped / SDAC)."""
+    if self.has_target:
+      pred_raw = self.raw(obs, action)
+      next_raw = self.target_raw(next_obs, next_action)
     else:
-      horizon = jnp.asarray(horizon, reward.dtype).reshape(-1, 1)
-    discount = jnp.power(jnp.asarray(self.gamma, reward.dtype), horizon)
-    return reward + (1.0 - term) * discount * (bootstrap + shift)
+      pred_raw, next_raw = self.raw_batches((obs, action), (next_obs, next_action))
+    target = self.bellman_target(chunk_return, terminated, horizon,
+                                 self.bootstrap_from_raw(next_raw), entropy_bonus)
+    self.loss_from_raw(pred_raw, target, losses)
+
+  def bellman_target(self, chunk_return, terminated, horizon, bootstrap, entropy_bonus=0.0):
+    """td_target = chunk_return + bootstrap_discount * (bootstrap + entropy_bonus),
+    bootstrap_discount = (1 - terminated) * gamma**horizon (n_step_discount)."""
+    chunk_return = chunk_return.reshape(-1, 1)
+    discount = n_step_discount(self.gamma, horizon, terminated, chunk_return.dtype)
+    return chunk_return + discount * (bootstrap + entropy_bonus)
 
   def target_from_raw(self, raw):
     return jax.lax.stop_gradient(raw.mean(axis=0))
@@ -211,19 +243,20 @@ class CategoricalCriticBase(QCriticBase, CriticDistConfig):
     self.metrics.dist("return_std", jnp.sqrt(var).mean(axis=0))
 
 
-def categorical_projection(next_probs, atoms, reward, term, gamma, shift, v_min, v_max,
-                           horizon=None):
+def categorical_projection(next_probs, atoms, chunk_return, terminated, horizon, gamma,
+                           v_min, v_max, entropy_bonus=0.0):
+  """Builds the transformed support `chunk_return + bootstrap_discount*(atoms +
+  entropy_bonus)` explicitly, then projects `next_probs` onto the fixed atom
+  grid by linear interpolation -- the categorical distribution is never
+  collapsed to its scalar expectation before projecting. Same discount as
+  `QCriticBase.bellman_target` (`n_step_discount`), a different target
+  representation."""
   num_atoms = atoms.shape[0]
   delta_z   = (v_max - v_min) / (num_atoms - 1)
 
-  reward = reward.reshape(-1, 1)
-  term   = term.reshape(-1, 1).astype(reward.dtype)
-  if horizon is None:
-    horizon = jnp.ones_like(reward)
-  else:
-    horizon = jnp.asarray(horizon, reward.dtype).reshape(-1, 1)
-  discount = jnp.power(jnp.asarray(gamma, reward.dtype), horizon)
-  tz = jnp.clip(reward + (1.0 - term) * discount * (atoms.reshape(1, -1) + shift),
+  chunk_return = chunk_return.reshape(-1, 1)
+  discount = n_step_discount(gamma, horizon, terminated, chunk_return.dtype)
+  tz = jnp.clip(chunk_return + discount * (atoms.reshape(1, -1) + entropy_bonus),
                 v_min, v_max)
 
   b = (tz - v_min) / delta_z

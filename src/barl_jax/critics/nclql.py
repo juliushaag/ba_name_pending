@@ -33,6 +33,36 @@ class NoiseConditionedCritic(HParamsOwner):
   def target_modules(self) -> dict:
     return {**super().target_modules(), "encoder": self.encoder}
 
+  def noise_td_loss(self, obs, action, next_obs, next_action, chunk_return, terminated, horizon,
+                    sigmas, key, losses: dict, entropy_bonus=0.0) -> None:
+    """NCLQL has no entropy dual -- `entropy_bonus` stays at its 0.0 default at
+    every call site. See `QCriticBase.td_loss` for the chunk_return/terminated/
+    horizon contract this shares."""
+    clean_level = sigmas.shape[0] - 1
+
+    level_key, noise_key = jax.random.split(key)
+    levels = jax.random.randint(level_key, (action.shape[0],), 0, clean_level)
+    noisy  = action + sigmas[levels][:, None] * jax.random.normal(
+      noise_key, action.shape, action.dtype)
+
+    pred_clean, pred_noisy = self.raw_batches(
+      (obs, self.augment(action, clean_level)),
+      (obs, self.augment(noisy, levels)),
+    )
+
+    next_raw  = self.target_raw(next_obs, self.augment(next_action, clean_level, target=True))
+    td_target = self.bellman_target(chunk_return, terminated, horizon,
+                                    self.bootstrap_from_raw(next_raw), entropy_bonus)
+
+    td_loss = self.regression_loss(pred_clean, td_target)
+    smoothing_loss = self.regression_loss(pred_noisy, self.target_from_raw(pred_clean))
+
+    losses["critic"] = td_loss + self.smoothing_coef * smoothing_loss
+
+    self.record(pred_clean, td_target)
+    self.metrics.scalar("td_loss", td_loss)
+    self.metrics.scalar("smoothing_loss", smoothing_loss)
+
   def augment(self, act, level, target: bool = False):
     if not isinstance(level, jax.Array):
       level = jnp.full((act.shape[0],), level, jnp.int32)

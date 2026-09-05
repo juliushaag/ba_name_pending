@@ -45,7 +45,8 @@ def batch():
     f = lambda *s: jnp.asarray(rng.normal(size=s), jnp.float32)
     return {"obs": f(BATCH, OBS_DIM), "next_obs": f(BATCH, OBS_DIM),
             "act": jnp.clip(f(BATCH, ACT_DIM), -1, 1),
-            "rew": f(BATCH), "term": jnp.zeros((BATCH,), jnp.float32)}
+            "chunk_return": f(BATCH), "term": jnp.zeros((BATCH,), jnp.float32),
+            "horizon": jnp.ones((BATCH,), jnp.int32)}
 
 
 def test_update_due_matches_the_optimizers_own_predicate():

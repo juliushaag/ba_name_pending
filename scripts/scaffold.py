@@ -164,7 +164,8 @@ def _smoke_test_algorithm(name: str, model_path: Path) -> None:
     f = lambda *s: jnp.asarray(rng.normal(size=s), jnp.float32)
     fake_batch = {"obs": f(batch, obs_dim), "next_obs": f(batch, obs_dim),
                  "act": jnp.clip(f(batch, act_dim), -1, 1),
-                 "rew": f(batch), "term": jnp.zeros((batch,), jnp.float32)}
+                 "chunk_return": f(batch), "term": jnp.zeros((batch,), jnp.float32),
+                 "horizon": jnp.ones((batch,), jnp.int32)}
     losses = policy.train_step(fake_batch)
     expected = set(policy.create_optimizer())
     if set(losses) != expected:

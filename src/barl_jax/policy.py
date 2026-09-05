@@ -320,7 +320,7 @@ class Policy(OptimizerMixin, HParamsOwner, nnx.Module, ABC):
   def record_batch(self, batch: dict):
     """The `batch/*` family -- what every algorithm trains against, recorded
     once here rather than restated by each train_step."""
-    self.batch_metrics.dist("reward", batch["rew"])
+    self.batch_metrics.dist("reward", batch["chunk_return"])
     self.batch_metrics.dist("action", batch["act"])
 
   # ------------------------------------------------------------------

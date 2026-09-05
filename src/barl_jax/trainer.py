@@ -600,6 +600,9 @@ def _train(run: Run):
   steps_per_iter = cfg["rollout_steps"] // run.num_envs
 
   if cfg["random_steps"] > 0 and not run.progress:
+    # Prefill primitive steps are not counted into env_steps/grad_steps -- no
+    # log.advance() around this call. Only skipped on resume (`not run.progress`),
+    # never re-run against an already-filled buffer.
     run.collector.random_fill(run.rollout_env, n_steps=cfg["random_steps"] // run.num_envs,
                            seed=run.base_seed, chunk_size=run.reference.chunk_size,
                            discount=run.reference.discount, sink=run.buffer)

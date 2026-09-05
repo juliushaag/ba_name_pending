@@ -10,7 +10,6 @@ from barl_jax.critics.nclql import (
 from barl_jax.hparam import Config, HParam
 from barl_jax.metrics import DEBUG
 from barl_jax.networks.schedule import Schedule
-from barl_jax.objectives import noise_td_loss
 from barl_jax.policy import Policy, register_policy
 
 
@@ -144,12 +143,12 @@ class NCLQL(Policy):
     return self.critic.gamma
 
   def train_step(self, batch):
-    obs      = self.normalize_observations(batch["obs"])
-    next_obs = self.normalize_observations(batch["next_obs"])
-    action   = batch["act"]
-    term     = batch["term"]
-    reward   = batch["rew"] * self.reward_scale
-    horizon  = batch.get("horizon")
+    obs          = self.normalize_observations(batch["obs"])
+    next_obs     = self.normalize_observations(batch["next_obs"])
+    action       = batch["act"]
+    terminated   = batch["term"]
+    chunk_return = batch["chunk_return"] * self.reward_scale
+    horizon      = batch["horizon"]
 
     losses = {}
     keys = jax.random.split(self.rngs.noise(), 2)
@@ -157,8 +156,8 @@ class NCLQL(Policy):
     next_action, score_norm = self.sample(next_obs, keys[0])
     next_action = jax.lax.stop_gradient(next_action)
 
-    noise_td_loss(self.critic, obs, action, next_obs, next_action, reward, term,
-                     self.sigmas[...], keys[1], losses, horizon=horizon)
+    self.critic.noise_td_loss(obs, action, next_obs, next_action, chunk_return, terminated,
+                              horizon, self.sigmas[...], keys[1], losses)
 
     self.metrics.vec("action", next_action.reshape(
       next_action.shape[0], self.chunk_size, self.action_dim), limit=1.0)
