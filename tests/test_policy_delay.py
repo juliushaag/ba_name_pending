@@ -21,7 +21,8 @@ import pytest
 from flax import nnx
 
 from barl_jax.metrics import DEBUG, PRIMARY, recording
-from barl_jax.policy import TRAINABLE, Policy, gated_loss, update_due
+from barl_jax.components import TRAINABLE, gated_loss, update_due
+from barl_jax.policy import Policy
 from barl_jax.trainer import train_step
 
 from conftest import ACT_DIM, BATCH, OBS_DIM, make_env_stats
@@ -133,7 +134,7 @@ def test_the_gate_survives_the_seed_vmap(name):
         p = make(name)
         policies.append((p, nnx.Optimizer(p, p.build_optimizer(lr_schedule=None), wrt=TRAINABLE)))
 
-    from barl_jax.policy import stack
+    from barl_jax.multiseed import stack
     graphdef, state = stack(policies)
 
     seeded = jax.vmap(train_step, in_axes=(None, 0, 0, None, None))

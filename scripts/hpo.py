@@ -10,8 +10,8 @@ generator (sampled points instead of a cross product) and a results channel to
 drive the next round with; both live here, beside the pipeline rather than in
 it.
 
-    uv run python scripts/hpo.py --search config/search/demo.yaml --n-trials 20
-    uv run python scripts/hpo.py --search config/search/demo.yaml --executor local --seeds 1
+    uv run python scripts/hpo.py --search src/barl_jax/defaults/search/demo.yaml --n-trials 20
+    uv run python scripts/hpo.py --search src/barl_jax/defaults/search/demo.yaml --executor local --seeds 1
     uv run python scripts/hpo.py --report sweeps/<timestamp>
 
 Batch by default: `n_trials` are sampled, materialized as one fully-expanded
@@ -85,7 +85,7 @@ def report(sweep_dir: str) -> None:
 def main():
   ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
   ap.add_argument("--search", default=None,
-                  help="path to a search spec YAML (config/search/*.yaml)")
+                  help="path to a search spec YAML (src/barl_jax/defaults/search/*.yaml)")
   ap.add_argument("--n-trials", type=int, default=None,
                   help="trials to sample (default: the spec's n_trials)")
   ap.add_argument("--seeds", type=int, default=None,

@@ -10,7 +10,7 @@ import pytest
 
 import barl_jax.config.tree as model_config
 from barl_jax.networks.registry import get_component
-from barl_jax.policy import Component
+from barl_jax.components import Component
 
 from conftest import ALL, CRITICS, ACTORS, SCHEDULES, SQUASHES, built, tiny_kwargs
 
@@ -39,7 +39,7 @@ def test_constructs_from_its_baseline(name):
 def test_components_yaml_entries_are_registered():
     """Every entry in config/components/ has to name a class the registry can
     resolve -- a typo's baseline kwargs would otherwise silently never apply."""
-    entries = set(model_config.tree().components)
+    entries = set(model_config.ConfigTree().components)
     stale = sorted(entries - set(ALL) - KNOWN_UNREGISTERED)
     assert not stale, f"components.yaml entries with no registered class: {stale}"
 

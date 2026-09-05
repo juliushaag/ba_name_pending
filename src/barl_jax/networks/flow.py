@@ -5,7 +5,7 @@ import jax.numpy as jnp
 from flax import nnx
 
 from barl_jax.hparam import Config
-from barl_jax.policy import Buffer
+from barl_jax.components import Buffer
 
 # ---------------------------------------------------------------------------
 # TIME_STYLES -- the named time/level-embedding surfaces a component *selects*

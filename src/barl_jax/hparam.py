@@ -30,7 +30,7 @@ own declarations and the slot's YAML.
 
 Composition beyond styles is still plain class inheritance for *algorithm
 geometry* -- an optimizer role (`networks/optim.py`'s `CriticOptim`), a critic's
-Bellman geometry (`networks/critic.py`'s `CriticLossConfig`, `Polyak`) -- since
+Bellman geometry (`critics/base.py`'s `CriticLossConfig`, `Polyak`) -- since
 those are decisions about which algorithm code a component implements, not about
 a selectable default.
 

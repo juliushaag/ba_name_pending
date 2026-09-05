@@ -12,7 +12,7 @@ import pytest
 from flax import nnx
 
 import barl_jax.config.tree as model_config
-from barl_jax.config import INJECTED_KEYS, load_config, run_keys
+from barl_jax.config.run import INJECTED_KEYS, load_config, run_keys
 from barl_jax.config.toolkit import CONFIG_DIR
 from barl_jax.config.tree import TRAINING_KEYS, ConfigTree
 from barl_jax.networks.registry import available_components, get_component
@@ -36,12 +36,12 @@ def test_every_component_resolves_from_the_tree_alone(name, tree):
 
 
 def test_the_tree_is_structurally_sound():
-    assert not model_config.structure_problems()
+    assert not model_config.structure_problems(ConfigTree())
 
 
 @pytest.mark.parametrize("name", MODELS)
 def test_every_model_validates(name):
-    assert not model_config.validate(name)
+    assert not model_config.validate(name, ConfigTree())
 
 
 # --- tiers ----------------------------------------------------------------
@@ -145,8 +145,8 @@ def test_a_resolved_run_has_every_run_key():
     """The run side of the same guarantee: a resolved run dict carries a value
     for every declared run key, so trainer's `cfg[...]` indexing and the
     wandb `run/*` block are complete by construction."""
-    from barl_jax.config import load_config
-    from barl_jax.config import RUN_CONFIGS
+    from barl_jax.config.run import load_config
+    from barl_jax.config.run import RUN_CONFIGS
     runs = load_config(str(CONFIG_DIR / "experiments" / "online_learning.yaml"))
     assert runs
     for run in runs:
@@ -178,48 +178,15 @@ def test_a_snapshot_replays_through_an_edit_to_the_tree():
         hparam.BUNDLES[key] = saved
 
 
-def test_a_stale_snapshot_overlays_missing_keys_instead_of_raising(tmp_path):
-    """A snapshot taken before a config/ change added a new required key must
-    not fail to replay: the recorded keys stay authoritative, but a key the
-    snapshot never saw falls back to today's live value instead of being
-    missing from the resolved dict."""
+def test_incomplete_snapshot_fails_instead_of_using_new_defaults():
     snapshot = ConfigTree().snapshot_for("SAC")
-    resolved = dict(snapshot["resolved"])
-
-    # Simulate "before a key existed": drop one params.* and one
-    # components.<slot>.* key the snapshot actually recorded.
-    dropped_param = next(k for k in resolved if k.startswith("params."))
-    dropped_slot_kwarg = next(k for k in resolved
-                              if k.startswith("components.actor.")
-                              and k not in ("components.actor.class", "components.actor.tier"))
-    stale = dict(snapshot, resolved={k: v for k, v in resolved.items()
-                                     if k not in (dropped_param, dropped_slot_kwarg)})
-
-    tree = ConfigTree(snapshot=stale)
-    live_params = ConfigTree().resolve_params("SAC", None)
-    live_slot = ConfigTree().resolve_slot("SAC", "actor", None)[1]
-
-    replayed_params = tree.resolve_params("SAC", None)
-    replayed_slot = tree.resolve_slot("SAC", "actor", None)[1]
-
-    dropped_param_name = dropped_param[len("params."):]
-    dropped_slot_name = dropped_slot_kwarg.split(".", 2)[2]
-    assert replayed_params[dropped_param_name] == live_params[dropped_param_name]
-    assert replayed_slot[dropped_slot_name] == live_slot[dropped_slot_name]
-
-    # A key the stale snapshot *did* keep still wins over the live value, even
-    # if the live tree would resolve it differently -- that is the guarantee
-    # the overlay must not weaken. Mutate the recorded value so it disagrees
-    # with the live tree, and confirm the replayed value is the recorded one.
-    kept_slot_kwarg = next(k for k in resolved
-                           if k.startswith("components.actor.")
-                           and k not in ("components.actor.class", "components.actor.tier",
-                                         dropped_slot_kwarg))
-    kept_name = kept_slot_kwarg.split(".", 2)[2]
-    mutated_value = "unmistakably-not-a-live-value"
-    stale["resolved"][kept_slot_kwarg] = mutated_value
-    tree = ConfigTree(snapshot=stale)
-    assert tree.resolve_slot("SAC", "actor", None)[1][kept_name] == mutated_value
+    del snapshot["resolved"]["params.normalize_obs"]
+    with pytest.raises(ValueError, match="Snapshot.*lacks keys"):
+        ConfigTree(snapshot=snapshot).resolve_params("SAC", None)
+    snapshot = ConfigTree().snapshot_for("SAC")
+    del snapshot["resolved"]["components.actor.lr"]
+    with pytest.raises(ValueError, match="Snapshot.*lacks keys"):
+        ConfigTree(snapshot=snapshot).resolve_slot("SAC", "actor", None)
 
 
 def test_a_snapshot_is_json_round_trippable():

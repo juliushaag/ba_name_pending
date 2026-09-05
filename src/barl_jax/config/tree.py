@@ -2,31 +2,16 @@
 becomes a kwarg.
 """
 
-import importlib.util
 import os
 from pathlib import Path
+from copy import deepcopy
 
 import yaml
 
-_CONFIGS_PATH = Path(__file__).resolve().with_name("toolkit.py")
-_spec = importlib.util.spec_from_file_location("barl_jax_config_toolkit", _CONFIGS_PATH)
-_configs = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_configs)
-CONFIG_DIR       = _configs.CONFIG_DIR
-ConfigMixin      = _configs.ConfigMixin
-_format_value    = _configs._format_value
-deep_merge       = _configs.deep_merge
-resolve_includes = _configs.resolve_includes
-
-# Loaded by path, not as `barl_jax.config.run`, for the same reason
-# toolkit.py is above: a real dotted import here would force this launcher-
-# safe module to execute `barl_jax/__init__.py` (jax, mujoco) just to read
-# `run_defaults()`'s plain dict, regardless of how *this* module was reached.
-_RUN_PATH = Path(__file__).resolve().with_name("run.py")
-_run_spec = importlib.util.spec_from_file_location("barl_jax_config_tree_run", _RUN_PATH)
-_run = importlib.util.module_from_spec(_run_spec)
-_run_spec.loader.exec_module(_run)
-run_defaults = _run.run_defaults
+from barl_jax.config.toolkit import (CONFIG_DIR, ConfigMixin, _format_value,
+                                     deep_merge, resolve_includes)
+from barl_jax.config.run import run_defaults
+from barl_jax.registration import load_builtins
 
 TRAINING_KEYS = frozenset({
   "rollout_steps",
@@ -49,10 +34,9 @@ def _component_cls(cls_name: str):
 
 def _policy_cls(policy_name: str, tree=None):
   from barl_jax.policy import Policy
+  load_builtins("policies")
   class_name = tree.policy_class_name(policy_name) if tree is not None else policy_name
-  if class_name not in Policy._classes:
-    raise KeyError(f"config/models/: {policy_name!r} names unregistered policy {class_name!r}")
-  return Policy._classes[class_name]
+  return Policy.class_for(class_name)
 
 
 def _hparam_defaults(cls) -> dict:
@@ -124,14 +108,14 @@ class ConfigTree:
                snapshot: dict | None = None):
     root = Path(root)
     self.root       = root
-    self.overrides  = dict(overrides or {})
+    self.overrides  = deepcopy(overrides or {})
     self.presets    = _load_dir(root / "presets")
     self.components = _load_dir_merged(root / "components")
     self.models     = _load_dir_merged(root / "models")
     self.run = run_defaults()
     self.run.update(_load_yaml(root / "run" / "defaults.yaml"))
     self.envs       = _load_yaml(root / "run" / "envs.yaml")
-    self.snapshot = snapshot
+    self.snapshot = deepcopy(snapshot)
     if snapshot:
       for attr, key in (("presets", "presets"), ("components", "components"), ("models", "models")):
         setattr(self, attr, deep_merge(getattr(self, attr), snapshot.get(key) or {}))
@@ -259,7 +243,10 @@ class ConfigTree:
     replayed = dict(self._replayed(f"components.{slot}."))
     replayed.pop("tier", None)
     cls_name = replayed.pop("class", cls_name)
-    return cls_name, {**live, **replayed}
+    missing = set(live) - set(replayed)
+    if missing:
+      raise ValueError(f"Snapshot for {policy_name}.{slot} lacks keys: {sorted(missing)}")
+    return cls_name, replayed
 
   def slots(self, policy_name: str) -> list[str]:
     if self.replaying:
@@ -293,7 +280,11 @@ class ConfigTree:
     live = merge(self.params_layers(policy_name, profile))
     if not self.replaying:
       return live
-    return {**live, **self._replayed("params.")}
+    replayed = self._replayed("params.")
+    missing = set(live) - set(replayed)
+    if missing:
+      raise ValueError(f"Snapshot for {policy_name}.params lacks keys: {sorted(missing)}")
+    return replayed
 
   def resolve_training(self, name: str, profile: str | None = None) -> dict:
     if self.replaying:
@@ -399,93 +390,19 @@ def _nest(flat: dict) -> dict:
   return out
 
 
-_tree: ConfigTree | None = None
-_overrides: dict = {}
-_snapshot: dict | None = None
-
-
-def tree() -> ConfigTree:
-  global _tree
-  if _tree is None:
-    _tree = ConfigTree(overrides=_overrides, snapshot=_snapshot)
-  return _tree
-
-
-def _invalidate():
-  global _tree
-  _tree = None
-
-
-def set_snapshot(snapshot: dict | None):
-  global _snapshot
-  _snapshot = snapshot
-  _invalidate()
-
-
-def get_snapshot() -> dict | None:
-  return _snapshot
-
-
-def set_overrides(overrides: dict | None):
-  global _overrides
-  _overrides = dict(overrides or {})
-  _invalidate()
-
-
-def get_overrides() -> dict:
-  return dict(_overrides)
-
-
-def resolve_slot(policy_name: str, slot: str, profile: str | None) -> tuple[type, dict]:
-  cls_name, kwargs = tree().resolve_slot(policy_name, slot, profile)
-  from barl_jax.networks.registry import get_component
-  return get_component(cls_name), kwargs
-
-
-def resolve_params(policy_name: str, profile: str | None) -> dict:
-  return tree().resolve_params(policy_name, profile)
-
-
-def resolve_training(name: str) -> dict:
-  return tree().resolve_training(name)
-
-
-def resolve_model_name(name: str) -> tuple[str, str | None]:
-  return tree().resolve_model_name(name)
-
-
-def explain(name: str) -> dict:
-  return tree().explain(name)
-
-
-def available_models() -> list[str]:
-  return tree().available_models()
-
-
-def resolved_flat(name: str, profile: str | None = None) -> dict:
-  return tree().resolved(name, profile)
-
-
-def snapshot_for(name: str, profile: str | None = None) -> dict:
-  return tree().snapshot_for(name, profile)
-
-
-def env_stats(env_name: str) -> dict:
-  return tree().env_stats(env_name)
-
-
-def unknown_component_defaults(policy_name: str = None) -> list[str]:
+def unknown_component_defaults(policy_name: str = None, *, config) -> list[str]:
   from barl_jax.networks.registry import available_components
   known = set(available_components())
-  candidates = dict(tree().components)
+  t = config
+  candidates = dict(t.components)
   if policy_name is not None:
-    named = {tree().slot_class(policy_name, slot) for slot in tree().slots(policy_name)}
+    named = {t.slot_class(policy_name, slot) for slot in t.slots(policy_name)}
     candidates = {k: v for k, v in candidates.items() if k in named}
   return sorted(k for k in candidates if k not in known)
 
 
-def structure_problems() -> list[str]:
-  t = tree()
+def structure_problems(config) -> list[str]:
+  t = config
   if t.replaying:
     return []
   problems = []
@@ -504,23 +421,27 @@ def structure_problems() -> list[str]:
   return problems
 
 
-def validate(name: str) -> list[str]:
+def validate(name: str, config) -> list[str]:
   from barl_jax.policy import Policy
+  load_builtins("policies")
 
-  t = tree()
+  t = config
   policy_name, profile = t.resolve_model_name(name)
 
   problems = [f"config/components/: {key!r} names no registered component, "
               f"so its baseline kwargs never apply"
-              for key in unknown_component_defaults(policy_name)]
-  problems += structure_problems()
+              for key in unknown_component_defaults(policy_name, config=t)]
+  problems += structure_problems(t)
 
   if not t.policy_cfg(policy_name):
     return problems + [f"config/models/ has no block for {policy_name!r}"]
 
   slots = t.slots(policy_name)
   class_name = t.policy_class_name(policy_name)
-  policy_cls = Policy._classes.get(class_name)
+  try:
+    policy_cls = Policy.class_for(class_name)
+  except KeyError:
+    policy_cls = None
   if policy_cls is None:
     problems.append(f"config/models/: {policy_name}'s policy: names {class_name!r}, "
                     f"which is not a registered Policy ({', '.join(sorted(Policy._classes))})")
@@ -537,7 +458,7 @@ def validate(name: str) -> list[str]:
                  f"belong in config/run/defaults.yaml"
                  for key in sorted(set(block) - TRAINING_KEYS)]
 
-  for key in _overrides:
+  for key in t.overrides:
     parts = key.split(".")
     if parts[:1] == ["params"] and len(parts) == 2:
       if parts[1] not in merge(t.params_layers(policy_name, profile)[:-1]):
@@ -547,18 +468,23 @@ def validate(name: str) -> list[str]:
         problems.append(f"override {key!r} names no slot of {policy_name} ({', '.join(slots)})")
       elif parts[2] == "tier":
         kind = t.component_kind(t.slot_class(policy_name, parts[1]))
-        if _overrides[key] not in t.tier_table(kind):
-          problems.append(f"override {key!r}={_overrides[key]!r} is not a {kind} tier "
+        if t.overrides[key] not in t.tier_table(kind):
+          problems.append(f"override {key!r}={t.overrides[key]!r} is not a {kind} tier "
                           f"({', '.join(sorted(t.tier_table(kind)))})")
     else:
       problems.append(f"override {key!r} must be 'params.<name>' or 'components.<slot>.<name>'")
 
   for slot in slots:
     try:
-      cls, _kwargs = resolve_slot(policy_name, slot, profile)
+      cls_name, _kwargs = t.resolve_slot(policy_name, slot, profile)
+      cls = _component_cls(cls_name)
     except KeyError as e:
       problems.append(str(e))
       continue
+
+    objective = getattr(policy_cls, "SLOT_OBJECTIVES", {}).get(slot)
+    if objective is not None and getattr(cls, "learning_objective", None) != objective:
+      problems.append(f"{policy_name}.{slot}: {cls.__name__} does not support {objective!r}")
 
     kind = t.component_kind(t.slot_class(policy_name, slot))
     if t.tier_table(kind) and t.slot_tier(policy_name, slot, profile) is None:

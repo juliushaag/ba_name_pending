@@ -12,7 +12,7 @@ from barl_jax.networks.diffusion import TimeConditionedField, controlled_sde
 from barl_jax.networks.mlp import MLP, MLP_PRESETS
 from barl_jax.networks.optim import adam, ActorOptim
 from barl_jax.networks.registry import get_component, register_component
-from barl_jax.policy import Actor, Buffer, Critic, frozen
+from barl_jax.components import Actor, Buffer, Critic, frozen
 
 
 def clip_score(score, max_norm: float, percentile: float):

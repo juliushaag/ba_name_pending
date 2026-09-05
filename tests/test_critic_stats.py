@@ -9,10 +9,12 @@ than a recorded value, so the tolerances are derived, not tuned.
 Nothing here trains anything: every law below is exact at initialization.
 """
 
+from barl_jax.objectives import td_loss, noise_td_loss
+
 import jax.numpy as jnp
 import pytest
 
-from barl_jax.networks.critic import (C51Critic, EnsembleCritic, HLGaussCritic,
+from barl_jax.critics import (C51Critic, EnsembleCritic, HLGaussCritic,
                                       categorical_projection)
 from barl_jax.metrics import DEBUG, PRIMARY, DebugMetric, Metric, collect, recording
 from barl_jax.networks.registry import get_component
@@ -269,7 +271,7 @@ def test_smoothing_coefficient_is_actually_wired_in(name, obs, act, key):
     def loss_at(coef):
         c.smoothing_coef = coef
         losses = {}
-        c.loss(obs, act, obs[::-1], act, jnp.zeros((BATCH,)),
+        noise_td_loss(c, obs, act, obs[::-1], act, jnp.zeros((BATCH,)),
                                  jnp.zeros((BATCH,)), sigmas, key, losses)
         assert set(losses) == {"critic"}
         return losses["critic"]
@@ -290,7 +292,7 @@ def drain(name, obs, act) -> dict:
     c = build(name)
     a = critic_action(c, act)
     with recording(PRIMARY, DEBUG):
-        c.loss(obs, a, obs[::-1], a, jnp.zeros((BATCH,)), jnp.zeros((BATCH,)), {})
+        td_loss(c, obs, a, obs[::-1], a, jnp.zeros((BATCH,)), jnp.zeros((BATCH,)), {})
         sown, sown_debug = nnx.pop(c, Metric, DebugMetric)
     return {**collect(sown), **collect(sown_debug)}
 

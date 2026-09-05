@@ -8,7 +8,7 @@ from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.hparam import Config
 from barl_jax.networks.optim import adam, DualOptim
 from barl_jax.networks.registry import register_component
-from barl_jax.policy import Component
+from barl_jax.components import Component
 
 
 @register_component

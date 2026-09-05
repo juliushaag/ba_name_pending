@@ -23,7 +23,7 @@ from barl_jax.networks.registry import get_component
 
 from conftest import build, make_env_stats
 
-GAMMA = model_config.tree().component_kwargs("C51Critic")["gamma"]
+GAMMA = model_config.ConfigTree().component_kwargs("C51Critic")["gamma"]
 DM_HORIZON = 1000                      # every suite task; see DMControlEnvironment's docstring
 
 

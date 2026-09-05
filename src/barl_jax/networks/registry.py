@@ -15,10 +15,16 @@ def register_component(cls: type) -> type:
 
 
 def get_component(name: str) -> type:
+  from barl_jax.registration import load_builtins, import_type
+  load_builtins("components")
+  if ":" in name:
+    return import_type(name)
   if name not in _COMPONENT_REGISTRY:
     raise KeyError(f"{name} not in registered components: {list(_COMPONENT_REGISTRY.keys())}")
   return _COMPONENT_REGISTRY[name]
 
 
 def available_components() -> list[str]:
+  from barl_jax.registration import load_builtins
+  load_builtins("components")
   return list(_COMPONENT_REGISTRY.keys())

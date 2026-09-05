@@ -5,7 +5,6 @@ from abc import ABC, abstractmethod
 import gymnasium as gym
 import numpy as np
 
-from barl_jax_env_worker import make_env
 
 
 class EnvStats(dict):
@@ -84,7 +83,7 @@ class Environment(ABC):
     ...
 
   def get_vector_env(self, num_envs: int, asynchronous: bool = None) -> gym.vector.VectorEnv:
-    """autoreset_mode=DISABLED is mandatory -- ReplayBuffer.rollout() resets
+    """autoreset_mode=DISABLED is mandatory -- Collector.collect() resets
     finished sub-envs itself via reset_mask. `asynchronous` overrides
     `use_async_vector_env` for a caller the class-level choice doesn't suit --
     a rendering env has to be synchronous, since a forked worker's render()
@@ -101,26 +100,28 @@ class Environment(ABC):
     # single-threaded server process instead.
     methods = mp.get_all_start_methods()
     context = "forkserver" if "forkserver" in methods else "spawn"
-    # Not `self.get_env` directly: a worker unpickling a bound method has to
-    # import this instance's class, and any name under `barl_jax.*` runs
-    # `barl_jax/__init__.py` first -- eagerly importing every policy/critic
-    # (jax) and ManiSkill (torch via sapien), none of which a plain
-    # env-stepping worker needs. `barl_jax_env_worker` lives outside the
-    # `barl_jax` package specifically so unpickling it never touches that --
-    # see its docstring for the measured cost this avoids.
-    module_name = type(self).__module__.rsplit(".", 1)[-1]
-    factory = functools.partial(make_env, module_name, type(self).__name__)
-    return gym.vector.AsyncVectorEnv([factory for _ in range(num_envs)],
+    return gym.vector.AsyncVectorEnv([self.get_env for _ in range(num_envs)],
                                      autoreset_mode=gym.vector.AutoresetMode.DISABLED,
                                      context=context)
 
   @staticmethod
   def make(name : str) -> "Environment":
-    return Environment._classes[name]()
+    return Environment.class_for(name)()
 
 
   @staticmethod
+  def class_for(name: str):
+    from barl_jax.registration import load_builtins, import_type
+    load_builtins("environments")
+    cls = import_type(name) if ":" in name else Environment._classes[name]
+    if not issubclass(cls, Environment):
+      raise TypeError(f"{name!r} must implement Environment")
+    return cls
+
+  @staticmethod
   def available() -> list[str]:
+    from barl_jax.registration import load_builtins
+    load_builtins("environments")
     return list(Environment._classes.keys())
 
 

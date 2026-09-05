@@ -21,7 +21,6 @@ its `__init__` runs. None of humanoid_bench's own tasks read flex-* fields
 doesn't have from the sizing table -- once, up front -- costs nothing."""
 
 import gymnasium as gym
-import humanoid_bench  # noqa: F401 -- side effect: registers every <robot>-<task>-v0 gym id
 
 from barl_jax.env import Environment, register_environment
 
@@ -39,7 +38,6 @@ def _patch_stale_mujoco_fields():
       del fields[field_name]
 
 
-_patch_stale_mujoco_fields()
 
 
 class HumanoidBenchEnvironment(Environment):
@@ -58,6 +56,8 @@ class HumanoidBenchEnvironment(Environment):
     raise NotImplementedError
 
   def get_env(self) -> gym.Env:
+    import humanoid_bench  # noqa: F401
+    _patch_stale_mujoco_fields()
     return gym.make(self.task_id(), render_mode="rgb_array")
 
   def get_dataset(self):

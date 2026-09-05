@@ -23,9 +23,6 @@ Two things differ from the MuJoCo/DMC families and are load-bearing:
 
 import gymnasium as gym
 
-# Importing the package is what registers every `*-v1` task id with gymnasium.
-import mani_skill.envs  # noqa: F401
-from mani_skill.utils.wrappers import CPUGymWrapper
 
 from barl_jax.env import Environment, register_environment
 
@@ -47,6 +44,8 @@ class ManiSkillEnvironment(Environment):
     raise NotImplementedError
 
   def get_env(self) -> gym.Env:
+    import mani_skill.envs  # noqa: F401
+    from mani_skill.utils.wrappers import CPUGymWrapper
     # `num_envs=1` + physx_cpu is the unbatched backend; CPUGymWrapper is what
     # unwraps ManiSkill's batched torch tensors back to single-env numpy.
     # `reward_mode` is named rather than defaulted because the declared return

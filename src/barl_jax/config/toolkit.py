@@ -23,6 +23,8 @@ file it reads through this, so `$()` works anywhere under `config/`).
 from __future__ import annotations
 
 import re
+import os
+from importlib.resources import files
 import types
 from pathlib import Path
 from typing import Any, Dict, Optional, Type, TypeVar, Union, get_args, get_origin
@@ -35,7 +37,7 @@ T = TypeVar("T")
 
 _MISSING = object()
 
-CONFIG_DIR = Path(__file__).resolve().parents[3] / "config"
+CONFIG_DIR = Path(os.environ["BARL_CONFIG_DIR"]).expanduser().resolve() if "BARL_CONFIG_DIR" in os.environ else Path(str(files("barl_jax") / "defaults"))
 
 INCLUDE_PATTERN = re.compile(r"\$\(([^)]+)\)")
 

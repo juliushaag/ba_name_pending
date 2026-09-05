@@ -5,7 +5,7 @@
     uv run python scripts/submit.py --algos SAC DIME --envs HalfCheetah --seeds 5
     uv run python scripts/submit.py --algos SAC --envs HalfCheetah \
         --set model.components.critic.tier=large
-    uv run python scripts/submit.py --grid config/experiments/sweep_grid.yaml --dry-run
+    uv run python scripts/submit.py --grid src/barl_jax/defaults/experiments/sweep_grid.yaml --dry-run
     uv run python scripts/submit.py --algos SAC --envs HalfCheetah --executor local --validate
 
 A "sweep" here is any set of runs, including one. The grid is a cross product
@@ -55,7 +55,7 @@ problems = [f"{env!r} is not a registered environment"
 
 for algo in algos:
     try:
-        problems += [f"{algo}: {p}" for p in model_config.validate(algo)]
+        problems += [f"{algo}: {p}" for p in model_config.validate(algo, model_config.ConfigTree())]
     except Exception as exc:  # an unresolvable name raises rather than reporting
         problems.append(f"{algo}: {type(exc).__name__}: {exc}")
 
@@ -122,7 +122,7 @@ def parse_args():
                            "given, which win per axis.")
     what.add_argument("--config", default=None,
                       help="Base experiment config providing `defaults:` for every run (default: "
-                           "--grid's `base:`, else config/experiments/online_learning.yaml). Run "
+                           "--grid's `base:`, else src/barl_jax/defaults/experiments/online_learning.yaml). Run "
                            "keys themselves are declared in config/run/defaults.yaml and per-env "
                            "overrides in config/run/envs.yaml.")
     what.add_argument("--seeds", type=int, default=None,

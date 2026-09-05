@@ -1,3 +1,4 @@
+from contextlib import ExitStack
 import time
 from collections import defaultdict
 
@@ -61,31 +62,42 @@ class Logger():
     wedge for 17 minutes with wandb-core idle and the network fine."""
 
     self._seeds = list(seeds)
-    self._runs  = [
-      wandb.init(project=log_name, group=group or run_name,
-                 name=f"{run_name}/s{seed}",
-                 config={**(config or {}), "seed": seed}, tags=tags,
-                 reinit="create_new",
-                 settings=wandb.Settings(finish_timeout=finish_timeout,
-                                         console="auto" if i == 0 else "off"))
-      for i, seed in enumerate(self._seeds)
-    ]
+    self._resources = ExitStack()
+    self._runs = []
+    try:
+      for i, seed in enumerate(self._seeds):
+        run = wandb.init(project=log_name, group=group or run_name,
+                         name=f"{run_name}/s{seed}",
+                         config={**(config or {}), "seed": seed}, tags=tags,
+                         reinit="create_new",
+                         settings=wandb.Settings(finish_timeout=finish_timeout,
+                                                console="auto" if i == 0 else "off"))
+        self._runs.append(run)
+        self._resources.callback(run.finish)
+    except BaseException:
+      self._resources.close()
+      raise
 
-    self._steps = {k: 0 for k in step_keys}
+    try:
+      self._steps = {k: 0 for k in step_keys}
 
-    for k in self._steps:
-      self._each("define_metric", k)
+      for k in self._steps:
+        self._each("define_metric", k)
 
-    self._run_name    = run_name or self._runs[0].name
-    self._console     = Console()
-    self._latest      = dict()
-    self._start_time  = time.monotonic()
-    self._last_render = 0.0
-    self._rate_ref    = dict(self._steps)
-    self._rate_time   = self._start_time
+      self._run_name    = run_name or self._runs[0].name
+      self._console     = Console()
+      self._latest      = dict()
+      self._start_time  = time.monotonic()
+      self._last_render = 0.0
+      self._rate_ref    = dict(self._steps)
+      self._rate_time   = self._start_time
 
-    self._live = Live(self._render(), console=self._console, refresh_per_second=4, transient=False)
-    self._live.start()
+      self._live = Live(self._render(), console=self._console, refresh_per_second=4, transient=False)
+      self._resources.callback(self._live.stop)
+      self._live.start()
+    except BaseException:
+      self._resources.close()
+      raise
 
   def _each(self, method : str, *args, **kwargs):
     """Fan a wandb call out over every seed's run."""
@@ -217,10 +229,7 @@ class Logger():
     self._runs[seed_index].log({key: wandb.Video(video, fps=30, format="mp4")})
 
   def finish(self):
-    # Bounded by the `finish_timeout` passed at init: wandb gives up on the
-    # upload rather than blocking the process forever, and what it could not
-    # send stays in wandb/ for `wandb sync` to push later.
-    self._live.update(self._render())
-    self._live.stop()
-    for run in self._runs:
-      run.finish()
+    try:
+      self._live.update(self._render())
+    finally:
+      self._resources.close()

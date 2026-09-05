@@ -43,7 +43,7 @@ from barl_jax.env import EnvStats
 from barl_jax.networks.registry import available_components, get_component
 from barl_jax.networks.schedule import Schedule
 from barl_jax.networks.squash import Squash
-from barl_jax.policy import Actor, Critic
+from barl_jax.components import Actor, Critic
 
 OBS_DIM, ACT_DIM, BATCH = 5, 3, 4
 RETURN_MIN, RETURN_MAX = -10.0, 10.0
@@ -92,7 +92,7 @@ POLICY_SUPPLIED = {
 
 
 def tiny_kwargs(name: str, **extra) -> dict:
-    base = model_config.tree().component_kwargs(name)
+    base = model_config.ConfigTree().component_kwargs(name)
     if issubclass(get_component(name), Schedule):
         base.update(SCHEDULE_KWARGS)
     base.update({k: v for k, v in TINY.items() if k in base})

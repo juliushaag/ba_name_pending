@@ -240,7 +240,7 @@ def test_repr(simple_config):
 # ---------------------------------------------------------------------------
 
 def test_experiment_file_runs_list_can_be_included(tmp_path):
-  from barl_jax.config import load_config
+  from barl_jax.config.run import load_config
 
   (tmp_path / "run").mkdir()
   (tmp_path / "run" / "defaults.yaml").write_text(yaml.safe_dump({}))

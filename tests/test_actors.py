@@ -12,7 +12,7 @@ from flax import nnx
 
 from barl_jax.networks.registry import get_component
 from barl_jax.actors.sdac import DDPMActor
-from barl_jax.policy import TRAINABLE
+from barl_jax.components import TRAINABLE
 
 from conftest import ACT_DIM, ACTORS, BATCH, build, built, finite
 

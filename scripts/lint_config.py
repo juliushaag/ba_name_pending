@@ -28,7 +28,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import barl_jax  # noqa: F401  -- populates the policy/component registries
 import barl_jax.config.tree as model_config
-from barl_jax.config import INJECTED_KEYS, run_keys
+from barl_jax.config.run import INJECTED_KEYS, run_keys
 from barl_jax.networks.registry import available_components, get_component
 from barl_jax.policy import Policy
 
@@ -46,7 +46,7 @@ def component_problems() -> list[str]:
   selects its tier ladder (a tiered component must name one), and a `tier:` a
   slot states must resolve to an actual rung."""
   problems = []
-  tree = model_config.tree()
+  tree = model_config.ConfigTree()
   for name in sorted(available_components()):
     cls = get_component(name)
     if getattr(cls, "kind", None) is None:
@@ -59,12 +59,14 @@ def policy_classes_problems() -> list[str]:
   naming a missing class passes every YAML-only check and then fails at
   `trainer.setup` on the compute node -- check the registry here, where the
   error is still one message."""
-  tree = model_config.tree()
+  tree = model_config.ConfigTree()
   problems = []
   for name in sorted(tree.available_models()):
     policy_name, _ = tree.resolve_model_name(name)
     class_name = tree.policy_class_name(policy_name)
-    if class_name not in Policy._classes:
+    try:
+      Policy.class_for(class_name)
+    except KeyError:
       problems.append(f"config/models/: {name}'s policy: names {class_name!r}, "
                       f"which is not a registered Policy ({', '.join(sorted(Policy._classes))})")
   return problems
@@ -74,7 +76,7 @@ def slot_problems() -> list[str]:
   """Every slot of every model: a tier where the kind has a ladder, and a
   `components:` block that disagrees with its policy class's SLOTS."""
   problems = []
-  tree = model_config.tree()
+  tree = model_config.ConfigTree()
   for name in sorted(tree.available_models()):
     policy_name, profile = tree.resolve_model_name(name)
     slots = tree.slots(policy_name)
@@ -84,7 +86,10 @@ def slot_problems() -> list[str]:
     # config with nothing behind it; a built slot not declared fails later at
     # build_component -- both are worth saying here, where the model files sit.
     class_name = tree.policy_class_name(policy_name)
-    policy_cls = Policy._classes.get(class_name)
+    try:
+      policy_cls = Policy.class_for(class_name)
+    except KeyError:
+      policy_cls = None
     if policy_cls is not None:
       declared, expected = set(slots), set(policy_cls.SLOTS)
       problems += [f"{policy_name}: YAML declares slot {s!r} that {class_name} does not "
@@ -129,7 +134,7 @@ def undeclared_run_keys() -> list[str]:
 
 CHECKS = {
   "components":  component_problems,
-  "structure":   model_config.structure_problems,
+  "structure":   lambda: model_config.structure_problems(model_config.ConfigTree()),
   "policies":    policy_classes_problems,
   "slots":       slot_problems,
   "run_keys":    undeclared_run_keys,

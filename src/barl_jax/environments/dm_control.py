@@ -1,7 +1,5 @@
 from barl_jax.env import Environment, register_environment
 
-from dm_control import suite
-from shimmy.dm_control_compatibility import DmControlCompatibilityV0
 
 import gymnasium as gym
 
@@ -26,6 +24,8 @@ class DMControlEnvironment(Environment):
     raise NotImplementedError
 
   def get_env(self) -> gym.Env:
+    from dm_control import suite
+    from shimmy.dm_control_compatibility import DmControlCompatibilityV0
     domain, task = self.domain_task()
     dm_env = suite.load(domain_name=domain, task_name=task)
     env = DmControlCompatibilityV0(dm_env, render_mode="rgb_array")

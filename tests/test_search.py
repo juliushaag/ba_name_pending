@@ -20,8 +20,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import grid
 from search import load_search, sample_trial, sample_trials
 
-SPEC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    "config", "search", "demo.yaml")
+from barl_jax.config.toolkit import CONFIG_DIR
+SPEC = str(CONFIG_DIR / "search" / "demo.yaml")
 
 
 def test_sampled_values_stay_inside_their_space():

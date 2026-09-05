@@ -19,7 +19,8 @@ from flax import nnx
 
 from barl_jax.config.tree import ConfigTree
 from barl_jax.metrics import PRIMARY
-from barl_jax.policy import TRAINABLE, Policy
+from barl_jax.components import TRAINABLE
+from barl_jax.policy import Policy
 from barl_jax.trainer import train_step
 
 from conftest import ACT_DIM, BATCH, OBS_DIM, make_env_stats
@@ -104,18 +105,11 @@ def test_metric_keys_are_pinned(name):
   assert sorted(primary) == METRIC_KEYS[name]
 
 
-def test_rl_policy_gate_excludes_noise_conditioned_critics():
-  """`RLPolicy`'s critic slot gates on `QCriticBase`, which a noise-conditioned
-  critic satisfies -- but `NoiseConditionedCritic.loss` is a wider signature
-  than the template's one-backward call can drive. The refusal lives on the
-  `noise_conditioned` marker (`rl.py` asserts it off), so pin that marker: a
-  normal critic must keep it off and every NCLQL critic on, or the pairing
-  silently passes the gate."""
+def test_critics_declare_supported_objectives():
   from barl_jax.networks.registry import get_component
-
-  assert get_component("C51Critic").noise_conditioned is False
+  assert get_component("C51Critic").learning_objective == "td"
   for name in ("NCLQLCritic", "NCLQLC51Critic", "NCLQLHLGaussCritic"):
-    assert get_component(name).noise_conditioned is True
+    assert get_component(name).learning_objective == "noise_td"
 
 
 def test_resolved_style_surface_is_the_surface_that_gets_built():
@@ -126,21 +120,15 @@ def test_resolved_style_surface_is_the_surface_that_gets_built():
 
 
 def test_unknown_component_override_is_rejected_at_construction():
-  import barl_jax.config.tree as model_config
-
-  previous = model_config.get_overrides()
-  try:
-    model_config.set_overrides({"components.actor.activaton": "relu"})
-    with pytest.raises(KeyError, match="unused config keys.*activaton"):
-      make("SAC")
-  finally:
-    model_config.set_overrides(previous)
+  config = ConfigTree(overrides={"components.actor.activaton": "relu"})
+  with pytest.raises(KeyError, match="unused config keys.*activaton"):
+    Policy.make("SAC", FakeEnv(), config=config, env_stats=make_env_stats())
 
 
 def test_duplicate_optimizer_keys_are_rejected(monkeypatch):
   import optax
   from barl_jax.actors.sac import StochasticActor
-  from barl_jax.networks.critic import C51Critic
+  from barl_jax.critics import C51Critic
 
   duplicate = lambda self: {"shared": optax.identity()}
   monkeypatch.setattr(StochasticActor, "create_optimizer", duplicate)

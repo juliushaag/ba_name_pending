@@ -37,17 +37,7 @@ from pathlib import Path
 
 import yaml
 
-# config/toolkit.py loaded by path, the same way config/tree.py loads it: an absolute
-# `barl_jax.config...` import would trigger barl_jax/__init__ (jax, mujoco) in the
-# launcher, which is exactly what the by-path loading exists to avoid. scripts/
-# runs on a login node that must not pay for -- or inherit device vars from --
-# the full package.
-_CONFIGS_PATH = Path(__file__).resolve().parent.parent / "src" / "barl_jax" / "config" / "toolkit.py"
-_spec = importlib.util.spec_from_file_location("barl_jax_search_config_toolkit", _CONFIGS_PATH)
-_configs = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_configs)
-CONFIG_DIR = _configs.CONFIG_DIR
-load_yaml_with_includes = _configs.load_yaml_with_includes
+from barl_jax.config.toolkit import CONFIG_DIR, load_yaml_with_includes
 
 RESERVED = ("algo", "env", "seed")
 
@@ -170,7 +160,10 @@ def check_searchability(spec: dict, *, tree=None) -> list[str]:
       if not tree.policy_cfg(policy_name):
         continue
       pn = tree.policy_class_name(policy_name)
-      cls = Policy._classes.get(pn)
+      try:
+        cls = Policy.class_for(pn)
+      except KeyError:
+        cls = None
       if cls is None:
         continue
       if rest.startswith("params."):

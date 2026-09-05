@@ -1,0 +1,301 @@
+from barl_jax.checkpoints import load_policy
+from barl_jax.checkpoints import save_policy
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+import gymnasium as gym
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from flax import nnx
+
+from barl_jax.components import HParamsOwner, TRAINABLE
+import barl_jax.config.tree as model_config
+from barl_jax.config.model import ModelSpec
+from barl_jax.config.tree import ConfigTree
+from barl_jax.env import Environment
+from barl_jax.hparam import Config, HParam
+from barl_jax.policy import Policy
+from barl_jax import trainer
+from barl_jax.training_checkpoint import save_training
+
+
+class ToyEnv(gym.Env):
+  observation_space = gym.spaces.Box(-10, 10, (3,), dtype=np.float32)
+  action_space = gym.spaces.Box(-1, 1, (2,), dtype=np.float32)
+
+  def __init__(self, value=2.0):
+    self.value = value
+    self.closed = False
+
+  def reset(self, *, seed=None, options=None):
+    super().reset(seed=seed)
+    self.steps = 0
+    return np.full(3, self.value, np.float32), {}
+
+  def step(self, action):
+    self.steps += 1
+    return np.full(3, self.value, np.float32), 1.0, False, self.steps >= 4, {}
+
+  def close(self):
+    self.closed = True
+
+
+class ToyFamily(Environment):
+  stats = {"return_min": -10.0, "return_max": 10.0}
+
+  def __init__(self, value=7.0):
+    self.value = value
+    self.created = []
+
+  def get_env(self):
+    env = ToyEnv(self.value)
+    self.created.append(env)
+    return env
+
+  def get_dataset(self):
+    raise NotImplementedError
+
+
+def tiny_config(**overrides):
+  return ConfigTree(overrides={"components.actor.latent_dim": 8,
+                               "components.critic.latent_dim": 8, **overrides})
+
+
+def make_policy(config=None):
+  return Policy.make("SAC", ToyEnv(), config=config or tiny_config(), env_stats=ToyFamily().get_env_stats(ToyEnv()))
+
+
+def run_config(tmp_path):
+  from barl_jax.config.run import run_defaults
+  return {**run_defaults(), "model": "SAC", "env": "Toy", "num_seeds": 1,
+          "batch_size": 4, "total_env_steps": 16, "random_steps": 0,
+          "buffer_size": 16, "eval_video_every": None,
+          "run_dir": str(tmp_path), "compile_cache_dir": str(tmp_path / "cache"),
+          "model_overrides": tiny_config().overrides}
+
+
+def test_imports_do_not_initialize_runtime():
+  code = '''
+import sys
+import barl_jax
+import barl_jax.config.tree
+assert not set(("jax", "mujoco", "torch", "orbax")) & sys.modules.keys()
+from barl_jax.env import Environment
+assert "DogRun" in Environment.available()
+assert not set(("jax", "mujoco", "dm_control", "mani_skill", "humanoid_bench")) & sys.modules.keys()
+'''
+  subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_async_factory_keeps_instance_settings():
+  family = ToyFamily(9.0)
+  env = family.get_vector_env(2, asynchronous=True)
+  try:
+    obs, _ = env.reset(seed=0)
+    np.testing.assert_array_equal(obs, np.full((2, 3), 9.0))
+  finally:
+    env.close()
+
+
+@pytest.mark.parametrize("parent,child", [(HParam, Config), (Config, HParam)])
+def test_declaration_kind_can_change_in_subclass(parent, child):
+  class Base(HParamsOwner):
+    knob = parent(1)
+  class Child(Base):
+    knob = child(2)
+  assert Child()._decls["knob"].default == 2
+  assert ("knob" in Child._hparams) == (child is HParam)
+  assert ("knob" in Child._configs) == (child is Config)
+
+
+def test_model_spec_is_isolated_from_config_mutation():
+  config = tiny_config(**{"params.policy_delay": 2})
+  spec = ModelSpec.resolve("SAC", config)
+  config.overrides["params.policy_delay"] = 7
+  p = Policy.make("SAC", ToyEnv(), spec=spec, env_stats=ToyFamily().get_env_stats(ToyEnv()))
+  assert p.policy_delay == 2
+  data = spec.data()
+  data["params"]["policy_delay"] = 20
+  assert p.resolve_params()["policy_delay"] == 2
+
+
+def test_incompatible_objective_is_rejected_before_building():
+  config = tiny_config(**{"components.critic.class": "NCLQLCritic"})
+  assert any("does not support 'td'" in p for p in model_config.validate("SAC", config))
+  with pytest.raises(TypeError, match="does not support 'td'"):
+    make_policy(config)
+
+
+def test_running_normalization_handles_unequal_batches_and_constant_channels():
+  p = make_policy()
+  first = jnp.array([[1., 3., 5.], [3., 3., 7.]])
+  second = jnp.array([[5., 3., 9.]])
+  p.update_observation_stats(first)
+  p.update_observation_stats(second)
+  all_obs = np.concatenate([first, second])
+  np.testing.assert_allclose(p.obs_mean[...], all_obs.mean(0))
+  np.testing.assert_allclose(p.obs_std[...], all_obs.std(0), rtol=1e-6)
+  assert np.isfinite(p.normalize_observations(second)).all()
+  p.normalize_obs = False
+  p.update_observation_stats(second)
+  assert float(p.obs_count[...]) == 3
+  np.testing.assert_array_equal(p.normalize_observations(second), second)
+
+
+def test_checkpoint_uses_saved_class_and_does_not_mutate_config(tmp_path, monkeypatch):
+  policy = make_policy()
+  policy.update_observation_stats(jnp.ones((3, 3)))
+  save_policy(policy, tmp_path / "policy")
+  original_init = ConfigTree.__init__
+  def changed_defaults(self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    if self.snapshot is None:
+      self.models["SAC"] = {"policy": "Nonexistent"}
+  monkeypatch.setattr(ConfigTree, "__init__", changed_defaults)
+  restored = load_policy(tmp_path / "policy", ToyEnv(), ToyFamily().get_env_stats(ToyEnv()))
+  assert type(restored) is type(policy)
+  assert ConfigTree().policy_class_name("SAC") == "Nonexistent"
+  for a, b in zip(jax.tree.leaves(nnx.state(policy)), jax.tree.leaves(nnx.state(restored))):
+    if jax.dtypes.issubdtype(a.dtype, jax.dtypes.prng_key):
+      a, b = jax.random.key_data(a), jax.random.key_data(b)
+    np.testing.assert_array_equal(a, b)
+
+
+def test_future_checkpoint_version_fails_clearly(tmp_path):
+  policy = make_policy()
+  save_policy(policy, tmp_path / "policy")
+  path = tmp_path / "policy/meta.json"
+  meta = json.loads(path.read_text())
+  meta["format_version"] = 999
+  path.write_text(json.dumps(meta))
+  with pytest.raises(ValueError, match="Unsupported policy checkpoint version"):
+    load_policy(path.parent, ToyEnv())
+
+
+def test_setup_failure_closes_already_created_environments(tmp_path, monkeypatch):
+  family = ToyFamily()
+  monkeypatch.setattr(Environment, "make", lambda name: family)
+  def fail(*args, **kwargs):
+    raise RuntimeError("build failure")
+  monkeypatch.setattr(Policy, "make", fail)
+  with pytest.raises(RuntimeError, match="build failure"):
+    trainer.setup(run_config(tmp_path), 1)
+  assert family.created and all(env.closed for env in family.created)
+
+
+def test_validation_failure_closes_run(tmp_path, monkeypatch):
+  family = ToyFamily()
+  monkeypatch.setattr(Environment, "make", lambda name: family)
+  run = trainer.setup(run_config(tmp_path), 1)
+  def fail(*args, **kwargs):
+    raise RuntimeError("rollout failure")
+  monkeypatch.setattr(run.collector, "collect", fail)
+  with pytest.raises(RuntimeError, match="rollout failure"):
+    trainer.validate(run)
+  assert all(env.closed for env in family.created)
+
+
+def test_training_resume_restores_next_update_and_replay_rng(tmp_path, monkeypatch):
+  family = ToyFamily()
+  monkeypatch.setattr(Environment, "make", lambda name: family)
+  cfg = run_config(tmp_path)
+  with trainer.setup(cfg, 1) as original:
+    original.collector.random_fill(original.rollout_env, 8, seed=0, sink=original.buffer)
+    batch = original.buffer.sample(4)
+    original.state, *_ = trainer.seeded_step(original.graphdef, original.state, batch, (), jnp.asarray(0))
+    progress = {"env_steps": 8, "grad_steps": 1, "iteration": 1, "best": [1.]}
+    save_training(original, tmp_path / "resume", progress)
+    expected_batch = original.buffer.sample(4)
+    expected_state, *_ = trainer.seeded_step(original.graphdef, original.state, expected_batch, (), jnp.asarray(1))
+    resume_cfg = {**cfg, "checkpoint": str(tmp_path / "resume"), "checkpoint_mode": "resume"}
+    with trainer.setup(resume_cfg, 1) as restored:
+      assert restored.progress == progress
+      actual_batch = restored.buffer.sample(4)
+      for key in actual_batch:
+        np.testing.assert_array_equal(actual_batch[key], expected_batch[key])
+      actual_state, *_ = trainer.seeded_step(restored.graphdef, restored.state, actual_batch, (), jnp.asarray(1))
+      for a, b in zip(jax.tree.leaves(actual_state), jax.tree.leaves(expected_state)):
+        if jax.dtypes.issubdtype(a.dtype, jax.dtypes.prng_key):
+          a, b = jax.random.key_data(a), jax.random.key_data(b)
+        np.testing.assert_allclose(a, b, rtol=1e-6, atol=1e-7)
+      assert restored.collector.state is None
+
+
+class MemoryLogger:
+  def __init__(self, *args, step_keys, **kwargs):
+    self.steps = dict.fromkeys(step_keys, 0)
+    self.finished = False
+
+  def get_step(self, name):
+    return self.steps[name]
+
+  def advance(self, values):
+    for key, value in values.items():
+      self.steps[key] += value
+
+  def finish(self):
+    self.finished = True
+
+  def __getattr__(self, name):
+    return lambda *args, **kwargs: None
+
+
+def test_warmup_failure_closes_logger_and_all_environments(tmp_path, monkeypatch):
+  import barl_jax.logger as logging
+  family = ToyFamily()
+  loggers = []
+  def logger(*args, **kwargs):
+    instance = MemoryLogger(*args, **kwargs)
+    loggers.append(instance)
+    return instance
+  monkeypatch.setattr(Environment, "make", lambda name: family)
+  monkeypatch.setattr(logging, "Logger", logger)
+  def fail(*args):
+    raise RuntimeError("warmup failed")
+  monkeypatch.setattr(trainer, "warmup", fail)
+  run = trainer.setup(run_config(tmp_path), 1)
+  with pytest.raises(RuntimeError, match="warmup failed"):
+    trainer.train(run)
+  assert loggers[0].finished
+  assert all(env.closed for env in family.created)
+
+
+def test_complete_training_writes_resumable_state(tmp_path, monkeypatch):
+  import barl_jax.logger as logging
+  family = ToyFamily()
+  monkeypatch.setattr(Environment, "make", lambda name: family)
+  monkeypatch.setattr(logging, "Logger", MemoryLogger)
+  monkeypatch.setattr(trainer, "warmup", lambda *args: {})
+  cfg = {**run_config(tmp_path), "total_env_steps": 2, "buffer_size": 2}
+  run = trainer.setup(cfg, 1)
+  trainer.train(run)
+  result = json.loads((tmp_path / "objective.json").read_text())
+  assert result["status"] == "finished"
+  assert all(env.closed for env in family.created)
+  path = tmp_path / "checkpoints/resume"
+  with trainer.setup({**cfg, "checkpoint": str(path), "checkpoint_mode": "resume"}, 1) as restored:
+    assert restored.progress["env_steps"] == 2
+    assert restored.progress["grad_steps"] == 4
+
+
+def test_unversioned_checkpoints_are_rejected(tmp_path):
+  (tmp_path / "meta.json").write_text(json.dumps({"model": "SAC"}))
+  with pytest.raises(ValueError, match="Unsupported policy checkpoint version"):
+    load_policy(tmp_path, ToyEnv())
+
+
+def test_failed_checkpoint_write_keeps_previous_generation(tmp_path):
+  from barl_jax.checkpoints import checkpoint_directory
+  path = tmp_path / "checkpoint"
+  path.mkdir()
+  (path / "marker").write_text("previous")
+  with pytest.raises(RuntimeError):
+    with checkpoint_directory(path) as candidate:
+      (candidate / "marker").write_text("partial")
+      raise RuntimeError("disk failure")
+  assert (path / "marker").read_text() == "previous"

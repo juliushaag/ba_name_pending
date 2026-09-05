@@ -16,7 +16,7 @@ import jax
 import numpy as np
 import pytest
 
-from barl_jax.policy import run_episodes
+from barl_jax.evaluation import run_episodes
 
 ACT_DIM, OBS_DIM, EPISODE_LEN = 3, 4, 5
 ACT_SCALE, ACT_BIAS = 2.0, 0.5

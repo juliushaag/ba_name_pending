@@ -9,8 +9,8 @@ import barl_jax  # noqa: F401  -- populates the policy/component registries
 import barl_jax.config.tree as model_config
 
 
-def print_model(name: str) -> None:
-  cfg = model_config.explain(name)
+def print_model(name: str, config) -> None:
+  cfg = config.explain(name)
 
   header = f"{cfg['model']}  ->  {cfg['policy']}"
   if cfg["profile"]:
@@ -58,20 +58,20 @@ if __name__ == "__main__":
     if not sep:
       raise SystemExit(f"--set {assignment!r} is not of the form path=value")
     overrides[path.strip()] = yaml.safe_load(value)
-  model_config.set_overrides(overrides)
+  config = model_config.ConfigTree(overrides=overrides)
 
-  names = kwargs.models or model_config.available_models()
+  names = kwargs.models or config.available_models()
 
   if kwargs.json:
     import json
-    print(json.dumps({name: model_config.resolved_flat(name) for name in names},
+    print(json.dumps({name: config.resolved(name) for name in names},
                      indent=2, sort_keys=True, default=str))
     raise SystemExit(0)
 
   problems = []
   for name in names:
-    print_model(name)
-    problems += [f"{name}: {p}" for p in model_config.validate(name)]
+    print_model(name, config)
+    problems += [f"{name}: {p}" for p in model_config.validate(name, config)]
 
   if problems:
     print("\nPROBLEMS (these abort a run -- see model_config.validate)")

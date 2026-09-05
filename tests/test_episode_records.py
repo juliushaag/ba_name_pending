@@ -10,7 +10,7 @@ backwards silently reports a policy that never succeeds as a perfect one.
 import numpy as np
 import pytest
 
-from barl_jax.policy import episode_success
+from barl_jax.evaluation import episode_success
 
 
 def vector_info(success, present=None):

@@ -1,34 +1,11 @@
 """Run-config declarations and loading."""
 
-import importlib.util
-from pathlib import Path
-
-# `CONFIG_DIR`/`load_yaml_with_includes`/`Config` are loaded by path, not as
-# `barl_jax.config.toolkit`/`barl_jax.hparam`: this module is itself loaded by
-# path from `barl_jax/config/tree.py` (which scripts/grid.py in turn loads by
-# path) specifically so a CPU-only launcher process reading `RUN_CONFIGS`
-# never triggers a real `import barl_jax` -- its `__init__` pulls in
-# jax/mujoco. A real dotted import here would defeat that regardless of how
-# *this* module was loaded, since Python always initializes the parent
-# package first. `ConfigTree` has no such constraint (see below) since
-# nothing at this module's top level needs it.
-def _load_by_path(name: str, path: Path):
-  spec = importlib.util.spec_from_file_location(name, path)
-  module = importlib.util.module_from_spec(spec)
-  spec.loader.exec_module(module)
-  return module
-
-
-_config_dir = Path(__file__).resolve().parent
-_toolkit = _load_by_path("barl_jax_config_run_toolkit", _config_dir / "toolkit.py")
-_hparam  = _load_by_path("barl_jax_config_run_hparam", _config_dir.parent / "hparam.py")
-
-CONFIG_DIR              = _toolkit.CONFIG_DIR
-load_yaml_with_includes = _toolkit.load_yaml_with_includes
-Config                  = _hparam.Config
+from barl_jax.config.toolkit import CONFIG_DIR, load_yaml_with_includes
+from barl_jax.hparam import Config
 
 RUN_CONFIGS: dict[str, Config] = {
   "checkpoint": Config(None),
+  "checkpoint_mode": Config("weights"),
   "seed": Config(0),
   "num_seeds": Config(3),
   "validate": Config(False),
@@ -73,7 +50,10 @@ def run_keys(root=CONFIG_DIR) -> set:
 
 def _env_defaults(env_name: str) -> dict:
   from barl_jax.env import Environment
-  cls = Environment._classes.get(env_name)
+  try:
+    cls = Environment.class_for(env_name)
+  except KeyError:
+    cls = None
   return cls.merged_defaults() if cls is not None else {}
 
 

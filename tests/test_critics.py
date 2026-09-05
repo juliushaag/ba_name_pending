@@ -8,6 +8,8 @@ Grouped a few assertions to a test on purpose: an eager `Ensemble` forward costs
 real time, so each test re-uses one `raw()` rather than paying for its own.
 """
 
+from barl_jax.objectives import td_loss, noise_td_loss
+
 import jax
 import jax.numpy as jnp
 import pytest
@@ -15,7 +17,7 @@ from flax import nnx
 
 from barl_jax.networks.registry import get_component
 from barl_jax.policies.lql import NoiseConditionedCritic
-from barl_jax.policy import TRAINABLE, frozen
+from barl_jax.components import TRAINABLE, frozen
 
 from conftest import (BATCH, CRITICS, build, built, critic_action, finite,
                       target_expectation)
@@ -103,7 +105,7 @@ def test_loss_is_differentiable(name, obs, act):
 
     def loss_fn(critic):
         losses = {}
-        critic.loss(obs, a, obs[::-1], a, REWARD, jnp.zeros((BATCH,)), losses)
+        td_loss(critic, obs, a, obs[::-1], a, REWARD, jnp.zeros((BATCH,)), losses)
         assert set(losses) == {"critic"}
         return losses["critic"]
 
@@ -125,7 +127,7 @@ def test_noise_conditioned_loss_is_differentiable(name, obs, act):
 
     def loss_fn(critic):
         losses = {}
-        critic.loss(obs, act, obs[::-1], act, REWARD, jnp.zeros((BATCH,)),
+        noise_td_loss(critic, obs, act, obs[::-1], act, REWARD, jnp.zeros((BATCH,)),
                     sigmas, jax.random.PRNGKey(0), losses)
         assert set(losses) == {"critic"}
         return losses["critic"]

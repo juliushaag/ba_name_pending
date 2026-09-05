@@ -11,6 +11,10 @@ an enclosing jit the step is dispatched op-by-op and costs ~4x more at N=1 and
 ~2x at N=10.
 """
 
+from barl_jax.checkpoints import load_policy
+from barl_jax.checkpoints import save_policy
+
+from contextlib import ExitStack
 import datetime
 import hashlib
 import json
@@ -27,10 +31,14 @@ from flax import nnx
 
 import barl_jax.config.tree as model_config
 from barl_jax.env import Environment
-from barl_jax.logger import Logger
 from barl_jax.metrics import DEBUG, PRIMARY, DebugMetric, Metric, collect, recording, to_host
-from barl_jax.policy import TRAINABLE, Policy, StackedPolicy, gating, run_episodes, split_metrics, stack, unstack
+from barl_jax.components import TRAINABLE, gating
+from barl_jax.policy import Policy
+from barl_jax.multiseed import StackedPolicy, split_metrics, stack, unstack
+from barl_jax.evaluation import run_episodes
 from barl_jax.rollout import MultiSeedReplay
+from barl_jax.collection import Collector
+from barl_jax.training_checkpoint import read_training, restore_training, save_training, validate_resume
 
 
 @partial(jax.jit, static_argnums=(0, 3))
@@ -41,6 +49,9 @@ def train_step(graphdef, state, batch, tiers, grad_step=None):
   def scalar_loss(policy):
     policy.record_batch(batch)
     losses = policy.train_step(batch)
+    expected = set(policy.create_optimizer())
+    if set(losses) != expected:
+      raise ValueError(f"Loss keys {sorted(losses)} differ from optimizer keys {sorted(expected)}")
     return sum(losses.values()), losses
 
   def loss_fn(policy):
@@ -49,6 +60,7 @@ def train_step(graphdef, state, batch, tiers, grad_step=None):
     return total, (losses, sown, sown_debug)
 
   with recording(*tiers), gating(grad_step):
+    policy.update_observation_stats(batch["obs"])
     policy.before_step()
     (_, (losses, sown, sown_debug)), grads = nnx.value_and_grad(
       loss_fn, argnums=nnx.DiffState(0, TRAINABLE), has_aux=True)(policy)
@@ -157,57 +169,98 @@ class Run:
   than each rebuilding the world."""
 
   def __init__(self, cfg, num_seeds):
+    self.resources = ExitStack()
     self.cfg = cfg
     self.num_seeds = num_seeds
     self.model_name, self.env_name = cfg["model"], cfg["env"]
     self.base_seed = cfg["seed"]
     self.num_envs = cfg["num_envs"]
+    self.progress = {}
+
+  def own(self, resource):
+    self.resources.callback(resource.close)
+    return resource
+
+  def __enter__(self):
+    return self
+
+  def __exit__(self, *exc):
+    return self.resources.__exit__(*exc)
 
 
 def setup(cfg: dict, num_seeds: int, *, validate_only: bool = False) -> Run:
   run = Run(cfg, num_seeds)
-  np.random.seed(run.base_seed)
+  try:
+    return _setup(run, validate_only=validate_only)
+  except BaseException:
+    run.resources.close()
+    raise
+
+
+def _setup(run, *, validate_only):
+  cfg, num_seeds = run.cfg, run.num_seeds
   enable_compilation_cache(cfg["compile_cache_dir"])
 
-  # Unconditional: also resets anything left over from a previous run in this
-  # process's `runs:` series when the current run doesn't carry one.
-  model_config.set_snapshot(cfg.get("snapshot"))
-  model_config.set_overrides(cfg.get("model_overrides"))
-
-  problems = model_config.validate(run.model_name)
+  mode = cfg.get("checkpoint_mode", "weights")
+  if mode not in ("weights", "resume"):
+    raise ValueError("checkpoint_mode must be weights or resume")
+  resume_meta = None
+  if mode == "resume":
+    if cfg["checkpoint"] is None:
+      raise ValueError("checkpoint_mode: resume requires checkpoint")
+    resume_meta = read_training(cfg["checkpoint"])
+    validate_resume(cfg, num_seeds, resume_meta)
+    cfg = run.cfg = {**cfg, **{key: resume_meta["config"].get(key)
+                            for key in ("snapshot", "model_overrides")}}
+  if cfg["checkpoint"] and mode == "weights":
+    from barl_jax.checkpoints import policy_spec
+    saved_spec, _ = policy_spec(cfg["checkpoint"])
+    cfg = run.cfg = {**cfg, "snapshot": saved_spec.data()["snapshot"],
+                     "model_overrides": saved_spec.data()["overrides"]}
+  run.config = model_config.ConfigTree(snapshot=cfg.get("snapshot"), overrides=cfg.get("model_overrides"))
+  problems = model_config.validate(run.model_name, run.config)
   if problems:
     raise ValueError(f"{run.model_name}: unusable model config, refusing to start:\n  "
                      + "\n  ".join(problems))
 
   run.environment = Environment.make(run.env_name)
-  run.env = run.environment.get_env()       # single env: spaces and EnvStats
+  run.env = run.own(run.environment.get_env())       # single env: spaces and EnvStats
   run.env_stats = run.environment.get_env_stats(run.env)
 
   num_envs = 1 if validate_only else run.num_envs
   run.num_envs = num_envs
-  run.rollout_env = run.environment.get_vector_env(num_seeds * num_envs)
+  run.rollout_env = run.own(run.environment.get_vector_env(num_seeds * num_envs))
   # A seed's buffer never receives more than total_env_steps transitions --
   # preallocating past that just reserves address space (and, as training
   # fills it in, real RAM) no run will ever use.
   buffer_size = min(cfg["buffer_size"], cfg["total_env_steps"])
-  run.buffer = MultiSeedReplay(num_seeds, num_envs, buffer_size)
+  run.collector = Collector(seed=run.base_seed)
+  run.buffer = MultiSeedReplay(num_seeds, num_envs, buffer_size, seed=run.base_seed)
 
   checkpoint = cfg["checkpoint"]
   if checkpoint is None:
     policies = [Policy.make(run.model_name, run.env, env_stats=run.env_stats,
-                            seed=run.base_seed + i, chunk_size=cfg["chunk_size"])
+                            seed=run.base_seed + i, chunk_size=cfg["chunk_size"], config=run.config)
                 for i in range(num_seeds)]
-  elif num_seeds > 1:
-    raise NotImplementedError(
-      f"checkpoint={checkpoint!r}: a checkpoint holds one seed's state, so it cannot "
-      f"resume a {num_seeds}-seed vmapped run -- restart with num_seeds: 1.")
   elif not os.path.exists(checkpoint):
     raise FileNotFoundError(f"checkpoint={checkpoint!r}: no such directory")
+  elif resume_meta is not None:
+    policies = [load_policy(os.path.join(checkpoint, f"seed{i}"), run.env, run.env_stats)
+                for i in range(num_seeds)]
   else:
-    # load_any, not Policy.load(run.model_name, ...): the meta sidecar carries the
-    # registered class name, so resuming under a `model:` alias resolves to the
-    # policy class that was saved instead of missing from the registry.
-    policies = [Policy.load_any(checkpoint, run.env, run.env_stats, chunk_size=cfg["chunk_size"])]
+    policies = [load_policy(checkpoint, run.env, run.env_stats) for _ in range(num_seeds)]
+    for i, policy in enumerate(policies):
+      policy.train_steps[...] = jnp.zeros_like(policy.train_steps[...])
+      policy.rngs = nnx.Rngs(run.base_seed + i)
+      for component in policy.components.values():
+        if hasattr(component, "target_steps"):
+          component.target_steps[...] = jnp.zeros_like(component.target_steps[...])
+    if policies[0].chunk_size != cfg["chunk_size"]:
+      raise ValueError("Checkpoint chunk_size differs from the run")
+
+  expected_name, _ = run.config.resolve_model_name(run.model_name)
+  if policies[0].model_name != expected_name:
+    raise ValueError(f"Checkpoint model {policies[0].model_name!r} differs from {expected_name!r}")
 
   if policies[0].on_policy:
     raise NotImplementedError(
@@ -224,6 +277,8 @@ def setup(cfg: dict, num_seeds: int, *, validate_only: bool = False) -> Run:
   # Constant for the run, and a full walk of the state tree (1.7 ms) -- at
   # `rollout_steps: 1` it was 6% of a single-seed run to recompute it per
   # iteration. Measured once here and logged from the cache.
+  if resume_meta is not None:
+    restore_training(run, checkpoint, resume_meta)
   run.num_params = run.reference.num_params()
   return run
 
@@ -286,10 +341,10 @@ def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
 
     policy, _ = unstack(run.graphdef, run.state, i)
     root = _checkpoint_dir(run, ckpt_dir, i)
-    policy.save(os.path.join(root, "latest"))
+    save_policy(policy, os.path.join(root, "latest"))
     if reward > best[i]:
       best[i] = reward
-      policy.save(os.path.join(root, "best"))
+      save_policy(policy, os.path.join(root, "best"))
 
   ckpt_s = time.perf_counter() - t0
 
@@ -303,7 +358,7 @@ def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
     log.log({}, quiet={"eval/phase": PHASE_EVAL_VIDEO})
     t0 = time.perf_counter()
     policy, _ = unstack(run.graphdef, run.state, 0)
-    for v, r in enumerate(policy._run_episodes(render_env, n_videos, render=True)):
+    for v, r in enumerate(run_episodes(policy, render_env, n_videos, render=True)):
       log.log_video(f"eval/video_{v}", r["frames"])
     video_s = time.perf_counter() - t0
 
@@ -354,7 +409,7 @@ def wandb_config(run: Run) -> dict:
   no `cfg.get(key, default)` left anywhere for a value to hide behind. `snapshot`
   is the same thing nested, kept so a finished run can be replayed exactly."""
   cfg = run.cfg
-  snapshot = cfg.get("snapshot") or model_config.snapshot_for(run.model_name)
+  snapshot = run.reference._snapshot
   resolved = snapshot["resolved"]
 
   env_stats = {}
@@ -446,6 +501,12 @@ def warmup(run: Run, envs, log) -> dict:
 
 
 def train(run: Run):
+  with run:
+    return _train(run)
+
+
+def _train(run: Run):
+  from barl_jax.logger import Logger
   cfg, num_seeds = run.cfg, run.num_seeds
   now  = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
   name = f"{run.model_name.lower()}/{run.env_name.lower()}/{now}_x{num_seeds}"
@@ -457,8 +518,8 @@ def train(run: Run):
 
   # `num_seeds * eval_runs` wide so every seed's episodes run in one vmapped
   # pass -- still narrower than the rollout env, which is num_seeds * num_envs.
-  eval_envs = (run.environment.get_vector_env(num_seeds * cfg["eval_runs"]),
-               run.environment.get_vector_env(n_videos, asynchronous=False) if n_videos else None)
+  eval_envs = (run.own(run.environment.get_vector_env(num_seeds * cfg["eval_runs"])),
+               run.own(run.environment.get_vector_env(n_videos, asynchronous=False)) if n_videos else None)
 
   tags = [run.model_name, run.env_name, "online", "jax", "multiseed"]
   if cfg["sweep_tag"]:
@@ -470,6 +531,8 @@ def train(run: Run):
     finish_timeout=cfg["wandb_finish_timeout"],
     seeds=[run.base_seed + i for i in range(num_seeds)]
   )
+
+  run.resources.callback(log.finish)
 
   log.register("eval/*", "env_steps")
   log.register("rollout/*", "env_steps")
@@ -498,16 +561,22 @@ def train(run: Run):
 
   steps_per_iter = cfg["rollout_steps"] // run.num_envs
 
-  if cfg["random_steps"] > 0:
-    run.buffer.random_fill(run.rollout_env, n_steps=cfg["random_steps"] // run.num_envs,
+  if cfg["random_steps"] > 0 and not run.progress:
+    run.collector.random_fill(run.rollout_env, n_steps=cfg["random_steps"] // run.num_envs,
                            seed=run.base_seed, chunk_size=run.reference.chunk_size,
-                           discount=run.reference.critic.gamma)
+                           discount=run.reference.discount, sink=run.buffer)
     log.message(f"Random-filled the buffer with {cfg['random_steps']} env steps before training")
 
-  best = [float("-inf")] * num_seeds
+  if run.progress:
+    log.advance({key: run.progress[key] for key in ("env_steps", "grad_steps")})
+    log.message("Resumed optimizer, replay and counters; environment episodes restart")
+  best = run.progress.get("best", [float("-inf")] * num_seeds)
   eval_every, next_eval = cfg["eval_every"], cfg["eval_every"]
   video_every, next_video = cfg["eval_video_every"], cfg["eval_video_every"]
-  it = 0
+  next_eval = (log.get_step("env_steps") // eval_every + 1) * eval_every
+  if video_every is not None:
+    next_video = (log.get_step("env_steps") // video_every + 1) * video_every
+  it = run.progress.get("iteration", 0)
   chunk_seen = False
   run_started = time.perf_counter()
   # `rollout_steps` may be as small as `num_envs` (one env step per slot per
@@ -523,13 +592,15 @@ def train(run: Run):
     while log.get_step("env_steps") < cfg["total_env_steps"]:
       iter_start = time.perf_counter()
       actor = StackedPolicy(run.graphdef, run.state, num_seeds, run.num_envs, run.reference)
-      rollout_stats = run.buffer.rollout(actor, env=run.rollout_env, n_steps=steps_per_iter,
-                                         seed=run.base_seed if it == 0 else None)
+      rollout_stats = run.collector.collect(actor, env=run.rollout_env, n_steps=steps_per_iter,
+                                         seed=run.base_seed + int(run.progress.get("env_steps", 0))
+                                         if run.collector.state is None else None,
+                                         discount=actor.discount, sink=run.buffer)
       rollout_time = time.perf_counter() - iter_start
       log.advance({"env_steps": cfg["rollout_steps"]})
 
       log.log_per_seed([{f"rollout/{k}": v for k, v in seed.items()}
-                        for seed in run.buffer.last_rollout_per_seed()],
+                        for seed in run.collector.per_seed(run.num_seeds, run.num_envs)],
                        panel={f"rollout/{k}": v for k, v in rollout_stats.items()})
 
       grad_steps_this_iter = round(cfg["rollout_steps"] * cfg["utd_ratio"])
@@ -648,6 +719,11 @@ def train(run: Run):
                **eval_phases, **warmup_stats}
       log.log(stats)
       it += 1
+      run.progress = {"env_steps": int(log.get_step("env_steps")),
+                      "grad_steps": int(log.get_step("grad_steps")),
+                      "iteration": it, "best": list(best)}
+      if eval_time > 0:
+        save_training(run, os.path.join(ckpt_dir, "resume"), run.progress)
   except BaseException as exc:
     crash = exc
     raise
@@ -655,9 +731,12 @@ def train(run: Run):
     try:
       for i in range(num_seeds):
         policy, _ = unstack(run.graphdef, run.state, i)
-        policy.save(os.path.join(_checkpoint_dir(run, ckpt_dir, i), "final"))
+        save_policy(policy, os.path.join(_checkpoint_dir(run, ckpt_dir, i), "final"))
     except Exception as save_error:
       log.message(f"Could not write the final checkpoint: {save_error!r}")
+
+    if crash is None:
+      save_training(run, os.path.join(ckpt_dir, "resume"), run.progress)
 
     if crash is not None:
       log.message(f"Run failed: {type(crash).__name__}: {crash}")
@@ -668,17 +747,21 @@ def train(run: Run):
                      env_steps=int(log.get_step("env_steps")), best=best,
                      status="failed" if crash is not None else "finished")
 
-    close(run, eval_envs)
-    log.finish()
+
 
 
 def validate(run: Run):
+  with run:
+    return _validate(run)
+
+
+def _validate(run: Run):
   """Cheap smoke test for `--validate` sweeps: one rollout chunk + one
   train_step + optimizer step, no eval/checkpointing/wandb logging."""
   cfg = run.cfg
   actor = StackedPolicy(run.graphdef, run.state, run.num_seeds, run.num_envs, run.reference)
-  run.buffer.rollout(actor, env=run.rollout_env, n_steps=cfg["batch_size"],
-                     seed=run.base_seed)
+  run.collector.collect(actor, env=run.rollout_env, n_steps=cfg["batch_size"],
+                     seed=run.base_seed, discount=actor.discount, sink=run.buffer)
 
   batch = run.buffer.sample(cfg["batch_size"])
   run.state, losses, primary, debug = seeded_step(run.graphdef, run.state, batch,
@@ -692,15 +775,6 @@ def validate(run: Run):
   shown = "  ".join(f"{k}={float(np.mean(v)):+.4f}" for k, v in sorted(losses.items()))
   print(f"  validate OK: {shown}  "
         f"({len(primary[0])} primary / {len(debug[0])} debug metrics)")
-  close(run)
-
-
-def close(run: Run, eval_envs=()):
-  run.env.close()
-  run.rollout_env.close()
-  for e in eval_envs:
-    if e is not None:
-      e.close()
 
 
 def _write_objective(objective_dir: str, *, model: str, env: str, seed: int,

@@ -47,11 +47,11 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"wandb\..
 
 import jax
 
-from barl_jax.config import load_config
+from barl_jax.config.run import load_config
 from barl_jax.trainer import setup, train, validate
 
-DEFAULT_CONFIG = os.path.join(os.path.dirname(__file__), "..", "config", "experiments",
-                              "online_learning.yaml")
+from barl_jax.config.toolkit import CONFIG_DIR
+DEFAULT_CONFIG = str(CONFIG_DIR / "experiments" / "online_learning.yaml")
 
 
 def require_accelerator() -> None:
@@ -82,7 +82,7 @@ def require_accelerator() -> None:
 if __name__ == "__main__":
   args = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
   args.add_argument("--config", default=DEFAULT_CONFIG,
-                    help="Path to a YAML experiment config (see config/experiments/online_learning.yaml). "
+                    help="Path to a YAML experiment config (see src/barl_jax/defaults/experiments/online_learning.yaml). "
                          "Lists one or more {model, env, ...} runs, executed in series.")
   args.add_argument("--seeds", type=int, default=None,
                     help="How many seeds to run vmapped in this process. "

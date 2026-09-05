@@ -9,7 +9,7 @@ from barl_jax.hparam import Config, HParam
 from barl_jax.networks.ensemble import Ensemble
 from barl_jax.networks.mlp import MLP, MLP_PRESETS
 from barl_jax.networks.optim import adam, CriticOptim
-from barl_jax.policy import TARGET_SUFFIX, Buffer, Critic, frozen
+from barl_jax.components import TARGET_SUFFIX, Buffer, Critic, frozen
 
 
 class CriticLossConfig:
@@ -32,7 +32,7 @@ class Polyak:
 
 
 class QCriticBase(CriticLossConfig, CriticOptim, Critic):
-  noise_conditioned = False
+  learning_objective = "td"
 
   def __init__(self, env_stats, config: ConfigMixin, q_function, **kwargs):
     super().__init__(env_stats, config, **kwargs)
@@ -143,16 +143,7 @@ class QCriticBase(CriticLossConfig, CriticOptim, Critic):
     losses["critic"] = self.regression_loss(raw, target)
     self.record(raw, target)
 
-  def loss(self, obs, action, next_obs, next_action, reward, term,
-              losses: dict, shift=0.0, horizon=None) -> None:
-    if self.has_target:
-      pred_raw = self.raw(obs, action)
-      next_raw = self.target_raw(next_obs, next_action)
-    else:
-      pred_raw, next_raw = self.raw_batches((obs, action), (next_obs, next_action))
-    target = self.bellman_target(reward, term, self.bootstrap_from_raw(next_raw), shift,
-                                 horizon=horizon)
-    self.loss_from_raw(pred_raw, target, losses)
+
 
 
 class ConcatQ(nnx.Module):

@@ -13,7 +13,7 @@ from barl_jax.networks.diffusion import TimeConditionedField, reverse_chain
 from barl_jax.networks.optim import adam, ActorOptim
 from barl_jax.networks.registry import get_component, register_component
 from barl_jax.networks.schedule import Schedule
-from barl_jax.policy import Actor, Buffer, Critic, frozen
+from barl_jax.components import Actor, Buffer, Critic, frozen
 
 
 def _inv_sigmoid(y: float) -> float:

@@ -17,10 +17,12 @@ import gymnasium as gym
 import jax
 import jax.numpy as jnp
 
+from barl_jax.objectives import td_loss
 from barl_jax.hparam import Config, HParam
-from barl_jax.networks.critic import QCriticBase
+from barl_jax.critics import QCriticBase
 from barl_jax.networks.regulator import AutotuneRegulator
-from barl_jax.policy import Actor, Policy, gated_losses, register_policy
+from barl_jax.components import Actor, gated_losses
+from barl_jax.policy import Policy, register_policy
 
 
 @register_policy
@@ -32,6 +34,7 @@ class RLPolicy(Policy):
   adds no entropy term to its own objective needs no dual at all."""
 
   SLOTS = ("critic", "actor")
+  SLOT_OBJECTIVES = {"critic": "td"}
   policy_delay = HParam(1, descr="grad steps between actor/dual updates (critic steps every step)")
   normalize_obs = Config(True)
 
@@ -43,13 +46,6 @@ class RLPolicy(Policy):
     chunked = self.env_stats.derive(act_dim=self.env_stats["chunked_act_dim"])
     self.critic: QCriticBase = self.build_component("critic", QCriticBase,
                                                     env_stats=chunked)
-    # The build gate is QCriticBase, which a noise-conditioned critic satisfies
-    # -- but its `loss` is a wider signature this template's one-backward
-    # `critic.loss(..., shift=...)` call cannot drive. Refuse the pairing here
-    # rather than letting it pass the gate and fail at the first train_step.
-    assert not getattr(self.critic, "noise_conditioned", False), (
-      f"{self.model_name}: {type(self.critic).__name__} is noise-conditioned and trains "
-      f"through its own wider loss -- it belongs under the NCLQL policy, not this template.")
     self.actor: Actor        = self.build_component("actor", Actor)
     # No cadence/optimizer-key guard here: `self.optimizer_cadence()` is a
     # virtual call, and a MaxEntRLPolicy subclass hasn't built `self.entropy`
@@ -75,6 +71,10 @@ class RLPolicy(Policy):
 
   # ---------------------------------------------------------------------
 
+  @property
+  def discount(self):
+    return self.critic.gamma
+
   def train_step(self, batch):
     obs      = self._obs(batch["obs"])
     next_obs = self._obs(batch["next_obs"])
@@ -98,7 +98,7 @@ class RLPolicy(Policy):
       self.actor.generate_action(next_obs, critic=self.critic, key=keys[0]))
     next_action = next_action.reshape(next_action.shape[0], -1)
 
-    self.critic.loss(obs, action, next_obs, next_action, reward, term,
+    td_loss(self.critic, obs, action, next_obs, next_action, reward, term,
                      losses, shift=self.target_shift(alpha, entropy), horizon=horizon)
 
     # Skipped outright on the steps `policy_delay` would mask the update on

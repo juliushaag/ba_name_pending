@@ -3,6 +3,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from barl_jax.objectives import noise_td_loss
 from barl_jax.hparam import Config, HParam
 from barl_jax.critics.nclql import (
   NCLQLC51Critic,
@@ -11,7 +12,8 @@ from barl_jax.critics.nclql import (
   NoiseConditionedCritic,
 )
 from barl_jax.metrics import DEBUG
-from barl_jax.policy import Buffer, Policy, frozen, register_policy
+from barl_jax.components import Buffer, frozen
+from barl_jax.policy import Policy, register_policy
 from barl_jax.networks.schedule import Schedule
 
 
@@ -41,6 +43,7 @@ class NCLQL(Policy):
   level L-1 == sigma_L (clean); annealing runs 0 -> L-1."""
 
   SLOTS = ("critic", "sigmas")
+  SLOT_OBJECTIVES = {"critic": "noise_td"}
 
   # The annealed-Langevin sampler's knobs, each with its reference's default as
   # the class default; a model YAML's `params:` overrides the ones that differ.
@@ -139,6 +142,10 @@ class NCLQL(Policy):
 
     return a, score_norm
 
+  @property
+  def discount(self):
+    return self.critic.gamma
+
   def train_step(self, batch):
     obs      = self.normalize_observations(batch["obs"])
     next_obs = self.normalize_observations(batch["next_obs"])
@@ -153,7 +160,7 @@ class NCLQL(Policy):
     next_action, score_norm = self.sample(next_obs, keys[0])
     next_action = jax.lax.stop_gradient(next_action)
 
-    self.critic.loss(obs, action, next_obs, next_action, reward, term,
+    noise_td_loss(self.critic, obs, action, next_obs, next_action, reward, term,
                      self.sigmas[...], keys[1], losses, horizon=horizon)
 
     self.metrics.vec("action", next_action.reshape(

@@ -7,7 +7,7 @@ from barl_jax.hparam import Config, HParam
 from barl_jax.networks.flow import TIME_STYLES, TimeEmbedding
 from barl_jax.networks.mlp import MLP_PRESETS
 from barl_jax.networks.registry import register_component
-from barl_jax.policy import HParamsOwner
+from barl_jax.components import HParamsOwner
 
 from .base import Polyak
 from .categorical import C51Critic, HLGaussCritic
@@ -15,7 +15,7 @@ from .ensemble import EnsembleCritic
 
 
 class NoiseConditionedCritic(HParamsOwner):
-  noise_conditioned = True
+  learning_objective = "noise_td"
 
   time_emb  = Config("fourier", style=TIME_STYLES)
   smoothing_coef = HParam(1.0)
@@ -40,32 +40,7 @@ class NoiseConditionedCritic(HParamsOwner):
     embed = self.encoder_target if target and self.has_target else self.encoder
     return jnp.concatenate([act, embed(level.astype(jnp.float32)[:, None])], axis=-1)
 
-  def loss(self, obs, action, next_obs, next_action, reward, term,
-                             sigmas, key, losses: dict, shift=0.0, horizon=None) -> None:
-    clean_level = sigmas.shape[0] - 1
 
-    level_key, noise_key = jax.random.split(key)
-    levels = jax.random.randint(level_key, (action.shape[0],), 0, clean_level)
-    noisy  = action + sigmas[levels][:, None] * jax.random.normal(
-      noise_key, action.shape, action.dtype)
-
-    pred_clean, pred_noisy = self.raw_batches(
-      (obs, self.augment(action, clean_level)),
-      (obs, self.augment(noisy, levels)),
-    )
-
-    next_raw  = self.target_raw(next_obs, self.augment(next_action, clean_level, target=True))
-    td_target = self.bellman_target(reward, term, self.bootstrap_from_raw(next_raw), shift,
-                                    horizon=horizon)
-
-    td_loss = self.regression_loss(pred_clean, td_target)
-    smoothing_loss = self.regression_loss(pred_noisy, self.target_from_raw(pred_clean))
-
-    losses["critic"] = td_loss + self.smoothing_coef * smoothing_loss
-
-    self.record(pred_clean, td_target)
-    self.metrics.scalar("td_loss", td_loss)
-    self.metrics.scalar("smoothing_loss", smoothing_loss)
 
 
 @register_component

@@ -2,8 +2,9 @@ import gymnasium as gym
 import numpy as np
 import pytest
 
-from barl_jax.policy import StackedPolicy, stack, unstack
-from barl_jax.rollout import MultiSeedReplay, RandomPolicy, ReplayBuffer
+from barl_jax.multiseed import StackedPolicy, stack, unstack
+from barl_jax.rollout import MultiSeedReplay, ReplayBuffer
+from barl_jax.collection import Collector, RandomPolicy
 
 
 def _stacked_fixture(num_seeds: int):
@@ -12,7 +13,8 @@ def _stacked_fixture(num_seeds: int):
   build; the routing under test is the Policy-agnostic part."""
   from flax import nnx
   from barl_jax.env import Environment
-  from barl_jax.policy import TRAINABLE, Policy
+  from barl_jax.components import TRAINABLE
+  from barl_jax.policy import Policy
 
   environment = Environment.make("HalfCheetah")
   env = environment.get_env()
@@ -171,8 +173,8 @@ def _rollout_fields(term_at, n_steps=7):
     [lambda: _Counting(term_at), lambda: _Counting(99)],
     autoreset_mode=gym.vector.AutoresetMode.DISABLED)
   buffer = ReplayBuffer(1000)
-  buffer.rollout(RandomPolicy(env.single_action_space, seed=0), env,
-                 n_steps=n_steps, seed=0)
+  Collector().collect(RandomPolicy(env.single_action_space, seed=0), env,
+                 n_steps=n_steps, seed=0, sink=buffer)
   n = buffer.n_transitions
   return {k: v[:n] for k, v in buffer._fields.items()}
 
@@ -211,7 +213,7 @@ def test_rollout_executes_chunked_actions_and_discards_done_tail():
     [[0.75], [0.5], [0.25]],
   ])
 
-  buffer.rollout(policy, env, n_steps=5, seed=0)
+  Collector().collect(policy, env, n_steps=5, seed=0, sink=buffer)
   # One replay row per completed/cut-short chunk, not per primitive step.
   assert buffer.n_transitions == 2
   plans = buffer._fields["act"][:buffer.n_transitions]

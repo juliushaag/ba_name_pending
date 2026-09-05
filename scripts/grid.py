@@ -28,28 +28,11 @@ import yaml
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT  = os.path.dirname(SCRIPT_DIR)
-CONFIG_DIR = os.path.join(REPO_ROOT, "config")
-DEFAULT_BASE_CONFIG = os.path.join(CONFIG_DIR, "experiments", "online_learning.yaml")
 
-# Config modules are loaded by path so the launcher stays free of barl_jax's
-# heavyweight package import (jax, mujoco) until it actually needs the
-# registries to freeze a snapshot for a concrete run.
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
-os.environ.setdefault("MUJOCO_GL", "egl")
 
-_TOOLKIT_PATH = Path(REPO_ROOT) / "src" / "barl_jax" / "config" / "toolkit.py"
-_toolkit_spec = importlib.util.spec_from_file_location("barl_jax_grid_config_toolkit", _TOOLKIT_PATH)
-_toolkit = importlib.util.module_from_spec(_toolkit_spec)
-_toolkit_spec.loader.exec_module(_toolkit)
-
-_TREE_PATH = Path(REPO_ROOT) / "src" / "barl_jax" / "config" / "tree.py"
-_tree_spec = importlib.util.spec_from_file_location("barl_jax_grid_config_tree", _TREE_PATH)
-_tree = importlib.util.module_from_spec(_tree_spec)
-_tree_spec.loader.exec_module(_tree)
-
-CONFIG_DIR = _toolkit.CONFIG_DIR
-resolve_includes = _toolkit.resolve_includes
-ConfigTree = _tree.ConfigTree
+from barl_jax.config.toolkit import CONFIG_DIR, resolve_includes
+from barl_jax.config.tree import ConfigTree
+DEFAULT_BASE_CONFIG = str(CONFIG_DIR / "experiments" / "online_learning.yaml")
 
 RESERVED_AXES = ("algo", "env", "seed")
 
