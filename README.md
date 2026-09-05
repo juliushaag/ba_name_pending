@@ -251,7 +251,14 @@ snapshots take precedence over current defaults.
 
 Environment episodes restart on resume. Partial action chunks are discarded;
 completed replay transitions remain intact. This is training-state continuation,
-not bit-identical simulator trajectory continuation. A failed iteration retains
+not bit-identical simulator trajectory continuation, for every environment --
+`barl_jax.exact_resume.ExactResumeMixin` is an opt-in mechanism for an
+environment family whose full state (simulator internals, wrapper counters,
+RNGs) is demonstrably captured (verified with a real save/interrupt/restore/
+continue test, `tests/test_exact_resume.py`'s Pendulum-v1 adapter is the one
+example today), but it is not wired into `trainer.py`'s resume flow itself --
+episodes still restart on every resume regardless, including for an
+environment with an exact-resume adapter declared. A failed iteration retains
 the last completed resume generation; `final` policy weights may be newer.
 Full replay checkpoints can be large, so account for their storage and I/O cost --
 `save_training` refuses to start a new generation when free disk looks

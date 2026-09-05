@@ -48,6 +48,12 @@ class Environment(ABC):
   # dominates IPC overhead.
   use_async_vector_env = False
 
+  # True only for a family that mixes in exact_resume.ExactResumeMixin and
+  # has verified its state-capture attribute lists are actually complete
+  # (see that module). Every environment defaults to ordinary resume
+  # semantics: episodes restart, pending action chunks are discarded.
+  supports_exact_resume = False
+
   # Env facts no gym space can report -- `return_min`/`return_max` bound the
   # achievable episode return, which is what a categorical/histogram critic's
   # fixed support needs -- and per-env run-key overrides. Both are class
