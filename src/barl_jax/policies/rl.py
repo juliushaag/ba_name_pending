@@ -101,12 +101,11 @@ class RLPolicy(Policy):
     self.critic.td_loss(obs, action, next_obs, next_action, chunk_return, terminated, horizon,
                         losses, entropy_bonus=self.target_entropy_bonus(alpha, entropy))
 
-    # Skipped outright on the steps `policy_delay` would mask the update on
-    # anyway -- the losses price through a frozen critic and their targets are
-    # stop_gradient'd, so nothing here reaches the critic's parameters and the
-    # skip is parameter-identical (see `gated_losses`).
+    # An actor can own multiple optimizers (e.g. SDAC actor + exploration).
+    # Compute their shared loss whenever any partition is due; mask each
+    # optimizer independently according to optimizer_cadence().
     losses.update(gated_losses(
-      self, self.policy_delay,
+      self,
       lambda actor, critic: actor.loss(obs, critic, alpha, key=keys[1]),
       tuple(sorted(self.actor.create_optimizer())), self.actor, self.critic))
     self.dual_loss(entropy, losses)

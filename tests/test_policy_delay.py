@@ -1,15 +1,8 @@
-"""`policy_delay` skips the actor's work, and skipping it changes nothing.
+"""Loss groups follow optimizer cadences without changing state when logged.
 
-dime_am gates the actor and the entropy dual behind `policy_delay: 3` while the
-critic steps every gradient step. This repo implemented that at the *optimizer*
-(`Policy.build_optimizer` -> `optax.conditionally_mask`), so the loss ran on all
-three steps and two thirds of the result was thrown away -- for DIME that is a
-16-deep differentiated sampling chain, the dominant term in its step.
-
-`gated_losses` skips the loss itself. These pin the two properties that makes
-sound: the gate agrees with the optimizer's own predicate, and the branch is
-only taken when nothing is being recorded (`lax.cond` traces both branches, so a
-metric on one side and not the other is a pytree mismatch, not a silent zero).
+The conditional must survive the seed vmap, skipped optimizer transforms must
+preserve Adam state, and extra diagnostic evaluation must not advance actor
+batch statistics or RNG streams.
 """
 
 import gymnasium as gym
@@ -55,29 +48,26 @@ def test_update_due_matches_the_optimizers_own_predicate():
     policy = make("AMDP")
     for step in range(9):
         policy.train_steps[...] = jnp.asarray(step, jnp.int32)
-        assert bool(update_due(policy, 3)) == ((step + 1) % 3 == 0)
+        assert bool(update_due(policy.train_steps[...], 3)) == ((step + 1) % 3 == 0)
 
 
-def test_update_due_is_python_true_while_a_tier_is_armed():
-    """A logged step must report the real loss, not the skip branch's zero."""
+def test_update_due_does_not_depend_on_recording():
+    """Diagnostics must not change which optimizers are due."""
     policy = make("AMDP")
     policy.train_steps[...] = jnp.asarray(0, jnp.int32)   # not a multiple of 3
-    assert update_due(policy, 3) is not True
+    assert update_due(policy.train_steps[...], 3) is not True
     with recording(PRIMARY):
-        assert update_due(policy, 3) is True
+        assert not bool(update_due(policy.train_steps[...], 3))
 
 
 def test_gated_losses_returns_zero_off_cadence_and_the_value_on():
     policy = make("AMDP")
-    called = []
-
     def fn(module):
-        called.append(True)
         return {"actor": jnp.asarray(2.5)}
 
     for step, due in [(0, False), (1, False), (2, True)]:
         policy.train_steps[...] = jnp.asarray(step, jnp.int32)
-        value = float(gated_losses(policy, 3, fn, ("actor",), policy.critic)["actor"])
+        value = float(gated_losses(policy, fn, ("actor",), policy.critic)["actor"])
         assert value == pytest.approx(2.5 if due else 0.0)
 
 
@@ -124,7 +114,7 @@ def test_the_gate_survives_the_seed_vmap(name):
     """The trainer vmaps the step over seeds. `jax.vmap` lowers a `lax.cond` on a
     *batched* predicate into a select over both branches -- correct, and exactly
     as expensive as not gating at all -- so the gradient-step index has to reach
-    the predicate unbatched (`policy.gating`, `in_axes=None`). If it ever goes
+    the predicate unbatched (`optimization.gating`, `in_axes=None`). If it ever goes
     back to being read off the per-seed `train_steps` buffer, the `cond`
     disappears from the jaxpr and the saving silently goes with it.
     """
@@ -156,3 +146,175 @@ def _primitives(jaxpr, seen=None) -> set:
         for sub in jax.extend.core.jaxprs_in_params(eqn.params):
             _primitives(sub, seen)
     return seen
+
+
+class StatefulLoss(nnx.Module):
+    def __init__(self):
+        self.calls = nnx.BatchStat(jnp.asarray(0, jnp.int32))
+        self.weight = nnx.Param(jnp.asarray(2.0))
+        self.rngs = nnx.Rngs(noise=0)
+
+    def loss(self):
+        from barl_jax.metrics import Recorder
+        self.calls[...] += 1
+        self.rngs.noise()
+        Recorder(self).scalar("loss_calls", self.calls[...])
+        return {"actor": self.weight[...] ** 2}
+
+
+def test_logged_skipped_loss_preserves_module_state():
+    policy = make("AMDP")
+    module = StatefulLoss()
+    before = jax.tree.map(_numpy_leaf, nnx.state(module))
+    with recording(PRIMARY):
+        losses = gated_losses(policy, lambda m: m.loss(), ("actor",), module)
+    assert float(losses["actor"]) == 4.0
+    from barl_jax.metrics import Metric
+    nnx.pop(module, Metric)
+    after = jax.tree.map(_numpy_leaf, nnx.state(module))
+    for a, b in zip(jax.tree.leaves(before), jax.tree.leaves(after)):
+        np.testing.assert_array_equal(a, b)
+
+
+def test_grouped_loss_runs_when_another_optimizer_is_due():
+    policy = make("SDAC")
+    policy.policy_delay = 3
+    module = StatefulLoss()
+    def loss(m):
+        return {**m.loss(), "explore": m.weight[...] ** 2}
+    values = gated_losses(policy, loss, ("actor", "explore"), module)
+    assert float(values["explore"]) == 4.0
+    assert int(module.calls[...]) == 1
+
+
+def _numpy_leaf(value):
+    if jax.dtypes.issubdtype(value.dtype, jax.dtypes.prng_key):
+        value = jax.random.key_data(value)
+    return np.array(value, copy=True)
+
+
+def _assert_state_equal(left, right, *, exact=False):
+    assert jax.tree.structure(left) == jax.tree.structure(right)
+    for a, b in zip(jax.tree.leaves(left), jax.tree.leaves(right)):
+        a, b = _numpy_leaf(a), _numpy_leaf(b)
+        if exact or not np.issubdtype(a.dtype, np.inexact):
+            np.testing.assert_array_equal(a, b)
+        else:
+            np.testing.assert_allclose(a, b, rtol=2e-5, atol=2e-6)
+
+
+def test_logging_does_not_change_training_state_with_stateful_actor():
+    from barl_jax.config.tree import ConfigTree
+    policy = Policy.make("SAC", FakeEnv(), env_stats=make_env_stats(), seed=0,
+                         config=ConfigTree(overrides={
+                             "params.policy_delay": 3,
+                             "components.actor.norm": "batchrenorm",
+                             "components.actor.norm_kwargs": {
+                                 "momentum": 0.99, "epsilon": 1e-5, "r_max": 3.0,
+                                 "d_max": 5.0, "warmup_steps": 0,
+                             },
+                             "components.actor.dropout": 0.2,
+                             # Compare gate semantics without bf16 kernel reassociation.
+                             "components.actor.dtype": "float32",
+                             "components.critic.dtype": "float32",
+                             "components.actor.latent_dim": 8,
+                             "components.critic.latent_dim": 8,
+                         }))
+    optimizer = nnx.Optimizer(policy, policy.build_optimizer(lr_schedule=None), wrt=TRAINABLE)
+    graphdef, initial = nnx.split((policy, optimizer))
+    unlogged = jax.tree.map(jnp.copy, initial)
+    logged = jax.tree.map(jnp.copy, initial)
+    data = batch()
+    for step in range(6):
+        unlogged, *_ = train_step(graphdef, unlogged, data, (), jnp.asarray(step))
+        logged, *_ = train_step(graphdef, logged, data, (PRIMARY, DEBUG), jnp.asarray(step))
+        _assert_state_equal(unlogged, logged)
+
+
+def test_optimizer_mask_freezes_adam_moments_after_a_real_update():
+    policy = make("AMDP")
+    tx = policy.build_optimizer(lr_schedule=lambda step: 1.0 / (step + 1))
+    params = nnx.state(policy, TRAINABLE)
+    state = tx.init(params)
+    grads = jax.tree.map(jnp.ones_like, params)
+    for step in range(6):
+        before = state
+        updates, state = tx.update(grads, state, params)
+        for key in ("actor", "entropy_alpha"):
+            # The outer schedule and mask counters advance every gradient step;
+            # the inner Adam transform advances only on this partition's update.
+            old_mask = before.inner_states[key].inner_state[0]
+            new_mask = state.inner_states[key].inner_state[0]
+            assert int(new_mask.step) == step + 1
+            if (step + 1) % 3:
+                _assert_state_equal(old_mask.inner_state, new_mask.inner_state, exact=True)
+            else:
+                assert any(not np.array_equal(_numpy_leaf(a), _numpy_leaf(b))
+                           for a, b in zip(jax.tree.leaves(old_mask.inner_state),
+                                           jax.tree.leaves(new_mask.inner_state)))
+        if (step + 1) % 3:
+            for component in ("actor", "entropy"):
+                assert all(np.count_nonzero(_numpy_leaf(x)) == 0
+                           for x in jax.tree.leaves(updates[component]))
+
+
+def test_gate_context_restores_outer_step():
+    from barl_jax.optimization import gating
+    policy = make("AMDP")
+    module = StatefulLoss()
+    with gating(jnp.asarray(2)):
+        with pytest.raises(RuntimeError), gating(jnp.asarray(0)):
+            values = gated_losses(policy, lambda m: m.loss(), ("actor",), module)
+            assert float(values["actor"]) == 0.0
+            raise RuntimeError("inner trace failed")
+        values = gated_losses(policy, lambda m: m.loss(), ("actor",), module)
+        assert float(values["actor"]) == 4.0
+    values = gated_losses(policy, lambda m: m.loss(), ("actor",), module)
+    assert float(values["actor"]) == 0.0
+
+
+class MixedCadencePolicy(nnx.Module):
+    def __init__(self):
+        self.train_steps = nnx.Variable(jnp.asarray(0, jnp.int32))
+
+    def optimizer_cadence(self):
+        return {"actor": 2, "explore": 3}
+
+    def create_optimizer(self):
+        return {"actor": None, "explore": None}
+
+
+def test_loss_group_uses_union_of_distinct_delayed_cadences():
+    policy = MixedCadencePolicy()
+    module = StatefulLoss()
+    def loss(m):
+        return {**m.loss(), "explore": m.weight[...] ** 2}
+    observed = []
+    for step in range(6):
+        policy.train_steps[...] = jnp.asarray(step)
+        values = gated_losses(policy, loss, ("actor", "explore"), module)
+        observed.append(float(values["actor"]) != 0)
+    assert observed == [False, True, True, True, False, True]
+    assert int(module.calls[...]) == 4
+
+
+def test_seed_vmap_keeps_the_loss_gate_conditional():
+    from barl_jax.multiseed import stack
+    from barl_jax.optimization import gating
+    policy = MixedCadencePolicy()
+    graphdef, state = stack([StatefulLoss(), StatefulLoss()])
+    def step_one(state, step):
+        module = nnx.merge(graphdef, state)
+        with gating(step):
+            values = gated_losses(policy, lambda m: m.loss(), ("actor",), module)
+        return nnx.state(module), values
+    batched = jax.jit(jax.vmap(step_one, in_axes=(0, None)))
+    # No optimizer cond is present here; this must be the loss gate itself.
+    traced = jax.make_jaxpr(batched)(state, jnp.asarray(0))
+    assert "cond" in _primitives(traced.jaxpr)
+    state, values = batched(state, jnp.asarray(0))
+    np.testing.assert_array_equal(values["actor"], [0.0, 0.0])
+    np.testing.assert_array_equal(state["calls"][...], [0, 0])
+    state, values = batched(state, jnp.asarray(1))
+    np.testing.assert_array_equal(values["actor"], [4.0, 4.0])
+    np.testing.assert_array_equal(state["calls"][...], [1, 1])

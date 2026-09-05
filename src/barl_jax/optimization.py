@@ -1,5 +1,6 @@
 """Optimizer ownership, partitioning, gradient steps, and schedules."""
 from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import partial
 
 import jax
@@ -131,7 +132,7 @@ class OptimizerMixin:
         # would not give: Adam with g=0 still moves on accumulated momentum.
         # Wrapped around `tx` alone rather than the whole chain, so the LR
         # schedule outside it still advances once per grad step.
-        tx = optax.conditionally_mask(tx, lambda step, k=every: (step + 1) % k == 0)
+        tx = optax.conditionally_mask(tx, lambda step, k=every: update_due(step, k))
       transforms[key] = (tx if lr_schedule is None else
                          optax.chain(tx, optax.scale_by_schedule(lr_schedule)))
     return optax.multi_transform(transforms, self.optimizer_labels())
@@ -165,62 +166,77 @@ class OptimizerMixin:
 
 
 # ---------------------------------------------------------------------------
-# Gradient-step gating -- the mechanism behind TD3-shaped `policy_delay`: a
-# loss guarded by `gated_losses` is skipped on exactly the steps the optimizer
-# itself would have masked (see `build_optimizer`'s `conditionally_mask`), so
-# the skip is parameter-identical rather than a second, cheaper approximation.
+# Loss groups and optimizer masks share cadence declarations and predicates.
+# Diagnostic evaluation may run off-cadence, but must not change training state.
 # ---------------------------------------------------------------------------
 
-_GRAD_STEP = None
+_GRAD_STEP = ContextVar("gradient_step", default=None)
 
 
 @contextmanager
 def gating(step):
-  """Publishes the gradient-step index for `update_due` for the duration.
+  """Keep the shared step unbatched under seed vmap, scoped to this trace.
 
-  It has to arrive from outside the policy state, because the trainer vmaps the
-  step over seeds: a predicate read from `policy.train_steps` is *batched*, and
-  `jax.vmap` lowers a `lax.cond` on a batched predicate to a `select` -- both
-  branches executed, the loser discarded. Every seed takes the same gradient
-  step at the same time, so the counter is genuinely shared and passing it in
-  with `in_axes=None` keeps the branch a branch."""
-  global _GRAD_STEP
-  previous = _GRAD_STEP
-  _GRAD_STEP = step
+  Reading the per-policy counter under vmap batches the predicate and turns
+  cond into select (executing both branches). The caller supplies in_axes=None.
+  ContextVar also isolates concurrent/nested traces instead of sharing a global.
+  """
+  token = _GRAD_STEP.set(step)
   try:
     yield
   finally:
-    _GRAD_STEP = previous
+    _GRAD_STEP.reset(token)
 
 
-def update_due(policy, every: int):
-  """Whether the optimizer key gated at `every` actually updates this gradient
-  step -- the same predicate `build_optimizer`'s `conditionally_mask` uses, so a
-  loss guarded by this is skipped exactly when its update would be discarded.
-
-  Returns a python `True` (not a traced one) when the step is ungated or when a
-  metric tier is armed -- see `gated_losses` for why that distinction matters."""
-  if every <= 1 or armed():
-    return True
-  step = policy.train_steps[...] if _GRAD_STEP is None else _GRAD_STEP
-  return (step + 1) % every == 0
+def update_due(step, every: int):
+  """A zero-based gradient step updates every kth time, starting at k - 1."""
+  return True if every == 1 else (step + 1) % every == 0
 
 
-def gated_losses(policy, every: int, fn, keys, *modules):
-  """Dict version of the gate: `fn(*modules) -> {key: scalar}`, one entry per
-  optimizer key the actor trains.
+def gated_losses(policy, fn, keys, *modules):
+  """Evaluate a loss group whenever any of its optimizer keys is due.
 
-  `keys` is the static key set `fn` returns -- the skip branch hands back zeros
-  under the same keys, which the optimizer's `conditionally_mask` would have
-  discarded anyway. The python `if` is load-bearing: `lax.cond` traces *both*
-  branches whatever the predicate, so a metric a gated loss records would be
-  missing from the skip branch and the two pytrees would not match. On a logged
-  step the guard is python-`True`, `fn` runs unbranched and every metric is
-  real; on an unlogged one nothing is recorded at all, so both branches agree."""
-  due = update_due(policy, every)
+  Cadences come from optimizer_cadence(), the same source as optimizer masks.
+  Each loss must reach only its declared optimizer partitions; modules must
+  include all mutable NNX state touched by fn. Optimizers still mask each key
+  independently when a group contains different cadences.
+
+  Logged steps evaluate real diagnostic losses even when no key is due, but
+  roll back non-metric NNX state (including batch statistics and RNG counters).
+  Unlogged skipped steps execute no loss computation and return scalar zeros.
+  """
+  keys = tuple(keys)
+  if not keys or len(set(keys)) != len(keys):
+    raise ValueError("A gated loss group needs distinct optimizer keys")
+  unknown = set(keys) - set(policy.create_optimizer())
+  if unknown:
+    raise ValueError(f"Gated loss names unknown optimizer keys: {sorted(unknown)}")
+  cadence = policy.optimizer_cadence()
+  periods = tuple(cadence.get(key, 1) for key in keys)
+  if any(not isinstance(k, int) or isinstance(k, bool) or k < 1 for k in periods):
+    raise ValueError("Optimizer cadence must contain positive integers")
+  step = _GRAD_STEP.get()
+  step = policy.train_steps[...] if step is None else step
+  due = True if 1 in periods else jnp.any(jnp.stack([update_due(step, k) for k in periods]))
+
+  def evaluate(*modules):
+    losses = fn(*modules)
+    if set(losses) != set(keys):
+      raise ValueError(f"Gated loss keys {sorted(losses)} differ from declared keys {sorted(keys)}")
+    return losses
+
   if due is True:
-    return fn(*modules)
-  return nnx.cond(due, fn, lambda *_: {k: jnp.zeros(()) for k in keys}, *modules)
+    return evaluate(*modules)
+  if armed():
+    # nnx.state alone aliases live Variables: clone their holders before fn
+    # mutates them. Immutable array buffers remain shared; no device copy.
+    persistent = nnx.Not((Metric, DebugMetric))
+    before = nnx.state(nnx.clone(modules), persistent)
+    losses = evaluate(*modules)
+    after = nnx.state(modules, persistent)
+    nnx.update(modules, jax.tree.map(lambda old, new: jnp.where(due, new, old), before, after))
+    return losses
+  return nnx.cond(due, evaluate, lambda *_: {k: jnp.zeros(()) for k in keys}, *modules)
 
 
 # ---------------------------------------------------------------------------
