@@ -147,16 +147,14 @@ def validate_run(cfg: dict, *, num_seeds: int = None) -> list[str]:
   if seeds is not None and (not isinstance(seeds, int) or isinstance(seeds, bool) or seeds < 1):
     fail("num_seeds", seeds, "must be an int >= 1")
 
-  # trainer._train computes `rollout_steps // num_envs` as the env-step count
-  # collected per iteration; below num_envs that floors to 0, so the loop
-  # collects nothing and env_steps never advances (an infinite loop, not a
-  # small one).
-  rollout_steps, num_envs = cfg.get("rollout_steps"), cfg.get("num_envs")
-  if (isinstance(rollout_steps, int) and isinstance(num_envs, int)
-      and not isinstance(rollout_steps, bool) and not isinstance(num_envs, bool)
-      and num_envs >= 1 and rollout_steps < num_envs):
-    fail("rollout_steps", rollout_steps, f"must be >= num_envs ({num_envs}), "
-        "or every iteration collects zero env steps and training never advances")
+  # Each vector step executes one primitive action in every environment.
+  # Require exact batches so requested and collected interaction counts agree.
+  num_envs = cfg.get("num_envs")
+  if isinstance(num_envs, int) and not isinstance(num_envs, bool) and num_envs >= 1:
+    for key in ("rollout_steps", "random_steps"):
+      steps = cfg.get(key)
+      if isinstance(steps, int) and not isinstance(steps, bool) and steps % num_envs:
+        fail(key, steps, f"must be divisible by num_envs ({num_envs})")
 
   # Syntax only -- an unknown mode or a bad candidate count. Capability
   # checks (mode='bon' needs a scorer, mode='mean' needs continuous actions)

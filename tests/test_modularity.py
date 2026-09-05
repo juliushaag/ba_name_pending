@@ -428,3 +428,20 @@ def test_checkpoint_info_rejects_an_unrecognized_directory(tmp_path):
   info = _load_checkpoint_info()
   with pytest.raises(SystemExit):
     info.inspect(str(tmp_path))
+
+
+@pytest.mark.parametrize("utd_ratio", [0.5, 2.0])
+def test_chunked_training_counts_primitive_steps(tmp_path, monkeypatch, utd_ratio):
+  import barl_jax.logger as logging
+  family = ToyFamily()
+  monkeypatch.setattr(Environment, "make", lambda name: family)
+  monkeypatch.setattr(logging, "make_logger", lambda kind, *a, **kw: MemoryLogger(*a, **kw))
+  monkeypatch.setattr(trainer, "warmup", lambda *args: {})
+  cfg = {**run_config(tmp_path), "total_env_steps": 8, "num_envs": 2,
+         "rollout_steps": 2, "chunk_size": 4, "utd_ratio": utd_ratio}
+  run = trainer.setup(cfg, 1)
+  trainer.train(run)
+  assert run.progress["env_steps"] == 8
+  assert run.progress["grad_steps"] == round(8 * utd_ratio)
+  assert run.buffer.min_transitions() == 2
+  assert np.array_equal(run.buffer.seeds[0]._fields["horizon"][:2], [4, 4])

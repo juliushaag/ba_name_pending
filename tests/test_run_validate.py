@@ -78,3 +78,9 @@ def test_num_seeds_must_be_a_positive_int():
 def test_problems_name_the_key_and_the_value():
   problems = validate_run(base(utd_ratio=-1.0), num_seeds=1)
   assert any("utd_ratio" in p and "-1.0" in p for p in problems)
+
+
+def test_vector_step_budgets_must_be_divisible_by_num_envs():
+  assert validate_run(base(rollout_steps=5, num_envs=4), num_seeds=1)
+  assert validate_run(base(rollout_steps=4, random_steps=5, num_envs=4), num_seeds=1)
+  assert validate_run(base(rollout_steps=8, random_steps=4, num_envs=4), num_seeds=1) == []

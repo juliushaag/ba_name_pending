@@ -647,7 +647,12 @@ def _train(run: Run):
                         for seed in run.collector.per_seed(run.num_seeds, run.num_envs)],
                        panel={f"rollout/{k}": v for k, v in rollout_stats.items()})
 
-      grad_steps_this_iter = round(cfg["rollout_steps"] * cfg["utd_ratio"])
+      # Chunks can span collection calls: wait for replay data, then catch up
+      # to the cumulative primitive-step budget (also preserves fractional UTD).
+      grad_steps_this_iter = (
+        max(0, round(log.get_step("env_steps") * cfg["utd_ratio"])
+            - log.get_step("grad_steps"))
+        if run.buffer.min_transitions() > 0 else 0)
       narrate = (it == 0 or time.perf_counter() - last_narration > PROGRESS_INTERVAL_S)
       if narrate:
         log.message(f"Rollout done: {run.buffer.min_transitions()} transitions per seed, "
@@ -676,7 +681,7 @@ def _train(run: Run):
                        or (base + i) % cfg["debug_every"] == 0
                        for i in range(grad_steps_this_iter))
 
-      if not armed_here:
+      if grad_steps_this_iter and not armed_here:
         batches = run.buffer.sample_chunk(grad_steps_this_iter, cfg["batch_size"])
         run.state = seeded_chunk(run.graphdef, run.state, batches,
                                  grad_steps_this_iter, jnp.asarray(base, jnp.int32))
@@ -726,7 +731,7 @@ def _train(run: Run):
       epoch_time = time.perf_counter() - epoch_start
       if narrate:
         log.message(f"Trained {grad_steps_this_iter} grad steps in {epoch_time / 60:.1f} min "
-                    f"({1000 * epoch_time / grad_steps_this_iter:.0f} ms/step)")
+                    f"({1000 * epoch_time / max(1, grad_steps_this_iter):.0f} ms/step)")
         last_narration = time.perf_counter()
 
       eval_time, eval_phases = 0.0, {}
