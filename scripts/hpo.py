@@ -159,14 +159,13 @@ def main():
       raise SystemExit(1)
     print("  OK")
 
-  base_config_path = spec.get("base") or grid.DEFAULT_BASE_CONFIG
   sweep_name = datetime.datetime.now().strftime(SWEEP_NAME_FORMAT)
   sweep_dir = Path(args.sweep_dir or (SWEEPS_DIR / sweep_name)).absolute()
   tags = [trial_tag(t, i, num_seeds) for i, t in enumerate(trials)]
   executor = resolve(args.executor)
 
   runs, head = grid.prepare_sweep(
-    trials, tags, base_config_path=base_config_path, sweep_dir=str(sweep_dir),
+    trials, tags, sweep_dir=str(sweep_dir),
     num_seeds=args.seeds or spec.get("seeds_per_trial"), validate=args.validate,
     sweep_name=sweep_name, executor_name=executor.name, seeds=num_seeds,
     head_extra={"kind": "search", "search": str(Path(args.search).resolve()),

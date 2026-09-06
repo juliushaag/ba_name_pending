@@ -162,9 +162,8 @@ def main():
         print("  OK")
 
     # ---- expand the grid onto disk ----------------------------------------
-    base_config_path = args.config or base or grid.DEFAULT_BASE_CONFIG
     runs, head = grid.prepare_sweep(
-        combos, tags, base_config_path=base_config_path, sweep_dir=str(sweep_dir),
+        combos, tags, sweep_dir=str(sweep_dir),
         num_seeds=args.seeds, validate=args.validate, sweep_name=sweep_name,
         executor_name=executor.name, seeds=num_seeds,
         head_extra={"validate": bool(args.validate), "debug": bool(args.debug),

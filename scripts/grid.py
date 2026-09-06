@@ -272,7 +272,7 @@ def materialize(combos: list[dict], tags: list[str], *, defaults: dict, sweep_di
   return runs
 
 
-def prepare_sweep(combos: list[dict], tags: list[str], *, base_config_path: str,
+def prepare_sweep(combos: list[dict], tags: list[str], *,
                   sweep_dir: str, num_seeds: int | None, validate: bool,
                   sweep_name: str, executor_name: str, seeds: int,
                   head_extra: dict) -> tuple[list[Run], dict]:
@@ -288,8 +288,9 @@ def prepare_sweep(combos: list[dict], tags: list[str], *, base_config_path: str,
   `n_trials`/`objective` -- passed through untouched rather than guessed at
   here, so a grid sweep's manifest and a search sweep's stay explicitly
   different shapes instead of one merged, lowest-common-denominator one."""
-  with open(base_config_path) as f:
-    defaults = dict((yaml.safe_load(f) or {}).get("defaults") or {})
+  
+  defaults = dict()
+
   if validate:
     defaults["validate"] = True
   defaults["sweep_tag"] = sweep_name
@@ -298,7 +299,7 @@ def prepare_sweep(combos: list[dict], tags: list[str], *, base_config_path: str,
   runs = materialize(combos, tags, defaults=defaults, sweep_dir=sweep_dir, num_seeds=num_seeds)
 
   head = {"sweep_tag": sweep_name, "created": sweep_name, "command": sweep_command(),
-         "base_config": os.path.abspath(base_config_path), "executor": executor_name,
+        "executor": executor_name,
          "seeds": seeds, **head_extra}
   write_sweep_yaml(sweep_dir, head, runs)
   return runs, head
