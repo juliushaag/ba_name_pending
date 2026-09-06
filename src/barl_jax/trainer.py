@@ -241,14 +241,10 @@ def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
               f"(every {cfg['eval_every']}), {run.num_seeds} seeds x {cfg['eval_runs']} episodes, "
               f"eval_seed={eval_seed}")
 
-  # Every seed's episodes in one vmapped pass, the same way the rollout collects
-  # them: `eval_env` is `num_seeds * eval_runs` wide and slot j belongs to seed
-  # j // eval_runs. Looping seeds instead cost N separate 1000-step loops, and
-  # an episode is a sequential chain of device round-trips, so that N was paid
-  # in full -- 29.7 s of a 39 s eval at 3 seeds.
+  # One slot per seed; run_episodes reuses these slots for successive rounds.
   per_run  = cfg["eval_runs"]
   n_videos = per_run if cfg["eval_videos"] is None else min(cfg["eval_videos"], per_run)
-  actor = StackedPolicy(run.graphdef, run.state, run.num_seeds, per_run, run.reference,
+  actor = StackedPolicy(run.graphdef, run.state, run.num_seeds, 1, run.reference,
                         execution_spec=run.eval_spec)
 
   # `eval/phase` is the one thing that reaches wandb *during* an eval, and it is
@@ -263,7 +259,8 @@ def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
   log.log({}, quiet={"eval/phase": PHASE_EVAL_CKPT})
   t0 = time.perf_counter()
   for i in range(run.num_seeds):
-    runs = all_runs[i * per_run:(i + 1) * per_run]
+    # Results are round-major: seed 0, seed 1, ... for each round.
+    runs = all_runs[i::run.num_seeds]
     reward = float(np.mean([np.sum(r["rewards"]) for r in runs]))
     rewards.append(reward)
     lengths.append(np.mean([len(r["rewards"]) for r in runs]))
@@ -295,7 +292,7 @@ def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
       log.log_video(f"eval/video_{v}", r["frames"])
     video_s = time.perf_counter() - t0
 
-  # Eval is already per-seed -- each seed owns its own block of slots above --
+  # Eval is already per-seed -- each seed owns one slot across all rounds --
   # so it goes straight to that seed's run rather than being averaged first.
   rewards = np.asarray(rewards)
   per_seed = [{"eval/avg_cum_reward": float(rewards[i]),
@@ -389,7 +386,7 @@ def warmup(run: Run, envs, log) -> dict:
   minutes or die without a python-level traceback:
 
   * `_stacked_infer` is static on `num_envs`, so the eval wave's batch shape
-    (num_seeds x eval_runs) is one XLA compile the training shape never triggers;
+    (one environment per seed) can differ from the training shape;
   * mujoco builds its offscreen GL context lazily on the first `render()`
     (`dm_control/mujoco/engine.py`), and dog.xml is the only DMC model asking for
     a 1920x1080 framebuffer -- allocated after jax has already taken its share of
@@ -397,14 +394,13 @@ def warmup(run: Run, envs, log) -> dict:
 
   Neither is avoidable, but both are cheap to move to minute one, where the run
   has lost nothing and the failure is unambiguous."""
-  cfg = run.cfg
   eval_env, render_env = envs
   out = {}
 
   t0 = time.perf_counter()
-  actor = StackedPolicy(run.graphdef, run.state, run.num_seeds, cfg["eval_runs"], run.reference,
+  actor = StackedPolicy(run.graphdef, run.state, run.num_seeds, 1, run.reference,
                         execution_spec=run.eval_spec)
-  probe = jnp.zeros((run.num_seeds * cfg["eval_runs"], run.env_stats["obs_dim"]), jnp.float32)
+  probe = jnp.zeros((run.num_seeds, run.env_stats["obs_dim"]), jnp.float32)
   jax.block_until_ready(actor.inference_fn()(probe, jax.random.PRNGKey(0)))
   out["time/warmup_compile_s"] = time.perf_counter() - t0
 
@@ -443,9 +439,8 @@ def _train(run: Run):
   n_videos  = 0 if cfg["eval_video_every"] is None else (
     cfg["eval_runs"] if cfg["eval_videos"] is None else min(cfg["eval_videos"], cfg["eval_runs"]))
 
-  # `num_seeds * eval_runs` wide so every seed's episodes run in one vmapped
-  # pass -- still narrower than the rollout env, which is num_seeds * num_envs.
-  eval_envs = (run.own(run.environment.get_vector_env(num_seeds * cfg["eval_runs"])),
+  # Keep one simulator per seed resident, independently of the episode count.
+  eval_envs = (run.own(run.environment.get_vector_env(num_seeds)),
                run.own(run.environment.get_vector_env(n_videos, asynchronous=False)) if n_videos else None)
 
   tags = [run.model_name, run.env_name, "online", "jax", "multiseed"]

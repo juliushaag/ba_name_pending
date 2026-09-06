@@ -400,14 +400,12 @@ def test_collector_chunk_return_matches_hand_computed_discount():
   assert buffer._fields["horizon"][0] == 3
 
 
-def test_eval_slot_blocks_map_to_seeds():
-  """`evaluate()` slices one vmapped pass as all_runs[i*eval_runs:(i+1)*eval_runs],
-  which is only correct if slot j is driven by seed j // eval_runs. Same
-  convention as the rollout, and the thing that silently mislabels every seed's
-  eval curve if it ever changes."""
+@pytest.mark.parametrize("per_run", [1, 4])
+def test_eval_slot_blocks_map_to_seeds(per_run):
+  """One-slot evaluation and wider rollout batches both route to the right policy."""
   import jax
   import jax.numpy as jnp
-  num_seeds, per_run = 3, 4
+  num_seeds = 3
   graphdef, state, reference, obs_dim = _stacked_fixture(num_seeds)
 
   obs = np.random.RandomState(0).randn(num_seeds * per_run, obs_dim).astype(np.float32)

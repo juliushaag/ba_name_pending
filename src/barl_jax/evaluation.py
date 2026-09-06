@@ -86,7 +86,7 @@ def run_episodes(actor, env: gym.Env, n: int, render: bool, *, seed: int = 0,
     while live.any():
       key, subkey = jax.random.split(key)
       action_np, _ = chunks.current(obs, subkey, to_device=lambda x: jnp.asarray(x, dtype=jnp.float32),
-                                    live=live)
+                                    live=live, full_batch=hasattr(actor, "num_seeds"))
       # Same failsafe the rollout applies (rollout.py). Without it a NaN action
       # reaches mj_step, which only warns and poisons qpos -- the eval returns
       # quietly wrong numbers and the next render() aborts the process inside

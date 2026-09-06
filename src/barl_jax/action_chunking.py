@@ -68,12 +68,17 @@ class ActionChunkExecutor:
       wasted=int(self.wasted),
     )
 
-  def current(self, obs, key, *, to_device, live=None) -> tuple[np.ndarray, dict]:
+  def current(self, obs, key, *, to_device, live=None, full_batch=False) -> tuple[np.ndarray, dict]:
     live = np.ones(self.n_envs, bool) if live is None else np.asarray(live, dtype=bool)
     slots = np.flatnonzero(live & ~self._active)
     self._last_refilled = np.zeros(self.n_envs, bool)
     if len(slots):
-      chunk, extras = self._infer(to_device(obs[slots]), key)
+      # Vmapped seed policies require every seed slot, even after some
+      # episodes finish. Only install plans for slots that need a refill.
+      chunk, extras = self._infer(to_device(obs if full_batch else obs[slots]), key)
+      if full_batch:
+        chunk = np.asarray(chunk)[slots]
+        extras = {name: np.asarray(value)[slots] for name, value in extras.items()}
       chunk = normalize_action_chunk(chunk, chunk_size=self.chunk_size,
                                      act_dim=self.act_dim, xp=np).astype(np.float32, copy=False)
       self._chunks[slots] = chunk
