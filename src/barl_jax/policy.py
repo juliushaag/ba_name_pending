@@ -235,6 +235,10 @@ class Policy(OptimizerMixin, HParamsOwner, nnx.Module, ABC):
     params = self._spec.data()["params"]
     return {**params, **self._raw_kwargs}
 
+  @classmethod
+  def slot_objective(cls, slot, actor_cls=None):
+    return cls.SLOT_OBJECTIVES.get(slot)
+
   def build_component(self, slot: str, gate_cls: type, *args,
                       env_stats: EnvStats = None, config_overrides: dict = None,
                       **explicit_kwargs):
@@ -258,7 +262,8 @@ class Policy(OptimizerMixin, HParamsOwner, nnx.Module, ABC):
       kwargs.update(config_overrides)
     if not issubclass(cls, gate_cls):
       raise TypeError(f"{self.model_name}.{slot}: {cls.__name__} must implement {gate_cls.__name__}")
-    objective = self.SLOT_OBJECTIVES.get(slot)
+    objective = self.slot_objective(
+      slot, self.resolve_component("actor")[0] if "actor" in self.SLOTS else None)
     if objective is not None and getattr(cls, "learning_objective", None) != objective:
       raise TypeError(f"{self.model_name}.{slot}: {cls.__name__} does not support {objective!r}")
     stats = env_stats if env_stats is not None else self.env_stats

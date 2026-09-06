@@ -34,7 +34,7 @@ class ScoreContinuousActor(Actor, ActorOptim):
   # drawn at the control net's dtype -- in bf16 the noise driving the SDE
   # carries ~3 significant digits. AMDP went non-finite in bf16 on both DMC
   # envs (sweep 2026-08-27_13-23-15).
-  mlp_preset = Config("silu_fp32", style=MLP_PRESETS)
+  mlp_preset = Config("gelu_fp32", style=MLP_PRESETS)
   time_emb  = Config("ctrl", style=TIME_STYLES)
   squash_cls = Config("ErfSquash")   # `erf_k` is derived from the noise schedule below
   sigma_min    = HParam(0.01)
@@ -165,7 +165,17 @@ class ScoreContinuousActor(Actor, ActorOptim):
     return X.reshape(B, self.chunk_size, self.action_dim), log_w
 
   def loss(self, obs, critic: Critic, alpha, *, key=None):
-    """The direct-score regression against the critic's action-gradient."""
+    """The direct-score regression against the critic's action-gradient.
+
+    dime_am's adjoint state (`am_diff.py`'s `update_actor`) is
+    `x_score/alpha + grad[prior_surprisal(X) + squash_correction(X)]`, not just
+    `x_score/alpha`. That second term is identically zero here, not dropped:
+    `prior_surprisal`'s gradient is `X/terminal_var` and `squash_correction`'s
+    is `-2*erf_k**2*X` (`ErfSquash.log_abs_det_jacobian`); `erf_k` is set to
+    `(2*terminal_var)**-0.5` in `__init__` precisely so `2*erf_k**2 == 1/terminal_var`
+    and the two cancel for every `X`. This only holds for `ErfSquash` -- if
+    `squash_cls` is ever pointed at a squash without that identity, this target
+    would need the dropped term reinstated."""
     key = self.rngs.noise() if key is None else key
     rollout_key, noise_key = jax.random.split(key)
 

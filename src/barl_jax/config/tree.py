@@ -21,7 +21,6 @@ TRAINING_KEYS = frozenset({
   "chunk_size",
   "batch_size",
   "utd_ratio",
-  "epochs_per_rollout",
   "random_steps",
   "lr_warmup_steps",
 })
@@ -485,7 +484,8 @@ def validate(name: str, config) -> list[str]:
       problems.append(str(e))
       continue
 
-    objective = getattr(policy_cls, "SLOT_OBJECTIVES", {}).get(slot)
+    objective = policy_cls.slot_objective(
+      slot, _component_cls(t.slot_class(policy_name, "actor")) if "actor" in slots else None)
     if objective is not None and getattr(cls, "learning_objective", None) != objective:
       problems.append(f"{policy_name}.{slot}: {cls.__name__} does not support {objective!r}")
 

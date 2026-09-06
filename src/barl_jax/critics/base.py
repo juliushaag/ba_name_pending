@@ -129,7 +129,7 @@ class QCriticBase(CriticLossConfig, CriticOptim, Critic):
     return jax.lax.stop_gradient(reduce(next_raw))
 
   def td_loss(self, obs, action, next_obs, next_action, chunk_return, terminated, horizon,
-              losses: dict, entropy_bonus=0.0) -> None:
+              losses: dict, entropy_bonus=0.0, *, key=None) -> None:
     """chunk_return: (B,) accumulated discounted return over the executed
     horizon (already gamma-weighted per primitive step by the collector --
     this applies exactly one more discount, from t+h to t+0, to the

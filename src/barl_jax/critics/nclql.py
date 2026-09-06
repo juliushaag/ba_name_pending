@@ -2,12 +2,13 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from barl_jax.components import HParamsOwner
+from barl_jax.components import Buffer, HParamsOwner
 from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.hparam import Config, HParam
 from barl_jax.networks.mlp import MLP_PRESETS
 from barl_jax.networks.time_embedding import TIME_STYLES, TimeEmbedding
-from barl_jax.registration import register_component
+from barl_jax.registration import get_component, register_component
+from barl_jax.networks.schedule import Schedule
 
 from .base import Polyak
 from .categorical import C51Critic, HLGaussCritic
@@ -16,12 +17,29 @@ from .ensemble import EnsembleCritic
 
 class NoiseConditionedCritic(HParamsOwner):
   learning_objective = "noise_td"
+  supports_bon = False
+  reward_scale = HParam(5.0)
+  noise_schedule = Config({"class": "ExponentialSchedule", "start": 0.1,
+                           "end": 0.001, "steps": 10})
 
   time_emb  = Config("fourier", style=TIME_STYLES)
   smoothing_coef = HParam(1.0)
 
   def __init__(self, env_stats, config: ConfigMixin, *args, rngs: nnx.Rngs, **kwargs):
     self.resolve_hparams(config, env_stats=env_stats)
+    schedule_config = dict(self.noise_schedule)
+    schedule_cls = get_component(schedule_config.pop("class"))
+    if not issubclass(schedule_cls, Schedule):
+      raise TypeError("noise_schedule must name a Schedule")
+    schedule_config = ConfigMixin("", schedule_config)
+    self.sigmas_schedule = schedule_cls(env_stats, schedule_config)
+    schedule_config.assert_all_consumed(owner="noise_schedule")
+    self.sigmas = Buffer(self.sigmas_schedule.ladder())
+    if self.sigmas.shape[0] < 2:
+      raise ValueError("Noise-conditioned TD requires at least two noise levels")
+    if env_stats.get("return_min") is not None:
+      env_stats = env_stats.derive(return_min=env_stats["return_min"] * self.reward_scale,
+                                   return_max=env_stats["return_max"] * self.reward_scale)
     self.encoder = TimeEmbedding(time_dim=self.time_dim, kind=self.time_embed,
                                  rngs=rngs, **self.hparam("time_kwargs"))
 
@@ -32,6 +50,15 @@ class NoiseConditionedCritic(HParamsOwner):
 
   def target_modules(self) -> dict:
     return {**super().target_modules(), "encoder": self.encoder}
+
+  def td_loss(self, obs, action, next_obs, next_action, chunk_return, terminated, horizon,
+              losses: dict, entropy_bonus=0.0, *, key=None) -> None:
+    """Clean TD plus smoothing, sharing the sampler's noise ladder."""
+    if key is None:
+      raise ValueError("Noise-conditioned TD requires an explicit random key")
+    self.noise_td_loss(obs, action, next_obs, next_action,
+                       chunk_return * self.reward_scale, terminated, horizon,
+                       self.sigmas[...], key, losses, entropy_bonus=entropy_bonus)
 
   def noise_td_loss(self, obs, action, next_obs, next_action, chunk_return, terminated, horizon,
                     sigmas, key, losses: dict, entropy_bonus=0.0) -> None:

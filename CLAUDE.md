@@ -21,6 +21,17 @@ when its declaration kind changes.
 Comments should explain non-obvious invariants or numerical/shape constraints.
 Prefer clear identifiers and short comments over historical implementation essays.
 
+## Algorithmic clarity
+
+Maximize abstraction reuse and algorithmic clarity together. Shared mathematical
+operations should have one implementation and explicit, readable composition.
+Read [docs/ALGORITHMIC_CLARITY.md](docs/ALGORITHMIC_CLARITY.md) before changing
+learning objectives or their data contracts. It defines the required overhaul:
+explicit chunk n-step targets, meaningful replay fields, visible gradient and
+update semantics, and equation-based acceptance tests. Evaluate abstraction and
+clarity jointly with the QOL simplification goals; redesign unclear boundaries
+before accepting either duplicated objectives or hidden mathematical choices.
+
 ## Active implementation handoff
 
 Read [docs/CLAUDE_IMPLEMENTATION_PLAN.md](docs/CLAUDE_IMPLEMENTATION_PLAN.md)

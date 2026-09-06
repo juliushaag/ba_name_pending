@@ -290,12 +290,15 @@ class Component(HParamsOwner):
 class ActionSampler(Component, nnx.Module, ABC):
   """Canonical action generation, independent of a training objective."""
 
+  critic_objective = "td"
+
   @abstractmethod
   def generate_action(self, obs, *, critic: "Critic" = None, key=None) -> tuple:
     """(action, entropy): a canonical [-1, 1] action, one row per obs row, and
     the differential entropy of whatever distribution produced it (shaped
     `(B, 1)`, or a scalar for an actor whose "entropy" is a property of a
-    parameter rather than of the draw -- SDAC's `noise_entropy`)."""
+    parameter rather than of the draw -- SDAC's `noise_entropy`).
+    A sampler without an entropy estimate returns None for entropy."""
 
   def sample(self, obs, *, critic: "Critic" = None, key=None):
     """The played action alone -- the default just discards the entropy

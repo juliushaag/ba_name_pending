@@ -17,7 +17,7 @@ import gymnasium as gym
 import jax
 import jax.numpy as jnp
 
-from barl_jax.components import Actor
+from barl_jax.components import ActionSampler
 from barl_jax.critics import QCriticBase
 from barl_jax.hparam import Config, HParam
 from barl_jax.networks.regulator import AutotuneRegulator
@@ -34,7 +34,12 @@ class RLPolicy(Policy):
   adds no entropy term to its own objective needs no dual at all."""
 
   SLOTS = ("critic", "actor")
-  SLOT_OBJECTIVES = {"critic": "td"}
+  @classmethod
+  def slot_objective(cls, slot, actor_cls=None):
+    if slot == "critic" and actor_cls is not None:
+      return cls.SLOT_OBJECTIVES.get(slot, actor_cls.critic_objective)
+    return super().slot_objective(slot, actor_cls)
+
   policy_delay = HParam(1, descr="grad steps between actor/dual updates (critic steps every step)")
   normalize_obs = Config(True)
 
@@ -46,7 +51,7 @@ class RLPolicy(Policy):
     chunked = self.env_stats.derive(act_dim=self.env_stats["chunked_act_dim"])
     self.critic: QCriticBase = self.build_component("critic", QCriticBase,
                                                     env_stats=chunked)
-    self.actor: Actor        = self.build_component("actor", Actor)
+    self.actor: ActionSampler = self.build_component("actor", ActionSampler)
     # No cadence/optimizer-key guard here: `self.optimizer_cadence()` is a
     # virtual call, and a MaxEntRLPolicy subclass hasn't built `self.entropy`
     # yet at this point in `super().__init__()` -- the check belongs at the
@@ -56,7 +61,7 @@ class RLPolicy(Policy):
     return self.normalize_observations(x) if self.normalize_obs else x
 
   def optimizer_cadence(self) -> dict:
-    return {"actor": self.policy_delay}
+    return {key: self.policy_delay for key in self.actor.create_optimizer() if key == "actor"}
 
   # ---- the three seams MaxEntRLPolicy fills in -----------------------------
 
@@ -92,27 +97,31 @@ class RLPolicy(Policy):
     # component's `rngs`. keys[2] is retired -- the explore term shares the
     # actor's stream now (one best-of-N) -- but the split stays 3-way so the
     # other two streams are unchanged.
-    keys = jax.random.split(self.rngs.noise(), 3)
+    actor_keys = tuple(sorted(self.actor.create_optimizer()))
+    # Critic-only samplers retain the original bootstrap/smoothing split.
+    keys = jax.random.split(self.rngs.noise(), 3 if actor_keys else 2)
 
     next_action, entropy = jax.lax.stop_gradient(
       self.actor.generate_action(next_obs, critic=self.critic, key=keys[0]))
     next_action = next_action.reshape(next_action.shape[0], -1)
 
     self.critic.td_loss(obs, action, next_obs, next_action, chunk_return, terminated, horizon,
-                        losses, entropy_bonus=self.target_entropy_bonus(alpha, entropy))
+                        losses, entropy_bonus=self.target_entropy_bonus(alpha, entropy), key=keys[-1])
 
     # An actor can own multiple optimizers (e.g. SDAC actor + exploration).
     # Compute their shared loss whenever any partition is due; mask each
     # optimizer independently according to optimizer_cadence().
-    losses.update(gated_losses(
-      self,
-      lambda actor, critic: actor.loss(obs, critic, alpha, key=keys[1]),
-      tuple(sorted(self.actor.create_optimizer())), self.actor, self.critic))
+    if actor_keys:
+      losses.update(gated_losses(
+        self,
+        lambda actor, critic: actor.loss(obs, critic, alpha, key=keys[1]),
+        actor_keys, self.actor, self.critic))
     self.dual_loss(entropy, losses)
 
     self.actor.metrics.vec("action", next_action.reshape(
       next_action.shape[0], self.actor.chunk_size, self.actor.action_dim), limit=1.0)
-    self.actor.metrics.dist("entropy", entropy)
+    if entropy is not None:
+      self.actor.metrics.dist("entropy", entropy)
 
     return losses
 
@@ -122,7 +131,9 @@ class RLPolicy(Policy):
 
   # ---- Best-of-N scoring (barl_jax.execution) -------------------------
 
-  supports_bon = True
+  @property
+  def supports_bon(self):
+    return getattr(self.critic, "supports_bon", True)
 
   def score(self, observation, action_chunk):
     """`critic.value()` at the online critic -- the same reduction (mean or
@@ -144,6 +155,7 @@ class MaxEntRLPolicy(RLPolicy):
   sets this false and the dual trains purely off the actor's DSM loss."""
 
   SLOTS = ("critic", "actor", "entropy")
+  SLOT_OBJECTIVES = {"critic": "td"}
   entropy_scale     = HParam(-1.0)
   entropy_in_target = Config(True)
 
