@@ -262,10 +262,12 @@ class DDPMActor(Actor, ActorOptim):
     return jnp.clip(action + noise, -1.0, 1.0)
 
   def noise_entropy(self):
-    """H of the additive exploration noise, the BoN output treated as
-    deterministic. A scalar, unlike the other actors' per-sample `(B, 1)`
-    entropy -- the entropy of a parameter, not of a draw."""
-    return (0.5 * math.log(2 * math.pi * math.e) + jnp.log(self.explore_std)).sum()
+    """H of the additive exploration noise per chunk position, `(chunk_size,)`
+    -- the entropy of a parameter, not of a per-sample draw, so unlike the
+    other actors' `(B, chunk_size)` this carries no batch axis. Summing within
+    each position's action_dim block rather than over the whole plan_dim is
+    the same total at chunk_size 1."""
+    return self.chunk_sum(0.5 * math.log(2 * math.pi * math.e) + jnp.log(self.explore_std))
 
   def after_step(self):
     super().after_step()
@@ -335,8 +337,11 @@ class DDPMActor(Actor, ActorOptim):
 
     a_bon   = self.squash(policy_x0)
     a_noisy = a_bon + self.explore_std * jax.random.normal(keys[4], a_bon.shape, a_bon.dtype)
-    explore_loss = -(frozen(critic).value(obs, a_noisy).mean()
-                     + jax.lax.stop_gradient(alpha) * self.noise_entropy())
+    # noise_entropy() is (chunk_size,); alpha is a scalar or (chunk_size,)
+    # (per_action granularity) -- either broadcasts, and the sum restores the
+    # single number this term needs, same as PathwiseActorMixin's entropy bonus.
+    entropy_term = (jax.lax.stop_gradient(alpha) * self.noise_entropy()).sum()
+    explore_loss = -(frozen(critic).value(obs, a_noisy).mean() + entropy_term)
     # Named "explore_noise_std", not "explore_std" -- a component's own
     # `self.metrics` carries no prefix (unlike a Policy's), so the metric key
     # is a bare attribute name and would collide with the `explore_std`

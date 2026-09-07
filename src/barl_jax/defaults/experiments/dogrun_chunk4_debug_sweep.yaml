@@ -14,7 +14,7 @@
 base: config/experiments/dogrun_debug.yaml
 
 axes:
-  algo: [AMDP, DIME, SDAC, NCLQL, SAC]
+  algo: [AMDP]
   env: [DogRun]
   run.chunk_size: [8]
 

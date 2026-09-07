@@ -118,9 +118,6 @@ class DISActor(PathwiseActorMixin, Actor, ActorOptim):
     """grad_x log N(x; 0, prior_std^2 I), the reference's uncontrolled drift."""
     return -x / self.prior_std**2
 
-  def prior_log_prob(self, x):
-    return gaussian.diag_log_prob(x, 0.0, self.prior_std)
-
   def control_at(self, obs, x, i: int):
     t = jnp.full((x.shape[0], 1), float(i), jnp.float32)
     u = self.field(obs, x, t).astype(jnp.float32)
@@ -140,14 +137,19 @@ class DISActor(PathwiseActorMixin, Actor, ActorOptim):
       x_new    = fwd_mean + scale * jax.random.normal(step_key, x.shape, jnp.float32)
 
       bwd_mean = x_new + eta * self.prior_score(x_new)
-      return x_new, gaussian.diag_log_prob(x, bwd_mean, scale) \
-                    - gaussian.diag_log_prob(x_new, fwd_mean, scale)
+      # Per-chunk-position log-ratio, (B, chunk_size): the diagonal kernel's
+      # log-density is a sum of independent per-dimension terms, so summing
+      # only within each position's action_dim block (chunk_sum) rather than
+      # over the whole plan_dim is the same total at chunk_size 1 and a
+      # genuine decomposition at chunk_size > 1.
+      return x_new, self.chunk_sum(gaussian.log_prob(x, bwd_mean, scale)) \
+                    - self.chunk_sum(gaussian.log_prob(x_new, fwd_mean, scale))
 
     X, entropy =  controlled_sde(euler_step, x, self.num_steps, key,
-                          aux=-self.prior_log_prob(x))
+                          aux=-self.chunk_sum(gaussian.log_prob(x, 0.0, self.prior_std)))
 
     if squash:
-      entropy = entropy + self.squash.log_abs_det_jacobian(X).sum(axis=-1, keepdims=True)
+      entropy = entropy + self.chunk_sum(self.squash.log_abs_det_jacobian(X))
       X = self.squash(X)
 
     return X.reshape(obs.shape[0], self.chunk_size, self.action_dim), entropy

@@ -2,6 +2,7 @@ import math
 
 import jax
 import jax.numpy as jnp
+import optax
 from flax import nnx
 
 from barl_jax.components import Component
@@ -19,15 +20,29 @@ class AutotuneRegulator(DualOptim, Component, nnx.Module):
   above target and rises while it sits below -- the sign canonical SAC needs, and
   the opposite of what this docstring claimed before.
 
-  `target` is always the owning Policy's own computed value (SAC/AMDP/DIME/SDAC
-  all pass `target=self.chunk_size * self.action_dim * self.entropy_scale` --
-  entropy is joint over the whole chunked plan, so the target scales with it
-  too), never a config/tunable -- so it stays a real keyword argument and is
-  not an HParam.
+  `target` is always the owning Policy's own computed value, never a
+  config/tunable -- so it stays a real keyword argument and is not an HParam.
+  It is either a plain float (one alpha for the whole chunked plan -- SAC/AMDP/
+  DIME/SDAC's default, `target=self.chunk_size * self.action_dim *
+  self.entropy_scale`, entropy being joint over the whole plan) or a
+  `(chunk_size,)` array (one alpha per chunk position -- `MaxEntRLPolicy`'s
+  `alpha_granularity: per_action`, `target=self.action_dim * self.entropy_scale`
+  per position). `log_alpha` just takes `target`'s shape, so this class carries
+  no granularity switch of its own -- the owning Policy decides by what shape
+  of `target` it passes in, and `value()`/`loss()` broadcast either way.
 
   The optimizer knobs come from the `DualOptim` mixin (a higher LR, unclipped)."""
 
   alpha_init   = Config(1.0)
+
+  # False pins alpha at `alpha_init` -- `components.<slot>.tune: false` in
+  # config. `create_optimizer()` still declares this dual's key (train_step's
+  # loss dict must match `create_optimizer()` exactly regardless), but backed
+  # by `optax.set_to_zero()` instead of Adam, so `log_alpha` still gets a
+  # gradient computed and logged, it is just never applied -- alpha is a
+  # config-set constant, not a silently-frozen-at-whatever-init-happened-to-be
+  # one.
+  tune = Config(True)
 
   # A dual has no tier ladder -- `kind` exists so the resolver can tell a sized
   # component from a non-sized one.
@@ -41,31 +56,47 @@ class AutotuneRegulator(DualOptim, Component, nnx.Module):
   min_alpha    = Config(1.0e-7)
   max_alpha    = Config(500.0)
 
-  def __init__(self, env_stats=None, config=None, *, target: float,
+  def __init__(self, env_stats=None, config=None, *, target,
                rngs: nnx.Rngs = None, **kwargs):
     super().__init__(env_stats, config, **kwargs)
 
-    # 0-dim, not shape (1,): the torch original carried a singleton dimension
-    # that made every product with alpha non-scalar, so a loss which did not
-    # happen to end in .mean() came out shaped (1,) and jax.grad rejected it.
-    self.log_alpha = nnx.Param(jnp.asarray(math.log(self.alpha_init), jnp.float32))
+    target = jnp.asarray(target, jnp.float32)
+    # 0-dim, not shape (1,), for a scalar target: the torch original carried a
+    # singleton dimension that made every product with alpha non-scalar, so a
+    # loss which did not happen to end in .mean() came out shaped (1,) and
+    # jax.grad rejected it. A (chunk_size,) target gives log_alpha the same
+    # shape -- one Lagrange multiplier per chunk position instead of one for
+    # the whole plan.
+    self.log_alpha = nnx.Param(jnp.full(target.shape, math.log(self.alpha_init), jnp.float32))
 
-    self.target_value = float(target)
+    # A bare Python float for the scalar case (unchanged from before -- kept
+    # out of the pytree entirely), a plain jnp array for the vector case.
+    self.target_value = float(target) if target.ndim == 0 else target
 
   def value(self):
     return jnp.exp(self.log_alpha[...])
 
   def loss(self, value, losses: dict) -> None:
     value = jax.lax.stop_gradient(value)
-    losses[f"{self.slot}_alpha"] = self.value() * (value - self.target_value).mean()
+    alpha = self.value()
+    target = self.target_value
+    # Elementwise product before the mean, not `alpha * (value - target).mean()`:
+    # identical for a scalar alpha (a scalar factors out of a mean either way),
+    # but for a (chunk_size,) alpha this is what gives log_alpha_i a gradient
+    # from position i's own discrepancy rather than from the discrepancy
+    # averaged across every position.
+    losses[f"{self.slot}_alpha"] = (alpha * (value - target)).mean()
 
-    alpha = jax.lax.stop_gradient(self.value())
-    self.metrics.scalar("alpha", alpha)
-    self.metrics.scalar("target", self.target_value)
+    alpha_sg = jax.lax.stop_gradient(alpha)
+    log = self.metrics.dist if alpha_sg.ndim else self.metrics.scalar
+    log("alpha", alpha_sg)
+    log("target", target)
     self.metrics.dist("value", value)
-    self.metrics.dist("value_scaled", value * alpha)
+    self.metrics.dist("value_scaled", value * alpha_sg)
 
   def create_optimizer(self) -> dict:
     # Keyed by slot, so a policy's two regulators stay distinct without a
     # `name` kwarg.
-    return {f"{self.slot}_alpha": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}
+    tx = (adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)
+          if self.tune else optax.set_to_zero())
+    return {f"{self.slot}_alpha": tx}

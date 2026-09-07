@@ -138,6 +138,59 @@ def test_regulator_dual_gradient_scales_with_alpha():
     assert grad_at(0.01) == pytest.approx(0.02, rel=1e-5)
 
 
+def test_regulator_with_a_vector_target_gives_one_alpha_per_position():
+    """`MaxEntRLPolicy`'s `alpha_granularity: per_action` passes a `(chunk_size,)`
+    target instead of a float -- log_alpha/value/target_value all take that
+    shape, with no separate switch on the regulator itself."""
+    target = jnp.array([-1.0, -2.0, -3.0])
+    r = build("AutotuneRegulator", alpha_init=0.5, target=target)
+
+    assert r.log_alpha[...].shape == (3,)
+    assert jnp.allclose(r.value(), 0.5)
+    assert jnp.array_equal(r.target_value, target)
+
+
+def test_regulator_vector_gradient_is_independent_per_position():
+    """Each log_alpha_i's gradient comes from position i's own discrepancy
+    only -- a batch of per-position values, reduced by `.mean()` over *both*
+    the batch and chunk axes (`(alpha * (value - target)).mean()`), must not
+    smear position i's signal onto position j's alpha."""
+    target = jnp.array([0.0, 0.0])
+    r = build("AutotuneRegulator", alpha_init=1.0, target=target)
+
+    # Batch of 2, chunk_size 2: position 0 sits 1.0 above target, position 1
+    # sits 3.0 above -- distinct gaps, so the two log_alpha grads must differ.
+    value = jnp.array([[1.0, 3.0], [1.0, 3.0]])
+
+    def dual_loss(reg):
+        losses = {}
+        reg.loss(value, losses)
+        return next(iter(losses.values()))
+
+    grads = nnx.grad(dual_loss)(r)["log_alpha"][...]
+    # d(loss)/d(log_alpha_i) = alpha_i * mean_b(value_{b,i} - target_i) /
+    # chunk_size (the /chunk_size falls out of the mean spanning both axes) --
+    # at alpha_init=1.0 that is the position's own gap halved, not the other
+    # position's.
+    assert grads.shape == (2,)
+    assert grads[0] == pytest.approx(0.5, rel=1e-5)
+    assert grads[1] == pytest.approx(1.5, rel=1e-5)
+
+
+def test_regulator_tune_false_pins_alpha_at_init():
+    """`tune: false` keeps `log_alpha` in the loss/gradient path (so the loss-key
+    contract `train_step` relies on is untouched) but backs its optimizer key
+    with `optax.set_to_zero()`, so an update never moves it off `alpha_init`."""
+    r = build("AutotuneRegulator", alpha_init=0.5, target=-1.0, tune=False)
+    tx = next(iter(r.create_optimizer().values()))
+    state = tx.init(r.log_alpha[...])
+
+    grads = jnp.array(3.0)                                # a nonzero gradient
+    updates, _ = tx.update(grads, state)
+    assert float(updates) == pytest.approx(0.0, abs=1e-12)
+    assert float(r.value()) == pytest.approx(0.5, abs=1e-6)
+
+
 # ----------------------------------------------------------------------
 # Free functions
 # ----------------------------------------------------------------------

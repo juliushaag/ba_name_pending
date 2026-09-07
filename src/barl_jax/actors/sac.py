@@ -91,10 +91,11 @@ class StochasticActor(PathwiseActorMixin, Actor, ActorOptim):
     log_prob = (gaussian.log_prob(x, mean, std)
                 - self.squash.log_abs_det_jacobian(x, action_flat)
                 - self.log_act_scale[...])
-    # Joint entropy of the whole plan, (B, 1) -- the same shape (and at
-    # chunk_size 1 the same value) as the single-action entropy was, so the
-    # Bellman shift and the dual read it unchanged.
-    entropy = -log_prob.sum(axis=-1, keepdims=True)
+    # Per-chunk-position entropy, (B, chunk_size): summing within each
+    # position's action_dim block rather than over the whole flattened plan --
+    # the same shape (and at chunk_size 1 the same value) as the old (B, 1)
+    # joint entropy, so a scalar alpha reads the chunk-summed total unchanged.
+    entropy = -self.chunk_sum(log_prob)
     return self._plan(action_flat), entropy
 
   def sample(self, s, *, critic: Critic = None, key=None):

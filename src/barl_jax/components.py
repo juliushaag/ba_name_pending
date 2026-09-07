@@ -264,6 +264,22 @@ class Component(HParamsOwner):
     the module tree, so it never names itself."""
     return Recorder(self)
 
+  def chunk_sum(self, x):
+    """An elementwise per-dimension quantity at plan resolution, `(..., plan_dim)`,
+    reduced within each chunk position's `action_dim` block: `(..., plan_dim) ->
+    (..., chunk_size)`. At chunk_size 1 this is the old full-plan `.sum(axis=-1)`
+    unchanged -- a per-chunk-position alpha and a single whole-plan alpha are the
+    same code path, just multiplied against a differently-shaped alpha."""
+    return x.reshape(*x.shape[:-1], self.chunk_size, self.action_dim).sum(axis=-1)
+
+  def chunk_broadcast(self, alpha):
+    """A per-chunk-position alpha, shape `()` or `(chunk_size,)`, widened to
+    `(plan_dim,)` by repeating each position's value across its `action_dim`
+    block -- the inverse reshape of `chunk_sum`, for a term that lives at plan
+    resolution (AMDP's score divisor) rather than being summed down to it."""
+    alpha = jnp.asarray(alpha)
+    return alpha if alpha.ndim == 0 else jnp.repeat(alpha, self.action_dim)
+
   def before_step(self):
     """Called once per gradient step, before the Policy's train_step."""
     ...
@@ -295,10 +311,15 @@ class ActionSampler(Component, nnx.Module, ABC):
   @abstractmethod
   def generate_action(self, obs, *, critic: "Critic" = None, key=None) -> tuple:
     """(action, entropy): a canonical [-1, 1] action, one row per obs row, and
-    the differential entropy of whatever distribution produced it (shaped
-    `(B, 1)`, or a scalar for an actor whose "entropy" is a property of a
-    parameter rather than of the draw -- SDAC's `noise_entropy`).
-    A sampler without an entropy estimate returns None for entropy."""
+    the differential entropy of whatever distribution produced it, decomposed
+    per chunk position -- shaped `(B, chunk_size)`, or `(chunk_size,)` for an
+    actor whose "entropy" is a property of a parameter rather than of the draw
+    (SDAC's `noise_entropy`). `chunk_size` 1 makes both the same shape (and
+    value) the old `(B, 1)`/scalar convention was, so every existing consumer
+    is unaffected; a caller wanting one number sums the chunk axis itself
+    (`target_entropy_bonus`/`PathwiseActorMixin.loss` do exactly that, weighted
+    by whatever shape `alpha` is). A sampler without an entropy estimate
+    returns None for entropy."""
 
   def sample(self, obs, *, critic: "Critic" = None, key=None):
     """The played action alone -- the default just discards the entropy
@@ -339,7 +360,12 @@ class PathwiseActorMixin:
   def loss(self, obs, critic: "Critic", alpha, *, key=None):
     action, entropy = self.generate_action(obs, key=key)
     q = frozen(critic).value(obs, action.reshape(action.shape[0], -1))
-    return {"actor": -(q + jax.lax.stop_gradient(alpha) * entropy).mean()}
+    # entropy is (B, chunk_size); alpha is either a scalar (one alpha for the
+    # whole chunk) or (chunk_size,) (one per chunk position) -- either way
+    # `alpha * entropy` broadcasts, and summing the chunk axis restores the
+    # single (B, 1) bonus the old whole-plan entropy already was.
+    bonus = (jax.lax.stop_gradient(alpha) * entropy).sum(axis=-1, keepdims=True)
+    return {"actor": -(q + bonus).mean()}
 
 
 class Critic(Component, nnx.Module, ABC):

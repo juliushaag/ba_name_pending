@@ -150,21 +150,38 @@ class RLPolicy(Policy):
 class MaxEntRLPolicy(RLPolicy):
   """`RLPolicy` plus an automatic entropy dual -- SAC, AMDP, DIME and SDAC all
   resolve here. `entropy_in_target` is the one real behavioural fork: SDAC's
-  Bellman target carries no entropy bonus (its `entropy` is a scalar over the
-  exploration parameter, not the per-sample quantity the target wants), so it
-  sets this false and the dual trains purely off the actor's DSM loss."""
+  Bellman target carries no entropy bonus (its `entropy` is a `(chunk_size,)`
+  property of the exploration parameter, not the per-sample quantity the
+  target wants), so it sets this false and the dual trains purely off the
+  actor's DSM loss.
+
+  `alpha_granularity` is the other fork: `"per_chunk"` (default) trains one
+  alpha for the whole chunked plan, exactly as before; `"per_action"` trains
+  one alpha per chunk position, each held at its own per-action target entropy
+  `action_dim * entropy_scale`. Every actor's `generate_action` already reports
+  entropy decomposed per chunk position (`(B, chunk_size)`, or `(chunk_size,)`
+  for SDAC's parameter entropy), so the only thing that changes between the two
+  is `target`'s shape -- `AutotuneRegulator` follows it -- and whether the dual
+  sees that decomposition summed to one number or as-is."""
 
   SLOTS = ("critic", "actor", "entropy")
   SLOT_OBJECTIVES = {"critic": "td"}
   entropy_scale     = HParam(-1.0)
   entropy_in_target = Config(True)
+  alpha_granularity = Config("per_action")
 
   def __init__(self, env: gym.Env, **kwargs):
     super().__init__(env, **kwargs)
 
+    assert self.alpha_granularity in ("per_chunk", "per_action"), (
+      f"{self.model_name}: alpha_granularity must be 'per_chunk' or "
+      f"'per_action', got {self.alpha_granularity!r}")
+
+    target = (jnp.full((self.chunk_size,), self.action_dim * self.entropy_scale, jnp.float32)
+              if self.alpha_granularity == "per_action"
+              else self.chunk_size * self.action_dim * self.entropy_scale)
     self.entropy: AutotuneRegulator = self.build_component(
-      "entropy", AutotuneRegulator,
-      target=self.chunk_size * self.action_dim * self.entropy_scale)
+      "entropy", AutotuneRegulator, target=target)
     assert set(self.optimizer_cadence()) <= set(self.create_optimizer()), (
       f"{self.model_name}: optimizer_cadence names a key create_optimizer() "
       f"doesn't -- build_optimizer's cadence.get(key, 1) would drop it silently.")
@@ -176,9 +193,16 @@ class MaxEntRLPolicy(RLPolicy):
     return self.entropy.value()
 
   def target_entropy_bonus(self, alpha, entropy):
+    """`entropy` is `(B, chunk_size)`; summing the chunk axis after weighting by
+    `alpha` (scalar or `(chunk_size,)`) restores the single `(B, 1)` bonus the
+    Bellman target wants, whichever granularity produced it."""
     if not self.entropy_in_target:
       return 0.0
-    return jax.lax.stop_gradient(alpha * entropy)
+    return jax.lax.stop_gradient((alpha * entropy).sum(axis=-1, keepdims=True))
 
   def dual_loss(self, entropy, losses) -> None:
-    self.entropy.loss(entropy, losses)
+    # per_chunk's target is one number for the whole plan, so the dual must see
+    # entropy summed the same way; per_action's target is per position, so the
+    # per-position decomposition goes in as-is.
+    value = entropy if self.alpha_granularity == "per_action" else entropy.sum(axis=-1, keepdims=True)
+    self.entropy.loss(value, losses)
