@@ -19,7 +19,7 @@ class LangevinActor(ActionSampler):
   kind = "sampler"
   critic_objective = "noise_td"
   steps_per_level = Config(2)
-  step_size = HParam(1.0e-4)
+  step_size = HParam(2.0e-3)
   temperature = HParam(500.0)
   normalize_score = Config(True)
   clip_actions = Config(True)
@@ -57,7 +57,15 @@ class LangevinActor(ActionSampler):
     score_norm = jnp.zeros(())
     keys = jax.random.split(key, num_levels * self.steps_per_level)
 
+    # Relative spacing only -- normalized to 1.0 at the coarsest level so `step_size`
+    # sets the actor's absolute step scale directly, independent of whatever
+    # absolute sigma units the critic's noise_schedule happens to use. Before this
+    # normalization, alpha_ratio[0] was (sigma_0/sigma_last)**2, which spans four
+    # orders of magnitude for the default ladder (0.1 -> 0.001) and drove the
+    # coarsest drift to ~250 against an action_limit of 1.0 -- a chain that spends
+    # its first levels slamming into the clip instead of annealing.
     alpha_ratio = (sigmas / sigmas[-1]) ** 2
+    alpha_ratio = alpha_ratio / alpha_ratio[0]
     for i in range(num_levels):
       alpha = self.step_size * alpha_ratio[i]
       for t in range(self.steps_per_level):
@@ -71,12 +79,10 @@ class LangevinActor(ActionSampler):
         noise = jax.random.normal(keys[i * self.steps_per_level + t], a.shape, a.dtype)
         a = a + drift + jnp.sqrt(alpha) * noise
 
-        # Per level, because the ladder spans four orders of magnitude in `alpha`
-        # and the two terms scale differently under it: `normalize_score` fixes
-        # |g| at 1, so the drift is 0.5*alpha*temperature outright while the
-        # noise is sqrt(alpha). Whether either is comparable to `action_limit`
-        # is the difference between a chain that anneals and one that spends its
-        # first levels slamming into the clip.
+        # `normalize_score` fixes |g| at 1, so the drift is 0.5*alpha*temperature
+        # outright while the noise is sqrt(alpha) -- whether either is comparable
+        # to `action_limit` is the difference between a chain that anneals and one
+        # that spends its first levels slamming into the clip.
         self.metrics.scalar(f"chain/drift_norm_l{i}",
                             jnp.linalg.norm(drift, axis=-1).mean(), tier=DEBUG)
         self.metrics.scalar(f"chain/noise_scale_l{i}", jnp.sqrt(alpha), tier=DEBUG)

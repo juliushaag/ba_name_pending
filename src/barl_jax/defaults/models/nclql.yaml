@@ -9,7 +9,7 @@ NCLQL:
     actor:
       class: LangevinActor
       steps_per_level: 2
-      step_size: 1.0e-4
+      step_size: 2.0e-3
       temperature: 500.0
       normalize_score: true
       clip_actions: true
