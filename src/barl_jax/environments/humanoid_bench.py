@@ -46,10 +46,16 @@ class HumanoidBenchEnvironment(Environment):
 
   use_async_vector_env = True
 
-  # HumanoidBench's per-task reward scale isn't documented per task; a random
-  # h1hand policy measures ~0.2/step -- the same order as DMC -- so this reuses
-  # DMC's +-200 bound. Horizon is 1000, so the discounting derivation applies
-  # unchanged. A task whose actual returns run past this should get its own.
+  # Most tasks' get_reward is a weighted sum of dm_control-style tolerance()
+  # terms whose weights sum to <=1, each term itself in [0, 1] -- the same
+  # per-step shape as DMC's suite (verified against basic_locomotion_envs.py,
+  # pole, highbar, balance, room, powerlift, spoon, window, door, cube and
+  # insert's source). So the DMC derivation applies unchanged: twice the
+  # discounted bound (1-gamma^T)/(1-gamma) at gamma 0.99, horizon 1000,
+  # symmetric. Tasks whose get_reward instead sustains a larger per-step
+  # magnitude (reach) or adds a sparse completion bonus well past 1 (push,
+  # package, basketball, cabinet, bookshelf, truck, maze, kitchen) override
+  # this below with their own derivation.
   stats = {"return_min": -200.0, "return_max": 200.0}
 
   def task_id(self) -> str:
@@ -88,6 +94,13 @@ class H1HandHurdle(HumanoidBenchEnvironment):
 
 @register_environment
 class H1HandMaze(HumanoidBenchEnvironment):
+  # get_reward's <=1/step shaping term (discounted bound ~100, as in the
+  # family default) is joined by a sparse `stage_convert_reward` of
+  # 100*stage_index at each of 4 checkpoint crossings (100,200,300,400).
+  # Discounting 4 back-to-back bonuses at gamma=0.99 barely dents their
+  # 1000 undiscounted sum (still ~980) -- the value near the last crossing
+  # is ~1080, doubled for headroom.
+  stats = {"return_min": -2200.0, "return_max": 2200.0}
   def task_id(self): return "h1hand-maze-v0"
 
 @register_environment
@@ -131,14 +144,29 @@ class H1HandHighbarHard(HumanoidBenchEnvironment):
 
 @register_environment
 class H1HandReach(HumanoidBenchEnvironment):
+  # get_reward = healthy_reward(<=5) - 1e-4*motion_penalty + reward_close(<=5)
+  # + reward_success(<=10): once the hand holds position all three positive
+  # terms are sustained every step, ~20/step rather than the family's ~1 --
+  # 20x the shared bound, doubled for headroom.
+  stats = {"return_min": -4000.0, "return_max": 4000.0}
   def task_id(self): return "h1hand-reach-v0"
 
 @register_environment
 class H1HandPush(HumanoidBenchEnvironment):
+  # get_reward's dense term is a small distance penalty, but reaching the
+  # goal (box within 5cm) adds a one-off +1000 and terminates the episode --
+  # the value approaching that transition is ~1000, doubled for headroom.
+  stats = {"return_min": -2000.0, "return_max": 2000.0}
   def task_id(self): return "h1hand-push-v0"
 
 @register_environment
 class H1HandCabinet(HumanoidBenchEnvironment):
+  # 4 subtasks each pay a one-off 100*subtask_index completion bonus on top
+  # of a <=1/step stabilization/subtask term (discounted bound ~100). Same
+  # near-back-to-back discounting as Maze's 4 checkpoints: 100+200+300+400
+  # discounts to ~980 at gamma=0.99, so the value near the last completion
+  # is ~1080, doubled for headroom.
+  stats = {"return_min": -2200.0, "return_max": 2200.0}
   def task_id(self): return "h1hand-cabinet-v0"
 
 @register_environment
@@ -147,6 +175,12 @@ class H1HandDoor(HumanoidBenchEnvironment):
 
 @register_environment
 class H1HandTruck(HumanoidBenchEnvironment):
+  # 5 packages each pay a pickup (+100) and a place (+100) bonus -- 10
+  # events, discounting to ~960 of their 1000 undiscounted sum at gamma=0.99
+  # if reached back-to-back -- plus a <=4/step (not <=1, unlike most tasks:
+  # `upright * (1 + 3 proximity terms)`) background whose discounted bound
+  # is ~400. Together ~1360, doubled for headroom.
+  stats = {"return_min": -2800.0, "return_max": 2800.0}
   def task_id(self): return "h1hand-truck-v0"
 
 @register_environment
@@ -155,14 +189,27 @@ class H1HandCube(HumanoidBenchEnvironment):
 
 @register_environment
 class H1HandBookshelfSimple(HumanoidBenchEnvironment):
+  # get_reward's <=1/step shaping term (discounted bound ~100) is joined by
+  # a one-off 100*task_index bonus per shelved object, for 5 objects
+  # (100+200+300+400+500=1500 undiscounted). Discounting 5 back-to-back
+  # placements at gamma=0.99 only brings that to ~1460 -- the value near the
+  # last placement is ~1560, doubled for headroom.
+  stats = {"return_min": -3000.0, "return_max": 3000.0}
   def task_id(self): return "h1hand-bookshelf_simple-v0"
 
 @register_environment
 class H1HandBookshelfHard(HumanoidBenchEnvironment):
+  stats = {"return_min": -3000.0, "return_max": 3000.0}
   def task_id(self): return "h1hand-bookshelf_hard-v0"
 
 @register_environment
 class H1HandBasketball(HumanoidBenchEnvironment):
+  # get_terminated ends the episode the instant the ball is within 5cm of
+  # the hoop, the same step get_reward's +1000 fires -- like Push/Package,
+  # the value approaching that transition is ~1000 undiscounted (gamma
+  # applies only to rewards *after* this step, and there are none), doubled
+  # for headroom.
+  stats = {"return_min": -2000.0, "return_max": 2000.0}
   def task_id(self): return "h1hand-basketball-v0"
 
 @register_environment
@@ -175,10 +222,20 @@ class H1HandSpoon(HumanoidBenchEnvironment):
 
 @register_environment
 class H1HandKitchen(HumanoidBenchEnvironment):
+  # get_reward is `len(completions)` -- at most one point per subtask, ever,
+  # since completed subtasks are removed from tasks_to_complete. success_bar
+  # (4) is the whole task's subtask count; doubled for headroom.
+  stats = {"return_min": -8.0, "return_max": 8.0}
   def task_id(self): return "h1hand-kitchen-v0"
 
 @register_environment
 class H1HandPackage(HumanoidBenchEnvironment):
+  # get_reward's dense term is a distance penalty, but reaching the
+  # destination (within 10cm) adds a one-off +1000 and get_terminated ends
+  # the episode the same step -- like Push, the value approaching that
+  # transition is ~1000 undiscounted (no future rewards left to discount),
+  # doubled for headroom.
+  stats = {"return_min": -2000.0, "return_max": 2000.0}
   def task_id(self): return "h1hand-package-v0"
 
 @register_environment
