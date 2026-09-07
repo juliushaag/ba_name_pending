@@ -27,7 +27,7 @@ class NoiseConditionedCritic(HParamsOwner):
 
   def __init__(self, env_stats, config: ConfigMixin, *args, rngs: nnx.Rngs, **kwargs):
     self.resolve_hparams(config, env_stats=env_stats)
-    schedule_config = dict(self.noise_schedule)
+    schedule_config = dict(self.hparam("noise_schedule"))
     schedule_cls = get_component(schedule_config.pop("class"))
     if not issubclass(schedule_cls, Schedule):
       raise TypeError("noise_schedule must name a Schedule")

@@ -63,11 +63,13 @@ def test_actor_loss_gradient_does_not_reach_the_critic(name):
   """`frozen(critic)` inside every actor's `loss()` has to actually stop the
   gradient, not just read the current price -- if it leaked, the actor's own
   objective would also be training the critic's heads on whatever the actor
-  happens to sample, silently changing what the critic regresses to. NCLQL
-  has no Actor slot (no seam this applies to)."""
+  happens to sample, silently changing what the critic regresses to. NCLQL's
+  LangevinActor has no `loss()` -- it climbs the live critic's action
+  gradients instead of an optimized objective, so there is no seam this
+  applies to."""
   policy = make(name)
-  if not hasattr(policy, "actor"):
-    pytest.skip(f"{name} has no Actor slot")
+  if not hasattr(policy, "actor") or not hasattr(policy.actor, "loss"):
+    pytest.skip(f"{name} has no actor loss")
   data = batch()
 
   def actor_loss(critic):
