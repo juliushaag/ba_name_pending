@@ -261,7 +261,10 @@ class SlurmExecutor(Executor):
         print(" ".join(cmd))
         print()
 
-        submitted = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        submitted = subprocess.run(cmd, capture_output=True, text=True)
+        if submitted.returncode != 0:
+            print(submitted.stderr, file=sys.stderr, end="")
+            submitted.check_returncode()
         run_id = submitted.stdout.strip().split(";")[0]
 
         # Held so the manifest -- whose `run_id` column is the array job id Slurm
