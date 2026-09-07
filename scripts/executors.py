@@ -263,6 +263,7 @@ class SlurmExecutor(Executor):
 
         submitted = subprocess.run(cmd, capture_output=True, text=True)
         if submitted.returncode != 0:
+            print(submitted.stdout, end="")
             print(submitted.stderr, file=sys.stderr, end="")
             submitted.check_returncode()
         run_id = submitted.stdout.strip().split(";")[0]
