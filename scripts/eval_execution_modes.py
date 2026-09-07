@@ -210,9 +210,16 @@ def main():
       per_seed = {}
       for seed, ckpt_path in checkpoints:
         eval_seed = derive_seed(run_dir.name, seed, "eval_execution_modes")
-        per_seed[seed] = evaluate_checkpoint(
-          ckpt_path, single_env, vector_env, env_stats,
-          seed=eval_seed, episodes=args.episodes, num_candidates=args.num_candidates)
+        try:
+          per_seed[seed] = evaluate_checkpoint(
+            ckpt_path, single_env, vector_env, env_stats,
+            seed=eval_seed, episodes=args.episodes, num_candidates=args.num_candidates)
+        except Exception as e:
+          # A checkpoint that fails to restore (a truncated transfer, seen on
+          # this sweep) should not cost every other seed/model's results --
+          # report it and keep going.
+          print(f"{model} seed{seed}: FAILED to load ({type(e).__name__}: {e}) -- skipping")
+          continue
         print(f"{model} seed{seed}: "
               f"direct={per_seed[seed]['direct'].get('mean_return'):.1f}  "
               f"mean_of_n={per_seed[seed]['mean_of_n'].get('mean_return'):.1f}")
@@ -226,13 +233,15 @@ def main():
     print(json.dumps(results, indent=2))
     return
 
-  print(f"\n{'model':<8}{'direct':>12}{'mean_of_n':>12}{'delta':>10}")
+  print(f"\n{'model':<8}{'seeds':>7}{'direct':>12}{'mean_of_n':>12}{'delta':>10}")
   for model, r in results.items():
-    direct = np.mean([s["direct"]["mean_return"] for s in r["per_seed"].values()
-                      if "mean_return" in s["direct"]])
-    mean_n = np.mean([s["mean_of_n"]["mean_return"] for s in r["per_seed"].values()
-                      if "mean_return" in s["mean_of_n"]])
-    print(f"{model:<8}{direct:>12.1f}{mean_n:>12.1f}{mean_n - direct:>+10.1f}")
+    directs = [s["direct"]["mean_return"] for s in r["per_seed"].values() if "mean_return" in s["direct"]]
+    mean_ns = [s["mean_of_n"]["mean_return"] for s in r["per_seed"].values() if "mean_return" in s["mean_of_n"]]
+    if not directs or not mean_ns:
+      print(f"{model:<8}{len(r['per_seed']):>7}{'no loadable seeds':>27}")
+      continue
+    direct, mean_n = np.mean(directs), np.mean(mean_ns)
+    print(f"{model:<8}{len(directs):>7}{direct:>12.1f}{mean_n:>12.1f}{mean_n - direct:>+10.1f}")
 
 
 if __name__ == "__main__":
