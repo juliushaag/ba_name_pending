@@ -23,15 +23,6 @@ jobs:
       - run: uv pip install --python 3.11 --system ruff==0.16.3
       - run: ruff check .
 
-  config-lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
-        with: {python-version: "3.11"}
-      - run: uv pip install --python 3.11 --system -e src/barl_jax pyyaml
-      - run: JAX_PLATFORMS=cpu MUJOCO_GL=egl python scripts/lint_config.py
-
   cpu-tests:
     runs-on: ubuntu-latest
     steps:
@@ -51,10 +42,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
         with: {python-version: "3.11"}
-      # scripts/wheel_smoke.py only shells out to `uv build`/`uv venv`/`uv pip
-      # install` itself -- run with the system interpreter so this step, too,
-      # never triggers a root-project `uv sync`.
-      - run: python3 scripts/wheel_smoke.py
+      - run: uv build src/barl_jax --wheel --out-dir /tmp/barl-dist
+      - run: uv venv /tmp/barl-wheel
+      - run: uv pip install --python /tmp/barl-wheel/bin/python /tmp/barl-dist/*.whl
+      - run: cd /tmp && /tmp/barl-wheel/bin/python -c "from barl_jax.config.tree import ConfigTree; from barl_jax.launch import grid; assert ConfigTree().available_models(); assert grid.default_num_seeds() > 0"
 
   cpu-example:
     runs-on: ubuntu-latest

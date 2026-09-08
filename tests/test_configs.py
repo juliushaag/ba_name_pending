@@ -5,25 +5,11 @@ isolation, against synthetic tmp_path trees, since config_tree.py's own
 tests (test_config_tree.py) cover the precedence chain built on top of it.
 """
 
-import importlib.util
-import pathlib
-import sys
 
 import pytest
 import yaml
 
 from barl_jax.config.toolkit import Config, ConfigMixin, _check_type, _format_type, deep_merge
-
-SCRIPTS = pathlib.Path(__file__).resolve().parent.parent / "scripts"
-sys.path.insert(0, str(SCRIPTS))
-
-
-def load_script(name: str):
-  spec = importlib.util.spec_from_file_location(name, SCRIPTS / f"{name}.py")
-  module = importlib.util.module_from_spec(spec)
-  spec.loader.exec_module(module)
-  return module
-
 
 # ---------------------------------------------------------------------------
 # fixtures
@@ -234,7 +220,7 @@ def test_repr(simple_config):
 
 
 # ---------------------------------------------------------------------------
-# real consumers: barl_jax.config.load_config and scripts/grid.py both take
+# real consumers: barl_jax.config.load_config and barl_jax.launch.grid both take
 # $() includes for free through the same toolkit, exercised here through
 # their actual production code paths rather than through configs.py directly.
 # ---------------------------------------------------------------------------
@@ -256,7 +242,7 @@ def test_experiment_file_runs_list_can_be_included(tmp_path):
 
 
 def test_grid_spec_exclude_list_can_be_included(tmp_path):
-  grid = load_script("grid")
+  from barl_jax.launch import grid
 
   (tmp_path / "shared_exclude.yaml").write_text(yaml.safe_dump([{"algo": "SAC", "seed": 2}]))
   spec = tmp_path / "spec.yaml"
@@ -265,7 +251,7 @@ def test_grid_spec_exclude_list_can_be_included(tmp_path):
     "exclude": "$(shared_exclude.yaml)",
   }))
 
-  _, axes, exclude = grid.build_axes(grid=str(spec))
+  axes, exclude = grid.build_axes(grid=str(spec))
   assert exclude == [{"algo": "SAC", "seed": 2}]
   combos = grid.build_combos(axes, exclude)
   assert combos == [{"algo": "SAC", "env": "HalfCheetah", "seed": 0},

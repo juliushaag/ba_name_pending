@@ -6,13 +6,11 @@ matter what `config/` says afterwards.
 """
 
 import json
-import shutil
 
 import pytest
 
 import barl_jax.config.tree as model_config
 from barl_jax.config.run import INJECTED_KEYS, load_config, run_keys
-from barl_jax.config.toolkit import CONFIG_DIR
 from barl_jax.config.tree import TRAINING_KEYS, ConfigTree
 from barl_jax.registration import available_components, get_component
 
@@ -46,8 +44,8 @@ def test_every_model_validates(name):
 # --- tiers ----------------------------------------------------------------
 
 def _ladder_kinds(tree) -> list[str]:
-    from barl_jax.hparam import BUNDLES
-    return sorted({name.split(".")[1] for name in BUNDLES if name.startswith("tiers.")})
+    from barl_jax.networks.mlp import MLP_TIERS
+    return sorted(MLP_TIERS)
 
 
 def test_a_tier_means_the_same_keys_across_a_kind(tree):
@@ -81,15 +79,15 @@ def test_the_ladder_is_monotone_in_width(tree, kind):
 
 def test_a_tier_override_moves_exactly_the_ladder_keys(tree):
     """What `--set model.components.critic.tier=large` has to do, and no more."""
-    from barl_jax import hparam
+    from barl_jax.networks.mlp import MLP_TIERS
     base  = tree.resolved("SAC")
     large = ConfigTree(overrides={"components.critic.tier": "large"}).resolved("SAC")
 
     moved = {k for k in base if base[k] != large.get(k)}
     expected = {f"components.critic.{k}" for k in tree.tier_keys("critic")
-                if base[f"components.critic.{k}"] != hparam.tier("critic", "large")[k]}
+                if base[f"components.critic.{k}"] != MLP_TIERS["critic"]["large"][k]}
     assert moved == expected | {"components.critic.tier"}
-    assert large["components.critic.latent_dim"] == hparam.tier("critic", "large")["latent_dim"]
+    assert large["components.critic.latent_dim"] == MLP_TIERS["critic"]["large"]["latent_dim"]
 
 
 def test_large_is_the_same_net_whichever_critic_class(tree):
@@ -103,10 +101,12 @@ def test_large_is_the_same_net_whichever_critic_class(tree):
 
 # --- run keys -------------------------------------------------------------
 
-def test_every_run_key_is_declared():
+def test_every_run_key_is_declared(tmp_path):
     """A run entry may not carry a key config/run/defaults.yaml doesn't declare;
     such a key could never be set and would never be logged."""
-    for run in load_config(str(CONFIG_DIR / "experiments" / "online_learning.yaml")):
+    path = tmp_path / "run.yaml"
+    path.write_text("runs: [{model: SAC, env: HalfCheetah}]\n")
+    for run in load_config(str(path)):
         assert not set(run) - run_keys() - INJECTED_KEYS
 
 
@@ -140,12 +140,14 @@ def test_resolved_covers_every_declared_hparam(tree):
                 f"{model}.{slot}: declared hparams missing from resolved()"
 
 
-def test_a_resolved_run_has_every_run_key():
+def test_a_resolved_run_has_every_run_key(tmp_path):
     """The run side of the same guarantee: a resolved run dict carries a value
     for every declared run key, so trainer's `cfg[...]` indexing and the
     wandb `run/*` block are complete by construction."""
     from barl_jax.config.run import RUN_CONFIGS, load_config
-    runs = load_config(str(CONFIG_DIR / "experiments" / "online_learning.yaml"))
+    path = tmp_path / "run.yaml"
+    path.write_text("runs: [{model: SAC, env: HalfCheetah}]\n")
+    runs = load_config(str(path))
     assert runs
     for run in runs:
         assert set(RUN_CONFIGS) <= set(run), \
@@ -157,23 +159,22 @@ def test_a_resolved_run_has_every_run_key():
 def test_a_snapshot_replays_through_an_edit_to_the_tree():
     """The guarantee that lets a finished sweep run be re-run months later: the
     snapshot serves resolved values, so editing the tree underneath it cannot
-    move them. Tiers now live in the code ladder (barl_jax.hparam), so "editing
+    move them. Tiers now live in the code ladder (barl_jax.networks.mlp), so "editing
     the tree" means monkeypatching the registered ladder."""
-    import barl_jax.hparam as hparam
+    from barl_jax.networks.mlp import MLP_TIERS
 
     snapshot = ConfigTree().snapshot_for("SAC")
     original = ConfigTree(snapshot=snapshot).resolved("SAC")
 
     rung = ConfigTree().policy_cfg("SAC")["components"]["critic"]["tier"]
-    key = f"tiers.critic.{rung}"
-    saved = hparam.BUNDLES[key]
+    saved = MLP_TIERS["critic"][rung]
     try:
-        hparam.BUNDLES[key] = {**saved, "latent_dim": 99, "layers": 7, "n_models": 5}
+        MLP_TIERS["critic"][rung] = {**saved, "latent_dim": 99, "layers": 7, "n_models": 5}
         assert ConfigTree().resolved("SAC")["components.critic.latent_dim"] == 99, \
             "the edit changed nothing, so this proves nothing"
         assert ConfigTree(snapshot=snapshot).resolved("SAC") == original
     finally:
-        hparam.BUNDLES[key] = saved
+        MLP_TIERS["critic"][rung] = saved
 
 
 def test_incomplete_snapshot_fails_instead_of_using_new_defaults():
@@ -204,40 +205,29 @@ def test_a_snapshot_resolves_what_the_live_tree_resolves(name):
 
 # --- profiles and aliases -------------------------------------------------
 
-def test_a_profile_reached_through_an_alias_overrides_every_block(tmp_path):
-    """The named-variant layer: an alias resolves to a (policy, profile) pair and
-    the profile may move a slot's `tier:`, its kwargs, the policy's `params:` and
-    its `training:` -- while a run override still beats all of it. Exercised here
-    because the tree ships no profiles of its own."""
-    root = tmp_path / "config"
-    shutil.copytree(CONFIG_DIR, root)
-    (root / "models" / "sac.yaml").write_text(
-        (root / "models" / "sac.yaml").read_text() + """
-  profiles:
-    big:
-      training: {batch_size: 1024}
-      params:   {entropy_scale: -2.0}
-      critic:   {tier: xlarge}
-      actor:    {tier: large, lr: 1.0e-4}
-""")
-    (root / "models" / "aliases.yaml").write_text(
-        "aliases:\n  sac_big: {policy: SAC, profile: big}\n")
-
-    tree = ConfigTree(root)
-    from barl_jax import hparam
+def test_a_profile_reached_through_an_alias_overrides_every_block():
+    tree = ConfigTree()
+    tree.models["SAC"]["profiles"] = {"big": {
+        "training": {"batch_size": 1024}, "params": {"entropy_scale": -2.0},
+        "critic": {"tier": "xlarge"}, "actor": {"tier": "large", "lr": 1.0e-4},
+    }}
+    tree.models["aliases"] = {"sac_big": {"policy": "SAC", "profile": "big"}}
+    from barl_jax.networks.mlp import MLP_TIERS
     assert "sac_big" in tree.available_models()
     big = tree.resolved("sac_big")
-    assert big["components.critic.latent_dim"] == hparam.tier("critic", "xlarge")["latent_dim"]
+    assert big["components.critic.latent_dim"] == MLP_TIERS["critic"]["xlarge"]["latent_dim"]
     assert big["components.actor.tier"] == "large"
     assert big["components.actor.lr"] == 1.0e-4      # a profile kwarg beats the tier preset
     assert big["params.entropy_scale"] == -2.0
     assert big["training.batch_size"] == 1024
 
-    overridden = ConfigTree(root, overrides={"components.critic.tier": "low"}).resolved("sac_big")
-    assert overridden["components.critic.latent_dim"] == hparam.tier("critic", "low")["latent_dim"]
+    overridden_tree = ConfigTree(overrides={"components.critic.tier": "low"})
+    overridden_tree.models = tree.models
+    overridden = overridden_tree.resolved("sac_big")
+    assert overridden["components.critic.latent_dim"] == MLP_TIERS["critic"]["low"]["latent_dim"]
 
     snapshot = tree.snapshot_for("sac_big")
-    assert ConfigTree(root, snapshot=snapshot).resolved("sac_big") == big
+    assert ConfigTree(snapshot=snapshot).resolved("sac_big") == big
 
     # Policy.make resolves the alias before constructing the policy, then asks
     # snapshot_for(canonical_model, explicit_profile). That path must preserve
@@ -247,14 +237,18 @@ def test_a_profile_reached_through_an_alias_overrides_every_block(tmp_path):
     assert tree.snapshot_for("SAC", "big")["resolved"]["training.batch_size"] == 1024
 
 
-def test_template_policy_defaults_are_inherited_without_yaml_repetition(tmp_path):
-    root = tmp_path / "config"
-    shutil.copytree(CONFIG_DIR, root)
-    path = root / "models" / "sac.yaml"
-    path.write_text(path.read_text().replace("    normalize_obs: true\n", ""))
+def test_template_policy_defaults_are_inherited_without_repetition():
+    tree = ConfigTree()
+    tree.models["SAC"]["params"].pop("normalize_obs", None)
+    assert tree.resolve_params("SAC", None)["normalize_obs"] is True
 
-    resolved = ConfigTree(root).resolve_params("SAC", None)
-    assert resolved["normalize_obs"] is True
+
+def test_actor_policy_defaults_are_instance_local():
+    from barl_jax.actors import ALGORITHMS
+    tree = ConfigTree()
+    tree.models["SAC"]["components"]["critic"]["tier"] = "low"
+    assert ALGORITHMS["SAC"].POLICY["components"]["critic"]["tier"] == "xlarge"
+    assert ConfigTree().slot_tier("SAC", "critic", None) == "xlarge"
 
 
 # --- provenance -----------------------------------------------------------

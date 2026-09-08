@@ -7,7 +7,6 @@ from flax import nnx
 from barl_jax.components import Buffer
 from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.hparam import Config, HParam
-from barl_jax.networks.mlp import MLP_PRESETS
 from barl_jax.registration import register_component
 
 from .base import ConcatQ, QCriticBase, n_step_discount
@@ -22,7 +21,16 @@ class CriticDistConfig:
 
 
 class CategoricalCriticBase(QCriticBase, CriticDistConfig):
-  mlp_preset = Config("crossq", style=MLP_PRESETS)
+  activation = Config('relu')
+  norm = Config('batchrenorm')
+  norm_stem = Config(True)
+  norm_input = Config(True)
+  norm_after_act = Config(True)
+  dropout = Config(0.0)
+  final_activation = Config(False)
+  residual = Config(False)
+  norm_kwargs = Config({'momentum': 0.99, 'warmup_steps': 100000, 'epsilon': 0.001, 'r_max': 3.0, 'd_max': 5.0})
+  dtype = Config('bfloat16')
 
   def __init__(self, env_stats, config: ConfigMixin, q_function, support, **kwargs):
     super().__init__(env_stats, config, q_function, **kwargs)

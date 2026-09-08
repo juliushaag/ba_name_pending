@@ -113,7 +113,8 @@ class ConfigTree:
     self.overrides  = deepcopy(overrides or {})
     self.presets    = _load_dir(root / "presets")
     self.components = _load_dir_merged(root / "components")
-    self.models     = _load_dir_merged(root / "models")
+    from barl_jax.actors import ALGORITHMS
+    self.models = {name: deepcopy(actor.POLICY) for name, actor in ALGORITHMS.items()}
     self.run = run_defaults()
     self.run.update(_load_yaml(root / "run" / "defaults.yaml"))
     self.envs       = _load_yaml(root / "run" / "envs.yaml")
@@ -131,8 +132,7 @@ class ConfigTree:
     return bool((self.snapshot or {}).get("resolved"))
 
   def tier_kwargs(self, kind: str, name: str) -> dict:
-    from barl_jax import hparam
-    return hparam.tier(kind, name)
+    return self.tier_table(kind)[name]
 
   def resolve_model_name(self, name: str) -> tuple[str, str | None]:
     alias = (self.models.get("aliases") or {}).get(name)
@@ -153,7 +153,7 @@ class ConfigTree:
   def _profile_cfg(self, policy_name: str, profile: str) -> dict:
     profiles = self.policy_cfg(policy_name).get("profiles") or {}
     if profile not in profiles:
-      raise KeyError(f"config/models/: {policy_name!r} has no profile {profile!r}\n"
+      raise KeyError(f"actor POLICY: {policy_name!r} has no profile {profile!r}\n"
                      f"  Available profiles: {sorted(profiles)}")
     return profiles[profile]
 
@@ -168,8 +168,8 @@ class ConfigTree:
     cls_name = slot_cfg.get("class")
     if cls_name is None:
       raise KeyError(
-        f"config/models/: {policy_name!r} has no `class:` for its {slot!r} slot -- every "
-        f"component must be named explicitly, there is no Python-level default.")
+        f"actor POLICY: {policy_name!r} has no `class:` for its {slot!r} slot -- every "
+        f"component must be named explicitly, declare it in the actor policy configuration.")
     return self.overrides.get(f"components.{slot}.class", cls_name)
 
   def slot_layers(self, policy_name: str, slot: str,
@@ -218,10 +218,8 @@ class ConfigTree:
     return getattr(_component_cls(cls_name), "kind", None)
 
   def tier_table(self, kind: str) -> dict:
-    from barl_jax import hparam
-    return {name[len(f"tiers.{kind}."):]: kwargs
-            for name, kwargs in hparam.BUNDLES.items()
-            if name.startswith(f"tiers.{kind}.")}
+    from barl_jax.networks.mlp import MLP_TIERS
+    return MLP_TIERS.get(kind, {})
 
   def tier_keys(self, kind: str) -> set:
     return {key for entry in self.tier_table(kind).values() for key in entry}
@@ -244,6 +242,9 @@ class ConfigTree:
       return cls_name, live
     replayed = dict(self._replayed(f"components.{slot}."))
     replayed.pop("tier", None)
+    # Older snapshots already contain every expanded MLP setting; the removed
+    # selector is metadata, not a constructor kwarg.
+    replayed.pop("mlp_preset", None)
     cls_name = replayed.pop("class", cls_name)
     missing = set(live) - set(replayed)
     if missing:
@@ -322,7 +323,7 @@ class ConfigTree:
   def explain(self, name: str) -> dict:
     policy_name, profile = self.resolve_model_name(name)
     if not self.policy_cfg(policy_name):
-      raise KeyError(f"config/models/: no block for {policy_name!r}")
+      raise KeyError(f"actor POLICY: no block for {policy_name!r}")
 
     def annotate(layers):
       keys = {k for _, kwargs in layers for k in kwargs}
@@ -409,8 +410,8 @@ def structure_problems(config) -> list[str]:
     return []
   problems = []
 
-  from barl_jax import hparam
-  kinds = sorted({name.split(".")[1] for name in hparam.BUNDLES if name.startswith(f"{TIERS}.")})
+  from barl_jax.networks.mlp import MLP_TIERS
+  kinds = sorted(MLP_TIERS)
   for kind in kinds:
     table = t.tier_table(kind)
     key_sets = {name: set(entry) for name, entry in table.items()}
@@ -436,7 +437,7 @@ def validate(name: str, config) -> list[str]:
   problems += structure_problems(t)
 
   if not t.policy_cfg(policy_name):
-    return problems + [f"config/models/ has no block for {policy_name!r}"]
+    return problems + [f"actor POLICY has no block for {policy_name!r}"]
 
   slots = t.slots(policy_name)
   class_name = t.policy_class_name(policy_name)
@@ -445,13 +446,13 @@ def validate(name: str, config) -> list[str]:
   except KeyError:
     policy_cls = None
   if policy_cls is None:
-    problems.append(f"config/models/: {policy_name}'s policy: names {class_name!r}, "
+    problems.append(f"actor POLICY: {policy_name}'s policy: names {class_name!r}, "
                     f"which is not a registered Policy ({', '.join(sorted(Policy._classes))})")
   else:
     declared, expected = set(slots), set(policy_cls.SLOTS)
-    problems += [f"{policy_name}: YAML declares slot {s!r} that {class_name} does not "
+    problems += [f"{policy_name}: actor declares slot {s!r} that {class_name} does not "
                  f"build (it builds {sorted(expected)})" for s in sorted(declared - expected)]
-    problems += [f"{policy_name}: {class_name} builds slot {s!r} but the YAML declares "
+    problems += [f"{policy_name}: {class_name} builds slot {s!r} but the actor declares "
                  f"none ({sorted(declared)})" for s in sorted(expected - declared)]
 
   for source, block in t.training_layers(policy_name, profile):

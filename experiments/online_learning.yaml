@@ -1,7 +1,6 @@
-# The run list for scripts/online_learning.py, and the base config every
-# scripts/submit.py grid expands from.
+# The default run list for scripts/submit.py.
 #
-#   uv run python scripts/online_learning.py [--config path/to/this.yaml]
+#   uv run python scripts/submit.py [--config path/to/this.yaml]
 #
 # Run keys come from config/run/defaults.yaml and per-env overrides from
 # config/run/envs.yaml; this file carries only what is specific to *these* runs.

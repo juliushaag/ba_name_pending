@@ -1,20 +1,10 @@
-"""Environment inventory and active probes for diagnosing "why won't this run
-here" without reading five scripts first.
+"""Report package versions, optional simulators, and submodule readiness.
 
-Cheap inventory (package versions, which optional simulators are importable,
-submodule readiness) runs in-process. Anything that can crash the interpreter
-outright -- picking a JAX backend, opening an EGL render context -- runs as a
-subprocess with a timeout, so a native fault here is a reported failure
-instead of a dead doctor process.
+    uv run python scripts/debug.py --probes --json
 
-    uv run python scripts/doctor.py
-    uv run python scripts/doctor.py --json
-    uv run python scripts/doctor.py --probes   # also run backend/render probes
-
-Exit code is nonzero only if a *required* probe fails (JAX importing, and the
-backend probe when --probes is given). Missing optional simulators are
-informational.
-"""
+Backend and EGL probes run in subprocesses with timeouts to contain native
+crashes. Missing JAX or a failed backend probe produces a nonzero exit status;
+optional simulator and render failures are informational."""
 
 import argparse
 import importlib.util
@@ -37,9 +27,6 @@ OPTIONAL_SIMULATORS = {
   "humanoid-bench": "humanoid_bench",
 }
 
-CORE_PACKAGES = ["jax", "flax", "optax", "numpy", "gymnasium", "orbax.checkpoint"]
-
-
 DIST_NAMES = {"jax": "jax", "flax": "flax", "optax": "optax", "numpy": "numpy",
               "gymnasium": "gymnasium", "orbax.checkpoint": "orbax-checkpoint"}
 
@@ -47,9 +34,9 @@ DIST_NAMES = {"jax": "jax", "flax": "flax", "optax": "optax", "numpy": "numpy",
 def versions() -> dict:
   import importlib.metadata as md
   out = {"python": sys.version.split()[0]}
-  for pkg in CORE_PACKAGES:
+  for pkg, dist in DIST_NAMES.items():
     try:
-      out[pkg] = md.version(DIST_NAMES[pkg])
+      out[pkg] = md.version(dist)
     except md.PackageNotFoundError:
       out[pkg] = None
   return out
@@ -142,17 +129,29 @@ def print_text(data: dict) -> None:
 
 if __name__ == "__main__":
   args = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+  args.add_argument("--model", help="Include resolved model settings and validation problems")
+  args.add_argument("--set", action="append", metavar="PATH=VALUE")
   args.add_argument("--probes", action="store_true",
                     help="Also run the JAX backend and EGL render probes (each a "
                          f"subprocess, {PROBE_TIMEOUT}s timeout).")
   args.add_argument("--json", action="store_true", help="Machine-readable output.")
   kwargs = args.parse_args()
+  if kwargs.set and not kwargs.model:
+    args.error("--set requires --model")
 
   data = report(run_probes=kwargs.probes)
+  if kwargs.model:
+    from barl_jax.config.toolkit import parse_set_overrides
+    from barl_jax.config.tree import ConfigTree, validate
+    tree = ConfigTree(overrides=parse_set_overrides(kwargs.set))
+    data["model"] = tree.resolved(kwargs.model)
+    data["config_problems"] = validate(kwargs.model, tree)
 
   if kwargs.json:
     print(json.dumps(data, indent=2, sort_keys=True))
   else:
     print_text(data)
+    if "model" in data:
+      print(json.dumps({k: data[k] for k in ("model", "config_problems")}, indent=2))
 
-  sys.exit(1 if required_probes_failed(data) else 0)
+  sys.exit(1 if required_probes_failed(data) or data.get("config_problems") else 0)

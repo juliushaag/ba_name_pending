@@ -1,22 +1,10 @@
 #!/usr/bin/env python3
 
-"""The local stand-in for Slurm, run by scripts/submit.py in window 0 of its own
-tmux session.
+"""Manage a sweep's GPU queue in a detached tmux session.
 
-One tmux window per manifest row, running exactly the command a Slurm array task
-runs -- so this is Slurm *and* run_rl.slurm together: it owns the queue that
-`--array=0-N%M` expresses, and hands each task a GPU. A window is a task: it has
-its own terminal to watch, its own scrollback, and can be killed on its own.
-
-It knows nothing about algorithms, environments or sweep axes. A manifest row is
-an index, a tag and a path to a config that submit.py already wrote; running it
-is one command. That is the whole interface, which is why a sweep over any axis
-needs no change here.
-
-Unlike a Slurm task there is no node-local scratch to work in and copy back: this
-is the same filesystem, and each run writes only into its own directory under the
-sweep folder, so it writes there directly.
-"""
+Started by TmuxExecutor. Each manifest row becomes a run window; completed
+windows release their GPU slot. Outputs remain in the sweep directory and
+live queue status is written to tasks.yaml."""
 
 import argparse
 import os
@@ -29,12 +17,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
-from executors import detect_gpus, read_manifest
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+from .executors import detect_gpus, read_manifest
+
+REPO_ROOT = Path.cwd()
 
 POLL_SECONDS = 0.5
 
@@ -106,7 +95,7 @@ class Pool:
     return set(out.splitlines())
 
   def start(self, task: Task, gpu: str) -> None:
-    inner = ["uv", "run", "python", "scripts/online_learning.py", "--config", str(task.config)]
+    inner = ["uv", "run", "python", "-m", "barl_jax.launch.worker", "--config", str(task.config)]
     if self.time_limit:
       inner = ["timeout", str(self.time_limit), *inner]
 

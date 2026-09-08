@@ -6,14 +6,16 @@
 # the (B, 4, act_dim) contract; no actor natively predicts a plan yet).
 #
 # 30-minute cap is NOT in this file -- it comes from `--debug` at submit time:
-#   uv run python scripts/submit.py --grid config/experiments/dogrun_chunk4_debug_sweep.yaml --debug
+#   uv run python scripts/submit.py --grid src/barl_jax/defaults/experiments/dogrun_chunk4_debug_sweep.yaml --debug
 #
 # Dry run (no submission):
-#   uv run python scripts/submit.py --grid config/experiments/dogrun_chunk4_debug_sweep.yaml --dry-run
+#   uv run python scripts/submit.py --grid src/barl_jax/defaults/experiments/dogrun_chunk4_debug_sweep.yaml --dry-run
 
-base: config/experiments/dogrun_debug.yaml
 
 axes:
+  run.total_env_steps: [100000]
+  run.num_seeds: [3]
+  run.eval_video_every: [null]
   algo: [AMDP]
   env: [DogRun]
   run.chunk_size: [8]

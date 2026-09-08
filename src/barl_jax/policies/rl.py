@@ -8,7 +8,7 @@ normalisation, the gate's cadence, the name of the actor's generator, and
 whether the dual is fed anything at all -- and none of those is an algorithm.
 
 `RLPolicy` states that shared step once; `MaxEntRLPolicy` adds the dual. An
-algorithm becomes a `config/models/*.yaml` entry naming a `policy:`, an
+algorithm becomes a `POLICY` dictionary on its actor naming a `policy:`, an
 `actor:` class and a `critic:` class -- not a Python subclass -- which is what
 lets SAC, AMDP, DIME and SDAC (once its actor owns best-of-N and exploration,
 see `actors`) share these two classes entirely."""

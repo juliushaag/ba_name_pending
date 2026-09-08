@@ -57,7 +57,7 @@ class Policy(OptimizerMixin, HParamsOwner, nnx.Module, ABC):
   on_policy = False
 
   # The component slots this Policy builds, by attribute name -- the contract a
-  # model YAML's `components:` must match. An omitted slot already fails at
+  # actor's POLICY `components:` must match. An omitted slot already fails at
   # build_component(); naming an *extra* one would resolve silently into the
   # snapshot and the wandb config with nothing behind it, so lint_config.py and
   # model_config.validate() check both directions against this.
@@ -180,7 +180,7 @@ class Policy(OptimizerMixin, HParamsOwner, nnx.Module, ABC):
     self.train_steps = Buffer(jnp.zeros((), jnp.int32))
 
     # The Policy's own declared params (Config/HParam) are resolved here against
-    # the resolved `params:` layer (model YAML, profile and run
+    # the resolved `params:` layer (actor defaults, profile and run
     # overrides). Subclasses read them off `self` (self.policy_delay, ...) -- the
     # same contract components get from Component.__init__.
     params_config = ConfigMixin("", self.resolve_params(),
@@ -256,7 +256,7 @@ class Policy(OptimizerMixin, HParamsOwner, nnx.Module, ABC):
     of a value that *is* a config-shaped tunable (so config/ may still declare
     a baseline for it) but that this call site pins regardless -- NCLQL's
     `sigmas` slot's `steps`, forced to `self.noise_levels` rather than
-    whatever config/models/nclql.yaml says, is the one real example."""
+    whatever LangevinActor.POLICY says, is the one real example."""
     cls, kwargs = self.resolve_component(slot)
     if config_overrides:
       kwargs.update(config_overrides)

@@ -12,7 +12,7 @@ Core APIs:
 - `barl_jax.trainer.setup` / `train` / `validate`
 
 Optional extras: `logging`, `mujoco`, `dm-control`, `mani-skill`, `humanoid-bench`.
-Defaults are packaged under `barl_jax/defaults`; `BARL_CONFIG_DIR` selects a
+Algorithm defaults live on actor classes; `BARL_CONFIG_DIR` selects a
 custom root before config modules are imported.
 
 The repository README documents experiment launching and training-state resume.

@@ -54,7 +54,7 @@ unset JAX_PLATFORMS JAX_PLATFORM_NAME
 # The array job id: shared by every task of one submission, so it is also the
 # manifest's `run_id` column and the sweep tag wandb filters on.
 RUN_ID="$SLURM_ARRAY_JOB_ID"
-RESULT_DIR="${SWEEPS_ROOT:-$PWD/sweeps}/$SWEEP_NAME"
+RESULT_DIR="${RESULT_DIR:-${SWEEPS_ROOT:-$PWD/sweeps}/$SWEEP_NAME}"
 SCRATCH="$TMPDIR/sweep-$SLURM_JOB_ID"
 MANIFEST="${MANIFEST:-$RESULT_DIR/experiments.csv}"
 
@@ -143,7 +143,7 @@ on_usr1() {
 }
 trap on_usr1 USR1
 
-uv run python scripts/online_learning.py \
+uv run python -m barl_jax.launch.worker \
     --config "$RESULT_DIR/$CONFIG" \
     --run-dir "$SCRATCH/$TAG" &
 TRAIN_PID=$!

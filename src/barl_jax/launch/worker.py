@@ -1,23 +1,11 @@
-"""Runs one experiment config: the single task every executor launches.
+"""Run experiment config entries sequentially, with seeds vmapped per entry.
 
-**Not the entry point.** Everything -- a one-off run as much as a grid -- goes
-through `scripts/submit.py`, which expands the sweep, writes each run's
-self-contained config, and hands the list to an executor. This script is what
-that executor then invokes per task, and it does exactly one thing: take a
-config, run the {model, env} entries in it, in series.
+Normally launched through submit.py and its executors. To replay one saved run:
 
-It stays a working command for the one case where reaching past submit.py is the
-point -- re-running a single finished run under a debugger, from the config it
-already left behind:
+    uv run python scripts/submit.py --config sweeps/<timestamp>/<run>/config.yaml
 
-    uv run python scripts/online_learning.py --config sweeps/<ts>/<tag>/config.yaml
-
-`num_seeds` (config, or `--seeds`) runs N independently-initialized seeds as one
-vmapped process, with `num_seeds: 1` as the degenerate case: one CUDA context,
-one compiled step, one set of envs. A 1-seed run that way is bit-identical to the
-same seed run alone. The loop itself lives in
-barl_jax.trainer -- this file is the CLI around it.
-"""
+Training lives in barl_jax.trainer. This CLI requires an accelerator unless
+BARL_ALLOW_CPU is explicitly set."""
 
 import argparse
 import faulthandler
@@ -93,13 +81,16 @@ if __name__ == "__main__":
                          "the tree back on exit, so the config itself stays the shared one.")
   kwargs = args.parse_args()
 
+  if kwargs.seeds is not None and kwargs.seeds < 1:
+    args.error("--seeds must be >= 1")
+
   require_accelerator()
 
   runs = load_config(kwargs.config)
   for i, cfg in enumerate(runs):
     if kwargs.run_dir is not None:
       cfg["run_dir"] = os.path.abspath(kwargs.run_dir)
-    num_seeds = kwargs.seeds or cfg["num_seeds"]
+    num_seeds = kwargs.seeds if kwargs.seeds is not None else cfg["num_seeds"]
     print(f"=== Run {i + 1}/{len(runs)}: {cfg['model']} on {cfg['env']}, "
           f"{num_seeds} seed{'s' if num_seeds != 1 else ''} vmapped ===")
 

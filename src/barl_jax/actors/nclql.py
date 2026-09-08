@@ -16,6 +16,33 @@ class LangevinActor(ActionSampler):
   The critic owns the noise ladder used by both sampling and smoothing loss.
   Score norms are diagnostics, never an entropy estimate.
   """
+
+  POLICY = {
+    "policy": "RLPolicy",
+    "components": {
+      "actor": {
+        "class": "LangevinActor",
+        "steps_per_level": 2,
+        "step_size": 0.002,
+        "temperature": 500.0,
+        "normalize_score": True,
+        "clip_actions": True,
+        "action_limit": 1.0,
+        "init_scale": 1.0
+      },
+      "critic": {
+        "class": "NCLQLC51Critic",
+        "tier": "xlarge",
+        "reward_scale": 1.0,
+        "noise_schedule": {
+          "class": "ExponentialSchedule",
+          "start": 0.1,
+          "end": 0.001,
+          "steps": 10
+        }
+      }
+    }
+  }
   kind = "sampler"
   critic_objective = "noise_td"
   steps_per_level = Config(2)

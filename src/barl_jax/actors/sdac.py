@@ -9,7 +9,6 @@ from barl_jax.components import Actor, Buffer, Critic, frozen
 from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.hparam import Config, HParam
 from barl_jax.networks.diffusion import TimeConditionedField, reverse_chain
-from barl_jax.networks.mlp import MLP_PRESETS
 from barl_jax.networks.schedule import Schedule
 from barl_jax.networks.time_embedding import TIME_STYLES
 from barl_jax.optimization import ActorOptim, adam
@@ -46,11 +45,43 @@ class DDPMActor(Actor, ActorOptim):
   be differentiated through, so the draws have to be ordinary values in the graph
   rather than a side effect on the module."""
 
+  POLICY = {
+    "policy": "MaxEntRLPolicy",
+    "params": {
+      "entropy_scale": -0.9,
+      "policy_delay": 1,
+      "normalize_obs": True,
+      "entropy_in_target": False
+    },
+    "components": {
+      "actor": {
+        "class": "DDPMActor",
+        "tier": "medium",
+        "num_steps": 20
+      },
+      "critic": {
+        "class": "C51Critic",
+        "tier": "xlarge"
+      },
+      "entropy": {
+        "class": "AutotuneRegulator"
+      }
+    }
+  }
+
   kind = "actor"
-  # gelu over the plain net and a 20-frequency sinusoidal time coder, by
-  # default -- both are Config selectors, so a gelu/silu run is a
-  # `mlp_preset`/`--set` choice rather than an inheritance one.
-  mlp_preset = Config("gelu", style=MLP_PRESETS)
+  # GELU MLP with a 20-frequency sinusoidal time coder.
+  # Vary activation directly for GELU/SiLU comparisons.
+  activation = Config('gelu')
+  norm = Config('none')
+  norm_stem = Config(False)
+  norm_input = Config(False)
+  norm_after_act = Config(True)
+  dropout = Config(0.0)
+  final_activation = Config(False)
+  residual = Config(False)
+  norm_kwargs = Config({})
+  dtype = Config('bfloat16')
   time_emb  = Config("sin_20", style=TIME_STYLES)
   squash_cls = Config("TanhSquash")
   num_steps    = Config(20)

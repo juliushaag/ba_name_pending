@@ -5,7 +5,7 @@ architecture, commands, extension interfaces and checkpoint semantics are in
 [README.md](README.md). Follow-up proposals are in [docs/QOL.md](docs/QOL.md).
 
 Use `uv` for dependencies and `scripts/submit.py` to launch experiments. Run
-`uv run pytest tests/ -q` and `JAX_PLATFORMS=cpu uv run python scripts/lint_config.py`
+`uv run pytest tests/ -q` and `uv run ruff check .`
 for verification. Tests use the CPU; the training CLI requires an accelerator
 unless `BARL_ALLOW_CPU=1` is explicitly set.
 
@@ -14,7 +14,8 @@ environment factories. Pass a `ModelSpec`/`ConfigTree` explicitly in new runtime
 code and keep configuration instance-local. Components
 import contracts from `components.py`, not from the policy implementation.
 
-Defaults have one source in `src/barl_jax/defaults`. Algorithm knobs are `HParam` declarations and structural defaults are
+Algorithm defaults live in each actor's `POLICY` dictionary.
+MLP settings are explicit Config declarations on each component; capacity tiers live in `networks/mlp.py`. Algorithm knobs are `HParam` declarations and structural defaults are
 `Config` declarations. A more-derived declaration overrides its ancestor even
 when its declaration kind changes.
 

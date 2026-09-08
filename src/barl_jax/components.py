@@ -165,7 +165,7 @@ class HParamsOwner:
     """Resolve every (or `names`-subset of) declared HParam/Config. Idempotent:
     a name already resolved (pre-super, by a subclass that needed a value to
     build a nested module) is re-set to the same value. A style-tagged Config
-    (a `mlp_preset`/`time_emb` selector) additionally materializes its named
+    (a `time_emb` selector) additionally materializes its named
     style's whole surface as instance attributes, so the component reads
     `self.activation`/`self.norm`/... exactly as if it had declared them."""
     if env_stats is not None:

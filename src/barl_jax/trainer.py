@@ -447,7 +447,7 @@ def _train(run: Run):
   if cfg["sweep_tag"]:
     tags.append(cfg["sweep_tag"])
 
-  # A sweep hands every run its own directory (scripts/grid.py) and its
+  # A sweep hands every run its own directory (barl_jax.launch.grid) and its
   # weights belong next to the config and log that produced them. A standalone
   # run has no such directory, and keeps the global checkpoints/ tree keyed by
   # the same <model>/<env>/<timestamp> the wandb run is named after.

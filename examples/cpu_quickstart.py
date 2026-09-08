@@ -90,7 +90,7 @@ def main():
 
   # 1) A full training run: collector, replay, training steps, eval,
   #    policy checkpoints (latest/best/final), and a resume checkpoint --
-  #    trainer.train() end to end, exactly as scripts/online_learning.py
+  #    trainer.train() end to end, exactly as scripts/submit.py
   #    calls it, only with `logger: none` in place of wandb.
   cfg = base_config()
   run = setup(cfg, num_seeds=1)

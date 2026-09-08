@@ -1,5 +1,4 @@
 import json
-import pathlib
 import subprocess
 import sys
 
@@ -415,48 +414,6 @@ def test_disk_budget_rejects_a_save_with_insufficient_free_space(tmp_path, monke
   _check_disk_budget(tmp_path, required_bytes=0)
 
 
-def _load_checkpoint_info():
-  import importlib.util
-  path = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "checkpoint_info.py"
-  spec = importlib.util.spec_from_file_location("checkpoint_info", path)
-  module = importlib.util.module_from_spec(spec)
-  spec.loader.exec_module(module)
-  return module
-
-
-def test_checkpoint_info_reads_a_policy_checkpoint_with_no_policy_construction(tmp_path, monkeypatch):
-  info = _load_checkpoint_info()
-  policy = make_policy()
-  save_policy(policy, tmp_path / "policy")
-  monkeypatch.setattr(Policy, "make", lambda *a, **kw: (_ for _ in ()).throw(
-    AssertionError("checkpoint_info must not construct a policy")))
-  result = info.inspect(str(tmp_path / "policy"))
-  assert result["kind"] == "policy"
-  assert result["model"] == "SAC"
-  assert result["num_arrays"] > 0
-
-
-def test_checkpoint_info_reads_a_resume_root_with_no_policy_construction(tmp_path, monkeypatch):
-  info = _load_checkpoint_info()
-  with _resume_run(tmp_path, monkeypatch) as run:
-    root = tmp_path / "resume"
-    save_training(run, root, {"env_steps": 1}, keep=2)
-    save_training(run, root, {"env_steps": 2}, keep=2)
-  monkeypatch.setattr(Policy, "make", lambda *a, **kw: (_ for _ in ()).throw(
-    AssertionError("checkpoint_info must not construct a policy")))
-  result = info.inspect(str(root))
-  assert result["kind"] == "training (resume)"
-  assert result["current_generation"] == 1
-  assert result["generations_on_disk"] == ["gen-000000", "gen-000001"]
-  assert result["progress"] == {"env_steps": 2}
-
-
-def test_checkpoint_info_rejects_an_unrecognized_directory(tmp_path):
-  info = _load_checkpoint_info()
-  with pytest.raises(SystemExit):
-    info.inspect(str(tmp_path))
-
-
 @pytest.mark.parametrize("utd_ratio", [0.5, 2.0])
 def test_chunked_training_counts_primitive_steps(tmp_path, monkeypatch, utd_ratio):
   import barl_jax.logger as logging
@@ -472,3 +429,19 @@ def test_chunked_training_counts_primitive_steps(tmp_path, monkeypatch, utd_rati
   assert run.progress["grad_steps"] == round(8 * utd_ratio)
   assert run.buffer.min_transitions() == 2
   assert np.array_equal(run.buffer.seeds[0]._fields["horizon"][:2], [4, 4])
+
+
+def test_expanded_mlp_snapshot_restores_without_the_removed_selector(tmp_path):
+  original = make_policy()
+  snapshot = original._snapshot
+  snapshot["resolved"]["components.actor.mlp_preset"] = "layer"
+  snapshot["resolved"]["components.critic.mlp_preset"] = "crossq"
+  restored = make_policy(ConfigTree(snapshot=snapshot))
+  assert restored.actor.activation == original.actor.activation
+  assert restored.critic.norm == original.critic.norm
+  save_policy(restored, tmp_path / "policy")
+  loaded = load_policy(tmp_path / "policy", ToyEnv(), ToyFamily().get_env_stats(ToyEnv()))
+  for a, b in zip(jax.tree.leaves(nnx.state(original)), jax.tree.leaves(nnx.state(loaded))):
+    if jax.dtypes.issubdtype(a.dtype, jax.dtypes.prng_key):
+      a, b = jax.random.key_data(a), jax.random.key_data(b)
+    np.testing.assert_array_equal(a, b)

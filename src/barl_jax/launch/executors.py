@@ -1,31 +1,10 @@
 #!/usr/bin/env python3
 
-"""Where a submitted sweep actually executes.
+"""Execute prepared sweeps through Slurm, tmux, or foreground local workers.
 
-Three backends behind one interface, so scripts/submit.py is only ever a CLI: it
-expands the grid, writes every run's config, and hands the list to whichever
-`Executor` is available.
-
-The grid is already fully expanded by the time anything here runs (see grid.py),
-so an executor's whole job is "run these N commands, at most M at a time". None
-of them knows what an algorithm, an environment or an axis is -- which is why an
-arbitrary `model.*` sweep axis reaches the cluster without the job script, the
-manifest format or the queue manager learning anything about it.
-
-Each still owns the whole of its own mechanism, because the parts that differ do
-not usefully generalise:
-
-* SlurmExecutor's run id only exists once `sbatch` has accepted the job, so it
-  submits held, writes the manifest, then releases.
-* TmuxExecutor has no scheduler to ask, so the sweep's own name is the id and
-  the manifest is written before anything starts.
-* LocalExecutor is the whole queue itself -- one worker thread per GPU, blocking
-  on its own subprocess -- and finishes before it returns rather than detaching.
-
-What they share is this module's sweep layout: one `sweeps/<timestamp>/` folder
-per submission holding `experiments.csv`, `sweep.yaml` and one directory per run.
-A finished sweep is the same shape whichever backend produced it.
-"""
+Each backend consumes self-contained run configs. Slurm holds the array until
+its manifest is written; tmux writes the manifest before starting its manager;
+local workers block until completion. All use the same sweep directory layout."""
 
 import csv
 import os
@@ -39,7 +18,7 @@ import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-from grid import Run
+from .grid import Run
 
 SWEEPS_DIR = Path("sweeps")
 MANIFEST_NAME = "experiments.csv"
@@ -162,10 +141,10 @@ class LocalExecutor(Executor):
     def submit(self, runs, sweep_name, sweep_dir, *, max_parallel, debug, stream=False):
         write_manifest(sweep_dir, sweep_name, runs)
 
-        gpus = detect_gpus()[:max_parallel] or [None] * min(max_parallel, 1)
+        gpus = detect_gpus() or [None]
         # More slots than GPUs is a deliberate ask (submit.py --max-parallel), so
         # the extra workers share devices round-robin rather than being dropped.
-        slots = [gpus[i % len(gpus)] for i in range(max_parallel)] if gpus else [None]
+        slots = [gpus[i % len(gpus)] for i in range(max_parallel)]
 
         pending: queue.Queue = queue.Queue()
         for run in runs:
@@ -248,13 +227,13 @@ class SlurmExecutor(Executor):
         # which is the point: each is one GPU's work and they queue independently.
         cmd = ["sbatch", "--parsable", "--hold",
                f"--array=0-{len(runs) - 1}%{max_parallel}",
-               f"--export=ALL,SWEEP_NAME={sweep_name}"]
+               f"--export=ALL,SWEEP_NAME={sweep_name},RESULT_DIR={sweep_dir}"]
 
         if debug:
             cmd += [f"--partition={self.DEBUG_PARTITION}", f"--time={DEBUG_TIME_LABEL}",
                     f"--job-name={self.DEBUG_JOB_NAME}"]
 
-        cmd.append("scripts/run_rl.slurm")
+        cmd.append(str(Path(__file__).with_name("run_rl.slurm")))
 
         print()
         print("Submitting:")
@@ -287,7 +266,7 @@ class SlurmExecutor(Executor):
 
 
 class TmuxExecutor(Executor):
-    """One detached session per sweep: scripts/tmux_pool.py in window 0 owning
+    """One detached session per sweep: barl_jax.launch.tmux_pool in window 0 owning
     the queue, and one window per run that it opens as a slot frees up. Detached
     and returning immediately is the point -- `sbatch` does not block either."""
 
@@ -310,7 +289,7 @@ class TmuxExecutor(Executor):
         write_manifest(sweep_dir, run_id, runs)
 
         session = f"barl-{sweep_name}"
-        manager = [sys.executable, "scripts/tmux_pool.py",
+        manager = [sys.executable, "-m", "barl_jax.launch.tmux_pool",
                    "--session", session,
                    "--sweep-dir", str(sweep_dir),
                    "--max-parallel", str(max_parallel)]
@@ -353,9 +332,7 @@ EXECUTORS = {cls.name: cls for cls in (SlurmExecutor, TmuxExecutor, LocalExecuto
 
 
 def resolve(choice: str) -> Executor:
-    """`auto` is what makes one command work in both places: Slurm where there is
-    a scheduler, tmux where there is only this box. `local` is never auto-picked
-    -- running a sweep in the foreground is something you ask for."""
+    """Auto-select Slurm, then tmux, then foreground local execution."""
     if choice == "auto":
         for name in ("slurm", "tmux"):
             if EXECUTORS[name].available():
@@ -366,3 +343,4 @@ def resolve(choice: str) -> Executor:
     if not cls.available():
         raise SystemExit(f"--executor {choice}: not usable here (nothing to run it with on PATH)")
     return cls()
+

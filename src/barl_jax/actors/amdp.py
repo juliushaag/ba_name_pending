@@ -8,7 +8,6 @@ from barl_jax.components import Actor, Buffer, Critic, frozen
 from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.hparam import Config, HParam
 from barl_jax.networks.diffusion import TimeConditionedField, controlled_sde
-from barl_jax.networks.mlp import MLP_PRESETS
 from barl_jax.networks.time_embedding import TIME_STYLES
 from barl_jax.optimization import ActorOptim, adam
 from barl_jax.registration import get_component, register_component
@@ -23,17 +22,49 @@ def clip_score(score, max_norm: float, percentile: float):
 
 @register_component
 class ScoreContinuousActor(Actor, ActorOptim):
-  """AMDP's controlled-SDE actor. The net is `silu_fp32` (the chain accumulates
-  a log-weight) and the ctrl time coder by default; both are `Config` selectors
-  you can switch with `mlp_preset`/`time_emb` -- configuration, not inheritance.
+  """AMDP's controlled-SDE actor. The net uses GELU in float32 (the chain accumulates
+  a log-weight) and the ctrl time coder by default. MLP settings are explicit
+  Config declarations; time_emb selects the time coder.
   Only the SDE and score-clipping knobs are this class's own HParams."""
+
+  POLICY = {
+    "policy": "MaxEntRLPolicy",
+    "params": {
+      "entropy_scale": -1.0,
+      "policy_delay": 3,
+      "normalize_obs": False,
+      "entropy_in_target": True
+    },
+    "components": {
+      "actor": {
+        "class": "ScoreContinuousActor",
+        "tier": "medium"
+      },
+      "critic": {
+        "class": "C51Critic",
+        "tier": "xlarge"
+      },
+      "entropy": {
+        "class": "AutotuneRegulator"
+      }
+    }
+  }
 
   kind = "actor"
   # fp32 not bf16: the 16-step chain accumulates a log-weight, and `eps` is
   # drawn at the control net's dtype -- in bf16 the noise driving the SDE
   # carries ~3 significant digits. AMDP went non-finite in bf16 on both DMC
   # envs (sweep 2026-08-27_13-23-15).
-  mlp_preset = Config("gelu_fp32", style=MLP_PRESETS)
+  activation = Config('gelu')
+  norm = Config('none')
+  norm_stem = Config(False)
+  norm_input = Config(False)
+  norm_after_act = Config(True)
+  dropout = Config(0.0)
+  final_activation = Config(False)
+  residual = Config(False)
+  norm_kwargs = Config({})
+  dtype = Config('float32')
   time_emb  = Config("ctrl", style=TIME_STYLES)
   squash_cls = Config("ErfSquash")   # `erf_k` is derived from the noise schedule below
   sigma_min    = HParam(0.01)

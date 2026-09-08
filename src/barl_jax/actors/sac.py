@@ -7,7 +7,7 @@ from barl_jax.components import Actor, Buffer, Critic, PathwiseActorMixin
 from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.hparam import Config
 from barl_jax.networks import gaussian
-from barl_jax.networks.mlp import MLP, MLP_PRESETS
+from barl_jax.networks.mlp import MLP
 from barl_jax.optimization import ActorOptim, adam
 from barl_jax.registration import get_component, register_component
 
@@ -19,15 +19,46 @@ class StochasticActor(PathwiseActorMixin, Actor, ActorOptim):
   selects which -- any no-arg Squash works generically here).
 
   The shallow Gaussian policy has just a state-independent `log_std` plus the
-  std bounds; the net is the `layer` style (a LayerNorm stem over silu) by
-  default -- switch it with `mlp_preset` (a configuration value, not
-  inheritance).
+  std bounds. The MLP uses SiLU and LayerNorm on hidden blocks, with no input
+  or stem normalization; its settings are explicit Config declarations below.
 
   `log_std` is a state-independent parameter rather than a network head --
   barl's deliberate deviation from canonical SAC, kept as-is."""
 
+  POLICY = {
+    "policy": "MaxEntRLPolicy",
+    "params": {
+      "entropy_scale": -1.0,
+      "policy_delay": 1,
+      "normalize_obs": True,
+      "entropy_in_target": True
+    },
+    "components": {
+      "actor": {
+        "class": "StochasticActor",
+        "tier": "medium"
+      },
+      "critic": {
+        "class": "C51Critic",
+        "tier": "xlarge"
+      },
+      "entropy": {
+        "class": "AutotuneRegulator"
+      }
+    }
+  }
+
   kind = "actor"
-  mlp_preset = Config("layer", style=MLP_PRESETS)
+  activation = Config('silu')
+  norm = Config('layer')
+  norm_stem = Config(False)
+  norm_input = Config(False)
+  norm_after_act = Config(True)
+  dropout = Config(0.0)
+  final_activation = Config(False)
+  residual = Config(False)
+  norm_kwargs = Config({'epsilon': 1e-05})
+  dtype = Config('bfloat16')
   squash_cls = Config("TanhSquash")
   log_std_min  = Config(-20.0)
   log_std_max  = Config(2.0)

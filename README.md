@@ -9,7 +9,6 @@ evaluation and execution infrastructure.
 ```bash
 uv sync
 uv run pytest tests/ -q
-JAX_PLATFORMS=cpu uv run python scripts/lint_config.py
 ```
 
 The repository environment includes the simulator families and CUDA dependencies
@@ -20,35 +19,29 @@ compatibility constraints declared in the root `pyproject.toml`.
 
 ```bash
 uv build src/barl_jax
-uv run python scripts/wheel_smoke.py   # builds + installs that wheel into a throwaway
-                                        # venv and smoke-tests it outside the repo
 ```
 
 `uv run ruff check .` lints the first-party tree (`third_party/`, `wandb/`, `sweeps/`
 and `checkpoints/` are excluded); the rule set is deliberately small for now
 (syntax errors, pyflakes, import sorting -- see `[tool.ruff]` in `pyproject.toml`).
 
-`scripts/fastcheck.py` is the fast edit/check loop for config, registry and
-launcher changes -- config lint plus the cheap boundary tests, without paying
-for the full training-loop suite:
+The command-line tools are limited to three scripts:
+
+- `scripts/submit.py`: launch grids or replay an experiment config.
+- `scripts/evaluate.py`: evaluate a checkpoint, run directory, or sweep with default,
+  Mean-of-N, or Best-of-N action selection.
+- `scripts/debug.py`: report package/backend diagnostics and resolved model settings;
+  `--json` produces output suitable for sharing with an LLM.
 
 ```bash
-JAX_PLATFORMS=cpu uv run python scripts/fastcheck.py
+uv run python scripts/debug.py --model SAC --json
+uv run python scripts/debug.py --probes
+uv run python scripts/evaluate.py sweeps/<submission> --mode default mean --json
 ```
 
-`scripts/doctor.py` reports installed versions, optional simulator availability,
-and submodule readiness; `--probes` additionally runs the JAX backend and EGL
-render checks (each in its own subprocess, so a native crash is a reported
-failure rather than a dead process), and `--json` gives machine-readable output:
-
-```bash
-uv run python scripts/doctor.py --probes
-```
-
-CI (`.github/workflows/ci.yml`) runs `ruff check`, `scripts/lint_config.py`, the
-CPU test suite, `scripts/wheel_smoke.py`, and `examples/cpu_quickstart.py`, all
-against the standalone `src/barl_jax` install rather than the root workspace's
-CUDA/simulator dependencies.
+CI runs Ruff, the CPU test suite, an installed-wheel import check, and the CPU
+example against the standalone library. Launcher workers and Slurm/tmux support
+live in `barl_jax.launch`; they are implementation details of `submit.py`.
 
 `examples/cpu_quickstart.py` is a complete round trip on CPU only, no
 accelerator, W&B account, simulator download, or render dependency: a tiny
@@ -67,13 +60,15 @@ BARL_ALLOW_CPU=1 uv run python -m examples.cpu_quickstart
 ## Running experiments
 
 `scripts/submit.py` expands configurations before handing commands to the local,
-tmux or Slurm executor. Seeds are vmapped within each run.
+tmux or Slurm executor. Seeds are vmapped within each run. Grid settings use `run.<key>` axes; the
+obsolete grid `base:` field is rejected. `--config` replays a saved experiment
+in the foreground and accepts only `--seeds` as an override.
 
 ```bash
 uv run python scripts/submit.py --algos SAC NCLQL --envs HalfCheetah --seeds 3 --dry-run
 uv run python scripts/submit.py --algos SAC --envs HalfCheetah --executor local --validate
-uv run python scripts/print_config.py SAC
-uv run python scripts/online_learning.py --config sweeps/<submission>/<run>/config.yaml
+uv run python scripts/debug.py --model SAC --json
+uv run python scripts/submit.py --config sweeps/<submission>/<run>/config.yaml
 ```
 
 The training CLI requires an accelerator. Set `BARL_ALLOW_CPU=1` for intentional
@@ -89,12 +84,15 @@ value and violated rule, not partway through setup.
 live terminal panel, with metrics/summary written as strict JSON under the
 run directory instead of shipped to wandb), or `none` (step bookkeeping only,
 for a training smoke test with no reporting backend at all). Only `wandb`
-imports the `wandb` package. A run's `objective.json` (`trainer._write_objective`,
-read by `scripts/hpo.py --report`) is strict JSON too: a seed with no
+imports the `wandb` package. A run's `objective.json` (`trainer._write_objective`) is strict JSON too: a seed with no
 completed evaluation is `null` there, not a non-finite float, with
 `objective_reason` saying why.
 
-Defaults live in `src/barl_jax/defaults/` and ship inside the library wheel.
+Algorithm defaults live in each actor's `POLICY` dictionary under
+`src/barl_jax/actors/`; policy YAML files are no longer required. MLP settings
+are explicit `Config(...)` declarations on actors and critics. Capacity tiers
+live in `src/barl_jax/networks/mlp.py` (`MLP_TIERS`). For example, change an
+activation with `--set model.components.actor.activation=silu`.
 Set `BARL_CONFIG_DIR` before importing config tools, or pass an explicit root to
 `ConfigTree`/`load_config`, to use another configuration directory.
 
@@ -181,23 +179,6 @@ discovered once per process and loaded only when actually selected; or
 built-in and a plugin, or by two plugins, is a deterministic error at lookup
 time, not a silent precedence rule.
 
-`scripts/scaffold.py env <ClassName> --gym-id <id>` generates a new
-`Environment` subclass (selected via the external `module:Class` path, no
-registry edit) and smoke-tests it in a temp copy. `scripts/scaffold.py
-algorithm <Name> --actor <ActorClass> --critic <CriticClass>` generates a
-`config/models/<name>.yaml`-shaped file combining existing actor/critic
-classes on the shared `MaxEntRLPolicy` template (how SAC/AMDP/DIME/SDAC are
-each already just a model YAML entry) and smoke-tests it against the Policy
-contract (`train_step` losses match `create_optimizer()`'s keys and are
-finite; `inference_step`'s shape is right) in a disposable copy of the
-packaged defaults. Both refuse to overwrite an existing file.
-
-`scripts/benchmark.py` measures fresh-process import latency, async
-vector-env worker RSS, collection throughput, and compiled gradient
-throughput, reporting device/library versions and every shape/count needed
-to judge whether a number is comparable to another run. No hard thresholds --
-compare two of its own `--json` outputs on the same machine.
-
 For independent in-process experiments, pass configuration explicitly:
 
 ```python
@@ -264,15 +245,6 @@ the last completed resume generation; `final` policy weights may be newer.
 Full replay checkpoints can be large, so account for their storage and I/O cost --
 `save_training` refuses to start a new generation when free disk looks
 insufficient to hold it alongside the previous one.
-
-`scripts/checkpoint_info.py <path>` inspects a policy checkpoint or a resume
-root's metadata -- kind, format version, saved implementation, array/shape
-counts, counters, config hash, resume limitations -- without constructing a
-policy or an environment. `scripts/config_diff.py <model> --against <path>`
-diffs a model's currently-resolved config against a frozen snapshot (from
-either kind of checkpoint, or a bare snapshot JSON file), labeling each
-changed key as a declaration/default change, an explicit override, or a
-tier/profile choice.
 
 Use `with setup(config, num_seeds) as run:` when managing a run directly. The
 public `train` and `validate` functions close owned resources on success or

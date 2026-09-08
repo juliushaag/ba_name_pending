@@ -9,7 +9,6 @@ from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.hparam import Config, HParam
 from barl_jax.networks import gaussian
 from barl_jax.networks.diffusion import TimeConditionedField, controlled_sde
-from barl_jax.networks.mlp import MLP_PRESETS
 from barl_jax.networks.time_embedding import TIME_STYLES
 from barl_jax.optimization import ActorOptim, adam
 from barl_jax.registration import get_component, register_component
@@ -49,11 +48,43 @@ class DISActor(PathwiseActorMixin, Actor, ActorOptim):
   supplies the log-det, and adding it inside the integration would count it
   twice."""
 
+  POLICY = {
+    "policy": "MaxEntRLPolicy",
+    "params": {
+      "entropy_scale": -4.0,
+      "policy_delay": 3,
+      "normalize_obs": True,
+      "entropy_in_target": True
+    },
+    "components": {
+      "actor": {
+        "class": "DISActor",
+        "tier": "medium"
+      },
+      "critic": {
+        "class": "C51Critic",
+        "tier": "xlarge"
+      },
+      "entropy": {
+        "class": "AutotuneRegulator"
+      }
+    }
+  }
+
   kind = "actor"
   # fp32: the reference is fp32, and the log-ratio accumulates. Both are Config
   # selectors, not inheritance -- switch the net / time embedding with
-  # `mlp_preset` / `time_emb`.
-  mlp_preset = Config("gelu_fp32", style=MLP_PRESETS)
+  # explicit MLP settings and `time_emb`.
+  activation = Config('gelu')
+  norm = Config('none')
+  norm_stem = Config(False)
+  norm_input = Config(False)
+  norm_after_act = Config(True)
+  dropout = Config(0.0)
+  final_activation = Config(False)
+  residual = Config(False)
+  norm_kwargs = Config({})
+  dtype = Config('float32')
   time_emb  = Config("pisgrad", style=TIME_STYLES)
   squash_cls = Config("TanhSquash")
   # dime_am trains the sampler's nets with the critic's b1, not the actor's

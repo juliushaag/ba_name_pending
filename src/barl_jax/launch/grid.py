@@ -1,16 +1,7 @@
-"""The sweep language: a grid spec becomes a list of ready-to-run configs.
+"""Expand grid axes and exclusions into named, self-contained run configs.
 
-Everything here is pure. It expands axes, names each run, and writes each run's
-self-contained `config.yaml` -- and executes nothing. That is what lets every
-backend in executors.py be no more than "run these N commands, M at a time":
-the grid is fully expanded before a single task starts, so no executor, job
-script or queue manager ever has to know what an axis is.
-
-Axes are `algo`/`env`/`seed`, plus any number of `model.<dotted path>` axes
-(written into that run's `model_overrides:`) and `run.<key>` axes (written into
-its run entry). Since the axes are just overrides, no config file is ever edited
-to run a sweep.
-"""
+algo/env/seed select each run; model.<path> and run.<key> override its settings.
+All runs are materialized before an executor starts any tasks."""
 
 import itertools
 import json
@@ -26,29 +17,16 @@ from pathlib import Path
 
 import yaml
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT  = os.path.dirname(SCRIPT_DIR)
-
-
 from barl_jax.config.toolkit import CONFIG_DIR, resolve_includes
 from barl_jax.config.tree import ConfigTree
-
-DEFAULT_BASE_CONFIG = str(CONFIG_DIR / "experiments" / "online_learning.yaml")
 
 RESERVED_AXES = ("algo", "env", "seed")
 
 
 def default_num_seeds() -> int:
-  """`num_seeds` from config/run/defaults.yaml -- the single place the seed count
-  is declared. submit.py's `--seeds` overrides it; nothing else has an opinion."""
+  """Default vmapped seed count from the run declarations."""
   return int(ConfigTree(CONFIG_DIR).run["num_seeds"])
 
-
-# ---------------------------------------------------------------------------
-# config check -- reusable across submit.py's grid sweeps and hpo.py's search
-# sweeps, since both materialize the same kind of run and want the same
-# preflight before submitting it.
-# ---------------------------------------------------------------------------
 
 #: The check itself, run as a program in a child process. Everything it needs
 #: is on stdin; what it found comes back through the file named by argv[1],
@@ -58,7 +36,6 @@ import importlib, json, sys
 
 algos, envs = json.load(sys.stdin)
 
-import barl_jax  # noqa: F401  -- the import is what populates the registries
 model_config = importlib.import_module("barl_jax.config.tree")
 from barl_jax.env import Environment
 
@@ -115,20 +92,16 @@ def check_config(algos: list[str], envs: list[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def build_axes(*, grid: str = None, algos: list = None, envs: list = None,
-               sets: list = None) -> tuple[str | None, dict, list[dict]]:
-  """The sweep's axes from a `--grid` file, the `--algos`/`--envs` shorthand and
-  any `--set` pins (which win per axis). Returns (base_config, axes, exclude).
-
-  `$()` includes (barl_jax.configs, loaded above by path for the same reason
-  config_tree.py itself is) are resolved against CONFIG_DIR, so e.g. an
-  `exclude:` list shared by more than one grid spec can live in one place."""
-  base, axes, exclude = None, {}, []
+               sets: list = None) -> tuple[dict, list[dict]]:
+  """Combine a grid spec with CLI axes and pins; return (axes, exclude)."""
+  axes, exclude = {}, []
 
   if grid:
     with open(grid) as f:
       spec = yaml.safe_load(f) or {}
     spec = resolve_includes(spec, Path(grid).resolve().parent, Path(CONFIG_DIR))
-    base = spec.get("base")
+    if "base" in spec:
+      raise SystemExit("grid base: is no longer supported; use run.<key> axes for run settings")
     axes = dict(spec.get("axes") or {})
     exclude = list(spec.get("exclude") or [])
 
@@ -166,7 +139,7 @@ def build_axes(*, grid: str = None, algos: list = None, envs: list = None,
     raise SystemExit(f"{grid}: exclude names non-axis key(s) {unknown} -- it would never match "
                      f"anything. Axes are: {', '.join(axes)}")
 
-  return base, axes, exclude
+  return axes, exclude
 
 
 def build_combos(axes: dict, exclude: list[dict]) -> list[dict]:
@@ -197,7 +170,7 @@ def name_combos(combos: list[dict], axes: dict, num_seeds: int) -> list[str]:
     parts = [str(combo["algo"]), str(combo["env"])]
     if len(axes["seed"]) > 1:
       parts.append(f"base{combo['seed']}")
-    parts.append(f"{num_seeds}seeds")
+    parts.append(f"{combo.get('run.num_seeds', num_seeds)}seeds")
     parts += [f"{short[k]}={combo[k]}" for k in varying]
     tags.append(re.sub(r"[^A-Za-z0-9.=_-]", "-", "_".join(parts)))
   return tags
@@ -225,8 +198,8 @@ class Run:
     """The one command that runs this. `run_dir` redirects the output somewhere
     other than beside the config -- node-local scratch, for a batch job."""
     uv = shutil.which("uv")
-    cmd = ([uv, "run", "python", os.path.join(SCRIPT_DIR, "online_learning.py")]
-           if uv else [sys.executable, os.path.join(SCRIPT_DIR, "online_learning.py")])
+    cmd = ([uv, "run", "python", "-m", "barl_jax.launch.worker"]
+           if uv else [sys.executable, "-m", "barl_jax.launch.worker"])
     cmd += ["--config", os.path.join(sweep_dir, self.config)]
     if run_dir is not None:
       cmd += ["--run-dir", run_dir]
@@ -242,7 +215,6 @@ def materialize(combos: list[dict], tags: list[str], *, defaults: dict, sweep_di
   carries a fully resolved `snapshot:` taken *under that run's own overrides*, so
   it replays exactly regardless of what config/ says later."""
   runs = []
-  import barl_jax  # noqa: F401 -- registries needed for snapshot_for()
   for index, (combo, tag) in enumerate(zip(combos, tags)):
     # `seed` is the base the run's `num_seeds` vmapped seeds count up from
     # (barl_jax.trainer.Run: base_seed + i), not one seed per process.
@@ -276,20 +248,9 @@ def prepare_sweep(combos: list[dict], tags: list[str], *,
                   sweep_dir: str, num_seeds: int | None, validate: bool,
                   sweep_name: str, executor_name: str, seeds: int,
                   head_extra: dict) -> tuple[list[Run], dict]:
-  """The launch preparation submit.py's grid sweeps and hpo.py's search sweeps
-  share once each has its own combos/tags: load the base config's `defaults:`,
-  apply the two launch-time overrides every caller makes (`--validate`
-  collapses every run to the smoke-test path; `sweep_tag` is stamped in so
-  every run of this sweep is one filter in wandb), materialize every run's
-  `config.yaml`, and publish `sweep.yaml`.
-
-  `head_extra` carries whatever only the caller knows about the sweep it
-  built -- a grid's `axes`/`exclude`/`debug`, or a search's `kind`/`sampler`/
-  `n_trials`/`objective` -- passed through untouched rather than guessed at
-  here, so a grid sweep's manifest and a search sweep's stay explicitly
-  different shapes instead of one merged, lowest-common-denominator one."""
+  """Materialize run configs and write their initial sweep manifest."""
   
-  defaults = dict()
+  defaults = {}
 
   if validate:
     defaults["validate"] = True
@@ -298,7 +259,7 @@ def prepare_sweep(combos: list[dict], tags: list[str], *,
   os.makedirs(sweep_dir, exist_ok=True)
   runs = materialize(combos, tags, defaults=defaults, sweep_dir=sweep_dir, num_seeds=num_seeds)
 
-  head = {"sweep_tag": sweep_name, "created": sweep_name, "command": sweep_command(),
+  head = {"sweep_tag": sweep_name, "created": sweep_name, "command": shlex.join(sys.argv),
         "executor": executor_name,
          "seeds": seeds, **head_extra}
   write_sweep_yaml(sweep_dir, head, runs)
@@ -325,6 +286,3 @@ def describe(combos: list[dict], axes: dict, num_seeds: int) -> str:
   return (f"{len(combos)} run(s) ({axis_desc}), "
           f"{num_seeds} seed{'s' if num_seeds != 1 else ''} vmapped each")
 
-
-def sweep_command() -> str:
-  return shlex.join(sys.argv)

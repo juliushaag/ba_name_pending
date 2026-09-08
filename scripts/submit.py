@@ -1,33 +1,37 @@
 #!/usr/bin/env python3
 
-"""Launch an experiment sweep -- the one entry point for running anything.
+"""Expand a grid and launch it through Slurm, tmux, or local workers.
 
     uv run python scripts/submit.py --algos SAC DIME --envs HalfCheetah --seeds 5
-    uv run python scripts/submit.py --algos SAC --envs HalfCheetah \
-        --set model.components.critic.tier=large
     uv run python scripts/submit.py --grid src/barl_jax/defaults/experiments/sweep_grid.yaml --dry-run
     uv run python scripts/submit.py --algos SAC --envs HalfCheetah --executor local --validate
 
-A "sweep" here is any set of runs, including one. The grid is a cross product
-over named axes -- `algo`/`env`/`seed`, plus any number of `model.<dotted path>`
-axes and `run.<key>` axes -- declared on the command line or in a `--grid` spec
-file, with an `exclude:` list for pruning. Because the axes are just overrides,
-no config file is ever edited to run a sweep.
-
-This script expands that grid, writes each run's self-contained config, and hands
-the list to an executor: **slurm** where there is a scheduler, **tmux** where
-there is not, **local** in the foreground when you ask. The grid is fully
-expanded before anything is submitted, so all three backends are only "run these
-N commands, M at a time" -- which is why an arbitrary model axis works the same
-on the cluster as it does here.
-"""
+A sweep can contain one run. --set pins model.<path> or run.<key> axes; --grid
+adds cross products and exclusions. Configs are frozen before submission."""
 
 import argparse
 import datetime
+import subprocess
+import sys
 from pathlib import Path
 
-import grid
-from executors import EXECUTORS, SWEEP_NAME_FORMAT, SWEEPS_DIR, resolve
+from barl_jax.launch import grid
+from barl_jax.launch.executors import EXECUTORS, SWEEP_NAME_FORMAT, SWEEPS_DIR, resolve
+
+
+def submit_sweep(executor, runs, sweep_name, sweep_dir, head, *,
+                 max_parallel, debug=False, stream=False):
+    """Submit prepared runs, record blocking results, and propagate failures."""
+    report = executor.submit(runs, sweep_name, sweep_dir,
+                             max_parallel=max_parallel, debug=debug, stream=stream)
+    if executor.blocking:
+        grid.write_sweep_yaml(str(sweep_dir), head, runs)
+    print()
+    width = max(map(len, report), default=0)
+    for label, value in report.items():
+        print(f"  {label + ':':<{width + 1}} {value}")
+    if executor.blocking and any(r.exit_code != 0 for r in runs):
+        raise SystemExit(1)
 
 
 def parse_args():
@@ -40,6 +44,7 @@ def parse_args():
                "each run, so `--algos SAC DIME --seeds 5` is 2 runs of 5 seeds, not 10 runs.")
 
     what = parser.add_argument_group("what to run")
+    what.add_argument("--config", help="Replay an experiment config in the foreground")
     what.add_argument("--algos", nargs="+",
                       help="`algo` axis, e.g. SAC DIME AMDP. Required unless --grid declares one.")
     what.add_argument("--envs", nargs="+",
@@ -50,14 +55,9 @@ def parse_args():
                            "--set model.components.critic.tier=large --set run.batch_size=512. "
                            "Repeatable.")
     what.add_argument("--grid", default=None,
-                      help="YAML sweep spec: {base: <experiment config>, axes: {name: [values]}, "
+                      help="YAML sweep spec: {axes: {name: [values]}, "
                            "exclude: [{axis: value, ...}]}. Combined with any --algos/--envs/--set "
                            "given, which win per axis.")
-    what.add_argument("--config", default=None,
-                      help="Base experiment config providing `defaults:` for every run (default: "
-                           "--grid's `base:`, else src/barl_jax/defaults/experiments/online_learning.yaml). Run "
-                           "keys themselves are declared in config/run/defaults.yaml and per-env "
-                           "overrides in config/run/envs.yaml.")
     what.add_argument("--seeds", type=int, default=None,
                       help="Seeds per run, vmapped inside the one process. Overrides `num_seeds` "
                            "in config/run/defaults.yaml, which is otherwise the only place the "
@@ -70,7 +70,7 @@ def parse_args():
                             "the cluster and on a workstation. `local` runs the sweep in the "
                             "foreground on this machine and is never chosen automatically.")
     where.add_argument("--max-parallel", type=int, default=None,
-                       help="Runs in flight at once (Slurm's --array %%N). Default: 4 under slurm, "
+                       help="Runs in flight at once (Slurm's --array %%N). Default: 8 under slurm, "
                             "one per detected GPU under tmux/local. Setting it above the GPU count "
                             "is how you deliberately put more than one run on a GPU.")
     where.add_argument("--sweep-dir", default=None,
@@ -105,9 +105,19 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.config:
+        if (args.algos or args.envs or args.grid or args.sets or args.validate or args.debug
+                or args.executor != "auto" or args.max_parallel or args.sweep_dir or args.dry_run):
+            raise SystemExit("--config replays directly; only --seeds may override the saved config")
+        command = [sys.executable, "-m", "barl_jax.launch.worker", "--config", args.config]
+        if args.seeds is not None:
+            command += ["--seeds", str(args.seeds)]
+        raise SystemExit(subprocess.call(command))
 
-    base, axes, exclude = grid.build_axes(grid=args.grid, algos=args.algos,
+    axes, exclude = grid.build_axes(grid=args.grid, algos=args.algos,
                                           envs=args.envs, sets=args.sets)
+    if args.seeds is not None and "run.num_seeds" in axes:
+        axes["run.num_seeds"] = [args.seeds]
     if args.validate:
         # One run per {algo, env}: every other axis collapses to its first value.
         axes = {k: (v if k in ("algo", "env") else v[:1]) for k, v in axes.items()}
@@ -169,21 +179,8 @@ def main():
         head_extra={"validate": bool(args.validate), "debug": bool(args.debug),
                    "axes": {k: list(v) for k, v in axes.items()}, "exclude": exclude or None})
 
-    # ---- hand off ----------------------------------------------------------
-    report = executor.submit(runs, sweep_name, sweep_dir,
-                             max_parallel=max_parallel, debug=args.debug,
-                             stream=args.validate)
-
-    if executor.blocking:
-        grid.write_sweep_yaml(str(sweep_dir), head, runs)
-
-    print()
-    width = max(len(label) for label in report)
-    for label, value in report.items():
-        print(f"  {label + ':':<{width + 1}} {value}")
-
-    if executor.blocking and any(r.exit_code for r in runs):
-        raise SystemExit(1)
+    submit_sweep(executor, runs, sweep_name, sweep_dir, head,
+                 max_parallel=max_parallel, debug=args.debug, stream=args.validate)
 
 
 if __name__ == "__main__":

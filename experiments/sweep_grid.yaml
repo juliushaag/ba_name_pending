@@ -1,7 +1,7 @@
 # Example sweep spec for scripts/submit.py:
 #
-#   uv run python scripts/submit.py --grid config/experiments/sweep_grid.yaml --dry-run
-#   uv run python scripts/submit.py --grid config/experiments/sweep_grid.yaml
+#   uv run python scripts/submit.py --grid src/barl_jax/defaults/experiments/sweep_grid.yaml --dry-run
+#   uv run python scripts/submit.py --grid src/barl_jax/defaults/experiments/sweep_grid.yaml
 #
 # Every run is one point of the cross product of `axes`, minus anything
 # `exclude` matches, launched as its own OS process. Four kinds of axis:
@@ -13,14 +13,13 @@
 #   run.<key>           a key of the run config (config/run/defaults.yaml),
 #                       e.g. run.batch_size, run.utd_ratio
 #
-# `uv run python scripts/print_config.py <model>` lists the dotted paths a
+# `uv run python scripts/debug.py --model <model> --json` lists the dotted paths a
 # `model.` axis can name; a path that resolves to nothing aborts the run before
 # any training starts rather than silently sweeping a no-op axis.
 #
 # --algos/--envs/--seeds/--set on the command line override the axis of the same
 # name here, so this file can also serve as the base for one-off runs.
 
-base: config/experiments/online_learning.yaml
 
 axes:
   algo: [SAC, AMDP]

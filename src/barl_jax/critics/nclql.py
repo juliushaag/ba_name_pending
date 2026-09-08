@@ -5,10 +5,9 @@ from flax import nnx
 from barl_jax.components import Buffer, HParamsOwner
 from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.hparam import Config, HParam
-from barl_jax.networks.mlp import MLP_PRESETS
+from barl_jax.networks.schedule import Schedule
 from barl_jax.networks.time_embedding import TIME_STYLES, TimeEmbedding
 from barl_jax.registration import get_component, register_component
-from barl_jax.networks.schedule import Schedule
 
 from .base import Polyak
 from .categorical import C51Critic, HLGaussCritic
@@ -103,7 +102,16 @@ class NoiseConditionedCritic(HParamsOwner):
 @register_component
 class NCLQLCritic(Polyak, NoiseConditionedCritic, EnsembleCritic):
   kind = "critic"
-  mlp_preset = Config("mish", style=MLP_PRESETS)
+  activation = Config('mish')
+  norm = Config('none')
+  norm_stem = Config(False)
+  norm_input = Config(False)
+  norm_after_act = Config(True)
+  dropout = Config(0.0)
+  final_activation = Config(False)
+  residual = Config(False)
+  norm_kwargs = Config({})
+  dtype = Config('bfloat16')
   rho                = HParam(1.0)
   pessimistic_target = Config(True)
 
@@ -111,7 +119,16 @@ class NCLQLCritic(Polyak, NoiseConditionedCritic, EnsembleCritic):
 @register_component
 class NCLQLC51Critic(Polyak, NoiseConditionedCritic, C51Critic):
   kind = "critic"
-  mlp_preset = Config("mish", style=MLP_PRESETS)
+  activation = Config('mish')
+  norm = Config('none')
+  norm_stem = Config(False)
+  norm_input = Config(False)
+  norm_after_act = Config(True)
+  dropout = Config(0.0)
+  final_activation = Config(False)
+  residual = Config(False)
+  norm_kwargs = Config({})
+  dtype = Config('bfloat16')
   entropy_coef    = HParam(0.005)
   rho             = HParam(1.0)
   pessimistic_target = Config(True)
@@ -120,4 +137,13 @@ class NCLQLC51Critic(Polyak, NoiseConditionedCritic, C51Critic):
 @register_component
 class NCLQLHLGaussCritic(Polyak, NoiseConditionedCritic, HLGaussCritic):
   kind = "critic"
-  mlp_preset = Config("mish", style=MLP_PRESETS)
+  activation = Config('mish')
+  norm = Config('none')
+  norm_stem = Config(False)
+  norm_input = Config(False)
+  norm_after_act = Config(True)
+  dropout = Config(0.0)
+  final_activation = Config(False)
+  residual = Config(False)
+  norm_kwargs = Config({})
+  dtype = Config('bfloat16')
