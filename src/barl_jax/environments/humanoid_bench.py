@@ -38,6 +38,60 @@ def _patch_stale_mujoco_fields():
       del fields[field_name]
 
 
+# humanoid_bench pins gymnasium<1.0 in its own setup.py (also overridden in
+# pyproject.toml, alongside the MuJoCo override above). Every task's
+# render() -- Task.render plus the Push/Reach overrides that additionally
+# reposition a goal marker before rendering -- calls the pre-1.0
+# `MujocoRenderer.render(render_mode, camera_id, camera_name)` signature.
+# gymnasium>=1.0 moved camera selection into `MujocoRenderer.__init__`
+# (already applied via the `camera_name=` env.py passes when building the
+# renderer) and narrowed render() to just `render(render_mode)`, so those
+# extra two positional args now raise a TypeError on every frame. Patching
+# MujocoRenderer.render itself -- rather than each task's render() override
+# -- fixes every call site in one place without duplicating their marker
+# logic; the ignored args are a no-op since the camera is already fixed at
+# construction.
+def _patch_stale_gymnasium_render():
+  from gymnasium.envs.mujoco.mujoco_rendering import MujocoRenderer
+
+  if getattr(MujocoRenderer.render, "_barl_jax_patched", False):
+    return
+
+  original_render = MujocoRenderer.render
+
+  def render(self, render_mode, camera_id=None, camera_name=None):
+    return original_render(self, render_mode)
+
+  render._barl_jax_patched = True
+  MujocoRenderer.render = render
+
+
+# The goal markers in Reach/Push's render() overrides (and the unused
+# double-reach/blocked-hands wrappers) call `viewer.add_marker(size=0.05, ...)`
+# -- a bare radius, valid under MuJoCo's pre-3.2 marker API where a scalar
+# broadcast into the geom's fixed-size 3-vector. MuJoCo>=3.2 (pinned above)
+# switched gymnasium's non-legacy `_add_marker_to_scene` to call
+# `mujoco.mjv_initGeom` directly, whose binding requires an actual 3-element
+# `size` array and rejects a bare float. Normalizing a scalar `size` to
+# `[size]*3` at `add_marker` time (its one call site) keeps every caller's
+# radius semantics unchanged.
+def _patch_stale_gymnasium_marker_size():
+  import numpy as np
+  from gymnasium.envs.mujoco.mujoco_rendering import BaseRender
+
+  if getattr(BaseRender.add_marker, "_barl_jax_patched", False):
+    return
+
+  original_add_marker = BaseRender.add_marker
+
+  def add_marker(self, **marker_params):
+    size = marker_params.get("size")
+    if isinstance(size, (int, float)):
+      marker_params["size"] = np.array([size, size, size])
+    return original_add_marker(self, **marker_params)
+
+  add_marker._barl_jax_patched = True
+  BaseRender.add_marker = add_marker
 
 
 class HumanoidBenchEnvironment(Environment):
@@ -64,6 +118,8 @@ class HumanoidBenchEnvironment(Environment):
   def get_env(self) -> gym.Env:
     import humanoid_bench  # noqa: F401
     _patch_stale_mujoco_fields()
+    _patch_stale_gymnasium_render()
+    _patch_stale_gymnasium_marker_size()
     return gym.make(self.task_id(), render_mode="rgb_array")
 
   def get_dataset(self):
