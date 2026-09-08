@@ -15,9 +15,13 @@ code and keep configuration instance-local. Components
 import contracts from `components.py`, not from the policy implementation.
 
 Algorithm defaults live in each actor's `POLICY` dictionary.
-MLP settings are explicit Config declarations on each component; capacity tiers live in `networks/mlp.py`. Algorithm knobs are `HParam` declarations and structural defaults are
-`Config` declarations. A more-derived declaration overrides its ancestor even
-when its declaration kind changes.
+MLP settings are grouped under one `ConfigDict` declaration (`mlp = ConfigDict(
+activation=..., norm=..., dtype=..., ...)`, read back as `self.mlp.activation`);
+capacity tiers live in `networks/mlp.py`. Every class-attribute default --
+algorithm knob or structural setting alike -- is a `Config` declaration
+(`ConfigDict` included); there is no separate searchable kind, and a
+`ConfigDict` field still overrides at its own flat YAML key, same as a
+standalone `Config`. A more-derived declaration overrides its ancestor.
 
 Comments should explain non-obvious invariants or numerical/shape constraints.
 Prefer clear identifiers and short comments over historical implementation essays.

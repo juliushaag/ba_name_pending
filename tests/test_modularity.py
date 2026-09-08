@@ -12,11 +12,11 @@ from flax import nnx
 import barl_jax.config.tree as model_config
 from barl_jax import optimization, trainer
 from barl_jax.checkpoints import load_policy, save_policy
-from barl_jax.components import HParamsOwner
+from barl_jax.components import ConfigOwner
 from barl_jax.config.model import ModelSpec
 from barl_jax.config.tree import ConfigTree
 from barl_jax.env import Environment
-from barl_jax.hparam import Config, HParam
+from barl_jax.hparam import Config
 from barl_jax.policy import Policy
 from barl_jax.training_checkpoint import save_training
 
@@ -99,15 +99,45 @@ def test_async_factory_keeps_instance_settings():
     env.close()
 
 
-@pytest.mark.parametrize("parent,child", [(HParam, Config), (Config, HParam)])
-def test_declaration_kind_can_change_in_subclass(parent, child):
-  class Base(HParamsOwner):
-    knob = parent(1)
+def test_declaration_overrides_ancestor_in_subclass():
+  class Base(ConfigOwner):
+    knob = Config(1)
   class Child(Base):
-    knob = child(2)
+    knob = Config(2)
+  assert Base()._decls["knob"].default == 1
   assert Child()._decls["knob"].default == 2
-  assert ("knob" in Child._hparams) == (child is HParam)
-  assert ("knob" in Child._configs) == (child is Config)
+
+
+def test_config_dict_resolves_each_field_at_its_own_flat_key():
+  """A ConfigDict field overrides exactly like a standalone Config would --
+  grouping only changes how the class declares and the instance reads back,
+  never the override surface a run's `--set` sees."""
+  from barl_jax.config.toolkit import ConfigMixin
+  from barl_jax.hparam import ConfigDict
+
+  class Owner(ConfigOwner):
+    mlp = ConfigDict(activation='gelu', norm='none', norm_kwargs={})
+
+  owner = Owner()
+  owner.resolve_config(ConfigMixin("", {"activation": "silu"}))
+  assert owner.mlp.activation == "silu"          # overridden at its flat key
+  assert owner.mlp.norm == "none"                # untouched default
+  assert owner.mlp.todict() == {"activation": "silu", "norm": "none", "norm_kwargs": {}}
+  hash(owner.mlp)                                # identity-hashable regardless of the dict field
+
+
+def test_config_dict_group_is_replaced_wholesale_by_a_subclass():
+  from barl_jax.config.toolkit import ConfigMixin
+  from barl_jax.hparam import ConfigDict
+
+  class Base(ConfigOwner):
+    mlp = ConfigDict(activation='gelu', norm='none')
+  class Child(Base):
+    mlp = ConfigDict(activation='relu', norm='layer')
+
+  child = Child()
+  child.resolve_config(ConfigMixin("", {}))
+  assert child.mlp.activation == "relu" and child.mlp.norm == "layer"
 
 
 def test_model_spec_is_isolated_from_config_mutation():
@@ -437,8 +467,8 @@ def test_expanded_mlp_snapshot_restores_without_the_removed_selector(tmp_path):
   snapshot["resolved"]["components.actor.mlp_preset"] = "layer"
   snapshot["resolved"]["components.critic.mlp_preset"] = "crossq"
   restored = make_policy(ConfigTree(snapshot=snapshot))
-  assert restored.actor.activation == original.actor.activation
-  assert restored.critic.norm == original.critic.norm
+  assert restored.actor.mlp.activation == original.actor.mlp.activation
+  assert restored.critic.mlp.norm == original.critic.mlp.norm
   save_policy(restored, tmp_path / "policy")
   loaded = load_policy(tmp_path / "policy", ToyEnv(), ToyFamily().get_env_stats(ToyEnv()))
   for a, b in zip(jax.tree.leaves(nnx.state(original)), jax.tree.leaves(nnx.state(loaded))):

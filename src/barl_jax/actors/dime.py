@@ -4,13 +4,14 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from barl_jax.actors.policy_dict import maxent_actor_policy
 from barl_jax.components import Actor, Buffer, Critic, PathwiseActorMixin
 from barl_jax.config.toolkit import ConfigMixin
-from barl_jax.hparam import Config, HParam
+from barl_jax.hparam import Config, ConfigDict
 from barl_jax.networks import gaussian
 from barl_jax.networks.diffusion import TimeConditionedField, controlled_sde
 from barl_jax.networks.time_embedding import TIME_STYLES
-from barl_jax.optimization import ActorOptim, adam
+from barl_jax.optimization import ActorOptim
 from barl_jax.registration import get_component, register_component
 
 
@@ -21,7 +22,7 @@ def _inv_softplus(x: float) -> float:
 
 
 @register_component
-class DISActor(PathwiseActorMixin, Actor, ActorOptim):
+class DISActor(PathwiseActorMixin, ActorOptim, Actor):
   """The time-reversed diffusion sampler (DIS) DIME actually uses --
   `dime_am/diffusion/od/dis.py` plus `od_integrators.py`.
 
@@ -48,53 +49,25 @@ class DISActor(PathwiseActorMixin, Actor, ActorOptim):
   supplies the log-det, and adding it inside the integration would count it
   twice."""
 
-  POLICY = {
-    "policy": "MaxEntRLPolicy",
-    "params": {
-      "entropy_scale": -4.0,
-      "policy_delay": 3,
-      "normalize_obs": True,
-      "entropy_in_target": True
-    },
-    "components": {
-      "actor": {
-        "class": "DISActor",
-        "tier": "medium"
-      },
-      "critic": {
-        "class": "C51Critic",
-        "tier": "xlarge"
-      },
-      "entropy": {
-        "class": "AutotuneRegulator"
-      }
-    }
-  }
+  POLICY = maxent_actor_policy(entropy_scale=-4.0, policy_delay=3)
 
   kind = "actor"
   # fp32: the reference is fp32, and the log-ratio accumulates. Both are Config
   # selectors, not inheritance -- switch the net / time embedding with
   # explicit MLP settings and `time_emb`.
-  activation = Config('gelu')
-  norm = Config('none')
-  norm_stem = Config(False)
-  norm_input = Config(False)
-  norm_after_act = Config(True)
-  dropout = Config(0.0)
-  final_activation = Config(False)
-  residual = Config(False)
-  norm_kwargs = Config({})
-  dtype = Config('float32')
+  mlp = ConfigDict(activation='gelu', norm='none', norm_stem=False, norm_input=False,
+                   norm_after_act=True, dropout=0.0, final_activation=False,
+                   residual=False, norm_kwargs={}, dtype='float32')
   time_emb  = Config("pisgrad", style=TIME_STYLES)
   squash_cls = Config("TanhSquash")
   # dime_am trains the sampler's nets with the critic's b1, not the actor's
   # usual 0.9 -- the one optimizer override this actor carries.
   adam_b1      = Config(0.5)
   num_steps    = Config(16)
-  prior_std    = HParam(2.5)   # a std, not a variance -- the reference's sampler.init_std
+  prior_std    = Config(2.5)   # a std, not a variance -- the reference's sampler.init_std
   out_clip     = Config(10000.0)   # PISGRADNet's `outer_clip`
-  dt_init      = HParam(0.1)       # configs/base.yaml `dt`, shaped by the cosine schedule below
-  dt_min       = HParam(0.001)     # configs/sampler/dt_schedule/cosine.yaml
+  dt_init      = Config(0.1)       # configs/base.yaml `dt`, shaped by the cosine schedule below
+  dt_min       = Config(0.001)     # configs/sampler/dt_schedule/cosine.yaml
   dt_s         = Config(0.008)
   dt_pow       = Config(2.0)
   friction_init = Config(1.0)      # configs/sampler/dis.yaml `friction`
@@ -103,7 +76,7 @@ class DISActor(PathwiseActorMixin, Actor, ActorOptim):
   learn_friction = Config(True)
 
   def __init__(self, env_stats, config: ConfigMixin, *, rngs: nnx.Rngs, **kwargs):
-    self.resolve_hparams(config, env_stats=env_stats)
+    self.resolve_config(config, env_stats=env_stats)
 
     # Both are stored through softplus, the reference's parameterization, so the
     # positivity a step size and a friction need is structural rather than a
@@ -127,10 +100,8 @@ class DISActor(PathwiseActorMixin, Actor, ActorOptim):
 
     self.field = TimeConditionedField(
       self.obs_dim, self.plan_dim, latent_dim=latent_dim, layers=layers,
-      time_dim=self.time_dim, time_embed=self.time_embed, time_kwargs=self.hparam("time_kwargs"),
-      activation=self.activation, norm=self.norm, norm_input=self.norm_input, norm_stem=self.norm_stem,
-      norm_after_act=self.norm_after_act, dropout=self.dropout, final_activation=self.final_activation,
-      residual=self.residual, norm_kwargs=self.hparam("norm_kwargs"), dtype=self.dtype, rngs=rngs)
+      time_dim=self.time_dim, time_embed=self.time_embed, time_kwargs=self.static("time_kwargs"),
+      rngs=rngs, **self.mlp.todict())
 
     self.field.zero_init_head()
 
@@ -187,9 +158,6 @@ class DISActor(PathwiseActorMixin, Actor, ActorOptim):
 
   # loss: PathwiseActorMixin's -(Q + alpha*entropy), applied to DIME's
   # path-KL entropy estimate exactly like SAC's closed-form one.
-
-  def create_optimizer(self) -> dict:
-    return {"actor": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}
 
   def derived(self) -> dict:
     return {"dt_0": float(jax.nn.softplus(self.dt_raw[...])[0] * self.dt_scale[...][0]),

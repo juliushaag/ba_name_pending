@@ -282,9 +282,8 @@ def test_smoothing_coefficient_is_actually_wired_in(name, obs, act, key):
 
     def loss_at(coef):
         c.smoothing_coef = coef
-        losses = {}
-        c.noise_td_loss(obs, act, obs[::-1], act, jnp.zeros((BATCH,)),
-                                 jnp.zeros((BATCH,)), jnp.ones((BATCH,)), sigmas, key, losses)
+        losses = c.noise_td_loss(obs, act, obs[::-1], act, jnp.zeros((BATCH,)),
+                                 jnp.zeros((BATCH,)), jnp.ones((BATCH,)), sigmas, key)
         assert set(losses) == {"critic"}
         return losses["critic"]
 
@@ -304,7 +303,7 @@ def drain(name, obs, act) -> dict:
     c = build(name)
     a = critic_action(c, act)
     with recording(PRIMARY, DEBUG):
-        c.td_loss(obs, a, obs[::-1], a, jnp.zeros((BATCH,)), jnp.zeros((BATCH,)), jnp.ones((BATCH,)), {})
+        c.td_loss(obs, a, obs[::-1], a, jnp.zeros((BATCH,)), jnp.zeros((BATCH,)), jnp.ones((BATCH,)))
         sown, sown_debug = nnx.pop(c, Metric, DebugMetric)
     return {**collect(sown), **collect(sown_debug)}
 

@@ -2,9 +2,9 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from barl_jax.components import Buffer, HParamsOwner
+from barl_jax.components import Buffer, ConfigOwner
 from barl_jax.config.toolkit import ConfigMixin
-from barl_jax.hparam import Config, HParam
+from barl_jax.hparam import Config, ConfigDict
 from barl_jax.networks.schedule import Schedule
 from barl_jax.networks.time_embedding import TIME_STYLES, TimeEmbedding
 from barl_jax.registration import get_component, register_component
@@ -14,19 +14,19 @@ from .categorical import C51Critic, HLGaussCritic
 from .ensemble import EnsembleCritic
 
 
-class NoiseConditionedCritic(HParamsOwner):
+class NoiseConditionedCritic(ConfigOwner):
   learning_objective = "noise_td"
   supports_bon = False
-  reward_scale = HParam(5.0)
+  reward_scale = Config(5.0)
   noise_schedule = Config({"class": "ExponentialSchedule", "start": 0.1,
                            "end": 0.001, "steps": 10})
 
   time_emb  = Config("fourier", style=TIME_STYLES)
-  smoothing_coef = HParam(1.0)
+  smoothing_coef = Config(1.0)
 
   def __init__(self, env_stats, config: ConfigMixin, *args, rngs: nnx.Rngs, **kwargs):
-    self.resolve_hparams(config, env_stats=env_stats)
-    schedule_config = dict(self.hparam("noise_schedule"))
+    self.resolve_config(config, env_stats=env_stats)
+    schedule_config = dict(self.static("noise_schedule"))
     schedule_cls = get_component(schedule_config.pop("class"))
     if not issubclass(schedule_cls, Schedule):
       raise TypeError("noise_schedule must name a Schedule")
@@ -40,7 +40,7 @@ class NoiseConditionedCritic(HParamsOwner):
       env_stats = env_stats.derive(return_min=env_stats["return_min"] * self.reward_scale,
                                    return_max=env_stats["return_max"] * self.reward_scale)
     self.encoder = TimeEmbedding(time_dim=self.time_dim, kind=self.time_embed,
-                                 rngs=rngs, **self.hparam("time_kwargs"))
+                                 rngs=rngs, **self.static("time_kwargs"))
 
     super().__init__(env_stats.derive(act_dim=env_stats["act_dim"] + self.time_dim),
                      config, *args, rngs=rngs, **kwargs)
@@ -51,16 +51,16 @@ class NoiseConditionedCritic(HParamsOwner):
     return {**super().target_modules(), "encoder": self.encoder}
 
   def td_loss(self, obs, action, next_obs, next_action, chunk_return, terminated, horizon,
-              losses: dict, entropy_bonus=0.0, *, key=None) -> None:
+              entropy_bonus=0.0, *, key=None) -> dict:
     """Clean TD plus smoothing, sharing the sampler's noise ladder."""
     if key is None:
       raise ValueError("Noise-conditioned TD requires an explicit random key")
-    self.noise_td_loss(obs, action, next_obs, next_action,
-                       chunk_return * self.reward_scale, terminated, horizon,
-                       self.sigmas[...], key, losses, entropy_bonus=entropy_bonus)
+    return self.noise_td_loss(obs, action, next_obs, next_action,
+                              chunk_return * self.reward_scale, terminated, horizon,
+                              self.sigmas[...], key, entropy_bonus=entropy_bonus)
 
   def noise_td_loss(self, obs, action, next_obs, next_action, chunk_return, terminated, horizon,
-                    sigmas, key, losses: dict, entropy_bonus=0.0) -> None:
+                    sigmas, key, entropy_bonus=0.0) -> dict:
     """NCLQL has no entropy dual -- `entropy_bonus` stays at its 0.0 default at
     every call site. See `QCriticBase.td_loss` for the chunk_return/terminated/
     horizon contract this shares."""
@@ -83,11 +83,10 @@ class NoiseConditionedCritic(HParamsOwner):
     td_loss = self.regression_loss(pred_clean, td_target)
     smoothing_loss = self.regression_loss(pred_noisy, self.target_from_raw(pred_clean))
 
-    losses["critic"] = td_loss + self.smoothing_coef * smoothing_loss
-
     self.record(pred_clean, td_target)
     self.metrics.scalar("td_loss", td_loss)
     self.metrics.scalar("smoothing_loss", smoothing_loss)
+    return {"critic": td_loss + self.smoothing_coef * smoothing_loss}
 
   def augment(self, act, level, target: bool = False):
     if not isinstance(level, jax.Array):
@@ -99,51 +98,29 @@ class NoiseConditionedCritic(HParamsOwner):
 
 
 
+_NCLQL_MLP = dict(activation='mish', norm='none', norm_stem=False, norm_input=False,
+                  norm_after_act=True, dropout=0.0, final_activation=False,
+                  residual=False, norm_kwargs={}, dtype='bfloat16')
+
+
 @register_component
 class NCLQLCritic(Polyak, NoiseConditionedCritic, EnsembleCritic):
   kind = "critic"
-  activation = Config('mish')
-  norm = Config('none')
-  norm_stem = Config(False)
-  norm_input = Config(False)
-  norm_after_act = Config(True)
-  dropout = Config(0.0)
-  final_activation = Config(False)
-  residual = Config(False)
-  norm_kwargs = Config({})
-  dtype = Config('bfloat16')
-  rho                = HParam(1.0)
+  mlp = ConfigDict(**_NCLQL_MLP)
+  rho                = Config(1.0)
   pessimistic_target = Config(True)
 
 
 @register_component
 class NCLQLC51Critic(Polyak, NoiseConditionedCritic, C51Critic):
   kind = "critic"
-  activation = Config('mish')
-  norm = Config('none')
-  norm_stem = Config(False)
-  norm_input = Config(False)
-  norm_after_act = Config(True)
-  dropout = Config(0.0)
-  final_activation = Config(False)
-  residual = Config(False)
-  norm_kwargs = Config({})
-  dtype = Config('bfloat16')
-  entropy_coef    = HParam(0.005)
-  rho             = HParam(1.0)
+  mlp = ConfigDict(**_NCLQL_MLP)
+  entropy_coef    = Config(0.005)
+  rho             = Config(1.0)
   pessimistic_target = Config(True)
 
 
 @register_component
 class NCLQLHLGaussCritic(Polyak, NoiseConditionedCritic, HLGaussCritic):
   kind = "critic"
-  activation = Config('mish')
-  norm = Config('none')
-  norm_stem = Config(False)
-  norm_input = Config(False)
-  norm_after_act = Config(True)
-  dropout = Config(0.0)
-  final_activation = Config(False)
-  residual = Config(False)
-  norm_kwargs = Config({})
-  dtype = Config('bfloat16')
+  mlp = ConfigDict(**_NCLQL_MLP)

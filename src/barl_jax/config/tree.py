@@ -41,31 +41,35 @@ def _policy_cls(policy_name: str, tree=None):
   return Policy.class_for(class_name)
 
 
-def _hparam_defaults(cls) -> dict:
-  return {name: decl.default for name, decl in getattr(cls, "_hparams", {}).items()}
-
-
-def _config_defaults(cls) -> dict:
-  return {name: decl.default for name, decl in getattr(cls, "_configs", {}).items()}
+def _decl_defaults(cls) -> dict:
+  # A ConfigDict's own `.default` is `{field: field_default}` -- flatten its
+  # fields in at top level, exactly as if each had been declared standalone,
+  # so the resolved config a run logs stays flat like every other layer.
+  defaults = {}
+  for name, decl in getattr(cls, "_decls", {}).items():
+    fields = getattr(decl, "fields", None)
+    if fields is not None:
+      defaults.update({field: field_decl.default for field, field_decl in fields.items()})
+    else:
+      defaults[name] = decl.default
+  return defaults
 
 
 def _decl_layers(cls, chosen: dict = None) -> list[tuple[str, dict]]:
-  configs = getattr(cls, "_configs", {})
+  decls = getattr(cls, "_decls", {})
   layers = []
-  for name, decl in configs.items():
+  for name, decl in decls.items():
     if decl.style is not None:
       eff = (chosen or {}).get(name, decl.default)
       layers.append((f"style: {eff}", decl.style[eff]))
-  if configs:
-    layers.append((f"decl configs: {cls.__name__}", _config_defaults(cls)))
-  layers.append((f"decl hparams: {cls.__name__}", _hparam_defaults(cls)))
+  layers.append((f"decl: {cls.__name__}", _decl_defaults(cls)))
   return layers
 
 
 def _chosen_styles(cls, slot: str, slot_cfg: dict, profile_cfg: dict,
                    overrides: dict) -> dict:
   chosen = {}
-  for name, decl in getattr(cls, "_configs", {}).items():
+  for name, decl in getattr(cls, "_decls", {}).items():
     if getattr(decl, "style", None):
       chosen[name] = (overrides.get(f"components.{slot}.{name}")
                       or profile_cfg.get(name) or slot_cfg.get(name) or decl.default)
@@ -260,10 +264,8 @@ class ConfigTree:
   def params_layers(self, policy_name: str, profile: str | None) -> list[tuple[str, dict]]:
     cls = _policy_cls(policy_name, self)
     layers = []
-    if getattr(cls, "_configs", {}):
-      layers.append(("decl params: configs", _config_defaults(cls)))
-    if getattr(cls, "_hparams", {}):
-      layers.append(("decl params: hparams", _hparam_defaults(cls)))
+    if getattr(cls, "_decls", {}):
+      layers.append(("decl params", _decl_defaults(cls)))
     layers += [(f"models: {policy_name}.params", dict(self.policy_cfg(policy_name).get("params", {})))]
     if profile:
       layers.append((f"models: {policy_name}.profiles.{profile}.params",

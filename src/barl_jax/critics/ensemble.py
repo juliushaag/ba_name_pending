@@ -3,7 +3,7 @@ import jax.numpy as jnp
 from flax import nnx
 
 from barl_jax.config.toolkit import ConfigMixin
-from barl_jax.hparam import Config, HParam
+from barl_jax.hparam import Config, ConfigDict
 from barl_jax.registration import register_component
 
 from .base import ConcatQ, Polyak, QCriticBase
@@ -12,30 +12,20 @@ from .base import ConcatQ, Polyak, QCriticBase
 @register_component
 class EnsembleCritic(QCriticBase):
   kind = "critic"
-  activation = Config('relu')
-  norm = Config('batchrenorm')
-  norm_stem = Config(True)
-  norm_input = Config(True)
-  norm_after_act = Config(True)
-  dropout = Config(0.0)
-  final_activation = Config(False)
-  residual = Config(False)
-  norm_kwargs = Config({'momentum': 0.99, 'warmup_steps': 100000, 'epsilon': 0.001, 'r_max': 3.0, 'd_max': 5.0})
-  dtype = Config('bfloat16')
-  rho                = HParam(1.0)
+  mlp = ConfigDict(
+    activation='relu', norm='batchrenorm', norm_stem=True, norm_input=True,
+    norm_after_act=True, dropout=0.0, final_activation=False, residual=False,
+    norm_kwargs={'momentum': 0.99, 'warmup_steps': 100000, 'epsilon': 0.001, 'r_max': 3.0, 'd_max': 5.0},
+    dtype='bfloat16')
+  rho                = Config(1.0)
   pessimistic_target = Config(True)
 
   def __init__(self, env_stats, config: ConfigMixin, *, rngs: nnx.Rngs, **kwargs):
-    self.resolve_hparams(config, env_stats=env_stats)
+    self.resolve_config(config, env_stats=env_stats)
     latent_dim, layers, n_models = (config.get(k, int) for k in ("latent_dim", "layers", "n_models"))
 
     q_function = ConcatQ(env_stats["obs_dim"] + env_stats["act_dim"], 1,
-                         latent_dim, layers, n_models=n_models,
-                         activation=self.activation, norm=self.norm, norm_input=self.norm_input,
-                         norm_stem=self.norm_stem, norm_after_act=self.norm_after_act,
-                         dropout=self.dropout, final_activation=self.final_activation,
-                         residual=self.residual, norm_kwargs=self.hparam("norm_kwargs"), dtype=self.dtype,
-                         rngs=rngs)
+                         latent_dim, layers, n_models=n_models, rngs=rngs, **self.mlp.todict())
 
     super().__init__(env_stats, config, q_function, **kwargs)
 
@@ -62,13 +52,6 @@ class EnsembleCritic(QCriticBase):
 @register_component
 class TargetEnsembleCritic(Polyak, EnsembleCritic):
   kind = "critic"
-  activation = Config('relu')
-  norm = Config('layer')
-  norm_stem = Config(True)
-  norm_input = Config(True)
-  norm_after_act = Config(True)
-  dropout = Config(0.0)
-  final_activation = Config(False)
-  residual = Config(False)
-  norm_kwargs = Config({'epsilon': 1e-05})
-  dtype = Config('bfloat16')
+  mlp = ConfigDict(activation='relu', norm='layer', norm_stem=True, norm_input=True,
+                   norm_after_act=True, dropout=0.0, final_activation=False,
+                   residual=False, norm_kwargs={'epsilon': 1e-05}, dtype='bfloat16')

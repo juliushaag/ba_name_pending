@@ -244,7 +244,6 @@ def gated_losses(policy, fn, keys, *modules):
 # attributes, grouped by role so every component that optimizes inherits
 # exactly the one that fits it (critic uses the critic's b1 and clip, actor
 # the actor's, dual the dual's). These are ordinary config defaults.
-# Searchability is opt-in through HParam, not implied by "this number exists".
 # ---------------------------------------------------------------------------
 
 
@@ -265,9 +264,17 @@ class CriticOptim(OptimizerConfig):
 
 class ActorOptim(OptimizerConfig):
   """The actors' optimizer (`optim.actor`): Adam with a per-element clip, which
-  is what actually bounds what one outlier sample can contribute under Adam."""
+  is what actually bounds what one outlier sample can contribute under Adam.
+
+  Mix in ahead of `Actor` (`class X(ActorOptim, Actor)`, as every actor does):
+  `Component.create_optimizer()` returns `{}` and would otherwise shadow this
+  one, since `Actor`'s own MRO chain precedes `ActorOptim` for any class that
+  lists `Actor` first."""
 
   grad_clip_mode = Config("element")
+
+  def create_optimizer(self) -> dict:
+    return {"actor": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}
 
 
 class DualOptim(OptimizerConfig):

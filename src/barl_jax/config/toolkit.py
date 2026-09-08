@@ -240,7 +240,7 @@ class ConfigMixin:
   def resolve(self, key: str, decl, *, owner: str = None):
     from barl_jax.hparam import Config
     if not isinstance(decl, Config):
-      raise TypeError(f"resolve() needs a Config/HParam for {key!r}, got {type(decl).__name__}")
+      raise TypeError(f"resolve() needs a Config for {key!r}, got {type(decl).__name__}")
     if not self.has(key):
       return decl.default
     value = self._data[key]

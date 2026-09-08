@@ -15,7 +15,7 @@ from barl_jax.components import (
   TRAINABLE,
   Buffer,
   Component,
-  HParamsOwner,
+  ConfigOwner,
   _Static,
   sanitize_action,
 )
@@ -48,7 +48,7 @@ def _jitted_infer_exec(graphdef, spec, state, observation, key):
   return execution.act(infer_step, score_fn, observation, key, spec)
 
 
-class Policy(OptimizerMixin, HParamsOwner, nnx.Module, ABC):
+class Policy(OptimizerMixin, ConfigOwner, nnx.Module, ABC):
 
   _classes = dict()
 
@@ -179,13 +179,13 @@ class Policy(OptimizerMixin, HParamsOwner, nnx.Module, ABC):
     # Gradient steps taken, for algorithms whose update cadence is `step % k`.
     self.train_steps = Buffer(jnp.zeros((), jnp.int32))
 
-    # The Policy's own declared params (Config/HParam) are resolved here against
+    # The Policy's own declared params (Config) are resolved here against
     # the resolved `params:` layer (actor defaults, profile and run
     # overrides). Subclasses read them off `self` (self.policy_delay, ...) -- the
     # same contract components get from Component.__init__.
     params_config = ConfigMixin("", self.resolve_params(),
                                 config_path=f"{self.model_name}.params")
-    self.resolve_hparams(params_config)
+    self.resolve_config(params_config)
     self._env_stats = _Static(stats.derive(
       chunk_size=self.chunk_size,
       chunked_act_dim=self.chunk_size * self.action_dim))

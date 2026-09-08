@@ -2,12 +2,12 @@ import math
 
 import jax
 import jax.numpy as jnp
-import optax
 from flax import nnx
 
+from barl_jax.actors.policy_dict import maxent_actor_policy
 from barl_jax.components import Actor, Buffer, Critic, frozen
 from barl_jax.config.toolkit import ConfigMixin
-from barl_jax.hparam import Config, HParam
+from barl_jax.hparam import Config, ConfigDict
 from barl_jax.networks.diffusion import TimeConditionedField, reverse_chain
 from barl_jax.networks.schedule import Schedule
 from barl_jax.networks.time_embedding import TIME_STYLES
@@ -30,7 +30,7 @@ def alpha_bar_from_betas(betas):
 
 
 @register_component
-class DDPMActor(Actor, ActorOptim):
+class DDPMActor(ActorOptim, Actor):
   """Fixed-step DDPM actor over an alpha_bar ladder, with the standard ancestral
   sampler -- SDAC's actor, and the only diffusion actor here.
 
@@ -45,55 +45,26 @@ class DDPMActor(Actor, ActorOptim):
   be differentiated through, so the draws have to be ordinary values in the graph
   rather than a side effect on the module."""
 
-  POLICY = {
-    "policy": "MaxEntRLPolicy",
-    "params": {
-      "entropy_scale": -0.9,
-      "policy_delay": 1,
-      "normalize_obs": True,
-      "entropy_in_target": False
-    },
-    "components": {
-      "actor": {
-        "class": "DDPMActor",
-        "tier": "medium",
-        "num_steps": 20
-      },
-      "critic": {
-        "class": "C51Critic",
-        "tier": "xlarge"
-      },
-      "entropy": {
-        "class": "AutotuneRegulator"
-      }
-    }
-  }
+  POLICY = maxent_actor_policy(entropy_scale=-0.9, entropy_in_target=False)
 
   kind = "actor"
   # GELU MLP with a 20-frequency sinusoidal time coder.
-  # Vary activation directly for GELU/SiLU comparisons.
-  activation = Config('gelu')
-  norm = Config('none')
-  norm_stem = Config(False)
-  norm_input = Config(False)
-  norm_after_act = Config(True)
-  dropout = Config(0.0)
-  final_activation = Config(False)
-  residual = Config(False)
-  norm_kwargs = Config({})
-  dtype = Config('bfloat16')
+  # Vary mlp.activation directly for GELU/SiLU comparisons.
+  mlp = ConfigDict(activation='gelu', norm='none', norm_stem=False, norm_input=False,
+                   norm_after_act=True, dropout=0.0, final_activation=False,
+                   residual=False, norm_kwargs={}, dtype='bfloat16')
   time_emb  = Config("sin_20", style=TIME_STYLES)
   squash_cls = Config("TanhSquash")
   num_steps    = Config(20)
   clip_denoised = Config(True)
-  prior_scale  = HParam(0.5)
+  prior_scale  = Config(0.5)
   # The noise ladder's *shape* is a Schedule named by class, with its endpoints
   # searchable; the selector and the kwargs dict are structural.
   ladder_cls   = Config("LinearSchedule")
 
   ladder_kind  = Config("beta")
-  ladder_start = HParam(3.0e-5)
-  ladder_end   = HParam(0.2997)
+  ladder_start = Config(3.0e-5)
+  ladder_end   = Config(0.2997)
   ladder_kwargs = Config({})
 
   # Best-of-N and softmax weighting for the soft-DSM loss (SDAC), and the
@@ -103,29 +74,27 @@ class DDPMActor(Actor, ActorOptim):
   # below.
   num_bon      = Config(8)
   num_candidates = Config(24)
-  softmax_temp = HParam(0.25)
-  explore_init = HParam(0.1)
-  explore_min  = HParam(1.0e-3)
-  explore_max  = HParam(1.0)
+  softmax_temp = Config(0.25)
+  explore_init = Config(0.1)
+  explore_min  = Config(1.0e-3)
+  explore_max  = Config(1.0)
   explore_raw_limit = Config(10.0)
   explore_lr   = Config(1.0e-2)   # its own optimizer, separate from the actor's
 
   def __init__(self, env_stats, config: ConfigMixin, *, rngs: nnx.Rngs, **kwargs):
-    self.resolve_hparams(config, env_stats=env_stats)
+    self.resolve_config(config, env_stats=env_stats)
 
     # latent_dim/layers are tier-ladder-owned.
     latent_dim, layers = config.get("latent_dim", int), config.get("layers", int)
 
     self.field = TimeConditionedField(
       self.obs_dim, self.plan_dim, latent_dim=latent_dim, layers=layers,
-      time_dim=self.time_dim, time_embed=self.time_embed, time_kwargs=self.hparam("time_kwargs"),
-      activation=self.activation, norm=self.norm, norm_input=self.norm_input, norm_stem=self.norm_stem,
-      norm_after_act=self.norm_after_act, dropout=self.dropout, final_activation=self.final_activation,
-      residual=self.residual, norm_kwargs=self.hparam("norm_kwargs"), dtype=self.dtype, rngs=rngs)
+      time_dim=self.time_dim, time_embed=self.time_embed, time_kwargs=self.static("time_kwargs"),
+      rngs=rngs, **self.mlp.todict())
 
     self.tau_table = Buffer(jnp.arange(self.num_steps + 1, dtype=jnp.float32) / self.num_steps)
     self.alpha_bar = Buffer(self._build_ladder(
-      self.ladder_cls, self.ladder_start, self.ladder_end, self.hparam("ladder_kwargs"),
+      self.ladder_cls, self.ladder_start, self.ladder_end, self.static("ladder_kwargs"),
       self.ladder_kind, self.num_steps))
     self.squash = get_component(self.squash_cls)(env_stats, ConfigMixin())
     self.rngs = rngs
@@ -386,8 +355,8 @@ class DDPMActor(Actor, ActorOptim):
     return {"actor": loss, "explore": explore_loss}
 
   def create_optimizer(self) -> dict:
-    return {"actor": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode),
-            "explore": optax.adam(self.explore_lr)}
+    return {**super().create_optimizer(),
+            "explore": adam(self.explore_lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}
 
   def param_labels(self, subpath) -> str:
     """`explore_raw` trains on its own optimizer key; every other parameter

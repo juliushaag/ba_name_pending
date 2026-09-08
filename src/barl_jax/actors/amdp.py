@@ -4,12 +4,13 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
+from barl_jax.actors.policy_dict import maxent_actor_policy
 from barl_jax.components import Actor, Buffer, Critic, frozen
 from barl_jax.config.toolkit import ConfigMixin
-from barl_jax.hparam import Config, HParam
+from barl_jax.hparam import Config, ConfigDict
 from barl_jax.networks.diffusion import TimeConditionedField, controlled_sde
 from barl_jax.networks.time_embedding import TIME_STYLES
-from barl_jax.optimization import ActorOptim, adam
+from barl_jax.optimization import ActorOptim
 from barl_jax.registration import get_component, register_component
 
 
@@ -21,66 +22,35 @@ def clip_score(score, max_norm: float, percentile: float):
 
 
 @register_component
-class ScoreContinuousActor(Actor, ActorOptim):
+class ScoreContinuousActor(ActorOptim, Actor):
   """AMDP's controlled-SDE actor. The net uses GELU in float32 (the chain accumulates
-  a log-weight) and the ctrl time coder by default. MLP settings are explicit
-  Config declarations; time_emb selects the time coder.
-  Only the SDE and score-clipping knobs are this class's own HParams."""
+  a log-weight) and the ctrl time coder by default. MLP settings are grouped under
+  `mlp`; time_emb selects the time coder.
+  Only the SDE and score-clipping knobs are this class's own."""
 
-  POLICY = {
-    "policy": "MaxEntRLPolicy",
-    "params": {
-      "entropy_scale": -1.0,
-      "policy_delay": 3,
-      "normalize_obs": False,
-      "entropy_in_target": True
-    },
-    "components": {
-      "actor": {
-        "class": "ScoreContinuousActor",
-        "tier": "medium"
-      },
-      "critic": {
-        "class": "C51Critic",
-        "tier": "xlarge"
-      },
-      "entropy": {
-        "class": "AutotuneRegulator"
-      }
-    }
-  }
+  POLICY = maxent_actor_policy(policy_delay=3, normalize_obs=False)
 
   kind = "actor"
-  # fp32 not bf16: the 16-step chain accumulates a log-weight, and `eps` is
-  # drawn at the control net's dtype -- in bf16 the noise driving the SDE
-  # carries ~3 significant digits. AMDP went non-finite in bf16 on both DMC
-  # envs (sweep 2026-08-27_13-23-15).
-  activation = Config('gelu')
-  norm = Config('none')
-  norm_stem = Config(False)
-  norm_input = Config(False)
-  norm_after_act = Config(True)
-  dropout = Config(0.0)
-  final_activation = Config(False)
-  residual = Config(False)
-  norm_kwargs = Config({})
-  dtype = Config('float32')
+  mlp = ConfigDict(activation='gelu', norm='none', norm_stem=False, norm_input=False,
+                   norm_after_act=True, dropout=0.0, final_activation=False,
+                   residual=False, norm_kwargs={}, dtype='float32')
+
   time_emb  = Config("ctrl", style=TIME_STYLES)
   squash_cls = Config("ErfSquash")   # `erf_k` is derived from the noise schedule below
-  sigma_min    = HParam(0.01)
-  sigma_max    = HParam(2.0)
-  tau_min      = HParam(0.0)
-  tau_max      = HParam(1.0)
+  sigma_min    = Config(0.01)
+  sigma_max    = Config(2.0)
+  tau_min      = Config(0.0)
+  tau_max      = Config(1.0)
   max_steps    = Config(16)
   out_clip     = Config(10000.0)   # ctrl_net.py's `outer_clip`
-  # The critic's action-gradient can spike on an outlier sample; this is the
-  # score-clipping intrinsic to how *this* actor's loss uses that gradient,
-  # not an algorithm-level tunable.
-  q_score_max_norm       = HParam(5.0)
-  q_score_max_percentile = HParam(95.0)
+
+  q_score_max_norm       = Config(5.0)
+  q_score_max_percentile = Config(95.0)
+
+  batch_rep = Config(1)
 
   def __init__(self, env_stats, config: ConfigMixin, *, rngs: nnx.Rngs, **kwargs):
-    self.resolve_hparams(config, env_stats=env_stats)
+    self.resolve_config(config, env_stats=env_stats)
 
     self._log_r    = math.log(self.sigma_max / self.sigma_min)
     self._int_base = float(self._raw_int(jnp.asarray(self.tau_min, jnp.float32)))
@@ -90,10 +60,8 @@ class ScoreContinuousActor(Actor, ActorOptim):
 
     self.field = TimeConditionedField(
       self.obs_dim, self.plan_dim, latent_dim=latent_dim, layers=layers,
-      time_dim=self.time_dim, time_embed=self.time_embed, time_kwargs=self.hparam("time_kwargs"),
-      activation=self.activation, norm=self.norm, norm_input=self.norm_input, norm_stem=self.norm_stem,
-      norm_after_act=self.norm_after_act, dropout=self.dropout, final_activation=self.final_activation,
-      residual=self.residual, norm_kwargs=self.hparam("norm_kwargs"), dtype=self.dtype, rngs=rngs)
+      time_dim=self.time_dim, time_embed=self.time_embed, time_kwargs=self.static("time_kwargs"),
+      rngs=rngs, **self.mlp.todict())
 
     self.field.zero_init_head()   # u ~ 0 at the beginning
 
@@ -105,10 +73,6 @@ class ScoreContinuousActor(Actor, ActorOptim):
 
     self._terminal_var = float(self.step_var[...].sum())
 
-    # The squash belongs to the actor because `erf_k` is a function of the noise
-    # schedule two lines up -- a Policy holding the squash had to reach back into
-    # the actor to build it. Any Squash works here; `erf_k` is absorbed by the
-    # ones that do not need it.
     self.squash = get_component(self.squash_cls)(
       env_stats, ConfigMixin(), erf_k=(2 * self._terminal_var) ** -0.5)
 
@@ -124,24 +88,11 @@ class ScoreContinuousActor(Actor, ActorOptim):
     """int_{tau_min}^{tau} sigma^2(t) dt -- matches what the sampler injects."""
     return self._raw_int(tau) - self._int_base
 
-  def sample_training_pair(self, obs, key):
-    """A stopped (endpoint, intermediate state, time) from one controlled path.
-
-    Lean adjoint matching regresses on E[terminal gradient | X_t]. Resampling
-    a Brownian bridge from an endpoint changes that conditional distribution:
-    it is not the controlled path law, particularly with unequal alphas.
-    Retain one uniformly chosen pre-step state per row while rolling forward,
-    so training still needs only one differentiable control evaluation.
-    """
-    rollout_key, time_key = jax.random.split(key)
-    indices = jax.random.randint(time_key, (obs.shape[0],), 0, self.max_steps)
-    X = jnp.zeros((obs.shape[0], self.plan_dim), jnp.float32)
-    X_t = jnp.zeros_like(X)
-    for i, step_key in enumerate(jax.random.split(rollout_key, self.max_steps)):
-      X_t = jnp.where((indices == i)[:, None], X, X_t)
-      X, _ = self.euler_step(obs, X, i, step_key)
-      X = jax.lax.stop_gradient(X)
-    return jax.lax.stop_gradient((X, X_t, self.taus[...][indices]))
+  def bridge_sample(self, endpoint, tau, noise):
+    sigma_sq = self.sigma_sq_int_fn(tau)
+    ratio    = sigma_sq / self._terminal_var
+    std      = jnp.sqrt(jnp.maximum(sigma_sq * (1.0 - ratio), 0.0))
+    return ratio * endpoint + std * noise
 
   @property
   def terminal_var(self) -> float:
@@ -149,26 +100,16 @@ class ScoreContinuousActor(Actor, ActorOptim):
     return self._terminal_var
 
   def squash_correction(self, X):
-    """H(action) = H(X) + E[log|dy/dx|]: the squash lifts the path weight onto
-    the action's density, whatever class fills it. (B, chunk_size), like
-    `prior_surprisal`/`generate_action`'s `log_w`."""
     return self.chunk_sum(self.squash.log_abs_det_jacobian(X))
 
   def derived(self) -> dict:
     return self.squash.derived()
 
   def prior_surprisal(self, X):
-    """-log N(X; 0, terminal_var I), per chunk position: the isotropic
-    normalizer splits evenly per position (`action_dim` dims each) and the
-    quadratic term sums within each position's block, giving (B, chunk_size)
-    -- the same whole-plan total at chunk_size 1."""
     const = 0.5 * self.action_dim * math.log(2 * math.pi * self._terminal_var)
     return const + 0.5 * self.chunk_sum(X ** 2) / self._terminal_var
 
   def control(self, obs, x, tau):
-    """The control net's output, clipped the way dime_am's does it
-    (ctrl_net.py `outer_clip`). At 1e4 it never binds on a healthy run; it is
-    what keeps one blown-up step from writing inf into the whole chain."""
     u = self.field(obs, x, self.scaled_time(tau))
     return jnp.clip(u, -self.out_clip, self.out_clip)
 
@@ -183,10 +124,11 @@ class ScoreContinuousActor(Actor, ActorOptim):
     tau = jnp.broadcast_to(self.taus[...][i], (obs.shape[0], 1))
     u_tilde = self.control(obs, X, tau)
     v = self.step_var[...][i]
+    sqrt_v = jnp.sqrt(v)
     eps = jax.random.normal(key, u_tilde.shape, u_tilde.dtype)
     log_w = (-0.5 * v * self.chunk_sum(u_tilde ** 2)
-             - jnp.sqrt(v) * self.chunk_sum(eps * u_tilde))
-    return X + v * u_tilde + jnp.sqrt(v) * eps, log_w
+             - sqrt_v * self.chunk_sum(eps * u_tilde))
+    return X + v * u_tilde + sqrt_v * eps, log_w
 
   def generate_action(self, obs, *, critic: Critic = None, squash=True, key=None):
     """`critic` is unused -- AMDP's actor needs none to sample -- and accepted
@@ -208,23 +150,14 @@ class ScoreContinuousActor(Actor, ActorOptim):
     return X.reshape(B, self.chunk_size, self.action_dim), log_w
 
   def loss(self, obs, critic: Critic, alpha, *, key=None):
-    """Lean adjoint matching for scalar or per-position control costs.
+    """Adjoint matching (Adjoint Matching, arXiv:2409.08861, Sec. 5.2)"""
 
-    With A = diag(chunk_broadcast(alpha)), the negative MaxEnt objective is
-    E[sum_k v_k/2 * u_tilde_k.T A u_tilde_k + g(X_N)], where
-    g(X) = -Q(squash(X)) - sum_i alpha_i * (prior_i(X) + squash_i(X)).
-    The lean adjoint is grad(g(X_N)): the reference drift and running state
-    cost are zero. Match u_tilde to -A^-1 grad(g) along the controlled path,
-    not a resampled reference bridge. Unequal alphas need not produce a
-    conservative control field. See docs/amdp_alpha.md for the derivation.
-
-    The terminal entropy correction cancels for the matched ErfSquash, even
-    with unequal alphas. Computing it also supports other configured squashes.
-    """
     key = self.rngs.noise() if key is None else key
+    rollout_key, tau_key, noise_key = jax.random.split(key, 3)
     alpha = jax.lax.stop_gradient(jnp.asarray(alpha))
-    X, X_t, tau = self.sample_training_pair(obs, key)
-    u_tilde  = self.control(obs, X_t, tau[:, None])
+
+    X, _ = self.generate_action(obs, key=rollout_key, squash=False)
+    X = jax.lax.stop_gradient(X)
 
     def q_values(critic, x):
       return critic.value(obs, self.squash(x)).sum()
@@ -236,14 +169,19 @@ class ScoreContinuousActor(Actor, ActorOptim):
       return (alpha * (actor.prior_surprisal(x) + actor.squash_correction(x))).sum()
 
     entropy_score = nnx.grad(terminal_entropy, argnums=1)(frozen(self), X)
-    sigma_tau = self.sigma_fn(tau)[:, None]
 
-    # This is a control target, not the score of a single Boltzmann density.
-    # A positive diagonal regression metric has the same conditional optimum;
-    # retain the existing Euclidean metric and time weighting for both modes.
+    score = jnp.repeat(x_score + entropy_score, self.batch_rep, axis=0)
+    obs_r = jnp.repeat(obs, self.batch_rep, axis=0)
+    X_r   = jnp.repeat(X, self.batch_rep, axis=0)
+
+    tau   = jax.random.uniform(tau_key, (X_r.shape[0], 1), minval=self.tau_min, maxval=self.tau_max)
+    noise = jax.random.normal(noise_key, X_r.shape)
+    a_t   = self.bridge_sample(X_r, tau, noise)
+    u_tilde   = self.control(obs_r, a_t, tau)
+    sigma_tau = self.sigma_fn(tau)
+
     u      = sigma_tau * u_tilde
-    target = jax.lax.stop_gradient(
-      sigma_tau * ((x_score + entropy_score) / self.chunk_broadcast(alpha)))
+    target = jax.lax.stop_gradient(sigma_tau * (score / self.chunk_broadcast(alpha)))
     loss   = (0.5 * ((u - target) ** 2).sum(axis=-1) / sigma_tau.squeeze(-1)).mean()
 
     self.metrics.scalar("score_loss", loss)
@@ -251,7 +189,5 @@ class ScoreContinuousActor(Actor, ActorOptim):
     self.metrics.vec("u", u)
     self.metrics.scalar("score_clipped_frac", clipped_frac)
     critic.metrics.vec("score", x_score)
-    return {"actor": loss}
 
-  def create_optimizer(self) -> dict:
-    return {"actor": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}
+    return { "actor" : loss }

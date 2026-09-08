@@ -1,4 +1,6 @@
-"""Config defaults and algorithmic HParam declarations.
+"""Config declarations: every class-attribute default a component resolves
+against its YAML layer, structural or algorithmic alike -- there is no
+separate searchable kind; a sweep varies any of them the same way.
 
 MLP settings are declared directly by their components. Capacity tiers live
 in networks/mlp.py; time embeddings may still use Config(style=TIME_STYLES).
@@ -53,18 +55,48 @@ class Config:
     return f"Config({self.default!r})"
 
 
-class HParam(Config):
-  """A searchable algorithmic knob: a default, the `range`/`choices` a sweep
-  varies, and a description. See Config for the non-searchable structural case."""
+class ConfigValues:
+  """The read-back for a resolved `ConfigDict`: plain attribute access
+  (`self.mlp.dtype`), not a dict lookup. Hashable by identity -- no `__eq__`/
+  `__hash__` override -- so it can sit directly on an nnx.Module the same way
+  a plain str/float/bool-valued `Config` already does, whatever its own
+  fields' hashability (a `norm_kwargs={}` field included)."""
 
-  __slots__ = ("range", "choices", "descr")
+  def __init__(self, **fields):
+    self.__dict__.update(fields)
 
-  def __init__(self, default: Any, *, type=None, range=None, choices: tuple = None,
-               descr: str = ""):
-    super().__init__(default, type=type)
-    self.range = range
-    self.choices = choices
-    self.descr = descr
+  def todict(self) -> dict:
+    """This group's fields as a plain dict, for `**self.mlp.todict()` at a
+    call site whose keyword names match the group's field names one-for-one."""
+    return dict(self.__dict__)
 
   def __repr__(self):
-    return f"HParam({self.default!r})"
+    return f"ConfigValues({self.__dict__!r})"
+
+
+class ConfigDict(Config):
+  """A named group of `Config` declarations, read back as one namespace
+  instead of one class attribute per field:
+
+      mlp = ConfigDict(dtype='float32', activation='gelu', norm='none')
+      # ...
+      self.mlp.dtype, self.mlp.activation, self.mlp.norm
+
+  Each field still resolves at its own flat name against the YAML layer --
+  `--set components.actor.dtype=bfloat16` overrides it exactly as it would a
+  standalone `Config(...)` declaration. Grouping only changes how the *class*
+  declares and the *component* reads the fields back, not the override
+  surface or what a run's resolved config logs. A raw value is auto-wrapped
+  the same way `Config`'s own constructor sugars one; pass an explicit
+  `Config(...)` for a field that needs its own `type` (`style` is not
+  supported on a grouped field -- give it its own top-level Config instead)."""
+
+  __slots__ = ("fields",)
+
+  def __init__(self, **fields):
+    self.fields = {name: value if isinstance(value, Config) else Config(value)
+                   for name, value in fields.items()}
+    super().__init__({name: f.default for name, f in self.fields.items()})
+
+  def __repr__(self):
+    return f"ConfigDict({', '.join(f'{k}={v.default!r}' for k, v in self.fields.items())})"

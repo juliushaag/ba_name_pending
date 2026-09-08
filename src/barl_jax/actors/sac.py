@@ -3,62 +3,35 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
+from barl_jax.actors.policy_dict import maxent_actor_policy
 from barl_jax.components import Actor, Buffer, Critic, PathwiseActorMixin
 from barl_jax.config.toolkit import ConfigMixin
-from barl_jax.hparam import Config
+from barl_jax.hparam import Config, ConfigDict
 from barl_jax.networks import gaussian
 from barl_jax.networks.mlp import MLP
-from barl_jax.optimization import ActorOptim, adam
+from barl_jax.optimization import ActorOptim
 from barl_jax.registration import get_component, register_component
 
 
 @register_component
-class StochasticActor(PathwiseActorMixin, Actor, ActorOptim):
+class StochasticActor(PathwiseActorMixin, ActorOptim, Actor):
   """Diagonal-Normal MLP actor shared by SAC/PPO/IQL. `dist()` stays an
   unconstrained Normal; sample()/mode() squash it (the `squash_cls` Config
   selects which -- any no-arg Squash works generically here).
 
   The shallow Gaussian policy has just a state-independent `log_std` plus the
   std bounds. The MLP uses SiLU and LayerNorm on hidden blocks, with no input
-  or stem normalization; its settings are explicit Config declarations below.
+  or stem normalization; its settings are grouped under `mlp` below.
 
   `log_std` is a state-independent parameter rather than a network head --
   barl's deliberate deviation from canonical SAC, kept as-is."""
 
-  POLICY = {
-    "policy": "MaxEntRLPolicy",
-    "params": {
-      "entropy_scale": -1.0,
-      "policy_delay": 1,
-      "normalize_obs": True,
-      "entropy_in_target": True
-    },
-    "components": {
-      "actor": {
-        "class": "StochasticActor",
-        "tier": "medium"
-      },
-      "critic": {
-        "class": "C51Critic",
-        "tier": "xlarge"
-      },
-      "entropy": {
-        "class": "AutotuneRegulator"
-      }
-    }
-  }
+  POLICY = maxent_actor_policy()
 
   kind = "actor"
-  activation = Config('silu')
-  norm = Config('layer')
-  norm_stem = Config(False)
-  norm_input = Config(False)
-  norm_after_act = Config(True)
-  dropout = Config(0.0)
-  final_activation = Config(False)
-  residual = Config(False)
-  norm_kwargs = Config({'epsilon': 1e-05})
-  dtype = Config('bfloat16')
+  mlp = ConfigDict(activation='silu', norm='layer', norm_stem=False, norm_input=False,
+                   norm_after_act=True, dropout=0.0, final_activation=False, residual=False,
+                   norm_kwargs={'epsilon': 1e-05}, dtype='bfloat16')
   squash_cls = Config("TanhSquash")
   log_std_min  = Config(-20.0)
   log_std_max  = Config(2.0)
@@ -79,11 +52,11 @@ class StochasticActor(PathwiseActorMixin, Actor, ActorOptim):
     # latent_dim/layers are tier-ladder-owned (see tier ladders in hparam.py).
     latent_dim, layers = config.get("latent_dim", int), config.get("layers", int)
 
-    self.net = MLP(self.obs_dim, self.plan_dim, latent_dim, layers,
-                   activation=self.activation, norm=self.norm, norm_input=self.norm_input,
-                         norm_stem=self.norm_stem, norm_after_act=self.norm_after_act,
-                   dropout=self.dropout, final_activation=self.final_activation,
-                   residual=self.residual, dtype=self.dtype, rngs=rngs, **(self.hparam("norm_kwargs") or {}))
+    # MLP takes norm's own kwargs spread (**norm_kwargs), not a `norm_kwargs=`
+    # parameter -- pop it out of the group and spread its contents instead.
+    mlp = self.mlp.todict()
+    norm_kwargs = mlp.pop("norm_kwargs") or {}
+    self.net = MLP(self.obs_dim, self.plan_dim, latent_dim, layers, rngs=rngs, **mlp, **norm_kwargs)
     self.rngs = rngs
 
   def _plan(self, flat):
@@ -141,6 +114,3 @@ class StochasticActor(PathwiseActorMixin, Actor, ActorOptim):
   # loss: PathwiseActorMixin's reparameterized max-entropy objective,
   # -(Q + alpha*H) -- SAC's actor improves against the critic but must not
   # train it (frozen(critic) inside the mixin), same as every actor here.
-
-  def create_optimizer(self) -> dict:
-    return {"actor": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}

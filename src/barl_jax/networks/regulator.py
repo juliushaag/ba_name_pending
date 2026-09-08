@@ -21,8 +21,8 @@ class AutotuneRegulator(DualOptim, Component, nnx.Module):
   the opposite of what this docstring claimed before.
 
   `target` is always the owning Policy's own computed value, never a
-  config/tunable -- so it stays a real keyword argument and is not an HParam.
-  It is either a plain float (one alpha for the whole chunked plan -- SAC/AMDP/
+  config/tunable -- so it stays a real keyword argument and is not a `Config`
+  declaration. It is either a plain float (one alpha for the whole chunked plan -- SAC/AMDP/
   DIME/SDAC's default, `target=self.chunk_size * self.action_dim *
   self.entropy_scale`, entropy being joint over the whole plan) or a
   `(chunk_size,)` array (one alpha per chunk position -- `MaxEntRLPolicy`'s
@@ -76,7 +76,7 @@ class AutotuneRegulator(DualOptim, Component, nnx.Module):
   def value(self):
     return jnp.exp(self.log_alpha[...])
 
-  def loss(self, value, losses: dict) -> None:
+  def loss(self, value) -> dict:
     value = jax.lax.stop_gradient(value)
     alpha = self.value()
     target = self.target_value
@@ -85,7 +85,7 @@ class AutotuneRegulator(DualOptim, Component, nnx.Module):
     # but for a (chunk_size,) alpha this is what gives log_alpha_i a gradient
     # from position i's own discrepancy rather than from the discrepancy
     # averaged across every position.
-    losses[f"{self.slot}_alpha"] = (alpha * (value - target)).mean()
+    loss = (alpha * (value - target)).mean()
 
     alpha_sg = jax.lax.stop_gradient(alpha)
     log = self.metrics.dist if alpha_sg.ndim else self.metrics.scalar
@@ -93,6 +93,7 @@ class AutotuneRegulator(DualOptim, Component, nnx.Module):
     log("target", target)
     self.metrics.dist("value", value)
     self.metrics.dist("value_scaled", value * alpha_sg)
+    return {f"{self.slot}_alpha": loss}
 
   def create_optimizer(self) -> dict:
     # Keyed by slot, so a policy's two regulators stay distinct without a

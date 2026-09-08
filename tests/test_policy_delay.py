@@ -177,13 +177,16 @@ def test_logged_skipped_loss_preserves_module_state():
 
 
 def test_grouped_loss_runs_when_another_optimizer_is_due():
-    policy = make("SDAC")
-    policy.policy_delay = 3
+    # actor's own cadence (2) is not due at step 2, but explore's (3) is --
+    # the group must still run, and "actor" gets a real value, not the zero
+    # fallback, from that one shared evaluation.
+    policy = MixedCadencePolicy()
+    policy.train_steps[...] = jnp.asarray(2)
     module = StatefulLoss()
     def loss(m):
         return {**m.loss(), "explore": m.weight[...] ** 2}
     values = gated_losses(policy, loss, ("actor", "explore"), module)
-    assert float(values["explore"]) == 4.0
+    assert float(values["actor"]) == 4.0
     assert int(module.calls[...]) == 1
 
 

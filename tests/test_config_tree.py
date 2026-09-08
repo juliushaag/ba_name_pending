@@ -26,7 +26,7 @@ def tree():
 def test_every_component_resolves_from_the_tree_alone(name, tree):
     """Whatever a component requires, config/ supplies -- checked by actually
     constructing it, which is the only way a missing kwarg shows up. The class
-    HParam declarations ARE the baseline now, so every registered component
+    Config declarations ARE the baseline now, so every registered component
     resolves from the tree even with no config/components/ entry."""
     from conftest import build
     build(name)
@@ -63,7 +63,7 @@ def test_tier_keys_are_owned_by_the_ladder_alone(tree):
     for name in sorted(available_components()):
         cls = get_component(name)
         owned = set(tree.tier_keys(tree.component_kind(name)))
-        declared = set(getattr(cls, "_hparams", {}))
+        declared = set(getattr(cls, "_decls", {}))
         assert not (owned & declared), f"{name} declares ladder-owned {sorted(owned & declared)}"
 
 
@@ -118,26 +118,37 @@ def test_training_keys_are_a_subset_of_the_run_keys():
 
 # --- completeness: no value is a silent default -------------------------------
 
-def test_resolved_covers_every_declared_hparam(tree):
+def _flat_decl_names(decls: dict) -> set:
+    """Declared attribute names, with a ConfigDict's own group name expanded
+    to its field names -- those flat names are what actually show up in
+    resolved(), not the group name itself."""
+    names = set()
+    for name, decl in decls.items():
+        fields = getattr(decl, "fields", None)
+        names.update(fields) if fields is not None else names.add(name)
+    return names
+
+
+def test_resolved_covers_every_declared_config(tree):
     """The requirement defaults moving into code was bought at: the resolved
-    config a run logs contains every declared HParam or Config -- parameter or
-    slot -- with its effective value. A class default a model never mentions
-    still shows up. Nothing can hide behind a Python default."""
+    config a run logs contains every declared Config -- parameter or slot --
+    with its effective value. A class default a model never mentions still
+    shows up. Nothing can hide behind a Python default."""
     from barl_jax.policy import Policy
     for model in tree.available_models():
         policy_name = tree.policy_class_name(model)
         cls = Policy.class_for(policy_name)
         res = tree.resolved(model)
         params = {k[len("params."):] for k in res if k.startswith("params.")}
-        assert set(cls._hparams) | set(cls._configs) <= params, \
+        assert _flat_decl_names(cls._decls) <= params, \
             f"{model}: declared params missing from resolved()"
         for slot in cls.SLOTS:
             comp = get_component(res[f"components.{slot}.class"])
             keys = {k[len(f"components.{slot}."):] for k in res
                     if k.startswith(f"components.{slot}.")
                     and k not in (f"components.{slot}.class", f"components.{slot}.tier")}
-            assert set(comp._hparams) | set(comp._configs) <= keys, \
-                f"{model}.{slot}: declared hparams missing from resolved()"
+            assert _flat_decl_names(comp._decls) <= keys, \
+                f"{model}.{slot}: declared config missing from resolved()"
 
 
 def test_a_resolved_run_has_every_run_key(tmp_path):

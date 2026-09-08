@@ -105,8 +105,7 @@ def test_regulator_dual_has_the_sign_sac_needs():
     assert float(r.value()) == pytest.approx(0.5, abs=1e-6)
 
     above = jnp.array([1.0, -1.0])                      # mean 0.0, a full 1.0 above target
-    losses = {}
-    r.loss(above, losses)
+    losses = r.loss(above)
 
     (key,) = losses
     assert key in r.create_optimizer(), "dual's loss key has no optimizer"
@@ -127,8 +126,7 @@ def test_regulator_dual_gradient_scales_with_alpha():
         r = build("AutotuneRegulator", alpha_init=alpha_init, target=0.0)
 
         def dual_loss(reg):
-            losses = {}
-            reg.loss(gap, losses)
+            losses = reg.loss(gap)
             return next(iter(losses.values()))
 
         grads = nnx.grad(dual_loss)(r)
@@ -163,8 +161,7 @@ def test_regulator_vector_gradient_is_independent_per_position():
     value = jnp.array([[1.0, 3.0], [1.0, 3.0]])
 
     def dual_loss(reg):
-        losses = {}
-        reg.loss(value, losses)
+        losses = reg.loss(value)
         return next(iter(losses.values()))
 
     grads = nnx.grad(dual_loss)(r)["log_alpha"][...]

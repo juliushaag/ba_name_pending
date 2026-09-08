@@ -19,7 +19,7 @@ import jax.numpy as jnp
 
 from barl_jax.components import ActionSampler
 from barl_jax.critics import QCriticBase
-from barl_jax.hparam import Config, HParam
+from barl_jax.hparam import Config
 from barl_jax.networks.regulator import AutotuneRegulator
 from barl_jax.optimization import gated_losses
 from barl_jax.policy import Policy, register_policy
@@ -40,7 +40,7 @@ class RLPolicy(Policy):
       return cls.SLOT_OBJECTIVES.get(slot, actor_cls.critic_objective)
     return super().slot_objective(slot, actor_cls)
 
-  policy_delay = HParam(1, descr="grad steps between actor/dual updates (critic steps every step)")
+  policy_delay = Config(1)   # grad steps between actor/dual updates (critic steps every step)
   normalize_obs = Config(True)
 
   def __init__(self, env: gym.Env, **kwargs):
@@ -61,7 +61,7 @@ class RLPolicy(Policy):
     return self.normalize_observations(x) if self.normalize_obs else x
 
   def optimizer_cadence(self) -> dict:
-    return {key: self.policy_delay for key in self.actor.create_optimizer() if key == "actor"}
+    return {key: self.policy_delay for key in self.actor.create_optimizer()}
 
   # ---- the three seams MaxEntRLPolicy fills in -----------------------------
 
@@ -71,8 +71,8 @@ class RLPolicy(Policy):
   def target_entropy_bonus(self, alpha, entropy):
     return 0.0
 
-  def dual_loss(self, entropy, losses) -> None:
-    pass
+  def dual_loss(self, entropy) -> dict:
+    return {}
 
   # ---------------------------------------------------------------------
 
@@ -105,8 +105,9 @@ class RLPolicy(Policy):
       self.actor.generate_action(next_obs, critic=self.critic, key=keys[0]))
     next_action = next_action.reshape(next_action.shape[0], -1)
 
-    self.critic.td_loss(obs, action, next_obs, next_action, chunk_return, terminated, horizon,
-                        losses, entropy_bonus=self.target_entropy_bonus(alpha, entropy), key=keys[-1])
+    losses.update(self.critic.td_loss(
+      obs, action, next_obs, next_action, chunk_return, terminated, horizon,
+      entropy_bonus=self.target_entropy_bonus(alpha, entropy), key=keys[-1]))
 
     # An actor can own multiple optimizers (e.g. SDAC actor + exploration).
     # Compute their shared loss whenever any partition is due; mask each
@@ -116,7 +117,7 @@ class RLPolicy(Policy):
         self,
         lambda actor, critic: actor.loss(obs, critic, alpha, key=keys[1]),
         actor_keys, self.actor, self.critic))
-    self.dual_loss(entropy, losses)
+    losses.update(self.dual_loss(entropy))
 
     self.actor.metrics.vec("action", next_action.reshape(
       next_action.shape[0], self.actor.chunk_size, self.actor.action_dim), limit=1.0)
@@ -166,7 +167,7 @@ class MaxEntRLPolicy(RLPolicy):
 
   SLOTS = ("critic", "actor", "entropy")
   SLOT_OBJECTIVES = {"critic": "td"}
-  entropy_scale     = HParam(-1.0)
+  entropy_scale     = Config(-1.0)
   entropy_in_target = Config(True)
   alpha_granularity = Config("per_action")
 
@@ -187,7 +188,8 @@ class MaxEntRLPolicy(RLPolicy):
       f"doesn't -- build_optimizer's cadence.get(key, 1) would drop it silently.")
 
   def optimizer_cadence(self) -> dict:
-    return {**super().optimizer_cadence(), "entropy_alpha": self.policy_delay}
+    return {**super().optimizer_cadence(),
+            **{key: self.policy_delay for key in self.entropy.create_optimizer()}}
 
   def alpha(self):
     return self.entropy.value()
@@ -200,9 +202,9 @@ class MaxEntRLPolicy(RLPolicy):
       return 0.0
     return jax.lax.stop_gradient((alpha * entropy).sum(axis=-1, keepdims=True))
 
-  def dual_loss(self, entropy, losses) -> None:
+  def dual_loss(self, entropy) -> dict:
     # per_chunk's target is one number for the whole plan, so the dual must see
     # entropy summed the same way; per_action's target is per position, so the
     # per-position decomposition goes in as-is.
     value = entropy if self.alpha_granularity == "per_action" else entropy.sum(axis=-1, keepdims=True)
-    self.entropy.loss(value, losses)
+    return self.entropy.loss(value)

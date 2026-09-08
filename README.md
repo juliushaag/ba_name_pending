@@ -90,9 +90,11 @@ completed evaluation is `null` there, not a non-finite float, with
 
 Algorithm defaults live in each actor's `POLICY` dictionary under
 `src/barl_jax/actors/`; policy YAML files are no longer required. MLP settings
-are explicit `Config(...)` declarations on actors and critics. Capacity tiers
-live in `src/barl_jax/networks/mlp.py` (`MLP_TIERS`). For example, change an
-activation with `--set model.components.actor.activation=silu`.
+are grouped under one `mlp = ConfigDict(...)` declaration on actors and
+critics, read back as `self.mlp.activation`/`self.mlp.norm`/...; each field
+still overrides at its own flat key, same as a standalone `Config`. Capacity
+tiers live in `src/barl_jax/networks/mlp.py` (`MLP_TIERS`). For example,
+change an activation with `--set model.components.actor.activation=silu`.
 Set `BARL_CONFIG_DIR` before importing config tools, or pass an explicit root to
 `ConfigTree`/`load_config`, to use another configuration directory.
 

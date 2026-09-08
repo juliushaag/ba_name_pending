@@ -4,7 +4,7 @@ import jax.numpy as jnp
 from flax import nnx
 
 from barl_jax.components import ActionSampler, frozen
-from barl_jax.hparam import Config, HParam
+from barl_jax.hparam import Config
 from barl_jax.metrics import DEBUG
 from barl_jax.registration import register_component
 
@@ -20,34 +20,19 @@ class LangevinActor(ActionSampler):
   POLICY = {
     "policy": "RLPolicy",
     "components": {
-      "actor": {
-        "class": "LangevinActor",
-        "steps_per_level": 2,
-        "step_size": 0.002,
-        "temperature": 500.0,
-        "normalize_score": True,
-        "clip_actions": True,
-        "action_limit": 1.0,
-        "init_scale": 1.0
-      },
+      "actor": {},
       "critic": {
         "class": "NCLQLC51Critic",
         "tier": "xlarge",
-        "reward_scale": 1.0,
-        "noise_schedule": {
-          "class": "ExponentialSchedule",
-          "start": 0.1,
-          "end": 0.001,
-          "steps": 10
-        }
+        "reward_scale": 1.0
       }
     }
   }
   kind = "sampler"
   critic_objective = "noise_td"
   steps_per_level = Config(2)
-  step_size = HParam(2.0e-3)
-  temperature = HParam(500.0)
+  step_size = Config(2.0e-3)
+  temperature = Config(500.0)
   normalize_score = Config(True)
   clip_actions = Config(True)
   action_limit = Config(1.0)

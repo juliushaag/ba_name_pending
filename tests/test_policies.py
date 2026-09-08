@@ -168,7 +168,7 @@ def test_critics_declare_supported_objectives():
 def test_resolved_style_surface_is_the_surface_that_gets_built():
   policy = make("SDAC")
   resolved = ConfigTree().resolve_slot("SDAC", "actor", None)[1]
-  assert policy.actor.activation.lower() == resolved["activation"].lower()
+  assert policy.actor.mlp.activation.lower() == resolved["activation"].lower()
   assert policy.actor.field.net.act is getattr(jax.nn, resolved["activation"].lower())
 
 

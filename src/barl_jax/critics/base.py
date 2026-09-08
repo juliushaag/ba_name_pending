@@ -5,21 +5,21 @@ from flax import nnx
 
 from barl_jax.components import TARGET_SUFFIX, Buffer, Critic, frozen
 from barl_jax.config.toolkit import ConfigMixin
-from barl_jax.hparam import Config, HParam
+from barl_jax.hparam import Config
 from barl_jax.networks.ensemble import Ensemble
 from barl_jax.networks.mlp import MLP
 from barl_jax.optimization import CriticOptim, adam
 
 
 class CriticLossConfig:
-  gamma             = HParam(0.99)
+  gamma             = Config(0.99)
   pessimistic_target = Config(False)
-  polyak_tau        = HParam(0.0)
+  polyak_tau        = Config(0.0)
   target_delay      = Config(1)
 
 
 class Polyak:
-  polyak_tau = HParam(0.005)
+  polyak_tau = Config(0.005)
 
 
 def n_step_discount(gamma, horizon, terminated, dtype):
@@ -48,9 +48,9 @@ class QCriticBase(CriticLossConfig, CriticOptim, Critic):
     self.q_function = q_function
 
     if self.polyak_tau > 0.0:
-      if self.norm in ("batch", "batchrenorm"):
+      if self.mlp.norm in ("batch", "batchrenorm"):
         raise ValueError(
-          f"{type(self).__name__}: polyak_tau={self.polyak_tau} with norm={self.norm!r}. A target net "
+          f"{type(self).__name__}: polyak_tau={self.polyak_tau} with norm={self.mlp.norm!r}. A target net "
           f"and CrossQ-style running-statistic normalization are alternative answers to the "
           f"same problem -- the target's separate forward pass removes the shared "
           f"[(s,a), (s',a')] batch that makes BatchRenorm worth having. Pick one: either "
@@ -129,7 +129,7 @@ class QCriticBase(CriticLossConfig, CriticOptim, Critic):
     return jax.lax.stop_gradient(reduce(next_raw))
 
   def td_loss(self, obs, action, next_obs, next_action, chunk_return, terminated, horizon,
-              losses: dict, entropy_bonus=0.0, *, key=None) -> None:
+              entropy_bonus=0.0, *, key=None) -> dict:
     """chunk_return: (B,) accumulated discounted return over the executed
     horizon (already gamma-weighted per primitive step by the collector --
     this applies exactly one more discount, from t+h to t+0, to the
@@ -144,8 +144,9 @@ class QCriticBase(CriticLossConfig, CriticOptim, Critic):
       pred_raw, next_raw = self.raw_batches((obs, action), (next_obs, next_action))
     target = self.bellman_target(chunk_return, terminated, horizon,
                                  self.bootstrap_from_raw(next_raw), entropy_bonus)
-    losses["critic"] = self.regression_loss(pred_raw, target)
+    loss = self.regression_loss(pred_raw, target)
     self.record(pred_raw, target)
+    return {"critic": loss}
 
   def bellman_target(self, chunk_return, terminated, horizon, bootstrap, entropy_bonus=0.0):
     """td_target = chunk_return + bootstrap_discount * (bootstrap + entropy_bonus),

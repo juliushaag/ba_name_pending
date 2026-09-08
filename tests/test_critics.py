@@ -158,8 +158,7 @@ def test_loss_is_differentiable(name, obs, act):
     a = critic_action(c, act)
 
     def loss_fn(critic):
-        losses = {}
-        critic.td_loss(obs, a, obs[::-1], a, REWARD, jnp.zeros((BATCH,)), ONE, losses)
+        losses = critic.td_loss(obs, a, obs[::-1], a, REWARD, jnp.zeros((BATCH,)), ONE)
         assert set(losses) == {"critic"}
         return losses["critic"]
 
@@ -180,9 +179,8 @@ def test_noise_conditioned_loss_is_differentiable(name, obs, act):
     sigmas = jnp.array([0.5, 0.2, 0.05])
 
     def loss_fn(critic):
-        losses = {}
-        critic.noise_td_loss(obs, act, obs[::-1], act, REWARD, jnp.zeros((BATCH,)), ONE,
-                    sigmas, jax.random.PRNGKey(0), losses)
+        losses = critic.noise_td_loss(obs, act, obs[::-1], act, REWARD, jnp.zeros((BATCH,)), ONE,
+                    sigmas, jax.random.PRNGKey(0))
         assert set(losses) == {"critic"}
         return losses["critic"]
 

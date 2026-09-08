@@ -9,7 +9,7 @@ from flax import nnx
 
 from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.env import EnvStats
-from barl_jax.hparam import Config, HParam
+from barl_jax.hparam import Config, ConfigDict, ConfigValues
 from barl_jax.metrics import Recorder
 
 
@@ -109,70 +109,68 @@ class _Static:
     return f"_Static({self.value!r})"
 
 
-class HParamsOwner:
-  """Collects class-attribute declarations (HParam and Config) and resolves
-  them to instance attributes against a ConfigMixin of the YAML-override layer.
+class ConfigOwner:
+  """Collects class-attribute `Config` declarations and resolves them to
+  instance attributes against a ConfigMixin of the YAML-override layer.
 
-  `_hparams` is every searchable `HParam` in the MRO (own declarations win), and
-  `_configs` every structural `Config` -- together `_decls`, which is what gets
-  resolved. `resolve_hparams` reads each against `config`: the YAML value if
-  present, the declaration's default otherwise -- which is what moves the
-  default out of YAML and into the class that uses the value. Because the
-  default lives in the declaration, the resolved config a run logs can
-  attribute every value to a layer, and no value is ever silent.
+  `_decls` is every declared `Config` in the MRO (own declarations win).
+  `resolve_config` reads each against `config`: the YAML value if present, the
+  declaration's default otherwise -- which is what moves the default out of
+  YAML and into the class that uses the value. Because the default lives in
+  the declaration, the resolved config a run logs can attribute every value to
+  a layer, and no value is ever silent.
 
   Two nnx constraints shape the storage:
   - a value resolved onto `self` before `Component.__init__` has run is fine
     for a scalar, but a subclass building a nested module first passes
     `env_stats` so `obs_dim`/`action_dim` exist too;
-  - an unhashable value (a dict `norm_kwargs`, `time_kwargs`, `ladder_kwargs`)
-    cannot live on the module as a plain attribute -- it would make the
-    GraphDef unhashable -- so it is held in a single identity-hashable
-    `_Static` and read back through `hparam(name)`.
+  - an unhashable value (a dict `time_kwargs`/`ladder_kwargs` declared as a
+    plain `Config`) cannot live on the module as a plain attribute -- it
+    would make the GraphDef unhashable -- so it is held in a single
+    identity-hashable `_Static` and read back through `static(name)`. A
+    `ConfigDict`'s resolved `ConfigValues` needs no such wrapping: it is
+    itself identity-hashable regardless of what its own fields hold.
 
   `nnx.Module` is not involved here: this mixin is pure Python and only reads
   the class hierarchy at `__init_subclass__` time."""
 
-  _hparams: dict[str, HParam] = {}
-  _configs: dict[str, "Config"] = {}
+  _decls: dict[str, Config] = {}
 
   def __init_subclass__(cls, **kw):
     # Every class in the MRO contributes its own declarations, including plain
     # geometry mixins (CriticOptim, CriticLossConfig, Polyak, ...) that are not
-    # themselves
-    # HParamsOwner -- a mixin *is* the config, and inheritance is how a class
-    # composes it. A later (more-derived) declaration wins over an earlier one.
+    # themselves ConfigOwner -- a mixin *is* the config, and inheritance is how
+    # a class composes it. A later (more-derived) declaration wins over an
+    # earlier one of the same name.
     super().__init_subclass__(**kw)
-    hparams, configs = {}, {}
+    decls = {}
     for base in reversed(cls.__mro__):
       for name, value in base.__dict__.items():
-        if isinstance(value, HParam):
-          hparams[name] = value
-          configs.pop(name, None)
-        elif isinstance(value, Config):
-          configs[name] = value
-          hparams.pop(name, None)
-    cls._hparams = hparams
-    cls._configs = configs
+        if isinstance(value, Config):
+          decls[name] = value
+    cls._decls = decls
 
-  @property
-  def _decls(self) -> dict[str, Config]:
-    """Every declaration, hparams overriding configs of the same name."""
-    return {**type(self)._configs, **type(self)._hparams}
-
-  def resolve_hparams(self, config: ConfigMixin, names: tuple = None,
-                      env_stats: EnvStats = None) -> None:
-    """Resolve every (or `names`-subset of) declared HParam/Config. Idempotent:
-    a name already resolved (pre-super, by a subclass that needed a value to
+  def resolve_config(self, config: ConfigMixin, names: tuple = None,
+                     env_stats: EnvStats = None) -> None:
+    """Resolve every (or `names`-subset of) declared Config. Idempotent: a
+    name already resolved (pre-super, by a subclass that needed a value to
     build a nested module) is re-set to the same value. A style-tagged Config
     (a `time_emb` selector) additionally materializes its named
     style's whole surface as instance attributes, so the component reads
-    `self.activation`/`self.norm`/... exactly as if it had declared them."""
+    `self.activation`/`self.norm`/... exactly as if it had declared them. A
+    `ConfigDict` resolves each of its fields at its own flat name -- same
+    override surface as a standalone Config -- and reads back as one
+    namespace (`self.mlp.activation`) instead of one attribute per field."""
     if env_stats is not None:
       self._derive_env(env_stats)
-    decls = self._decls if names is None else {n: self._decls[n] for n in names}
+    decls = type(self)._decls if names is None else {n: type(self)._decls[n] for n in names}
     owner = type(self).__name__
     for name, decl in decls.items():
+      if isinstance(decl, ConfigDict):
+        fields = {field: config.resolve(field, field_decl, owner=owner)
+                 for field, field_decl in decl.fields.items()}
+        self._absorb(name, ConfigValues(**fields))
+        continue
       value = config.resolve(name, decl, owner=owner)
       if decl.style is not None:
         # A style-selector Config: materialize the chosen style's whole
@@ -190,16 +188,16 @@ class HParamsOwner:
     the GraphDef in a single identity-hashable `_Static`; the rest as plain
     instance attributes."""
     if isinstance(value, (dict, list, set)):
-      if not hasattr(self, "_hparams_s"):
-        self._hparams_s = _Static({})
-      self._hparams_s.value[name] = value
+      if not hasattr(self, "_static_config"):
+        self._static_config = _Static({})
+      self._static_config.value[name] = value
     else:
       setattr(self, name, value)
 
-  def hparam(self, name: str):
+  def static(self, name: str):
     """A resolved value that could not live on the module (a dict, list or set
-    declaration) -- see `resolve_hparams`."""
-    return self._hparams_s.value[name]
+    declaration) -- see `resolve_config`."""
+    return self._static_config.value[name]
 
   def _derive_env(self, env_stats: EnvStats) -> None:
     self.obs_dim    = env_stats.get("obs_dim")
@@ -208,7 +206,7 @@ class HParamsOwner:
     self.plan_dim   = self.chunk_size * (self.action_dim or 0)
 
 
-class Component(HParamsOwner):
+class Component(ConfigOwner):
   """Mixin for anything Policy.build_component() constructs. Three jobs: consume
   the run's EnvStats and resolved config, which every component takes as its
   first two positional arguments; give the owning Policy a uniform lifecycle
@@ -249,13 +247,12 @@ class Component(HParamsOwner):
     # Both are overwritten by build_component with the real slot; the defaults
     # only keep a component constructed outside a Policy usable.
     self.slot       = type(self).__name__.lower()
-    # Every declared Config/HParam class attribute becomes an instance
-    # attribute: the YAML layer's value if present, the declaration's default
-    # otherwise. A subclass that needed values before this ran (to build a
-    # nested module first) calls resolve_hparams itself and this re-sets the
-    # same values.
+    # Every declared Config class attribute becomes an instance attribute: the
+    # YAML layer's value if present, the declaration's default otherwise. A
+    # subclass that needed values before this ran (to build a nested module
+    # first) calls resolve_config itself and this re-sets the same values.
     if config is not None:
-      self.resolve_hparams(config, env_stats=env_stats)
+      self.resolve_config(config, env_stats=env_stats)
 
   @property
   def metrics(self) -> Recorder:

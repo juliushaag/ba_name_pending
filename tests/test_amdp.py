@@ -11,23 +11,23 @@ from barl_jax.components import Buffer
 from barl_jax.metrics import Recorder
 
 
-def actor_for_test(*, steps=3, squash="ErfSquash"):
+def actor_for_test(*, steps=3, batch_rep=1, squash="ErfSquash"):
     stats = make_env_stats(act_dim=1, act_low=np.array([-1.0], np.float32),
                            act_high=np.array([1.0], np.float32), chunk_size=2)
-    return build("ScoreContinuousActor", env_stats=stats, max_steps=steps,
+    return build("ScoreContinuousActor", env_stats=stats, max_steps=steps, batch_rep=batch_rep,
                  squash_cls=squash, q_score_max_norm=1e6, q_score_max_percentile=100.0)
 
 
 class LinearField(nnx.Module):
-    """A separate affine controller at each Euler time, for analytic oracles."""
-    def __init__(self, gains):
-        self.gains = nnx.Param(jnp.asarray(gains, jnp.float32))
-        self.bias = nnx.Param(jnp.zeros(gains.shape[:2], jnp.float32))
+    """A time-independent affine controller, for closed-form gradient checks --
+    the bridge-sampled matching target no longer depends on a discrete Euler
+    step index, so this needn't vary with `scaled_time` either."""
+    def __init__(self, gain, bias):
+        self.gain = nnx.Param(jnp.asarray(gain, jnp.float32))
+        self.bias = nnx.Param(jnp.asarray(bias, jnp.float32))
 
     def __call__(self, obs, x, scaled_time):
-        n = self.gains[...].shape[0]
-        k = jnp.rint((scaled_time[:, 0] + 1) * n / 2).astype(jnp.int32)
-        return jnp.einsum("bij,bj->bi", self.gains[...][k], x) + self.bias[...][k]
+        return x @ self.gain[...].T + self.bias[...]
 
 
 class QuadraticCritic(nnx.Module):
@@ -44,49 +44,14 @@ class QuadraticCritic(nnx.Module):
         return Recorder(self)
 
 
-class IdentitySquash(nnx.Module):
-    def __call__(self, x):
-        return x
-
-    def log_abs_det_jacobian(self, x):
-        return jnp.zeros_like(x)
-
-
 def assert_tree_close(a, b, **kwargs):
     for x, y in zip(jax.tree.leaves(a), jax.tree.leaves(b), strict=True):
         np.testing.assert_allclose(x, y, **kwargs)
 
 
-def test_training_pair_uses_the_actual_controlled_path():
-    actor = actor_for_test()
-    gains = np.broadcast_to([[0.1, 0.2], [-0.3, 0.15]], (3, 2, 2))
-    actor.field = LinearField(gains)
-    actor.field.bias[...] = jnp.full((3, 2), 0.1)
-    obs = jnp.zeros((24, OBS_DIM))
-    key = jax.random.PRNGKey(3)
-    rollout_key, time_key = jax.random.split(key)
-    indices = jax.random.randint(time_key, (24,), 0, 3)
-    states = []
-    x = jnp.zeros((24, 2))
-    for k, step_key in enumerate(jax.random.split(rollout_key, 3)):
-        states.append(x)
-        c = x @ jnp.asarray(gains[k]).T + 0.1
-        v = actor.step_var[...][k]
-        x = x + v * c + jnp.sqrt(v) * jax.random.normal(step_key, x.shape)
-    end, mid, tau = actor.sample_training_pair(obs, key)
-    np.testing.assert_allclose(end, x, atol=1e-6)
-    np.testing.assert_allclose(mid, jnp.stack(states)[indices, jnp.arange(24)], atol=1e-6)
-    np.testing.assert_allclose(tau, actor.taus[...][indices])
-    sampled, _ = actor.generate_action(obs, squash=False, key=rollout_key)
-    np.testing.assert_array_equal(end, sampled.reshape(24, 2))
-
-    grads = nnx.grad(lambda a: sum(x.sum() for x in a.sample_training_pair(obs, key)))(actor)
-    assert all(np.count_nonzero(g) == 0 for g in jax.tree.leaves(grads))
-
-
 def test_scalar_alpha_and_equal_per_action_alphas_have_identical_actor_gradients():
-    actor = actor_for_test()
-    actor.field = LinearField(np.full((3, 2, 2), 0.05))
+    actor = actor_for_test(batch_rep=3)
+    actor.field = LinearField(np.full((2, 2), 0.05), np.array([0.02, -0.01]))
     critic = QuadraticCritic([[0.3, 0.1], [0.1, 0.4]])
     obs = jnp.zeros((8, OBS_DIM))
     key = jax.random.PRNGKey(4)
@@ -97,83 +62,72 @@ def test_scalar_alpha_and_equal_per_action_alphas_have_identical_actor_gradients
 
 
 @pytest.mark.parametrize("squash", ["ErfSquash", "TanhSquash"])
-def test_weighted_terminal_gradient_and_parameter_isolation(squash):
-    actor = actor_for_test(steps=1, squash=squash)
-    actor.field = LinearField(np.zeros((1, 2, 2)))
-    actor.field.bias[...] = jnp.array([[0.05, -0.04]])
-    matrix = jnp.array([[0.3, 0.1], [0.1, 0.4]])
+def test_loss_matches_manual_bridge_target(squash):
+    """Recomputes `loss`'s bridge-sampled target from scratch -- same PRNG
+    splits, same rollout, same closed-form score/entropy gradients -- and
+    checks the actor gradient against the least-squares closed form.
+
+    A time-independent field makes this exact for any number of Euler steps
+    or `batch_rep` bridge samples: the rollout endpoint is stop-gradient'd
+    before it reaches the score/entropy grads or the bridge sample, so
+    `u_tilde`'s evaluation at each bridge point is the only path carrying
+    gradient into `field` -- this incidentally also checks that isolation.
+    """
+    steps, rep, B = 2, 3, 5
+    actor = actor_for_test(steps=steps, batch_rep=rep, squash=squash)
+    gain = np.array([[0.2, -0.1], [0.05, 0.3]])
+    bias = np.array([0.05, -0.04])
+    actor.field = LinearField(gain, bias)
+    matrix = np.array([[0.3, 0.1], [0.1, 0.4]])
     critic = QuadraticCritic(matrix)
-    obs = jnp.zeros((8, OBS_DIM))
+    obs = jnp.zeros((B, OBS_DIM))
     alpha = jnp.array([0.4, 1.7])
-    key = jax.random.PRNGKey(5)
-    x, _, _ = actor.sample_training_pair(obs, key)
-    a = actor.squash(x)
+    key = jax.random.PRNGKey(7)
+
+    # Mirror loss()'s own key splits and rollout exactly.
+    rollout_key, tau_key, noise_key = jax.random.split(key, 3)
+    step_vars = np.asarray(actor.step_var[...])
+    X = np.zeros((B, 2), np.float32)
+    for i, step_key in enumerate(jax.random.split(rollout_key, steps)):
+      v = step_vars[i]
+      u = X @ gain.T + bias
+      eps = np.asarray(jax.random.normal(step_key, X.shape))
+      X = X + v * u + np.sqrt(v) * eps
+
+    a = np.asarray(actor.squash(jnp.asarray(X)))
     if squash == "ErfSquash":
-        k = actor.squash.erf_k
-        jac = 2 * k / np.sqrt(np.pi) * jnp.exp(-(k * x) ** 2)
-        entropy_grad = jnp.zeros_like(x)
+      k = actor.squash.erf_k
+      jac = 2 * k / np.sqrt(np.pi) * np.exp(-(k * X) ** 2)
+      entropy_grad = np.zeros_like(X)
     else:
-        jac = 1 - a ** 2
-        entropy_grad = alpha * (x / actor.terminal_var - 2 * a)
+      jac = 1 - a ** 2
+      entropy_grad = np.asarray(alpha) * (X / actor.terminal_var - 2 * a)
     q_grad = -(a @ matrix) * jac
-    expected = actor.sigma_fn(jnp.asarray(0.0)) * (
-        actor.field.bias[...] - ((q_grad + entropy_grad) / alpha).mean(axis=0))
+    score = q_grad + entropy_grad
+
+    score_r = np.repeat(score, rep, axis=0)
+    X_r = np.repeat(X, rep, axis=0)
+    N = X_r.shape[0]
+    tau = np.asarray(jax.random.uniform(tau_key, (N, 1), minval=actor.tau_min, maxval=actor.tau_max))
+    noise = np.asarray(jax.random.normal(noise_key, X_r.shape))
+    sigma_sq = np.asarray(actor.sigma_sq_int_fn(jnp.asarray(tau)))
+    ratio = sigma_sq / actor.terminal_var
+    std = np.sqrt(np.maximum(sigma_sq * (1.0 - ratio), 0.0))
+    a_t = ratio * X_r + std * noise
+    sigma_tau = np.asarray(actor.sigma_fn(jnp.asarray(tau)))
+    u = sigma_tau * (a_t @ gain.T + bias)
+    target = sigma_tau * (score_r / np.asarray(alpha))
+    r = u - target
+    expected_gain = np.mean(r[:, :, None] * a_t[:, None, :], axis=0)
+    expected_bias = np.mean(r, axis=0)
+
     actor_grad, critic_grad, alpha_grad = nnx.grad(
-        lambda a, c, t: a.loss(obs, c, t, key=key)["actor"], argnums=(0, 1, 2)
+      lambda a_, c, t: a_.loss(obs, c, t, key=key)["actor"], argnums=(0, 1, 2)
     )(actor, critic, alpha)
-    np.testing.assert_allclose(actor_grad["field"]["bias"][...], expected,
-                               rtol=2e-5, atol=2e-6)
+    np.testing.assert_allclose(actor_grad["field"]["gain"][...], expected_gain, rtol=2e-5, atol=2e-6)
+    np.testing.assert_allclose(actor_grad["field"]["bias"][...], expected_bias, rtol=2e-5, atol=2e-6)
     assert all(np.count_nonzero(g) == 0 for g in jax.tree.leaves(critic_grad))
     np.testing.assert_array_equal(alpha_grad, jnp.zeros_like(alpha))
-
-
-def test_unequal_alpha_matching_is_stationary_at_coupled_lqr_optimum(monkeypatch):
-    """An independent Riccati solution, integrated exactly for quadratic data.
-
-    Unequal A and off-diagonal terminal curvature give a nonconservative
-    optimal control. It must still be a fixed point of the matching update.
-    """
-    actor = actor_for_test()
-    actor.squash = IdentitySquash()
-    alpha = jnp.array([0.4, 1.7])
-    A = np.diag(np.asarray(alpha))
-    terminal = np.array([[0.35, 0.15], [0.15, 0.5]])
-    curvature = terminal.copy()
-    gains = []
-    for v in reversed(np.asarray(actor.step_var[...])):
-        gain = -np.linalg.solve(A + v * curvature, curvature)
-        gains.append(gain)
-        curvature = curvature + v * curvature @ gain
-    actor.field = LinearField(np.stack(gains[::-1]))
-    # Remove the Gaussian-prior terminal term through the critic, leaving
-    # exactly g(x) = x.T @ terminal @ x / 2 (up to a constant).
-    critic = QuadraticCritic(terminal + A / actor.terminal_var)
-    assert not np.allclose(gains[0], gains[0].T)
-
-    n, d = actor.max_steps, actor.plan_dim
-    m = n * d
-    points = np.concatenate([np.eye(m), -np.eye(m)]) * np.sqrt(m)
-    # Repeat a full cubature rule for each selected training time. Each rule
-    # has E[eps]=0 and E[eps eps.T]=I across every step and coordinate.
-    noises = jnp.asarray(np.tile(points, (n, 1)).reshape(n * 2 * m, n, d))
-    selected = jnp.repeat(jnp.arange(n), 2 * m)
-    obs = jnp.zeros((len(selected), OBS_DIM))
-    key = jax.random.PRNGKey(6)
-    rollout_key, _ = jax.random.split(key)
-    step_keys = jax.random.split(rollout_key, n)
-
-    def cubature_normal(key, shape, dtype=jnp.float32):
-        index = jnp.argmax(jnp.all(step_keys == key, axis=-1))
-        return noises[:, index, :].astype(dtype)
-
-    monkeypatch.setattr(jax.random, "normal", cubature_normal)
-    monkeypatch.setattr(jax.random, "randint", lambda *args, **kwargs: selected)
-    gradient = nnx.grad(lambda a: a.loss(obs, critic, alpha, key=key)["actor"])
-    grads = gradient(actor)
-    assert all(np.max(np.abs(g)) < 3e-6 for g in jax.tree.leaves(grads))
-    actor.field.gains[...] = actor.field.gains[...] + 0.1
-    perturbed = gradient(actor)
-    assert any(np.max(np.abs(g)) > 1e-3 for g in jax.tree.leaves(perturbed))
 
 
 @pytest.mark.parametrize("granularity", ["per_chunk", "per_action"])
