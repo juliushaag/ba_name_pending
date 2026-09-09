@@ -25,11 +25,18 @@ uv build src/barl_jax
 and `checkpoints/` are excluded); the rule set is deliberately small for now
 (syntax errors, pyflakes, import sorting -- see `[tool.ruff]` in `pyproject.toml`).
 
-The command-line tools are limited to three scripts:
+The command-line tools are limited to four scripts:
 
-- `scripts/submit.py`: launch grids or replay an experiment config.
+- `scripts/submit.py`: build a grid (or replay a saved config) and hand each run off
+  to an executor -- local, tmux, or Slurm. It never trains or evaluates anything
+  itself.
+- `scripts/train.py`: run one experiment config's entries -- the actual training
+  loop, invoked by submit.py's executors, and directly runnable to replay one
+  saved run.
 - `scripts/evaluate.py`: evaluate a checkpoint, run directory, or sweep under any
-  of the action-selection modes below.
+  of the action-selection modes below -- same role as train.py for evaluation,
+  and likewise invoked by submit.py's executors for a batched `--from-sweep`/
+  `--eval-config` submission.
 - `scripts/debug.py`: report package/backend diagnostics and resolved model settings;
   `--json` produces output suitable for sharing with an LLM.
 
@@ -40,8 +47,10 @@ uv run python scripts/evaluate.py sweeps/<submission> --mode default mean --json
 ```
 
 CI runs Ruff, the CPU test suite, an installed-wheel import check, and the CPU
-example against the standalone library. Launcher workers and Slurm/tmux support
-live in `barl_jax.launch`; they are implementation details of `submit.py`.
+example against the standalone library. Slurm/tmux executor support lives in
+`barl_jax.launch`; it is an implementation detail of `submit.py`, which shells
+out to train.py/evaluate.py exactly as a human running one of them directly
+would.
 
 `examples/cpu_quickstart.py` is a complete round trip on CPU only, no
 accelerator, W&B account, simulator download, or render dependency: a tiny

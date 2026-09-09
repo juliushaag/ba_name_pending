@@ -17,7 +17,7 @@ from pathlib import Path
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 
-# See launch/worker.py's identical guard: on a shared multi-GPU node,
+# See train.py's identical guard: on a shared multi-GPU node,
 # mujoco.egl's device enumeration ignores cgroup isolation and can silently
 # land on a GPU this job can't actually render on, producing a black video
 # with no error. Pin it to the node-wide index SLURM actually granted.

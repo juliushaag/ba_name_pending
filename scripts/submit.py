@@ -265,7 +265,7 @@ def main():
                 or args.executor != "auto" or args.max_parallel or args.sweep_dir or args.dry_run
                 or args.from_sweep or args.eval_config):
             raise SystemExit("--config replays directly; only --seeds may override the saved config")
-        command = [sys.executable, "-m", "barl_jax.launch.worker", "--config", args.config]
+        command = [sys.executable, "scripts/train.py", "--config", args.config]
         if args.seeds is not None:
             command += ["--seeds", str(args.seeds)]
         raise SystemExit(subprocess.call(command))

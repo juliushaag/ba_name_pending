@@ -189,7 +189,7 @@ def command_for(kind: str, config_path: str, *, output_path: str = None,
   bash -- they read a manifest row, not a `Run` -- but invoke the same two
   programs this does.)
 
-  `kind='train'` (`barl_jax.launch.worker`): `run_dir`, given, redirects
+  `kind='train'` (`scripts/train.py`): `run_dir`, given, redirects
   checkpoint output to node-local scratch. `kind='eval'`
   (`scripts/evaluate.py`): `output_path`, given, overrides where its combined
   `results.json` goes -- omitted, `evaluate.py` falls back to the config's own
@@ -203,7 +203,7 @@ def command_for(kind: str, config_path: str, *, output_path: str = None,
     if output_path is not None:
       cmd += ["--output", output_path]
     return cmd
-  cmd = [*py, "-m", "barl_jax.launch.worker", "--config", config_path]
+  cmd = [*py, "scripts/train.py", "--config", config_path]
   if run_dir is not None:
     cmd += ["--run-dir", run_dir]
   return cmd
@@ -221,7 +221,7 @@ class Run:
   #: here is an absolute path.
   dir:    str
   config: str
-  #: 'train' (barl_jax.launch.worker, the default -- every existing caller) or
+  #: 'train' (scripts/train.py, the default -- every existing caller) or
   #: 'eval' (scripts/evaluate.py, see materialize_eval()).
   kind: str = "train"
   exit_code: int | None = field(default=None, compare=False)

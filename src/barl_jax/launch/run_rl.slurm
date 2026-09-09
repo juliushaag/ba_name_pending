@@ -148,7 +148,7 @@ on_usr1() {
 }
 trap on_usr1 USR1
 
-uv run python -m barl_jax.launch.worker \
+uv run python scripts/train.py \
     --config "$RESULT_DIR/$CONFIG" \
     --run-dir "$SCRATCH/$TAG" &
 TRAIN_PID=$!

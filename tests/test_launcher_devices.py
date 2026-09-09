@@ -27,6 +27,15 @@ def _load_submit():
     return module
 
 
+def _load_train():
+    """scripts/train.py isn't a package module either -- same trick."""
+    spec = importlib.util.spec_from_file_location(
+        "train", pathlib.Path(__file__).resolve().parent.parent / "scripts/train.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_check_config_leaves_no_device_var_behind(monkeypatch):
     """The launcher's own environment is what sbatch --export=ALL, tmux and
     LocalExecutor hand to every run of the sweep, so the config check must not
@@ -57,19 +66,20 @@ def test_run_refuses_to_start_without_an_accelerator(monkeypatch):
     """The backstop, which holds whatever put the run on the CPU: the suite
     itself runs under JAX_PLATFORMS=cpu, so this is the real refusal."""
     monkeypatch.delenv("BARL_ALLOW_CPU", raising=False)
-    from barl_jax.launch import worker as online_learning
+    train = _load_train()
 
     with pytest.raises(SystemExit, match="no GPU/TPU backend"):
-        online_learning.require_accelerator()
+        train.require_accelerator()
 
     monkeypatch.setenv("BARL_ALLOW_CPU", "1")
-    online_learning.require_accelerator()
+    train.require_accelerator()
 
 
 def test_local_run_command_prefers_uv(monkeypatch):
     monkeypatch.setattr(grid.shutil, "which", lambda name: "/tmp/uv" if name == "uv" else None)
     run = grid.Run(index=0, tag="t", combo={}, dir="t", config="t/config.yaml")
-    assert run.command("/tmp/sweep")[:5] == ["/tmp/uv", "run", "python", "-m", "barl_jax.launch.worker"]
+    assert run.command("/tmp/sweep") == \
+        ["/tmp/uv", "run", "python", "scripts/train.py", "--config", "/tmp/sweep/t/config.yaml"]
 
 
 def test_eval_run_command_invokes_evaluate_py(monkeypatch):
