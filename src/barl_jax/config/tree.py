@@ -252,7 +252,16 @@ class ConfigTree:
     cls_name = replayed.pop("class", cls_name)
     missing = set(live) - set(replayed)
     if missing:
-      raise ValueError(f"Snapshot for {policy_name}.{slot} lacks keys: {sorted(missing)}")
+      # A key the *current* code declares that this checkpoint's snapshot
+      # doesn't have -- it predates that key, so it never actually trained
+      # with any particular value for it. Falling back to the current
+      # default is a guess, same as any other newly-introduced default would
+      # be for a fresh run; the alternative (refusing to load at all) makes
+      # every checkpoint permanently unloadable the moment the code gains one
+      # new declared setting, which is worse.
+      print(f"WARNING: snapshot for {policy_name}.{slot} lacks keys {sorted(missing)} -- "
+           f"using the current default for each: {({k: live[k] for k in missing})}")
+      replayed.update({k: live[k] for k in missing})
     return cls_name, replayed
 
   def slots(self, policy_name: str) -> list[str]:
@@ -288,7 +297,10 @@ class ConfigTree:
     replayed = self._replayed("params.")
     missing = set(live) - set(replayed)
     if missing:
-      raise ValueError(f"Snapshot for {policy_name}.params lacks keys: {sorted(missing)}")
+      # Same reasoning as resolve_slot()'s identical fallback.
+      print(f"WARNING: snapshot for {policy_name}.params lacks keys {sorted(missing)} -- "
+           f"using the current default for each: {({k: live[k] for k in missing})}")
+      replayed = {**replayed, **{k: live[k] for k in missing}}
     return replayed
 
   def resolve_training(self, name: str, profile: str | None = None) -> dict:

@@ -188,15 +188,27 @@ def test_a_snapshot_replays_through_an_edit_to_the_tree():
         MLP_TIERS["critic"][rung] = saved
 
 
-def test_incomplete_snapshot_fails_instead_of_using_new_defaults():
+def test_incomplete_snapshot_warns_and_falls_back_to_the_new_default(capsys):
+    """A snapshot missing a key the *current* code declares predates that key
+    -- it never actually trained with any particular value for it, so a
+    checkpoint from before it existed must stay loadable rather than becoming
+    permanently unloadable the moment the code gains one new declared
+    setting. The fallback is the current code's own default (the same one a
+    fresh run with no override would get), not a silent guess at what the old
+    run "really" used."""
     snapshot = ConfigTree().snapshot_for("SAC")
+    live_default = snapshot["resolved"]["params.normalize_obs"]
     del snapshot["resolved"]["params.normalize_obs"]
-    with pytest.raises(ValueError, match="Snapshot.*lacks keys"):
-        ConfigTree(snapshot=snapshot).resolve_params("SAC", None)
+    resolved = ConfigTree(snapshot=snapshot).resolve_params("SAC", None)
+    assert resolved["normalize_obs"] == live_default
+    assert "lacks keys" in capsys.readouterr().out
+
     snapshot = ConfigTree().snapshot_for("SAC")
+    live_default = snapshot["resolved"]["components.actor.lr"]
     del snapshot["resolved"]["components.actor.lr"]
-    with pytest.raises(ValueError, match="Snapshot.*lacks keys"):
-        ConfigTree(snapshot=snapshot).resolve_slot("SAC", "actor", None)
+    _, resolved = ConfigTree(snapshot=snapshot).resolve_slot("SAC", "actor", None)
+    assert resolved["lr"] == live_default
+    assert "lacks keys" in capsys.readouterr().out
 
 
 def test_a_snapshot_is_json_round_trippable():

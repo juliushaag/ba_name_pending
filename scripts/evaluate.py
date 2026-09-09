@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import time
+import traceback
 from pathlib import Path
 
 os.environ.setdefault("MUJOCO_GL", "egl")
@@ -27,6 +28,19 @@ if "MUJOCO_EGL_DEVICE_ID" not in os.environ:
 
 import numpy as np
 import yaml
+
+
+def _log_failure(label: str, exc: Exception) -> str:
+  """Prints a one-line summary plus the full traceback (indented so it reads
+  as attached to `label`, not blended into whatever prints next) and returns
+  that same traceback for the caller's own `error`/`traceback` result fields
+  -- one implementation shared by evaluate()'s per-mode, evaluate_entry()'s
+  per-checkpoint and main()'s per-entry catch sites, rather than a one-line
+  summary with no traceback anywhere but the JSON file."""
+  tb = traceback.format_exc()
+  print(f"{label}: FAILED -- {type(exc).__name__}: {exc}")
+  print("\n".join(f"    {line}" for line in tb.rstrip().splitlines()))
+  return tb
 
 
 def checkpoints(path: Path, checkpoint: str) -> list[Path]:
@@ -85,14 +99,23 @@ def evaluate(path, env_name, modes, *, episodes, num_envs, num_candidates, seed,
           results[mode] = {"error": "; ".join(problems)}
           print(f"    [{mode}] skipped -- {'; '.join(problems)}")
           continue
-        records = run_episodes(EvaluationActor(policy, spec), vector, episodes,
-                               render=False, seed=seed)
-        returns = np.asarray([sum(r["rewards"]) for r in records])
-        results[mode] = {"mean_return": float(returns.mean()),
-                         "std_return": float(returns.std()),
-                         "success_rate": float(np.mean([r["success"] for r in records]))}
-        print(f"    [{mode}] mean_return={results[mode]['mean_return']:.4g} "
-              f"success_rate={results[mode]['success_rate']:.2f}  ({time.perf_counter() - t0:.1f}s)")
+        # Caught per mode, not left to propagate: one mode dying (a NaN action
+        # poisoning mj_step, an OOM at a large num_candidates, ...) must not
+        # cost every mode that already finished for this checkpoint -- the
+        # caller only ever sees whatever `evaluate()` returns, not what it
+        # built up to before raising.
+        try:
+          records = run_episodes(EvaluationActor(policy, spec), vector, episodes,
+                                 render=False, seed=seed)
+          returns = np.asarray([sum(r["rewards"]) for r in records])
+          results[mode] = {"mean_return": float(returns.mean()),
+                           "std_return": float(returns.std()),
+                           "success_rate": float(np.mean([r["success"] for r in records]))}
+          print(f"    [{mode}] mean_return={results[mode]['mean_return']:.4g} "
+                f"success_rate={results[mode]['success_rate']:.2f}  ({time.perf_counter() - t0:.1f}s)")
+        except Exception as exc:
+          tb = _log_failure(f"    [{mode}]", exc)
+          results[mode] = {"error": f"{type(exc).__name__}: {exc}", "traceback": tb}
       return results
     finally:
       vector.close()
@@ -152,8 +175,8 @@ def evaluate_entry(entry: dict) -> dict:
         top_k=entry.get("top_k", DEFAULTS["top_k"]), sigma=entry.get("sigma", DEFAULTS["sigma"]),
         seed=entry.get("seed", DEFAULTS["seed"]))
     except Exception as exc:
-      out[str(path)] = {"error": f"{type(exc).__name__}: {exc}"}
-      print(f"  {path}: FAILED -- {type(exc).__name__}: {exc}")
+      tb = _log_failure(f"  {path}", exc)
+      out[str(path)] = {"error": f"{type(exc).__name__}: {exc}", "traceback": tb}
   return out
 
 
@@ -203,19 +226,39 @@ def main():
        + (f" from {args.config}" if args.config else ""))
   t0 = time.perf_counter()
   results = {}
-  for i, entry in enumerate(entries):
-    print(f"[{i + 1}/{len(entries)}]")
-    results.update(evaluate_entry(entry))
-  print(f"Done in {time.perf_counter() - t0:.1f}s")
-
-  if output:
-    out = Path(output)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(results, indent=2, allow_nan=False))
-    print(f"Wrote {len(results)} checkpoint result(s) to {out}")
+  # try/finally around the whole loop, not just each entry's own try/except
+  # below: whatever crashes -- a bug in that per-entry handling itself, a
+  # KeyboardInterrupt, anything else `evaluate_entry` doesn't already turn
+  # into an `error` entry -- every prior entry's real results still get
+  # written instead of the file simply never appearing.
+  try:
+    for i, entry in enumerate(entries):
+      print(f"[{i + 1}/{len(entries)}]")
+      try:
+        results.update(evaluate_entry(entry))
+      except Exception as exc:
+        key = entry.get("path", f"entry[{i}]")
+        tb = _log_failure(f"  {key}", exc)
+        results[str(key)] = {"error": f"{type(exc).__name__}: {exc}", "traceback": tb}
+  finally:
+    print(f"Done in {time.perf_counter() - t0:.1f}s")
+    if output:
+      out = Path(output)
+      out.parent.mkdir(parents=True, exist_ok=True)
+      try:
+        out.write_text(json.dumps(results, indent=2, allow_nan=False))
+      except ValueError:
+        # A legitimately-computed NaN/Inf return (a diverged policy) must not
+        # cost every other entry's results -- write it anyway rather than
+        # lose the whole file over one value.
+        out.write_text(json.dumps(results, indent=2, allow_nan=True))
+      print(f"Wrote {len(results)} checkpoint result(s) to {out}")
 
   if args.json:
-    print(json.dumps(results, indent=2, allow_nan=False))
+    try:
+      print(json.dumps(results, indent=2, allow_nan=False))
+    except ValueError:
+      print(json.dumps(results, indent=2, allow_nan=True))
   elif not output:
     for path, modes in results.items():
       print(path)

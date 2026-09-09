@@ -148,3 +148,83 @@ def test_main_rejects_single_run_flags_alongside_config(monkeypatch):
   monkeypatch.setattr("sys.argv", ["evaluate.py", "--config", "whatever.yaml", "--env", "HalfCheetah"])
   with pytest.raises(SystemExit):
     module.main()
+
+
+# ---------------------------------------------------------------------------
+# Crash handling: a failure must never cost results that already finished.
+# ---------------------------------------------------------------------------
+
+def test_evaluate_isolates_a_crashing_mode_and_keeps_the_rest(tmp_path, monkeypatch):
+  """One mode raising inside run_episodes (a real crash, not an
+  ExecutionSpec-rejected mode -- see the 'skipped' path) must not lose a
+  different mode's already-computed result, and the failure must carry a
+  traceback, not just a one-line message."""
+  best = tmp_path / "best"
+  family = ShortPendulum()
+  env = family.get_env()
+  try:
+    policy = Policy.make("SAC", env, env_stats=family.get_env_stats(env), seed=0)
+    save_policy(policy, best)
+  finally:
+    env.close()
+  monkeypatch.setattr(Environment, "make", lambda name: family)
+
+  import barl_jax.evaluation as evaluation_module
+  real_run_episodes = evaluation_module.run_episodes
+
+  def flaky_run_episodes(actor, vector, episodes, *, render, seed):
+    if actor.spec.mode == "mean":
+      raise RuntimeError("boom")
+    return real_run_episodes(actor, vector, episodes, render=render, seed=seed)
+
+  monkeypatch.setattr(evaluation_module, "run_episodes", flaky_run_episodes)
+
+  result = module.evaluate(best, "short", ["default", "mean"],
+                           episodes=2, num_envs=2, num_candidates=1, seed=7)
+  assert np.isfinite(result["default"]["mean_return"])
+  assert result["mean"]["error"] == "RuntimeError: boom"
+  assert "Traceback" in result["mean"]["traceback"]
+  assert "boom" in result["mean"]["traceback"]
+
+
+def test_main_writes_partial_results_when_one_entry_crashes(tmp_path, monkeypatch):
+  """A second entry that raises before evaluate_entry's own per-checkpoint
+  try/except (a malformed `path`, here) must not cost the first entry's real,
+  already-computed result -- and the file must still get written at all."""
+  run = tmp_path / "run"
+  best = run / "checkpoints" / "seed0" / "best"
+  family = ShortPendulum()
+  env = family.get_env()
+  try:
+    policy = Policy.make("SAC", env, env_stats=family.get_env_stats(env), seed=0)
+    save_policy(policy, best)
+  finally:
+    env.close()
+  monkeypatch.setattr(Environment, "make", lambda name: family)
+
+  cfg = tmp_path / "eval.yaml"
+  out = tmp_path / "out" / "results.json"
+  cfg.write_text(f"runs:\n  - path: {run}\n    env: short\n    episodes: 2\n"
+                 f"    num_envs: 2\n    num_candidates: 1\n  - path: null\n")
+  monkeypatch.setattr("sys.argv", ["evaluate.py", "--config", str(cfg), "--output", str(out)])
+  with pytest.raises(SystemExit):
+    module.main()
+
+  written = json.loads(out.read_text())
+  assert np.isfinite(written[str(best)]["default"]["mean_return"])
+  crashed = [row for row in written.values() if "error" in row]
+  assert len(crashed) == 1
+  assert "Traceback" in crashed[0]["traceback"]
+
+
+def test_main_writes_nan_results_instead_of_losing_the_file(tmp_path, monkeypatch):
+  monkeypatch.setattr(module, "evaluate_entry",
+                      lambda entry: {"x": {"default": {"mean_return": float("nan")}}})
+  cfg = tmp_path / "eval.yaml"
+  out = tmp_path / "out.json"
+  cfg.write_text("runs:\n  - path: whatever\n")
+  monkeypatch.setattr("sys.argv", ["evaluate.py", "--config", str(cfg), "--output", str(out)])
+  module.main()
+  # NaN is not valid JSON, but Python's json module writes it as a bare
+  # literal rather than the strict write silently losing the whole file.
+  assert "NaN" in out.read_text()
