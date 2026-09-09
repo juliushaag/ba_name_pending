@@ -85,10 +85,20 @@ def load_policy(path, env, env_stats=None, name=None, **kwargs):
   from barl_jax.policy import Policy
   path = Path(path).absolute()
   spec, meta = policy_spec(path, name)
+  # `.get("kwargs", {})` only falls back on a *missing* key -- an older
+  # checkpoint whose meta.json has `"kwargs": null` (the key present, value
+  # None) makes it through unchanged, and `{**None, **kwargs}` raises exactly
+  # "'NoneType' object is not a mapping". `or {}` catches both cases.
   policy = Policy.make(spec.name, env, spec=spec, env_stats=env_stats,
-                       **{**meta.get("kwargs", {}), **kwargs})
+                       **{**(meta.get("kwargs") or {}), **kwargs})
   target = nnx.state(policy)
-  with ocp.StandardCheckpointer() as ckpt:
-    restored = ckpt.restore(path / "state", target)
+  with ocp.PyTreeCheckpointer() as ckpt:
+    restored = ckpt.restore(
+      path / "state", 
+      args=ocp.args.PyTreeRestore(
+        item=target,
+        restore_args=ocp.checkpoint_utils.construct_restore_args(target),
+        partial_restore=True,
+    ))
   nnx.update(policy, restored)
   return policy
