@@ -5,12 +5,22 @@
 # skipping H1Hand{Walk,Run,Stand} since HumanoidRun/HumanoidWalk above already
 # cover plain bipedal locomotion:
 #
-#   - Crawl, Hurdle, Maze, Stair, Slide, HighbarHard: locomotion under an
-#     added constraint (posture, obstacle, navigation, dynamic swinging)
-#     rather than flat-ground gait.
-#   - Push, Cube, Basketball, Kitchen, Package, Truck: manipulation ranging
-#     from single dexterous placement to multi-stage/multi-object tasks with
-#     sparse completion bonuses.
+#   - Crawl, Hurdle, Maze, Stair, Slide, SitHard: locomotion under an added
+#     constraint (posture, obstacle, navigation, single-limb support) rather
+#     than flat-ground gait.
+#   - Push, Cube, Basketball, Door, Package, Truck: manipulation ranging from
+#     single dexterous placement to multi-object tasks with sparse completion
+#     bonuses.
+#
+# H1HandHighbarHard was dropped: this humanoid_bench checkout ships no
+# h1hand_pos_highbar_*.xml at all (assets/envs/ has it only for h1/h1strong),
+# so gym.make("h1hand-highbar_hard-v0") fails with an OSError before any
+# training starts, for every algo, every time -- not a transient issue.
+# H1HandKitchen was dropped too: its MJCF hits "top-level default class
+# 'main' cannot be renamed" under the MuJoCo version pinned here, same kind of
+# stale-asset incompatibility humanoid_bench.py already patches for a handful
+# of other fields, just not (yet) this one. SitHard/Door were verified to
+# gym.make() and reset cleanly under this checkout before being swapped in.
 #
 # Dry run:
 #   uv run python scripts/submit.py --grid experiments/dmc_hb_16env_sweep.yaml --dry-run
@@ -30,11 +40,11 @@ axes:
     - H1HandMaze
     - H1HandStair
     - H1HandSlide
-    - H1HandHighbarHard
+    - H1HandSitHard
     - H1HandPush
     - H1HandCube
     - H1HandBasketball
-    - H1HandKitchen
+    - H1HandDoor
     - H1HandPackage
     - H1HandTruck
   seed: [0]
