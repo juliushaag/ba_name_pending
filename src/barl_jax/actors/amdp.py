@@ -41,7 +41,7 @@ class ScoreContinuousActor(ActorOptim, Actor):
   sigma_max    = Config(2.0)
   tau_min      = Config(0.0)
   tau_max      = Config(1.0)
-  max_steps    = Config(16)
+  max_steps    = Config(32)
   out_clip     = Config(10000.0)   # ctrl_net.py's `outer_clip`
 
   q_score_max_norm       = Config(5.0)

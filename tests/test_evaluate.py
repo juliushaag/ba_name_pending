@@ -5,6 +5,7 @@ from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
+import pytest
 
 from barl_jax.checkpoints import save_policy
 from barl_jax.env import Environment
@@ -48,8 +49,102 @@ def test_evaluate_restores_checkpoint_and_pairs_modes(tmp_path, monkeypatch):
   finally:
     env.close()
   monkeypatch.setattr(Environment, "make", lambda name: family)
-  kwargs = dict(episodes=2, num_envs=2, num_candidates=1, seed=7)
-  result = evaluate(tmp_path / "best", "short", ["default", "mean", "bon"], **kwargs)
+  # top_k=1 too: at num_candidates=1 every mode here is bit-identical to
+  # default (execution.py's own invariant, see test_execution.py), so a real
+  # checkpoint evaluated end-to-end through the CLI should agree exactly.
+  kwargs = dict(episodes=2, num_envs=2, num_candidates=1, top_k=1, seed=7)
+  modes = ["default", "mean", "median", "bon", "topk", "axis_shuffle", "perturb"]
+  result = evaluate(tmp_path / "best", "short", modes, **kwargs)
   assert all(np.isfinite(row["mean_return"]) for row in result.values())
-  assert result["default"] == result["mean"] == result["bon"]
+  assert len({tuple(result[m].items()) for m in modes}) == 1
   json.dumps(result, allow_nan=False)
+
+
+# ---------------------------------------------------------------------------
+# --config: load_eval_config's merge/validation, evaluate_entry, main() glue
+# ---------------------------------------------------------------------------
+
+def test_load_eval_config_merges_defaults_into_each_run(tmp_path):
+  cfg = tmp_path / "eval.yaml"
+  cfg.write_text("""
+output: out.json
+defaults:
+  episodes: 5
+  num_candidates: 3
+runs:
+  - path: a
+    mode: [default, mean]
+  - path: b
+    episodes: 9
+""")
+  output, entries = module.load_eval_config(cfg)
+  assert output == "out.json"
+  assert entries == [
+    {"episodes": 5, "num_candidates": 3, "path": "a", "mode": ["default", "mean"]},
+    {"episodes": 9, "num_candidates": 3, "path": "b"},
+  ]
+
+
+@pytest.mark.parametrize("body, match", [
+  ("output: out.json\n", "runs"),
+  ("runs: [{env: HalfCheetah}]\n", "path"),
+])
+def test_load_eval_config_rejects_missing_runs_or_path(tmp_path, body, match):
+  cfg = tmp_path / "eval.yaml"
+  cfg.write_text(body)
+  with pytest.raises(ValueError, match=match):
+    module.load_eval_config(cfg)
+
+
+def test_evaluate_entry_reads_env_from_saved_config_when_omitted(tmp_path, monkeypatch):
+  run = tmp_path / "run"
+  best = run / "checkpoints" / "seed0" / "best"
+  family = ShortPendulum()
+  env = family.get_env()
+  try:
+    policy = Policy.make("SAC", env, env_stats=family.get_env_stats(env), seed=0)
+    save_policy(policy, best)
+  finally:
+    env.close()
+  (run / "config.yaml").write_text("runs: [{model: SAC, env: short}]\n")
+  monkeypatch.setattr(Environment, "make", lambda name: family)
+
+  entry = dict(path=str(run), episodes=2, num_envs=2, num_candidates=1, seed=7)
+  result = module.evaluate_entry(entry)
+  assert list(result) == [str(best)]
+  assert np.isfinite(result[str(best)]["default"]["mean_return"])
+
+
+def test_evaluate_entry_reports_missing_checkpoints_without_raising(tmp_path):
+  result = module.evaluate_entry(dict(path=str(tmp_path)))
+  assert "error" in next(iter(result.values()))
+
+
+def test_main_writes_config_results_to_output_json(tmp_path, monkeypatch, capsys):
+  run = tmp_path / "run"
+  best = run / "checkpoints" / "seed0" / "best"
+  family = ShortPendulum()
+  env = family.get_env()
+  try:
+    policy = Policy.make("SAC", env, env_stats=family.get_env_stats(env), seed=0)
+    save_policy(policy, best)
+  finally:
+    env.close()
+  monkeypatch.setattr(Environment, "make", lambda name: family)
+
+  cfg = tmp_path / "eval.yaml"
+  out = tmp_path / "out" / "results.json"
+  cfg.write_text(f"runs:\n  - path: {run}\n    env: short\n    episodes: 2\n"
+                 f"    num_envs: 2\n    num_candidates: 1\n")
+  monkeypatch.setattr("sys.argv", ["evaluate.py", "--config", str(cfg), "--output", str(out)])
+  module.main()
+
+  written = json.loads(out.read_text())
+  assert np.isfinite(written[str(best)]["default"]["mean_return"])
+  assert "Wrote 1 checkpoint result(s)" in capsys.readouterr().out
+
+
+def test_main_rejects_single_run_flags_alongside_config(monkeypatch):
+  monkeypatch.setattr("sys.argv", ["evaluate.py", "--config", "whatever.yaml", "--env", "HalfCheetah"])
+  with pytest.raises(SystemExit):
+    module.main()

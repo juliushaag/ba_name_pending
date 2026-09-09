@@ -22,6 +22,7 @@ from rich.live import Live
 from rich.table import Table
 
 from .executors import detect_gpus, read_manifest
+from .grid import command_for
 
 REPO_ROOT = Path.cwd()
 
@@ -39,6 +40,8 @@ class Task:
   #: config.yaml submit.py wrote, and where the run puts everything else.
   dir: Path
   config: Path
+  #: 'train' or 'eval' -- see grid.Run.kind and grid.command_for().
+  kind: str = "train"
   run_id: str = ""
   state: str = "queued"
   gpu: str | None = None
@@ -75,13 +78,14 @@ class Pool:
   # ---- manifest ------------------------------------------------------------
 
   def _load_tasks(self) -> list[Task]:
-    """The same experiments.csv run_rl.slurm reads a single row out of. A row is
-    already everything a task is -- no combo to re-derive, no tag to recompute."""
+    """The same experiments.csv run_rl.slurm/run_eval.slurm read a single row
+    out of. A row is already everything a task is -- no combo to re-derive, no
+    tag to recompute."""
     tasks = []
     for row in read_manifest(self.sweep_dir):
       config = self.sweep_dir / row["config"]
       tasks.append(Task(index=int(row["index"]), tag=row["tag"], run_id=row["run_id"],
-                        dir=config.parent, config=config))
+                        dir=config.parent, config=config, kind=row.get("kind", "train")))
     return tasks
 
   # ---- tmux ----------------------------------------------------------------
@@ -95,7 +99,7 @@ class Pool:
     return set(out.splitlines())
 
   def start(self, task: Task, gpu: str) -> None:
-    inner = ["uv", "run", "python", "-m", "barl_jax.launch.worker", "--config", str(task.config)]
+    inner = command_for(task.kind, str(task.config))
     if self.time_limit:
       inner = ["timeout", str(self.time_limit), *inner]
 

@@ -1,8 +1,9 @@
 """Policy-independent action selection (barl_jax.execution): Default, Best-of-N
-(BoN), Mean-of-N. Pure-function tests over fake candidate/scorer callables
-first (the reducers' actual arithmetic, isolated from any policy), then
-integration with a real actor policy (SAC) and the one policy without a
-scorer (NCLQL) for the capability-rejection path."""
+(BoN), Mean-of-N, Median-of-N, Top-K-of-N, Axis-Shuffle-of-N, Perturbation-of-N.
+Pure-function tests over fake candidate/scorer callables first (the reducers'
+actual arithmetic, isolated from any policy), then integration with a real
+actor policy (SAC) and the one policy without a scorer (NCLQL) for the
+capability-rejection path."""
 
 import gymnasium as gym
 import jax
@@ -11,6 +12,7 @@ import numpy as np
 import pytest
 from conftest import ACT_DIM, BATCH, OBS_DIM, make_env_stats
 
+from barl_jax.components import sanitize_action
 from barl_jax.execution import ExecutionSpec, act, validate_execution_spec
 from barl_jax.policy import Policy
 
@@ -32,6 +34,28 @@ def test_bad_candidate_count_is_rejected(n):
 def test_default_requires_exactly_one_candidate():
   with pytest.raises(ValueError, match="default"):
     ExecutionSpec(mode="default", num_candidates=2)
+
+
+@pytest.mark.parametrize("k", [0, -1, 1.5, True, 5])
+def test_bad_top_k_is_rejected(k):
+  with pytest.raises(ValueError, match="top_k"):
+    ExecutionSpec(mode="topk", num_candidates=4, top_k=k)
+
+
+def test_top_k_only_applies_to_topk_mode():
+  with pytest.raises(ValueError, match="top_k"):
+    ExecutionSpec(mode="bon", num_candidates=4, top_k=2)
+
+
+@pytest.mark.parametrize("sigma", [0.0, -0.1, True])
+def test_bad_sigma_is_rejected(sigma):
+  with pytest.raises(ValueError, match="sigma"):
+    ExecutionSpec(mode="perturb", num_candidates=4, sigma=sigma)
+
+
+def test_sigma_only_applies_to_perturb_mode():
+  with pytest.raises(ValueError, match="sigma"):
+    ExecutionSpec(mode="mean", num_candidates=4, sigma=0.2)
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +115,24 @@ def test_mean_of_n_only_averages_the_candidate_axis():
   np.testing.assert_allclose(action[:, 0, 0], expected_per_row, atol=1e-6)
 
 
-def test_n_equals_1_is_bit_identical_to_default_for_both_reducers():
+def test_median_of_n_is_the_exact_median_and_ignores_one_wild_candidate():
+  """A single outlier candidate must not drag the result the way it would
+  drag a mean -- median-of-5 stays at the 4 well-behaved candidates' value
+  regardless of how far the 5th one is."""
+  keys = list(jax.random.split(jax.random.PRNGKey(0), 5))
+
+  def infer_step(observation, key, _outlier_key=keys[-1]):
+    value = jnp.where(jnp.all(key == _outlier_key), 1000.0, 1.0)
+    return jnp.full((observation.shape[0], CHUNK, ACT_DIM), value, jnp.float32), {}
+
+  obs = jnp.zeros((BATCH, OBS_DIM))
+  key = jax.random.PRNGKey(0)
+  action, extras = act(infer_step, None, obs, key, ExecutionSpec(mode="median", num_candidates=5))
+  np.testing.assert_allclose(action, jnp.ones_like(action), atol=1e-6)
+  assert extras == {}
+
+
+def test_n_equals_1_is_bit_identical_to_default_for_every_reducer():
   infer_step = _fake_infer_step(0.0)
   obs = jnp.zeros((BATCH, OBS_DIM))
   key = jax.random.PRNGKey(11)
@@ -100,10 +141,76 @@ def test_n_equals_1_is_bit_identical_to_default_for_both_reducers():
   mean_action, _ = act(infer_step, None, obs, key, ExecutionSpec(mode="mean", num_candidates=1))
   np.testing.assert_array_equal(mean_action, default_action)
 
+  median_action, _ = act(infer_step, None, obs, key, ExecutionSpec(mode="median", num_candidates=1))
+  np.testing.assert_array_equal(median_action, default_action)
+
   def score_fn(observation, action_plan):
     return jnp.zeros((observation.shape[0],))
   bon_action, _ = act(infer_step, score_fn, obs, key, ExecutionSpec(mode="bon", num_candidates=1))
   np.testing.assert_array_equal(bon_action, default_action)
+
+  topk_action, _ = act(infer_step, score_fn, obs, key,
+                       ExecutionSpec(mode="topk", num_candidates=1, top_k=1))
+  np.testing.assert_array_equal(topk_action, default_action)
+
+  shuffle_action, _ = act(infer_step, None, obs, key, ExecutionSpec(mode="axis_shuffle", num_candidates=1))
+  np.testing.assert_array_equal(shuffle_action, default_action)
+
+  perturb_action, _ = act(infer_step, score_fn, obs, key, ExecutionSpec(mode="perturb", num_candidates=1))
+  np.testing.assert_array_equal(perturb_action, default_action)
+
+
+# ---------------------------------------------------------------------------
+# Axis-Shuffle-of-N
+# ---------------------------------------------------------------------------
+
+def test_axis_shuffle_of_n_recombines_axes_from_independent_candidates():
+  """Candidate c's plan is filled with c itself, so every entry of the
+  shuffled result must equal the index of *some* candidate -- and, with
+  act_dim > 1 candidates to choose from, different axes actually do pick
+  different candidates rather than one winner broadcast over the whole
+  action (that would be BoN, not this)."""
+  n, batch = 6, 4
+
+  def infer_step(observation, key):
+    idx = jax.random.uniform(key, ())
+    return jnp.full((observation.shape[0], CHUNK, ACT_DIM), idx, jnp.float32), {}
+
+  obs = jnp.zeros((batch, OBS_DIM))
+  key = jax.random.PRNGKey(0)
+  candidate_values = _candidate_values(key, n)
+  action, extras = act(infer_step, None, obs, key, ExecutionSpec(mode="axis_shuffle", num_candidates=n))
+
+  assert extras == {}  # per-candidate extras do not describe the recombined action
+  assert action.shape == (batch, CHUNK, ACT_DIM)
+  # Every entry must be one of the n candidate values.
+  matches = jnp.isclose(action[..., None], candidate_values, atol=1e-6)
+  assert bool(jnp.all(jnp.any(matches, axis=-1)))
+  # Not every entry picked the same candidate -- otherwise this is just BoN
+  # with a fixed winner.
+  assert len(jnp.unique(action)) > 1
+
+
+def test_axis_shuffle_of_n_only_shuffles_the_candidate_axis():
+  """Distinct batch rows must not bleed into each other's axis selection:
+  candidate c's plan is `row_index + offset_c`, so whichever candidate row r's
+  selection actually landed on, its value minus r must be exactly that
+  candidate's offset -- never another row's arange term mixed with a
+  candidate's offset that wasn't actually drawn for this row."""
+  n, batch = 5, 3
+
+  def infer_step(observation, key):
+    row = jnp.arange(observation.shape[0], dtype=jnp.float32)
+    offset = key[1].astype(jnp.float32)
+    return jnp.broadcast_to((row + offset)[:, None, None], (observation.shape[0], CHUNK, ACT_DIM)), {}
+
+  obs = jnp.zeros((batch, OBS_DIM))
+  key = jax.random.PRNGKey(5)
+  offsets = jnp.array([k[1] for k in jax.random.split(key, n)], dtype=jnp.float32)
+  action, _ = act(infer_step, None, obs, key, ExecutionSpec(mode="axis_shuffle", num_candidates=n))
+  drawn_offset = action[:, 0, 0] - jnp.arange(batch, dtype=jnp.float32)
+  matches = jnp.isclose(drawn_offset[:, None], offsets[None, :], atol=1e-4)
+  assert bool(jnp.all(jnp.any(matches, axis=-1)))
 
 
 def _keyed_infer_step(batch: int):
@@ -121,6 +228,78 @@ def _candidate_values(key, n: int):
   computed the same way `execution._candidate_keys` does, so a test can pick
   a score function that prefers a specific candidate deterministically."""
   return jnp.array([jax.random.uniform(k, ()) for k in jax.random.split(key, n)])
+
+
+# ---------------------------------------------------------------------------
+# Top-K-of-N
+# ---------------------------------------------------------------------------
+
+def test_topk_of_n_averages_the_k_best_scoring_candidates():
+  """Row 0 ranks candidates 3 > 1 > 2 > 0, row 1 ranks 0 > 2 > 1 > 3 --
+  top_k=2 must average exactly each row's top two, not the single best
+  (that's BoN) and not all n (that's mean)."""
+  n, batch = 4, 2
+  infer_step = _keyed_infer_step(batch)
+  key = jax.random.PRNGKey(0)
+  idx = _candidate_values(key, n)
+  scores_by_row = jnp.array([[0.0, 2.0, 1.0, 3.0],
+                             [3.0, 0.0, 2.0, 1.0]])
+
+  def score_fn(observation, action_plan):
+    return scores_by_row.T.reshape(n * batch)  # (n, batch) -> candidate-major flat
+
+  obs = jnp.zeros((batch, OBS_DIM))
+  action, extras = act(infer_step, score_fn, obs, key, ExecutionSpec(mode="topk", num_candidates=n, top_k=2))
+  expected = jnp.array([jnp.mean(idx[jnp.array([3, 1])]), jnp.mean(idx[jnp.array([0, 2])])])
+  np.testing.assert_allclose(action[:, 0, 0], expected, atol=1e-6)
+  assert extras == {}  # averaged across 2 candidates -- no single one's extras describe it
+
+
+def test_topk_with_k_equal_1_matches_best_of_n():
+  n, batch = 4, 1
+  infer_step = _keyed_infer_step(batch)
+  key = jax.random.PRNGKey(1)
+  idx = _candidate_values(key, n)
+
+  def score_fn(observation, action_plan):
+    grid = action_plan[:, 0, 0]
+    return -jnp.abs(grid - idx[2])  # prefers candidate 2
+
+  obs = jnp.zeros((batch, OBS_DIM))
+  bon_action, _ = act(infer_step, score_fn, obs, key, ExecutionSpec(mode="bon", num_candidates=n))
+  topk_action, _ = act(infer_step, score_fn, obs, key, ExecutionSpec(mode="topk", num_candidates=n, top_k=1))
+  np.testing.assert_array_equal(topk_action, bon_action)
+
+
+def test_topk_with_k_equal_n_matches_mean():
+  n, batch = 4, 1
+  infer_step = _keyed_infer_step(batch)
+  key = jax.random.PRNGKey(2)
+
+  def score_fn(observation, action_plan):
+    return jnp.zeros((action_plan.shape[0],))
+
+  obs = jnp.zeros((batch, OBS_DIM))
+  mean_action, _ = act(infer_step, None, obs, key, ExecutionSpec(mode="mean", num_candidates=n))
+  topk_action, _ = act(infer_step, score_fn, obs, key, ExecutionSpec(mode="topk", num_candidates=n, top_k=n))
+  np.testing.assert_allclose(topk_action, mean_action, atol=1e-6)
+
+
+def test_topk_of_n_excludes_non_finite_scores():
+  n, batch = 3, 1
+  infer_step = _keyed_infer_step(batch)
+  key = jax.random.PRNGKey(0)
+  idx = _candidate_values(key, n)
+  nan_candidate = 1
+
+  def score_fn(observation, action_plan):
+    scores = jnp.arange(n, dtype=jnp.float32)
+    return jnp.where(jnp.arange(n) == nan_candidate, jnp.nan, scores)
+
+  obs = jnp.zeros((batch, OBS_DIM))
+  action, _ = act(infer_step, score_fn, obs, key, ExecutionSpec(mode="topk", num_candidates=n, top_k=2))
+  expected = jnp.mean(idx[jnp.array([0, 2])])  # the two finite candidates
+  np.testing.assert_allclose(action[0, 0, 0], expected, atol=1e-6)
 
 
 def test_best_of_n_picks_the_known_winner_per_batch_row():
@@ -205,6 +384,74 @@ def test_best_of_n_masks_non_finite_scores_among_valid_ones():
 
 
 # ---------------------------------------------------------------------------
+# Perturbation-of-N
+# ---------------------------------------------------------------------------
+
+def test_perturbation_of_n_matches_the_manual_reduction():
+  n, batch = 6, 3
+  infer_step = _fake_infer_step(0.0)
+  obs = jnp.zeros((batch, OBS_DIM))
+  key = jax.random.PRNGKey(4)
+  sigma = 0.3
+
+  def score_fn(observation, action_plan):
+    # Prefers whichever candidate lands closest to a fixed positive target --
+    # picks out a genuinely perturbed candidate, not necessarily the base.
+    return -jnp.abs(action_plan[:, 0, 0] - 0.5)
+
+  action, extras = act(infer_step, score_fn, obs, key,
+                       ExecutionSpec(mode="perturb", num_candidates=n, sigma=sigma))
+
+  base_action, _ = infer_step(obs, key)
+  noise_key = jax.random.fold_in(key, 2)
+  noise = sigma * jax.random.normal(noise_key, (n - 1,) + base_action.shape, base_action.dtype)
+  perturbed = sanitize_action(base_action[None] + noise, xp=jnp)
+  candidates = jnp.concatenate([base_action[None], perturbed], axis=0)
+  scores = jnp.stack([score_fn(obs, candidates[c]) for c in range(n)])
+  winner = jnp.argmax(scores, axis=0)
+  expected = jnp.take_along_axis(candidates, winner[None, :, None, None], axis=0)[0]
+  expected_score = jnp.take_along_axis(scores, winner[None, :], axis=0)[0]
+
+  np.testing.assert_allclose(action, expected, atol=1e-6)
+  np.testing.assert_allclose(extras["selected_score"], expected_score, atol=1e-6)
+  np.testing.assert_array_equal(extras["num_invalid"], jnp.zeros(batch))
+
+
+def test_perturbation_of_n_never_scores_worse_than_the_base_action():
+  """The base action is always in the candidate pool, so a winner picked by
+  argmax can never score worse than not perturbing at all."""
+  n, batch = 8, 2
+
+  def infer_step(observation, key):
+    return jnp.zeros((observation.shape[0], CHUNK, ACT_DIM), jnp.float32), {}
+
+  obs = jnp.zeros((batch, OBS_DIM))
+  key = jax.random.PRNGKey(9)
+
+  def score_fn(observation, action_plan):
+    return -jnp.abs(action_plan[:, 0, 0])  # 0.0 scores 0 -- the max possible
+
+  action, _ = act(infer_step, score_fn, obs, key, ExecutionSpec(mode="perturb", num_candidates=n, sigma=0.5))
+  base_action, _ = infer_step(obs, key)
+  np.testing.assert_allclose(action, base_action, atol=1e-6)
+
+
+def test_perturbation_of_n_clips_to_the_valid_action_range():
+  n, batch = 20, 1
+
+  def infer_step(observation, key):
+    return jnp.full((observation.shape[0], CHUNK, ACT_DIM), 0.9, jnp.float32), {}
+
+  def score_fn(observation, action_plan):
+    return action_plan[:, 0, 0]  # prefers the largest value -- pushes toward the clip boundary
+
+  obs = jnp.zeros((batch, OBS_DIM))
+  key = jax.random.PRNGKey(1)
+  action, _ = act(infer_step, score_fn, obs, key, ExecutionSpec(mode="perturb", num_candidates=n, sigma=2.0))
+  assert bool(jnp.all(action <= 1.0)) and bool(jnp.all(action >= -1.0))
+
+
+# ---------------------------------------------------------------------------
 # validate_execution_spec -- capability / action-space checks
 # ---------------------------------------------------------------------------
 
@@ -214,22 +461,33 @@ class _FakePolicy:
     self.supports_bon = supports_bon
 
 
-def test_mean_is_rejected_for_discrete_action_spaces():
-  problems = validate_execution_spec(ExecutionSpec(mode="mean", num_candidates=4),
-                                     policy=_FakePolicy(action_discrete=True))
+@pytest.mark.parametrize("mode", ["mean", "median", "perturb"])
+def test_elementwise_blends_are_rejected_for_discrete_action_spaces(mode):
+  policy = _FakePolicy(action_discrete=True, supports_bon=True)
+  problems = validate_execution_spec(ExecutionSpec(mode=mode, num_candidates=4), policy=policy)
   assert problems and "discrete" in problems[0]
 
 
-def test_bon_is_rejected_without_a_scorer():
-  problems = validate_execution_spec(ExecutionSpec(mode="bon", num_candidates=4),
-                                     policy=_FakePolicy(supports_bon=False))
+def test_topk_is_rejected_for_discrete_action_spaces_only_above_k_equals_1():
+  policy = _FakePolicy(action_discrete=True, supports_bon=True)
+  # top_k=1 never blends -- it is a single winner, like BoN.
+  assert validate_execution_spec(ExecutionSpec(mode="topk", num_candidates=4, top_k=1), policy=policy) == []
+  problems = validate_execution_spec(ExecutionSpec(mode="topk", num_candidates=4, top_k=2), policy=policy)
+  assert problems and "discrete" in problems[0]
+
+
+@pytest.mark.parametrize("mode", ["bon", "topk", "perturb"])
+def test_score_guided_modes_are_rejected_without_a_scorer(mode):
+  problems = validate_execution_spec(ExecutionSpec(mode=mode, num_candidates=4), policy=_FakePolicy())
   assert problems and "score" in problems[0]
 
 
-def test_default_and_mean_need_no_scorer():
+def test_default_and_blind_reducers_need_no_scorer():
   policy = _FakePolicy(supports_bon=False)
   assert validate_execution_spec(ExecutionSpec(), policy=policy) == []
   assert validate_execution_spec(ExecutionSpec(mode="mean", num_candidates=4), policy=policy) == []
+  assert validate_execution_spec(ExecutionSpec(mode="median", num_candidates=4), policy=policy) == []
+  assert validate_execution_spec(ExecutionSpec(mode="axis_shuffle", num_candidates=4), policy=policy) == []
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +528,64 @@ def test_sac_mean_of_n_matches_the_manual_reduction():
   np.testing.assert_allclose(action, jnp.mean(candidates, axis=0), atol=1e-5)
 
 
+def test_sac_median_of_n_matches_the_manual_reduction():
+  policy = _make("SAC")
+  spec = ExecutionSpec(mode="median", num_candidates=5)
+  infer = policy.inference_fn(spec)
+  obs = jnp.zeros((BATCH, OBS_DIM))
+  key = jax.random.PRNGKey(0)
+  action, extras = infer(obs, key)
+  assert extras == {}
+
+  default_infer = policy.inference_fn()
+  candidates = jnp.stack([default_infer(obs, k)[0] for k in jax.random.split(key, 5)])
+  np.testing.assert_allclose(action, jnp.median(candidates, axis=0), atol=1e-5)
+
+
+def test_sac_topk_of_n_scores_are_finite_and_shape_is_right():
+  """Not a whitebox reconstruction like the other SAC tests here: the critic
+  uses batch renormalization (`CategoricalCriticBase.mlp`, norm='batchrenorm'),
+  whose output depends on how many rows share one forward pass -- scoring the
+  same candidates outside of `act()`'s own N*batch fold does not reproduce
+  the same numbers, only a policy-blind reducer (mean/median/axis_shuffle,
+  already covered above) can be verified that way against a real critic."""
+  policy = _make("SAC")
+  spec = ExecutionSpec(mode="topk", num_candidates=5, top_k=2)
+  infer = policy.inference_fn(spec)
+  obs = jnp.zeros((BATCH, OBS_DIM))
+  action, extras = infer(obs, jax.random.PRNGKey(0))
+  assert action.shape == (BATCH, policy.chunk_size, ACT_DIM)
+  assert extras == {}
+
+
+def test_sac_perturbation_of_n_stays_in_range_and_scores_are_finite():
+  policy = _make("SAC")
+  spec = ExecutionSpec(mode="perturb", num_candidates=8, sigma=0.2)
+  infer = policy.inference_fn(spec)
+  obs = jnp.zeros((BATCH, OBS_DIM))
+  action, extras = infer(obs, jax.random.PRNGKey(0))
+  assert action.shape == (BATCH, policy.chunk_size, ACT_DIM)
+  assert bool(jnp.all(jnp.isfinite(extras["selected_score"])))
+  assert bool(jnp.all(action >= -1.0)) and bool(jnp.all(action <= 1.0))
+
+
+def test_sac_axis_shuffle_of_n_matches_the_manual_reduction():
+  policy = _make("SAC")
+  spec = ExecutionSpec(mode="axis_shuffle", num_candidates=4)
+  infer = policy.inference_fn(spec)
+  obs = jnp.zeros((BATCH, OBS_DIM))
+  key = jax.random.PRNGKey(0)
+  action, extras = infer(obs, key)
+  assert extras == {}
+
+  default_infer = policy.inference_fn()
+  candidates = jnp.stack([default_infer(obs, k)[0]
+                          for k in jax.random.split(key, 4)])
+  winner = jax.random.randint(jax.random.fold_in(key, 1), action.shape, 0, 4)
+  expected = jnp.take_along_axis(candidates, winner[None], axis=0)[0]
+  np.testing.assert_allclose(action, expected, atol=1e-6)
+
+
 def test_sac_default_mode_is_unaffected_by_passing_an_explicit_default_spec():
   policy = _make("SAC")
   obs = jnp.zeros((BATCH, OBS_DIM))
@@ -280,14 +596,16 @@ def test_sac_default_mode_is_unaffected_by_passing_an_explicit_default_spec():
   assert e1.keys() == e2.keys()
 
 
-def test_nclql_has_no_scorer_and_bon_is_rejected_at_preflight():
+def test_nclql_has_no_scorer_and_score_guided_modes_are_rejected_at_preflight():
   policy = _make("NCLQL")
   assert not policy.supports_bon
-  problems = validate_execution_spec(ExecutionSpec(mode="bon", num_candidates=4), policy=policy)
-  assert problems
+  for mode in ("bon", "topk", "perturb"):
+    problems = validate_execution_spec(ExecutionSpec(mode=mode, num_candidates=4), policy=policy)
+    assert problems, mode
 
-  # default/mean still work without a critic-backed scorer.
+  # default/mean/median/axis_shuffle still work without a critic-backed scorer.
   obs = jnp.zeros((BATCH, OBS_DIM))
   key = jax.random.PRNGKey(0)
-  action, _ = policy.inference_fn(ExecutionSpec(mode="mean", num_candidates=3))(obs, key)
-  assert action.shape == (BATCH, policy.chunk_size, ACT_DIM)
+  for mode in ("mean", "median", "axis_shuffle"):
+    action, _ = policy.inference_fn(ExecutionSpec(mode=mode, num_candidates=3))(obs, key)
+    assert action.shape == (BATCH, policy.chunk_size, ACT_DIM), mode

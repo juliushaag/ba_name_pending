@@ -80,7 +80,7 @@ def _stacked_infer(graphdef, num_seeds, num_envs, spec, state, observation, key)
     if spec is None or spec.mode == "default":
       return policy.inference_step(obs, key=key)
     infer_step = lambda o, k: policy.inference_step(o, key=k)
-    score_fn = policy.score if spec.mode == "bon" else None
+    score_fn = policy.score if spec.mode in execution.SCORE_GUIDED_MODES else None
     return execution.act(infer_step, score_fn, obs, key, spec)
 
   action, extras = jax.vmap(one)(state, obs, keys)

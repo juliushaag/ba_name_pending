@@ -119,8 +119,13 @@ echo "=================================================="
 uv run python -c "import jax; print('JAX devices:', jax.devices())"
 
 # +2: one for the header row, one because array indices start at 0.
+# ROW_KIND (always "train" here) is named and unused rather than left off the
+# read: bash `read` crams every field past the last *named* variable, comma
+# included, into that variable -- naming one fewer than the row has would
+# silently glue ",train" onto $CONFIG the moment the manifest gained that
+# column (executors.py's MANIFEST_FIELDS), not drop it.
 LINE=$(sed -n "$((SLURM_ARRAY_TASK_ID + 2))p" "$MANIFEST")
-IFS=',' read -r ROW_INDEX ROW_RUN_ID TAG CONFIG <<< "${LINE%$'\r'}"
+IFS=',' read -r ROW_INDEX ROW_RUN_ID TAG CONFIG ROW_KIND <<< "${LINE%$'\r'}"
 
 if [ "$ROW_RUN_ID" != "$RUN_ID" ]; then
     echo "WARNING: $MANIFEST row $SLURM_ARRAY_TASK_ID says run id $ROW_RUN_ID, job says $RUN_ID"

@@ -38,13 +38,13 @@ def _jitted_infer(graphdef, state, observation, key):
 
 @partial(jax.jit, static_argnums=(0, 1))
 def _jitted_infer_exec(graphdef, spec, state, observation, key):
-  """`_jitted_infer`'s counterpart for `spec.mode in ('bon', 'mean')`. Kept
+  """`_jitted_infer`'s counterpart for every non-default `spec.mode`. Kept
   separate rather than folded into `_jitted_infer` so the plain default path
   (every caller that never touches execution.py) keeps its own jit cache,
   unperturbed by `spec` becoming part of the trace."""
   policy = nnx.merge(graphdef, state)
   infer_step = lambda obs, key: policy.inference_step(obs, key=key)
-  score_fn = policy.score if spec.mode == "bon" else None
+  score_fn = policy.score if spec.mode in execution.SCORE_GUIDED_MODES else None
   return execution.act(infer_step, score_fn, observation, key, spec)
 
 
@@ -457,7 +457,8 @@ class Policy(OptimizerMixin, ConfigOwner, nnx.Module, ABC):
 
   #: Whether `score()` is a real critic-backed scorer. False by default;
   #: `RLPolicy` (SAC/AMDP/DIME/SDAC) sets this True. Checked eagerly by
-  #: `execution.validate_execution_spec` before `mode='bon'` is ever traced.
+  #: `execution.validate_execution_spec` before any of `execution.SCORE_GUIDED_MODES`
+  #: is ever traced.
   supports_bon = False
 
   def score(self, observation, action_chunk):

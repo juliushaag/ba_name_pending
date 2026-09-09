@@ -28,8 +28,8 @@ and `checkpoints/` are excluded); the rule set is deliberately small for now
 The command-line tools are limited to three scripts:
 
 - `scripts/submit.py`: launch grids or replay an experiment config.
-- `scripts/evaluate.py`: evaluate a checkpoint, run directory, or sweep with default,
-  Mean-of-N, or Best-of-N action selection.
+- `scripts/evaluate.py`: evaluate a checkpoint, run directory, or sweep under any
+  of the action-selection modes below.
 - `scripts/debug.py`: report package/backend diagnostics and resolved model settings;
   `--json` produces output suitable for sharing with an LLM.
 
@@ -111,14 +111,34 @@ SDAC/NCLQL):
   elementwise. Continuous (box) action spaces only; can land between modes
   of a multimodal policy, so treat it as a research strategy, not an
   automatic improvement.
+- `median` -- like `mean`, but the elementwise median: unmoved by a single
+  wild candidate the way an average would be. Continuous action spaces only.
+- `axis_shuffle` -- samples `num_candidates` plans and, independently for
+  every `(batch, chunk, act_dim)` entry, takes the value from a randomly
+  chosen candidate -- a per-axis recombination of all N, not any one
+  candidate's action. Needs no critic; works for discrete action spaces too
+  (it only ever copies a real candidate's value, never blends one).
 - `bon` (Best-of-N) -- samples `num_candidates` plans and keeps the
   highest-scoring one under the policy's own critic (`Policy.score`,
   `Policy.supports_bon` -- SAC/AMDP/DIME/SDAC via `RLPolicy`; NCLQL has none
   and is rejected at preflight with an actionable message, same as any
   algorithm without a scorer).
+- `topk` (Top-K-of-N, `top_k`) -- BoN generalized: averages the `top_k`
+  highest-scoring candidates instead of hard-selecting one, softening BoN's
+  failure mode of exploiting a miscalibrated critic's noise on a single
+  winner. `top_k=1` is exactly `bon`; `top_k=num_candidates` is exactly
+  `mean`. Needs a scorer; blends elementwise (continuous-only) whenever
+  `top_k > 1`.
+- `perturb` (Perturbation-of-N, `sigma`) -- one base action plus
+  `num_candidates - 1` local Gaussian perturbations of it (std `sigma`,
+  clipped back to a valid action), scored and BoN-selected. Since the base
+  action is always in the pool, the winner can never score worse than not
+  perturbing at all -- a local search around the policy's own proposal,
+  handy when independent resampling (`bon`) barely moves the action (e.g. a
+  near-deterministic policy late in training). Needs a scorer.
 
-Both are validated before any resource is allocated: an unknown mode or bad
-candidate count in `barl_jax.config.run.validate_run`, and the
+All are validated before any resource is allocated: an unknown mode or bad
+candidate/`top_k`/`sigma` value in `barl_jax.config.run.validate_run`, and the
 capability/action-space checks (`execution.validate_execution_spec`) as soon
 as `trainer.setup()` has a constructed reference policy. `collection_mode`/
 `collection_candidates` are part of the training config (changing them is a

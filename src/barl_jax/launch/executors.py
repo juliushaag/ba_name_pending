@@ -68,25 +68,31 @@ def child_env(**extra: str) -> dict:
 
 #: The manifest's columns. `config` is relative to the sweep dir, so the tree
 #: stays relocatable -- a Slurm task copies it to node-local scratch and back.
-MANIFEST_FIELDS = ["index", "run_id", "tag", "config"]
+#: `kind` is new and last: both .slurm scripts read a row with bash `read`,
+#: which crams every field past the last *named* variable (comma included)
+#: into that last variable rather than dropping it -- run_rl.slurm's read line
+#: was updated to name a 5th (ignored) variable for exactly this column,
+#: rather than leaving it to silently corrupt $CONFIG.
+MANIFEST_FIELDS = ["index", "run_id", "tag", "config", "kind"]
 
 
 def write_manifest(sweep_dir: Path, run_id: str, runs: list[Run]) -> Path:
-    """The submitted sweep, one row per run. run_rl.slurm reads its own row out
-    of this by array index; tmux_pool.py reads the whole thing as its queue.
+    """The submitted sweep, one row per run. run_rl.slurm/run_eval.slurm read
+    their own row out of this by array index; tmux_pool.py reads the whole
+    thing as its queue.
 
-    Four columns, and only one of them is load-bearing: whatever the grid varied,
-    a row still points at one self-contained config."""
+    Five columns, and only two are load-bearing: whatever the grid varied, a
+    row still points at one self-contained config, of one kind."""
     sweep_dir.mkdir(parents=True, exist_ok=True)
     manifest = sweep_dir / MANIFEST_NAME
 
-    # `lineterminator`, not csv's "\r\n" default: run_rl.slurm reads these rows
-    # with `read`, which would carry the CR into the last field.
+    # `lineterminator`, not csv's "\r\n" default: the .slurm scripts read these
+    # rows with `read`, which would carry the CR into the last field.
     with manifest.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS, lineterminator="\n")
         writer.writeheader()
-        writer.writerows({"index": r.index, "run_id": run_id, "tag": r.tag, "config": r.config}
-                         for r in runs)
+        writer.writerows({"index": r.index, "run_id": run_id, "tag": r.tag,
+                          "config": r.config, "kind": r.kind} for r in runs)
 
     return manifest
 
@@ -222,9 +228,15 @@ class SlurmExecutor(Executor):
         return f"{self.DEBUG_PARTITION}, {super().describe_debug()}"
 
     def submit(self, runs, sweep_name, sweep_dir, *, max_parallel, debug, stream=False):
-        # One array task per *run*, i.e. per grid point -- not per {algo, env}.
-        # A grid that varies a model axis therefore submits that many more tasks,
-        # which is the point: each is one GPU's work and they queue independently.
+        # One array task per *run*, i.e. per grid point for training -- not per
+        # {algo, env} -- or per eval batch. A grid that varies a model axis
+        # therefore submits that many more training tasks, which is the point:
+        # each is one GPU's work and they queue independently. A submission is
+        # uniformly one kind or the other (materialize()/materialize_eval()
+        # each produce only their own), so the first run's kind picks the script.
+        kind = runs[0].kind if runs else "train"
+        script = "run_eval.slurm" if kind == "eval" else "run_rl.slurm"
+
         cmd = ["sbatch", "--parsable", "--hold",
                f"--array=0-{len(runs) - 1}%{max_parallel}",
                f"--export=ALL,SWEEP_NAME={sweep_name},RESULT_DIR={sweep_dir}"]
@@ -233,7 +245,7 @@ class SlurmExecutor(Executor):
             cmd += [f"--partition={self.DEBUG_PARTITION}", f"--time={DEBUG_TIME_LABEL}",
                     f"--job-name={self.DEBUG_JOB_NAME}"]
 
-        cmd.append(str(Path(__file__).with_name("run_rl.slurm")))
+        cmd.append(str(Path(__file__).with_name(script)))
 
         print()
         print("Submitting:")
@@ -256,7 +268,9 @@ class SlurmExecutor(Executor):
             subprocess.run(["scancel", run_id], check=False)
             raise
 
-        job_name = self.DEBUG_JOB_NAME if debug else "rl"
+        # Matches each script's own #SBATCH --job-name= line -- what decides
+        # the logs/<job_name>/ path both actually write to.
+        job_name = self.DEBUG_JOB_NAME if debug else ("eval" if kind == "eval" else "rl")
         return {"Run ID": run_id,
                 "Sweep dir": str(sweep_dir),
                 "Logs": f"logs/{job_name}/{run_id}_<task>/",

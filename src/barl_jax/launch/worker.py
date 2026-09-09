@@ -28,6 +28,21 @@ for _sig in (signal.SIGUSR1, signal.SIGUSR2, signal.SIGTERM):
 # leaves it locked onto GLFW, which hard-crashes env.render() on a headless box.
 os.environ.setdefault("MUJOCO_GL", "egl")
 
+# On a shared multi-GPU node, mujoco.egl enumerates every EGL device on the
+# node and silently uses the first one it can init a context on (mujoco/egl/
+# __init__.py:create_initialized_egl_device_display) -- unlike CUDA, this
+# enumeration ignores cgroup device isolation, so without a pin it can land on
+# a GPU this job has no access to and render *something* that reads back as
+# all-zero pixels: a black video with no error anywhere. SLURM_JOB_GPUS (set
+# from --gres=gpu:1) is the node-wide physical index EGL's enumeration uses,
+# not the possibly-remapped CUDA_VISIBLE_DEVICES -- same fix humanoid_bench's
+# own tdmpc2/dreamerv3 runners apply, just under the env var mujoco.egl (not
+# mujoco_py) actually reads.
+if "MUJOCO_EGL_DEVICE_ID" not in os.environ:
+  slurm_gpus = os.environ.get("SLURM_STEP_GPUS", os.environ.get("SLURM_JOB_GPUS"))
+  if slurm_gpus:
+    os.environ["MUJOCO_EGL_DEVICE_ID"] = slurm_gpus.split(",")[0]
+
 warnings.filterwarnings("ignore", module="glfw")  # dm_control still probes GLFW at import regardless
 # wandb's own sentry client trips half a dozen DeprecationWarnings against the
 # wandb API at login, once per process -- nothing here can act on them.

@@ -180,6 +180,35 @@ def name_combos(combos: list[dict], axes: dict, num_seeds: int) -> list[str]:
 # materialization
 # ---------------------------------------------------------------------------
 
+def command_for(kind: str, config_path: str, *, output_path: str = None,
+                run_dir: str = None) -> list[str]:
+  """The one command that runs a manifest row, whatever launched it -- shared by
+  `Run.command()` (LocalExecutor) and `tmux_pool.py`'s `Pool.start()`, so a
+  submitted task's command line is declared exactly once, not once per
+  backend. (The two .slurm scripts build their own command lines directly in
+  bash -- they read a manifest row, not a `Run` -- but invoke the same two
+  programs this does.)
+
+  `kind='train'` (`barl_jax.launch.worker`): `run_dir`, given, redirects
+  checkpoint output to node-local scratch. `kind='eval'`
+  (`scripts/evaluate.py`): `output_path`, given, overrides where its combined
+  `results.json` goes -- omitted, `evaluate.py` falls back to the config's own
+  `output:` (an absolute path `materialize_eval()` already wrote), which is
+  why no caller here needs to pass one; only run_eval.slurm's node-local
+  scratch redirection does, and it passes `--output` itself."""
+  uv = shutil.which("uv")
+  py = [uv, "run", "python"] if uv else [sys.executable]
+  if kind == "eval":
+    cmd = [*py, "scripts/evaluate.py", "--config", config_path]
+    if output_path is not None:
+      cmd += ["--output", output_path]
+    return cmd
+  cmd = [*py, "-m", "barl_jax.launch.worker", "--config", config_path]
+  if run_dir is not None:
+    cmd += ["--run-dir", run_dir]
+  return cmd
+
+
 @dataclass
 class Run:
   """One point of the grid, already written to disk and ready to execute. An
@@ -192,18 +221,17 @@ class Run:
   #: here is an absolute path.
   dir:    str
   config: str
+  #: 'train' (barl_jax.launch.worker, the default -- every existing caller) or
+  #: 'eval' (scripts/evaluate.py, see materialize_eval()).
+  kind: str = "train"
   exit_code: int | None = field(default=None, compare=False)
 
   def command(self, sweep_dir: str, run_dir: str = None) -> list[str]:
-    """The one command that runs this. `run_dir` redirects the output somewhere
-    other than beside the config -- node-local scratch, for a batch job."""
-    uv = shutil.which("uv")
-    cmd = ([uv, "run", "python", "-m", "barl_jax.launch.worker"]
-           if uv else [sys.executable, "-m", "barl_jax.launch.worker"])
-    cmd += ["--config", os.path.join(sweep_dir, self.config)]
-    if run_dir is not None:
-      cmd += ["--run-dir", run_dir]
-    return cmd
+    """The one command that runs this. `run_dir` redirects a *training* run's
+    checkpoint output somewhere other than beside the config -- node-local
+    scratch, for a batch job; an eval batch's own config already carries an
+    absolute `output:`, so it needs no such override here (see command_for)."""
+    return command_for(self.kind, os.path.join(sweep_dir, self.config), run_dir=run_dir)
 
 
 def materialize(combos: list[dict], tags: list[str], *, defaults: dict, sweep_dir: str,
@@ -241,6 +269,55 @@ def materialize(combos: list[dict], tags: list[str], *, defaults: dict, sweep_di
 
     runs.append(Run(index=index, tag=tag, combo=combo,
                     dir=tag, config=os.path.join(tag, "config.yaml")))
+  return runs
+
+
+def batch_tags(tags: list[str], batch_size: int | None) -> list[list[str]]:
+  """Chunks of `batch_size` (default: all of them, one chunk total). Pure and
+  side-effect-free on purpose -- separate from `materialize_eval()` so a
+  caller can preview the grouping (submit.py's --dry-run) without writing
+  anything to disk first."""
+  batch_size = batch_size or len(tags)
+  return [tags[i:i + batch_size] for i in range(0, len(tags), batch_size)]
+
+
+def materialize_eval(tags: list[str], *, from_sweep: str, batch_size: int | None,
+                     eval_defaults: dict, sweep_dir: str) -> list[Run]:
+  """Groups `tags` (the exact combo tags `name_combos()` produced -- identical
+  to what the earlier training submission wrote under `from_sweep`) into
+  batches of `batch_size` (default: all of them, one batch total -- eval is
+  cheap enough that one task per checkpoint would waste a node's worth of
+  scheduling overhead), writes one self-contained `eval.yaml` per batch --
+  the exact `{output, defaults, runs}` shape `scripts/evaluate.py --config`
+  already reads -- and returns one `kind='eval'` Run per batch.
+
+  `env` is deliberately not set per entry: `evaluate.py`'s own discovery reads
+  it from `<from_sweep>/<tag>/config.yaml`, the same file `materialize()`
+  wrote there when this tag was trained. A tag with no matching checkpoint (a
+  combo that was never actually trained, or trained under a different
+  `num_seeds`) surfaces as a per-checkpoint `error` entry in that batch's
+  results.json -- evaluate_entry's own isolation, not something to special-case
+  here."""
+  batches = batch_tags(tags, batch_size)
+
+  runs = []
+  for index, batch in enumerate(batches):
+    tag = f"batch{index:03d}"
+    batch_dir = os.path.join(sweep_dir, tag)
+    os.makedirs(batch_dir, exist_ok=True)
+
+    # Absolute, like materialize()'s run_dir: self-contained regardless of
+    # what invokes this file, not just Run.command()'s own --output (which
+    # still wins if given -- evaluate.py's main() takes --output over a
+    # config's own `output:`).
+    config = {"output": os.path.join(os.path.abspath(batch_dir), "results.json"),
+              "defaults": eval_defaults,
+              "runs": [{"path": os.path.join(os.path.abspath(from_sweep), t)} for t in batch]}
+    with open(os.path.join(batch_dir, "eval.yaml"), "w") as f:
+      yaml.safe_dump(config, f, sort_keys=False)
+
+    runs.append(Run(index=index, tag=tag, combo={"tags": batch}, dir=tag,
+                    config=os.path.join(tag, "eval.yaml"), kind="eval"))
   return runs
 
 

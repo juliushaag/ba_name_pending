@@ -13,19 +13,22 @@ from .base import ConcatQ, QCriticBase, n_step_discount
 
 
 class CriticDistConfig:
-  num_atoms          = Config(101)
-  num_bins           = Config(151)
+  num_atoms          = Config(100)
+  num_bins           = Config(100)
   sigma_to_bin_ratio = Config(0.75)
   entropy_coef       = Config(0.0)
   rho                = Config(0.0)
 
 
 class CategoricalCriticBase(QCriticBase, CriticDistConfig):
+
   mlp = ConfigDict(
     activation='relu', norm='batchrenorm', norm_stem=True, norm_input=True,
     norm_after_act=True, dropout=0.0, final_activation=False, residual=False,
     norm_kwargs={'momentum': 0.99, 'warmup_steps': 100000, 'epsilon': 0.001, 'r_max': 3.0, 'd_max': 5.0},
     dtype='bfloat16')
+
+  lr = Config(7e-4)
 
   def __init__(self, env_stats, config: ConfigMixin, q_function, support, **kwargs):
     super().__init__(env_stats, config, q_function, **kwargs)

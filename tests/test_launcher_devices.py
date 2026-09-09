@@ -35,7 +35,7 @@ def test_child_env_drops_device_vars(var, monkeypatch):
     assert executors.child_env(CUDA_VISIBLE_DEVICES="0")["CUDA_VISIBLE_DEVICES"] == "0"
 
 
-@pytest.mark.parametrize("script", ["run_rl.slurm", "tmux_pool.py"])
+@pytest.mark.parametrize("script", ["run_rl.slurm", "run_eval.slurm", "tmux_pool.py"])
 def test_started_runs_unset_device_vars(script):
     """Neither sbatch's `--export=ALL` nor a tmux server's environment is the
     launcher's to filter, so both paths unset the vars at their own end."""
@@ -60,6 +60,70 @@ def test_local_run_command_prefers_uv(monkeypatch):
     monkeypatch.setattr(grid.shutil, "which", lambda name: "/tmp/uv" if name == "uv" else None)
     run = grid.Run(index=0, tag="t", combo={}, dir="t", config="t/config.yaml")
     assert run.command("/tmp/sweep")[:5] == ["/tmp/uv", "run", "python", "-m", "barl_jax.launch.worker"]
+
+
+def test_eval_run_command_invokes_evaluate_py(monkeypatch):
+    monkeypatch.setattr(grid.shutil, "which", lambda name: "/tmp/uv" if name == "uv" else None)
+    run = grid.Run(index=0, tag="batch000", combo={"tags": ["x"]}, dir="batch000",
+                   config="batch000/eval.yaml", kind="eval")
+    assert run.command("/tmp/sweep") == \
+        ["/tmp/uv", "run", "python", "scripts/evaluate.py", "--config", "/tmp/sweep/batch000/eval.yaml"]
+
+
+def test_command_for_eval_passes_through_an_explicit_output(monkeypatch):
+    monkeypatch.setattr(grid.shutil, "which", lambda name: None)
+    cmd = grid.command_for("eval", "/x/eval.yaml", output_path="/scratch/results.json")
+    assert cmd[-2:] == ["--output", "/scratch/results.json"]
+
+
+@pytest.mark.parametrize("kind, script", [("train", "run_rl.slurm"), ("eval", "run_eval.slurm")])
+def test_slurm_submit_picks_the_script_matching_run_kind(tmp_path, monkeypatch, kind, script):
+    monkeypatch.setattr(executors.shutil, "which", lambda name: "/usr/bin/sbatch" if name == "sbatch" else None)
+    calls = []
+
+    class FakeCompleted:
+        returncode = 0
+        stdout = "12345;cluster"
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return FakeCompleted()
+
+    monkeypatch.setattr(executors.subprocess, "run", fake_run)
+    run = grid.Run(index=0, tag="t", combo={}, dir="t", config="t/config.yaml", kind=kind)
+    executors.SlurmExecutor().submit([run], "sweep", tmp_path, max_parallel=1, debug=False)
+
+    sbatch_cmd = calls[0]
+    assert sbatch_cmd[-1].endswith(script)
+
+
+def test_batch_tags_defaults_to_one_batch_and_chunks_when_given_a_size():
+    tags = ["a", "b", "c", "d", "e"]
+    assert grid.batch_tags(tags, None) == [tags]
+    assert grid.batch_tags(tags, 2) == [["a", "b"], ["c", "d"], ["e"]]
+
+
+def test_materialize_eval_writes_one_self_contained_config_per_batch(tmp_path):
+    import yaml
+
+    tags = ["SAC_HalfCheetah_1seeds", "NCLQL_HalfCheetah_1seeds", "DIME_HalfCheetah_1seeds"]
+    runs = grid.materialize_eval(tags, from_sweep=str(tmp_path / "trained"), batch_size=2,
+                                 eval_defaults={"episodes": 5}, sweep_dir=str(tmp_path / "evals"))
+
+    assert [r.kind for r in runs] == ["eval", "eval"]
+    assert [len(r.combo["tags"]) for r in runs] == [2, 1]
+
+    first = yaml.safe_load((tmp_path / "evals" / runs[0].config).read_text())
+    assert first["defaults"] == {"episodes": 5}
+    assert first["output"] == str(tmp_path / "evals" / "batch000" / "results.json")
+    assert first["runs"] == [
+        {"path": str(tmp_path / "trained" / "SAC_HalfCheetah_1seeds")},
+        {"path": str(tmp_path / "trained" / "NCLQL_HalfCheetah_1seeds")},
+    ]
+
+    second = yaml.safe_load((tmp_path / "evals" / runs[1].config).read_text())
+    assert second["runs"] == [{"path": str(tmp_path / "trained" / "DIME_HalfCheetah_1seeds")}]
 
 
 @pytest.mark.parametrize("exit_code", [0, 2, None])
@@ -109,3 +173,51 @@ def test_grid_materialization_freezes_overrides(tmp_path):
     assert data["runs"][0]["batch_size"] == 32
     assert data["runs"][0]["num_seeds"] == 1
     assert data["snapshot"]["resolved"]["params.entropy_scale"] == -0.5
+
+
+def test_submit_eval_end_to_end_through_local_executor(tmp_path):
+    """--from-sweep, all the way through: a real checkpoint on disk, a real
+    LocalExecutor subprocess (scripts/evaluate.py, which a monkeypatched
+    Environment.make can't reach -- it runs in its own process), a real
+    results.json. Two checkpoints, default batching (one batch total): both
+    must land in the one task's results, matching the ask this whole feature
+    is for -- every combo evaluated on the same node."""
+    import json
+
+    from barl_jax.checkpoints import save_policy
+    from barl_jax.env import Environment
+    from barl_jax.policy import Policy
+
+    trained = tmp_path / "trained"
+    for algo in ("SAC", "NCLQL"):
+        tag = f"{algo}_HalfCheetah_1seeds"
+        env_obj = Environment.class_for("HalfCheetah")()
+        env = env_obj.get_env()
+        try:
+            policy = Policy.make(algo, env, env_stats=env_obj.get_env_stats(env), seed=0)
+            save_policy(policy, trained / tag / "checkpoints" / "seed0" / "best")
+        finally:
+            env.close()
+        (trained / tag / "config.yaml").write_text(
+            f"runs: [{{model: {algo}, env: HalfCheetah, seed: 0}}]\n")
+
+    spec = importlib.util.spec_from_file_location(
+        "submit", pathlib.Path(__file__).resolve().parent.parent / "scripts/submit.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    sweep_dir = tmp_path / "evals"
+    args = module.parse_args([
+      "--algos", "SAC", "NCLQL", "--envs", "HalfCheetah", "--seeds", "1",
+      "--from-sweep", str(trained), "--executor", "local",
+      "--episodes", "2", "--num-candidates", "1", "--sweep-dir", str(sweep_dir),
+    ])
+    module.submit_eval(args)
+
+    import math
+
+    results = json.loads((sweep_dir / "batch000" / "results.json").read_text())
+    assert len(results) == 2
+    for row in results.values():
+        assert "error" not in row
+        assert math.isfinite(row["default"]["mean_return"])
