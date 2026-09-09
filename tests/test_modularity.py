@@ -49,7 +49,7 @@ class ToyFamily(Environment):
     self.value = value
     self.created = []
 
-  def get_env(self):
+  def get_env(self, *, render: bool = False):
     env = ToyEnv(self.value)
     self.created.append(env)
     return env

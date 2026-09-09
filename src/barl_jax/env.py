@@ -1,3 +1,4 @@
+import functools
 import multiprocessing as mp
 from abc import ABC, abstractmethod
 
@@ -78,7 +79,13 @@ class Environment(ABC):
     return out
 
   @abstractmethod
-  def get_env(self) -> gym.Env:
+  def get_env(self, *, render: bool = False) -> gym.Env:
+    """`render=True` is the only case that may ever need `env.render()` to
+    work later -- every implementation must honor it by requesting a real
+    renderer only then, since a training rollout env, the reference env
+    (spaces/EnvStats only) and eval's return-only env never call render()
+    at all, and some families (HumanoidBench's Task) build a full GL/EGL
+    context eagerly at construction otherwise, not lazily on first render()."""
     ...
 
   @abstractmethod
@@ -86,16 +93,20 @@ class Environment(ABC):
     """Only implemented by offline-dataset-backed environments."""
     ...
 
-  def get_vector_env(self, num_envs: int, asynchronous: bool = None) -> gym.vector.VectorEnv:
+  def get_vector_env(self, num_envs: int, asynchronous: bool = None,
+                     render: bool = False) -> gym.vector.VectorEnv:
     """autoreset_mode=DISABLED is mandatory -- Collector.collect() resets
     finished sub-envs itself via reset_mask. `asynchronous` overrides
     `use_async_vector_env` for a caller the class-level choice doesn't suit --
     a rendering env has to be synchronous, since a forked worker's render()
     comes back as an EOFError (MuJoCo's EGL context does not survive the
-    fork) and its frames would go through the pipe at ~900 KB a step."""
+    fork) and its frames would go through the pipe at ~900 KB a step. `render`
+    forwards to every sub-env's `get_env()` -- only the eval video env passes
+    True."""
     use_async = self.use_async_vector_env if asynchronous is None else asynchronous
+    env_fn = functools.partial(self.get_env, render=render)
     if not use_async:
-      return gym.vector.SyncVectorEnv([self.get_env for _ in range(num_envs)],
+      return gym.vector.SyncVectorEnv([env_fn for _ in range(num_envs)],
                                       autoreset_mode=gym.vector.AutoresetMode.DISABLED)
     # Not the default `fork`: JAX is multithreaded by the time this is called,
     # and forking a multithreaded parent is what python warns will "likely lead
@@ -104,7 +115,7 @@ class Environment(ABC):
     # single-threaded server process instead.
     methods = mp.get_all_start_methods()
     context = "forkserver" if "forkserver" in methods else "spawn"
-    return gym.vector.AsyncVectorEnv([self.get_env for _ in range(num_envs)],
+    return gym.vector.AsyncVectorEnv([env_fn for _ in range(num_envs)],
                                      autoreset_mode=gym.vector.AutoresetMode.DISABLED,
                                      context=context)
 

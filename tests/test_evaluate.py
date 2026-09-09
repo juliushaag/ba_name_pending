@@ -24,7 +24,7 @@ class ShortPendulum(Environment):
   def get_dataset(self):
     raise NotImplementedError
 
-  def get_env(self):
+  def get_env(self, *, render: bool = False):
     return gym.make("Pendulum-v1", max_episode_steps=3)
 
 

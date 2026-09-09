@@ -217,7 +217,7 @@ def _checkpoint_dir(run: Run, root: str, seed: int) -> str:
 
 
 def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
-  """Every seed in one vmapped pass, plus seed 0's video.
+  """Every seed in one vmapped pass, plus one video episode per seed.
 
   Returns `(best, timings)`; the three phases are timed apart because they fail
   and stall for unrelated reasons -- the wave is sequential physics, the saves
@@ -243,7 +243,6 @@ def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
 
   # One slot per seed; run_episodes reuses these slots for successive rounds.
   per_run  = cfg["eval_runs"]
-  n_videos = per_run if cfg["eval_videos"] is None else min(cfg["eval_videos"], per_run)
   actor = StackedPolicy(run.graphdef, run.state, run.num_seeds, 1, run.reference,
                         execution_spec=run.eval_spec)
 
@@ -277,19 +276,21 @@ def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
 
   ckpt_s = time.perf_counter() - t0
 
-  # Only seed 0's video is ever logged, so only seed 0 renders. It is an *extra*
+  # One video episode per seed, on `render_env` (sized num_seeds, synchronous
+  # -- a forked worker's render() does not survive the fork). It is an *extra*
   # episode rather than one of the counted `eval_runs`: it cannot join the
-  # vmapped pass (a VectorEnv renders all its sub-envs or none, at ~140x the env
-  # step), and holding every seed to the same episode count is what keeps the
-  # per-seed numbers comparable.
+  # main wave above (a VectorEnv renders all its sub-envs or none, at ~140x
+  # the env step), and holding every seed to the same episode count there is
+  # what keeps the per-seed numbers comparable. Reuses `actor`, so slot i is
+  # seed i exactly as it is in the main wave.
   video_s = 0.0
-  if n_videos and want_video:
+  if want_video:
     log.log({}, quiet={"eval/phase": PHASE_EVAL_VIDEO})
     t0 = time.perf_counter()
-    policy, _ = unstack(run.graphdef, run.state, 0)
     video_seed = derive_seed(run.base_seed, "eval-video", run.eval_count - 1)
-    for v, r in enumerate(run_episodes(policy, render_env, n_videos, render=True, seed=video_seed)):
-      log.log_video(f"eval/video_{v}", r["frames"])
+    episodes = run_episodes(actor, render_env, run.num_seeds, render=True, seed=video_seed)
+    for i, r in enumerate(episodes):
+      log.log_video("eval/video", r["frames"], seed_index=i)
     video_s = time.perf_counter() - t0
 
   # Eval is already per-seed -- each seed owns one slot across all rounds --
@@ -436,12 +437,15 @@ def _train(run: Run):
 
   # `eval_video_every: null` means never, so the render env is not built either
   # -- one fewer mujoco model resident, and no GL context to create at all.
-  n_videos  = 0 if cfg["eval_video_every"] is None else (
-    cfg["eval_runs"] if cfg["eval_videos"] is None else min(cfg["eval_videos"], cfg["eval_runs"]))
+  wants_video = cfg["eval_video_every"] is not None
 
-  # Keep one simulator per seed resident, independently of the episode count.
+  # One video slot per seed (see evaluate()'s video block) -- `render=True`
+  # only for this dedicated env; every other env in this run (the reference/
+  # rollout envs in _setup, scripts/evaluate.py's, and this one when videos
+  # are off) defaults to no renderer at all.
   eval_envs = (run.own(run.environment.get_vector_env(num_seeds)),
-               run.own(run.environment.get_vector_env(n_videos, asynchronous=False)) if n_videos else None)
+               run.own(run.environment.get_vector_env(num_seeds, asynchronous=False, render=True))
+               if wants_video else None)
 
   tags = [run.model_name, run.env_name, "online", "jax", "multiseed"]
   if cfg["sweep_tag"]:
@@ -498,10 +502,11 @@ def _train(run: Run):
     log.message("Resumed optimizer, replay and counters; environment episodes restart")
   best = run.progress.get("best", [float("-inf")] * num_seeds)
   eval_every, next_eval = cfg["eval_every"], cfg["eval_every"]
-  video_every, next_video = cfg["eval_video_every"], cfg["eval_video_every"]
+  # In evals, not env steps -- checked against run.eval_count (not restored on
+  # resume, so this always restarts counting from the top, same as eval_count
+  # itself) rather than a precomputed env-step threshold like next_eval's.
+  video_every = cfg["eval_video_every"]
   next_eval = (log.get_step("env_steps") // eval_every + 1) * eval_every
-  if video_every is not None:
-    next_video = (log.get_step("env_steps") // video_every + 1) * video_every
   # Resume persistence is its own cadence -- independent of eval_every, since
   # the replay dump it carries is what makes a save expensive, not the eval.
   resume_dir = os.path.join(ckpt_dir, "resume")
@@ -625,15 +630,14 @@ def _train(run: Run):
       eval_time, eval_phases = 0.0, {}
       if log.get_step("env_steps") >= next_eval:
         # A rendered episode is ~140x the cost of an env step plus a synchronous
-        # mp4 encode, and 40 of them per run is an hour on the heavier models --
-        # so the video runs on its own, coarser cadence than the eval itself.
-        want_video = video_every is not None and log.get_step("env_steps") >= next_video
+        # mp4 encode, so video runs on its own, coarser cadence than the eval
+        # itself -- every `video_every`th eval (run.eval_count is 0-based and
+        # not yet incremented for this call, so +1 makes it that call's number).
+        want_video = video_every is not None and (run.eval_count + 1) % video_every == 0
         eval_start = time.perf_counter()
         best, eval_phases = evaluate(run, eval_envs, log, ckpt_dir, best, want_video=want_video)
         eval_time = time.perf_counter() - eval_start
         next_eval = (log.get_step("env_steps") // eval_every + 1) * eval_every
-        if want_video:
-          next_video = (log.get_step("env_steps") // video_every + 1) * video_every
         _write_objective(objective_dir, model=run.model_name, env=run.env_name,
                          seed=run.base_seed, num_seeds=run.num_seeds,
                          env_steps=int(log.get_step("env_steps")), best=best, status="running")

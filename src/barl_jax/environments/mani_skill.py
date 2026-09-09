@@ -42,15 +42,18 @@ class ManiSkillEnvironment(Environment):
   def task_id(self) -> str:
     raise NotImplementedError
 
-  def get_env(self) -> gym.Env:
+  def get_env(self, *, render: bool = False) -> gym.Env:
     import mani_skill.envs  # noqa: F401
     from mani_skill.utils.wrappers import CPUGymWrapper
     # `num_envs=1` + physx_cpu is the unbatched backend; CPUGymWrapper is what
     # unwraps ManiSkill's batched torch tensors back to single-env numpy.
     # `reward_mode` is named rather than defaulted because the declared return
-    # support is derived from it being in [0, 1] per step.
+    # support is derived from it being in [0, 1] per step. render_mode=None
+    # (verified against a real ManiSkill env) skips renderer setup the same
+    # way it does for the other families.
     env = gym.make(self.task_id(), obs_mode="state", reward_mode="normalized_dense",
-                   sim_backend="physx_cpu", render_mode="rgb_array", num_envs=1)
+                   sim_backend="physx_cpu", render_mode="rgb_array" if render else None,
+                   num_envs=1)
     return CPUGymWrapper(env)
 
   def get_dataset(self):

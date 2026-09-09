@@ -17,12 +17,12 @@ class DMControlEnvironment(Environment):
   def domain_task(self) -> tuple[str, str]:
     raise NotImplementedError
 
-  def get_env(self) -> gym.Env:
+  def get_env(self, *, render: bool = False) -> gym.Env:
     from dm_control import suite
     from shimmy.dm_control_compatibility import DmControlCompatibilityV0
     domain, task = self.domain_task()
     dm_env = suite.load(domain_name=domain, task_name=task)
-    env = DmControlCompatibilityV0(dm_env, render_mode="rgb_array")
+    env = DmControlCompatibilityV0(dm_env, render_mode="rgb_array" if render else None)
     return gym.wrappers.FlattenObservation(env)
 
   def get_dataset(self):

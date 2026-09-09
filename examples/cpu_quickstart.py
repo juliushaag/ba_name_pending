@@ -52,7 +52,7 @@ class TinyPendulum(Environment):
   # episode gymnasium's own env spec sets.
   stats = {"return_min": -16.2736044 * 200, "return_max": 0.0}
 
-  def get_env(self) -> gym.Env:
+  def get_env(self, *, render: bool = False) -> gym.Env:
     return gym.make("Pendulum-v1")
 
   def get_dataset(self):

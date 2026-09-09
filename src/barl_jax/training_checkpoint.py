@@ -175,7 +175,7 @@ def validate_resume(cfg, num_seeds, meta):
   if num_seeds != meta["num_seeds"]:
     raise ValueError("Resume requires the saved num_seeds")
   mutable = {"checkpoint", "checkpoint_mode", "run_dir", "sweep_tag", "validate",
-             "log_every", "debug_every", "eval_every", "eval_runs", "eval_videos",
+             "log_every", "debug_every", "eval_every", "eval_runs",
              "eval_video_every", "compile_cache_dir", "wandb_finish_timeout",
              "logger", "resume_every", "resume_keep",
              # Evaluation strategy may change across a resume (recorded in

@@ -56,8 +56,8 @@ def test_random_steps_and_lr_warmup_may_be_zero():
   assert validate_run(base(random_steps=0, lr_warmup_steps=0), num_seeds=1) == []
 
 
-def test_eval_video_every_and_eval_videos_may_be_null():
-  assert validate_run(base(eval_video_every=None, eval_videos=None), num_seeds=1) == []
+def test_eval_video_every_may_be_null():
+  assert validate_run(base(eval_video_every=None), num_seeds=1) == []
 
 
 def test_rollout_steps_below_num_envs_is_rejected():

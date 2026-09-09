@@ -26,8 +26,9 @@ RUN_CONFIGS: dict[str, Config] = {
   "lr_decay": Config("constant"),
   "eval_every": Config(25000),
   "eval_runs": Config(10),
-  "eval_videos": Config(1),
-  "eval_video_every": Config(100000),
+  # Every Nth eval (not an env-step count) captures one video episode per
+  # seed -- see trainer.py's `evaluate()`. null means never.
+  "eval_video_every": Config(4),
   "log_every": Config(250),
   "debug_every": Config(1000),
   "wandb_finish_timeout": Config(300),
@@ -70,7 +71,6 @@ _NONNEGATIVE_INT_KEYS = ("random_steps", "lr_warmup_steps", "wandb_finish_timeou
 # `None` means "never" for these (see trainer.py's `_train`); a stated value
 # still goes through the same >= 1 rule as the always-on cadence keys above.
 _POSITIVE_OR_NONE_INT_KEYS = ("eval_video_every", "resume_every")
-_NONNEGATIVE_OR_NONE_INT_KEYS = ("eval_videos",)
 
 LOGGER_KINDS = ("wandb", "local", "none")
 
@@ -116,10 +116,6 @@ def validate_run(cfg: dict, *, num_seeds: int = None) -> list[str]:
     v = cfg.get(key)
     if v is not None and isinstance(v, int) and not isinstance(v, bool) and v < 1:
       fail(key, v, "must be >= 1 or null")
-  for key in _NONNEGATIVE_OR_NONE_INT_KEYS:
-    v = cfg.get(key)
-    if v is not None and isinstance(v, int) and not isinstance(v, bool) and v < 0:
-      fail(key, v, "must be >= 0 or null")
 
   utd = cfg.get("utd_ratio")
   if utd is not None and isinstance(utd, (int, float)) and not isinstance(utd, bool):

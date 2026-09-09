@@ -5,17 +5,19 @@ from barl_jax.env import Environment, register_environment
 
 class MuJoCoGymEnvironment(Environment):
   """Wraps gymnasium's built-in MuJoCo `-v5` envs. Online-only --
-  get_dataset() always raises. render_mode="rgb_array" is free for the N
-  parallel rollout envs that never render (MujocoRenderer sets up its
-  context lazily on the first real render() call)."""
+  get_dataset() always raises. Unlike HumanoidBench's Task, gymnasium's own
+  MujocoRenderer sets up its GL/EGL context lazily on the first real
+  render() call, so render_mode="rgb_array" would be free even for the N
+  parallel rollout envs that never render -- gated on `render` anyway, to
+  keep every Environment family to the same contract."""
 
   use_async_vector_env = True
 
   def mujoco_id(self) -> str:
     raise NotImplementedError
 
-  def get_env(self) -> gym.Env:
-    return gym.make(self.mujoco_id(), render_mode="rgb_array")
+  def get_env(self, *, render: bool = False) -> gym.Env:
+    return gym.make(self.mujoco_id(), render_mode="rgb_array" if render else None)
 
   def get_dataset(self):
     raise NotImplementedError(f"{type(self).__name__} has no offline dataset -- MuJoCo Gym is online-only.")

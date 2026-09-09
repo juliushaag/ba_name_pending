@@ -115,12 +115,18 @@ class HumanoidBenchEnvironment(Environment):
   def task_id(self) -> str:
     raise NotImplementedError
 
-  def get_env(self) -> gym.Env:
+  def get_env(self, *, render: bool = False) -> gym.Env:
     import humanoid_bench  # noqa: F401
     _patch_stale_mujoco_fields()
     _patch_stale_gymnasium_render()
     _patch_stale_gymnasium_marker_size()
-    return gym.make(self.task_id(), render_mode="rgb_array")
+    # humanoid_bench's own Task.__init__ (third_party/humanoid-bench/humanoid_bench/tasks.py)
+    # builds a full offscreen GL/EGL viewer immediately whenever render_mode is
+    # not None -- unlike gymnasium's own MujocoRenderer, this is eager, not
+    # lazy on first render(). A training rollout, the reference env and eval's
+    # return-only env never call render(), so render_mode=None skips that
+    # entirely for them -- one less GL context to fail on a flaky headless node.
+    return gym.make(self.task_id(), render_mode="rgb_array" if render else None)
 
   def get_dataset(self):
     raise NotImplementedError(f"{type(self).__name__} has no offline dataset -- HumanoidBench is online-only.")
