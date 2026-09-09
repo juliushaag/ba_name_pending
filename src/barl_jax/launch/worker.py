@@ -12,6 +12,7 @@ import faulthandler
 import os
 import signal
 import sys
+import time
 import warnings
 
 # Installed before jax and mujoco get a chance to fault: an EGL/mjr allocation
@@ -100,8 +101,10 @@ if __name__ == "__main__":
     args.error("--seeds must be >= 1")
 
   require_accelerator()
+  print(f"Accelerator: {jax.devices()}")
 
   runs = load_config(kwargs.config)
+  print(f"Loaded {len(runs)} run{'s' if len(runs) != 1 else ''} from {kwargs.config}")
   for i, cfg in enumerate(runs):
     if kwargs.run_dir is not None:
       cfg["run_dir"] = os.path.abspath(kwargs.run_dir)
@@ -110,5 +113,7 @@ if __name__ == "__main__":
           f"{num_seeds} seed{'s' if num_seeds != 1 else ''} vmapped ===")
 
     only_validate = bool(cfg["validate"])
+    t0 = time.perf_counter()
     run = setup(cfg, num_seeds, validate_only=only_validate)
     (validate if only_validate else train)(run)
+    print(f"=== Run {i + 1}/{len(runs)} done in {(time.perf_counter() - t0) / 60:.1f} min ===")

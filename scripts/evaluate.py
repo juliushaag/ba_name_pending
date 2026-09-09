@@ -11,6 +11,7 @@ that file, not the command line."""
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 
 os.environ.setdefault("MUJOCO_GL", "egl")
@@ -68,7 +69,9 @@ def evaluate(path, env_name, modes, *, episodes, num_envs, num_candidates, seed,
     vector = environment.get_vector_env(min(episodes, num_envs))
     try:
       results = {}
+      print(f"  {path}  env={env_name}  {episodes} episode(s) x {len(modes)} mode(s) {modes}")
       for mode in modes:
+        t0 = time.perf_counter()
         # top_k/sigma are rejected by ExecutionSpec at their non-default value
         # under every mode but their own -- see execution.py.
         kwargs = {}
@@ -80,6 +83,7 @@ def evaluate(path, env_name, modes, *, episodes, num_envs, num_candidates, seed,
         problems = validate_execution_spec(spec, policy=policy)
         if problems:
           results[mode] = {"error": "; ".join(problems)}
+          print(f"    [{mode}] skipped -- {'; '.join(problems)}")
           continue
         records = run_episodes(EvaluationActor(policy, spec), vector, episodes,
                                render=False, seed=seed)
@@ -87,6 +91,8 @@ def evaluate(path, env_name, modes, *, episodes, num_envs, num_candidates, seed,
         results[mode] = {"mean_return": float(returns.mean()),
                          "std_return": float(returns.std()),
                          "success_rate": float(np.mean([r["success"] for r in records]))}
+        print(f"    [{mode}] mean_return={results[mode]['mean_return']:.4g} "
+              f"success_rate={results[mode]['success_rate']:.2f}  ({time.perf_counter() - t0:.1f}s)")
       return results
     finally:
       vector.close()
@@ -129,7 +135,9 @@ def evaluate_entry(entry: dict) -> dict:
   checkpoint = entry.get("checkpoint", DEFAULTS["checkpoint"])
   paths = checkpoints(root, checkpoint)
   if not paths:
+    print(f"{root}: no {checkpoint} checkpoints found")
     return {str(root): {"error": f"no {checkpoint} policy checkpoints under {root}"}}
+  print(f"{root}: {len(paths)} {checkpoint} checkpoint(s)")
   out = {}
   for path in paths:
     try:
@@ -145,6 +153,7 @@ def evaluate_entry(entry: dict) -> dict:
         seed=entry.get("seed", DEFAULTS["seed"]))
     except Exception as exc:
       out[str(path)] = {"error": f"{type(exc).__name__}: {exc}"}
+      print(f"  {path}: FAILED -- {type(exc).__name__}: {exc}")
   return out
 
 
@@ -190,9 +199,14 @@ def main():
                     seed=args.seed)]
     output = args.output
 
+  print(f"Evaluating {len(entries)} entr{'y' if len(entries) == 1 else 'ies'}"
+       + (f" from {args.config}" if args.config else ""))
+  t0 = time.perf_counter()
   results = {}
-  for entry in entries:
+  for i, entry in enumerate(entries):
+    print(f"[{i + 1}/{len(entries)}]")
     results.update(evaluate_entry(entry))
+  print(f"Done in {time.perf_counter() - t0:.1f}s")
 
   if output:
     out = Path(output)

@@ -5,24 +5,31 @@
     uv run python scripts/submit.py --algos SAC DIME --envs HalfCheetah --seeds 5
     uv run python scripts/submit.py --grid src/barl_jax/defaults/experiments/sweep_grid.yaml --dry-run
     uv run python scripts/submit.py --algos SAC --envs HalfCheetah --executor local --validate
+    uv run python scripts/submit.py --eval-config experiments/eval.yaml --executor local
     uv run python scripts/submit.py --algos SAC DIME --envs HalfCheetah --from-sweep sweeps/<earlier>
 
 A sweep can contain one run. --set pins model.<path> or run.<key> axes; --grid
 adds cross products and exclusions. Configs are frozen before submission.
 
---from-sweep evaluates instead of training: the same {algo, env, seed} axes
+--eval-config and --from-sweep evaluate instead of training, through the same
+executors, batched --batch-size checkpoints per task rather than one task per
+checkpoint -- evaluation is cheap enough that one-task-per-checkpoint would
+waste a node's worth of scheduling overhead. --eval-config submits exactly the
+file scripts/evaluate.py --config already reads (see experiments/eval.yaml):
+every `path` is whatever the file says, batched as-is. --from-sweep is the
+narrower, axes-driven case: the same {algo, env, seed} axes training used
 select which of an earlier training sweep's checkpoints to evaluate (its tags
-have to match, since that is how a checkpoint is found -- see grid.py's
-name_combos/materialize_eval), batched --batch-size checkpoints per task
-rather than one task per checkpoint, since evaluation is cheap enough that
-one-task-per-checkpoint would waste a node's worth of scheduling overhead."""
+have to match, since that is how a checkpoint is found)."""
 
 import argparse
 import datetime
+import os
 import shlex
 import subprocess
 import sys
 from pathlib import Path
+
+import yaml
 
 from barl_jax.launch import grid
 from barl_jax.launch.executors import EXECUTORS, SWEEP_NAME_FORMAT, SWEEPS_DIR, resolve
@@ -106,22 +113,30 @@ def parse_args(argv=None):
                      help="Print the runs the grid expands to and exit, without writing or "
                           "submitting anything.")
 
-    ev = parser.add_argument_group("evaluation (only with --from-sweep)")
+    ev = parser.add_argument_group("evaluation (--eval-config or --from-sweep)")
+    ev.add_argument("--eval-config",
+                    help="Submit exactly the batch of evaluations this file describes -- the same "
+                         "{output, defaults, runs: [{path, env?, ...}]} shape "
+                         "scripts/evaluate.py --config reads (see experiments/eval.yaml). Its own "
+                         "`defaults:`/`runs:` are authoritative; --checkpoint/--mode/--episodes/etc. "
+                         "below don't apply here -- only --batch-size does.")
     ev.add_argument("--from-sweep",
                     help="Evaluate an earlier training sweep's checkpoints instead of training -- "
                          "the same {algo, env, seed} axes select which of its tags to evaluate.")
     ev.add_argument("--batch-size", type=int, default=None,
                     help="Checkpoints per evaluation task/node (default: all of them, one task "
                          "total -- pass a smaller number for more parallelism).")
-    ev.add_argument("--checkpoint", choices=("best", "final"), default="best")
+    ev.add_argument("--checkpoint", choices=("best", "final"), default="best",
+                    help="--from-sweep only.")
     ev.add_argument("--mode", nargs="+", choices=EVAL_MODES, default=["default"],
-                    help="Action-selection mode(s), see barl_jax.execution.")
-    ev.add_argument("--episodes", type=int, default=10)
-    ev.add_argument("--num-envs", type=int, default=8)
-    ev.add_argument("--num-candidates", type=int, default=8)
-    ev.add_argument("--top-k", type=int, default=2, help="Only used by --mode topk")
-    ev.add_argument("--sigma", type=float, default=0.1, help="Only used by --mode perturb")
-    ev.add_argument("--seed", type=int, default=0, help="Shared evaluation seed for paired comparisons")
+                    help="--from-sweep only. Action-selection mode(s), see barl_jax.execution.")
+    ev.add_argument("--episodes", type=int, default=10, help="--from-sweep only.")
+    ev.add_argument("--num-envs", type=int, default=8, help="--from-sweep only.")
+    ev.add_argument("--num-candidates", type=int, default=8, help="--from-sweep only.")
+    ev.add_argument("--top-k", type=int, default=2, help="--from-sweep only. Only used by --mode topk")
+    ev.add_argument("--sigma", type=float, default=0.1, help="--from-sweep only. Only used by --mode perturb")
+    ev.add_argument("--seed", type=int, default=0,
+                    help="--from-sweep only. Shared evaluation seed for paired comparisons")
 
     args = parser.parse_args(argv)
     if args.seeds is not None and args.seeds < 1:
@@ -130,21 +145,91 @@ def parse_args(argv=None):
         parser.error("--max-parallel must be >= 1")
     if args.batch_size is not None and args.batch_size < 1:
         parser.error("--batch-size must be >= 1")
-    if not args.from_sweep and (args.batch_size is not None or args.checkpoint != "best"
-                                or args.mode != ["default"] or args.episodes != 10
-                                or args.num_envs != 8 or args.num_candidates != 8
-                                or args.top_k != 2 or args.sigma != 0.1 or args.seed != 0):
-        parser.error("--batch-size/--checkpoint/--mode/--episodes/--num-envs/--num-candidates/"
-                     "--top-k/--sigma/--seed only apply with --from-sweep")
+    if args.eval_config and args.from_sweep:
+        parser.error("--eval-config and --from-sweep are two different ways to select what to "
+                     "evaluate; pass only one")
+    if args.batch_size is not None and not (args.eval_config or args.from_sweep):
+        parser.error("--batch-size only applies with --eval-config or --from-sweep")
+    if not args.from_sweep and (args.checkpoint != "best" or args.mode != ["default"]
+                                or args.episodes != 10 or args.num_envs != 8
+                                or args.num_candidates != 8 or args.top_k != 2
+                                or args.sigma != 0.1 or args.seed != 0):
+        parser.error("--checkpoint/--mode/--episodes/--num-envs/--num-candidates/--top-k/--sigma/"
+                     "--seed only apply with --from-sweep")
+    if args.eval_config and (args.algos or args.envs or args.grid or args.sets or args.seeds is not None):
+        parser.error("--eval-config's file already says what to evaluate; "
+                     "--algos/--envs/--grid/--set/--seeds don't apply")
     return args
 
 
+def _submit_eval(args, entries, eval_defaults, *, source_desc, extra_head, preview_lines=()):
+    """Shared by --eval-config and --from-sweep, once each has built its own
+    `entries` (each a full evaluate.py `runs:` item, `{path, env?, ...}`) and
+    `eval_defaults` (each batch's shared `defaults:`): preview, the --dry-run
+    gate, materialize_eval(), and the same submit_sweep() call training uses
+    -- same executors, same reporting, same blocking-vs-detached semantics."""
+    executor = resolve(args.executor)
+    max_parallel = 1 if args.debug else (args.max_parallel or executor.default_parallelism)
+
+    sweep_name = datetime.datetime.now().strftime(SWEEP_NAME_FORMAT)  # noqa: DTZ005
+    sweep_dir = Path(args.sweep_dir or (SWEEPS_DIR / f"eval_{sweep_name}")).absolute()
+    batches = grid.batch_tags(entries, args.batch_size)
+
+    # ---- what we're about to do -------------------------------------------
+    print()
+    print(f"Eval sweep: {len(entries)} checkpoint(s) from {source_desc}, "
+          f"{len(batches)} batch(es) of up to {args.batch_size or len(entries)}")
+    for line in preview_lines:
+        print(line)
+    print(f"Executor:   {executor.name}" + (" (auto)" if args.executor == "auto" else ""))
+    print(f"Parallel:   {max_parallel}")
+    if args.debug:
+        print(f"Debug:      {executor.describe_debug()}")
+    print(f"Dir:        {sweep_dir}")
+    print()
+    for index, batch in enumerate(batches):
+        paths = ", ".join(entry["path"] for entry in batch)
+        print(f"  [{index:03d}] batch{index:03d} -- {len(batch)} checkpoint(s): {paths}")
+
+    if args.dry_run:
+        print()
+        print("Dry run: nothing written, nothing submitted.")
+        return
+
+    # ---- expand the batches onto disk --------------------------------------
+    runs = grid.materialize_eval(entries, batch_size=args.batch_size,
+                                 eval_defaults=eval_defaults, sweep_dir=str(sweep_dir))
+    head = {"sweep_tag": sweep_name, "kind": "eval", "command": shlex.join(sys.argv),
+           "executor": executor.name, "batch_size": args.batch_size, **extra_head}
+
+    submit_sweep(executor, runs, sweep_name, sweep_dir, head,
+                max_parallel=max_parallel, debug=args.debug, stream=False)
+
+
+def submit_eval_config(args):
+    """--eval-config: the file is authoritative. Its own `defaults:`/`runs:`
+    -- the exact {output, defaults, runs} shape scripts/evaluate.py --config
+    already reads, see experiments/eval.yaml -- are what gets batched and
+    submitted; no axes are involved at all."""
+    data = yaml.safe_load(Path(args.eval_config).read_text()) or {}
+    entries = data.get("runs")
+    if not entries:
+        raise SystemExit(f"{args.eval_config}: no `runs` entries")
+    for i, entry in enumerate(entries):
+        if "path" not in entry:
+            raise SystemExit(f"{args.eval_config}: runs[{i}] has no `path`")
+
+    _submit_eval(args, entries, data.get("defaults") or {}, source_desc=args.eval_config,
+                extra_head={"eval_config": str(Path(args.eval_config).resolve())})
+
+
 def submit_eval(args):
-    """The --from-sweep path: same axes as training (build_axes/build_combos/
-    name_combos, unchanged), but materialize_eval() batches the resulting tags
-    into `kind='eval'` Runs instead of one training config per tag. Shares
-    submit_sweep() with the training path -- same executors, same reporting,
-    same blocking-vs-detached semantics."""
+    """--from-sweep: same axes as training (build_axes/build_combos/
+    name_combos, unchanged) -- what guarantees a tag this produces is the same
+    string the earlier training submission wrote under --from-sweep.
+    Synthesizes one `{"path": "<from_sweep>/<tag>"}` entry per tag; `env` is
+    left unset, evaluate.py's own discovery reads it from that tag's own
+    config.yaml."""
     axes, exclude = grid.build_axes(grid=args.grid, algos=args.algos,
                                     envs=args.envs, sets=args.sets)
     if args.seeds is not None and "run.num_seeds" in axes:
@@ -158,50 +243,19 @@ def submit_eval(args):
     # own is built from these combos the way materialize() does.
     num_seeds = args.seeds if args.seeds is not None else grid.default_num_seeds()
     tags = grid.name_combos(combos, axes, num_seeds)
+    from_sweep = os.path.abspath(args.from_sweep)
+    entries = [{"path": os.path.join(from_sweep, tag)} for tag in tags]
 
-    executor = resolve(args.executor)
-    max_parallel = 1 if args.debug else (args.max_parallel or executor.default_parallelism)
-
-    sweep_name = datetime.datetime.now().strftime(SWEEP_NAME_FORMAT)  # noqa: DTZ005
-    sweep_dir = Path(args.sweep_dir or (SWEEPS_DIR / f"eval_{sweep_name}")).absolute()
-    batches = grid.batch_tags(tags, args.batch_size)
-
-    # ---- what we're about to do -------------------------------------------
-    print()
-    print(f"Eval sweep: {len(tags)} checkpoint(s) from {args.from_sweep}, "
-          f"{len(batches)} batch(es) of up to {args.batch_size or len(tags)}")
-    print("Axes:       " + ", ".join(f"{k}={v}" for k, v in axes.items()))
-    if exclude:
-        print(f"Exclude:    {exclude}")
-    print(f"Executor:   {executor.name}" + (" (auto)" if args.executor == "auto" else ""))
-    print(f"Parallel:   {max_parallel}")
-    if args.debug:
-        print(f"Debug:      {executor.describe_debug()}")
-    print(f"Dir:        {sweep_dir}")
-    print()
-    for index, batch in enumerate(batches):
-        print(f"  [{index:03d}] batch{index:03d} -- {len(batch)} checkpoint(s): {', '.join(batch)}")
-
-    if args.dry_run:
-        print()
-        print("Dry run: nothing written, nothing submitted.")
-        return
-
-    # ---- expand the batches onto disk --------------------------------------
     eval_defaults = {"checkpoint": args.checkpoint, "mode": args.mode, "episodes": args.episodes,
                      "num_envs": args.num_envs, "num_candidates": args.num_candidates,
                      "top_k": args.top_k, "sigma": args.sigma, "seed": args.seed}
-    runs = grid.materialize_eval(tags, from_sweep=args.from_sweep, batch_size=args.batch_size,
-                                 eval_defaults=eval_defaults, sweep_dir=str(sweep_dir))
+    preview = ["Axes:       " + ", ".join(f"{k}={v}" for k, v in axes.items())]
+    if exclude:
+        preview.append(f"Exclude:    {exclude}")
 
-    head = {"sweep_tag": sweep_name, "kind": "eval",
-           "from_sweep": str(Path(args.from_sweep).resolve()),
-           "command": shlex.join(sys.argv), "executor": executor.name,
-           "batch_size": args.batch_size, "axes": {k: list(v) for k, v in axes.items()},
-           "exclude": exclude or None}
-
-    submit_sweep(executor, runs, sweep_name, sweep_dir, head,
-                max_parallel=max_parallel, debug=args.debug, stream=False)
+    _submit_eval(args, entries, eval_defaults, source_desc=args.from_sweep, preview_lines=preview,
+                extra_head={"from_sweep": from_sweep, "axes": {k: list(v) for k, v in axes.items()},
+                           "exclude": exclude or None})
 
 
 def main():
@@ -209,12 +263,17 @@ def main():
     if args.config:
         if (args.algos or args.envs or args.grid or args.sets or args.validate or args.debug
                 or args.executor != "auto" or args.max_parallel or args.sweep_dir or args.dry_run
-                or args.from_sweep):
+                or args.from_sweep or args.eval_config):
             raise SystemExit("--config replays directly; only --seeds may override the saved config")
         command = [sys.executable, "-m", "barl_jax.launch.worker", "--config", args.config]
         if args.seeds is not None:
             command += ["--seeds", str(args.seeds)]
         raise SystemExit(subprocess.call(command))
+
+    if args.eval_config:
+        if args.validate or args.skip_check:
+            raise SystemExit("--eval-config evaluates, not trains; --validate/--skip-check don't apply")
+        return submit_eval_config(args)
 
     if args.from_sweep:
         if args.validate or args.skip_check:

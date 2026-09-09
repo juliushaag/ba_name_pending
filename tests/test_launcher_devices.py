@@ -17,6 +17,16 @@ from barl_jax.launch import executors, grid
 LAUNCH = pathlib.Path(grid.__file__).parent
 
 
+def _load_submit():
+    """scripts/submit.py isn't a package module -- same load-by-path trick
+    tests/test_evaluate.py uses for scripts/evaluate.py."""
+    spec = importlib.util.spec_from_file_location(
+        "submit", pathlib.Path(__file__).resolve().parent.parent / "scripts/submit.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_check_config_leaves_no_device_var_behind(monkeypatch):
     """The launcher's own environment is what sbatch --export=ALL, tmux and
     LocalExecutor hand to every run of the sweep, so the config check must not
@@ -107,31 +117,27 @@ def test_batch_tags_defaults_to_one_batch_and_chunks_when_given_a_size():
 def test_materialize_eval_writes_one_self_contained_config_per_batch(tmp_path):
     import yaml
 
-    tags = ["SAC_HalfCheetah_1seeds", "NCLQL_HalfCheetah_1seeds", "DIME_HalfCheetah_1seeds"]
-    runs = grid.materialize_eval(tags, from_sweep=str(tmp_path / "trained"), batch_size=2,
-                                 eval_defaults={"episodes": 5}, sweep_dir=str(tmp_path / "evals"))
+    entries = [{"path": "/trained/SAC_HalfCheetah_1seeds"},
+              {"path": "/trained/NCLQL_HalfCheetah_1seeds", "env": "HalfCheetah"},
+              {"path": "/trained/DIME_HalfCheetah_1seeds"}]
+    runs = grid.materialize_eval(entries, batch_size=2, eval_defaults={"episodes": 5},
+                                 sweep_dir=str(tmp_path / "evals"))
 
     assert [r.kind for r in runs] == ["eval", "eval"]
-    assert [len(r.combo["tags"]) for r in runs] == [2, 1]
+    assert [len(r.combo["paths"]) for r in runs] == [2, 1]
 
     first = yaml.safe_load((tmp_path / "evals" / runs[0].config).read_text())
     assert first["defaults"] == {"episodes": 5}
     assert first["output"] == str(tmp_path / "evals" / "batch000" / "results.json")
-    assert first["runs"] == [
-        {"path": str(tmp_path / "trained" / "SAC_HalfCheetah_1seeds")},
-        {"path": str(tmp_path / "trained" / "NCLQL_HalfCheetah_1seeds")},
-    ]
+    assert first["runs"] == entries[:2]
 
     second = yaml.safe_load((tmp_path / "evals" / runs[1].config).read_text())
-    assert second["runs"] == [{"path": str(tmp_path / "trained" / "DIME_HalfCheetah_1seeds")}]
+    assert second["runs"] == entries[2:]
 
 
 @pytest.mark.parametrize("exit_code", [0, 2, None])
 def test_submit_sweep_records_results_and_propagates_failure(tmp_path, exit_code):
-    spec = importlib.util.spec_from_file_location(
-        "submit", pathlib.Path(__file__).resolve().parent.parent / "scripts/submit.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = _load_submit()
     submit_sweep = module.submit_sweep
     class FakeExecutor:
         blocking = True
@@ -148,6 +154,24 @@ def test_submit_sweep_records_results_and_propagates_failure(tmp_path, exit_code
         with pytest.raises(SystemExit, match="1"):
             submit_sweep(*args, max_parallel=1)
     assert (tmp_path / "sweep.yaml").is_file()
+
+
+def test_eval_config_and_from_sweep_are_mutually_exclusive():
+    module = _load_submit()
+    with pytest.raises(SystemExit):
+        module.parse_args(["--eval-config", "x.yaml", "--from-sweep", "y"])
+
+
+def test_eval_config_rejects_axes_flags():
+    module = _load_submit()
+    with pytest.raises(SystemExit):
+        module.parse_args(["--eval-config", "x.yaml", "--algos", "SAC"])
+
+
+def test_eval_config_rejects_from_sweep_only_flags():
+    module = _load_submit()
+    with pytest.raises(SystemExit):
+        module.parse_args(["--eval-config", "x.yaml", "--checkpoint", "final"])
 
 
 def test_grid_rejects_ignored_base_config(tmp_path):
@@ -201,10 +225,7 @@ def test_submit_eval_end_to_end_through_local_executor(tmp_path):
         (trained / tag / "config.yaml").write_text(
             f"runs: [{{model: {algo}, env: HalfCheetah, seed: 0}}]\n")
 
-    spec = importlib.util.spec_from_file_location(
-        "submit", pathlib.Path(__file__).resolve().parent.parent / "scripts/submit.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = _load_submit()
 
     sweep_dir = tmp_path / "evals"
     args = module.parse_args([
@@ -218,6 +239,52 @@ def test_submit_eval_end_to_end_through_local_executor(tmp_path):
 
     results = json.loads((sweep_dir / "batch000" / "results.json").read_text())
     assert len(results) == 2
+    for row in results.values():
+        assert "error" not in row
+        assert math.isfinite(row["default"]["mean_return"])
+
+
+def test_submit_eval_config_end_to_end_through_local_executor(tmp_path):
+    """--eval-config, all the way through: two checkpoints saved with no
+    training-sweep tag structure at all (no config.yaml to infer env from --
+    the point of --eval-config over --from-sweep) and an explicit `env:` per
+    entry in a hand-authored eval.yaml, submitted via a real LocalExecutor
+    subprocess, real results.json."""
+    import json
+    import math
+
+    from barl_jax.checkpoints import save_policy
+    from barl_jax.env import Environment
+    from barl_jax.policy import Policy
+
+    checkpoints = {}
+    for name, algo in [("agent-a", "SAC"), ("agent-b", "NCLQL")]:
+        env_obj = Environment.class_for("HalfCheetah")()
+        env = env_obj.get_env()
+        try:
+            policy = Policy.make(algo, env, env_stats=env_obj.get_env_stats(env), seed=0)
+            path = tmp_path / "somewhere" / name / "best"
+            save_policy(policy, path)
+            checkpoints[name] = path
+        finally:
+            env.close()
+
+    import yaml
+    eval_config = tmp_path / "eval.yaml"
+    eval_config.write_text(yaml.safe_dump({
+      "defaults": {"episodes": 2, "num_candidates": 1},
+      "runs": [{"path": str(p), "env": "HalfCheetah"} for p in checkpoints.values()],
+    }))
+
+    module = _load_submit()
+
+    sweep_dir = tmp_path / "evals"
+    args = module.parse_args(["--eval-config", str(eval_config), "--executor", "local",
+                              "--sweep-dir", str(sweep_dir)])
+    module.submit_eval_config(args)
+
+    results = json.loads((sweep_dir / "batch000" / "results.json").read_text())
+    assert set(results) == {str(p) for p in checkpoints.values()}
     for row in results.values():
         assert "error" not in row
         assert math.isfinite(row["default"]["mean_return"])

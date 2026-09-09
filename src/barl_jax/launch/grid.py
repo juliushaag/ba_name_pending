@@ -272,33 +272,38 @@ def materialize(combos: list[dict], tags: list[str], *, defaults: dict, sweep_di
   return runs
 
 
-def batch_tags(tags: list[str], batch_size: int | None) -> list[list[str]]:
-  """Chunks of `batch_size` (default: all of them, one chunk total). Pure and
-  side-effect-free on purpose -- separate from `materialize_eval()` so a
-  caller can preview the grouping (submit.py's --dry-run) without writing
-  anything to disk first."""
-  batch_size = batch_size or len(tags)
-  return [tags[i:i + batch_size] for i in range(0, len(tags), batch_size)]
+def batch_tags(items: list, batch_size: int | None) -> list[list]:
+  """Chunks of `batch_size` (default: all of them, one chunk total) -- tags
+  (`--from-sweep`) or eval entry dicts (`--eval-config`), `materialize_eval()`
+  doesn't care which. Pure and side-effect-free on purpose -- separate from
+  `materialize_eval()` so a caller can preview the grouping (submit.py's
+  --dry-run) without writing anything to disk first."""
+  batch_size = batch_size or len(items)
+  return [items[i:i + batch_size] for i in range(0, len(items), batch_size)]
 
 
-def materialize_eval(tags: list[str], *, from_sweep: str, batch_size: int | None,
+def materialize_eval(entries: list[dict], *, batch_size: int | None,
                      eval_defaults: dict, sweep_dir: str) -> list[Run]:
-  """Groups `tags` (the exact combo tags `name_combos()` produced -- identical
-  to what the earlier training submission wrote under `from_sweep`) into
+  """Groups `entries` -- each a full `scripts/evaluate.py --config` `runs:`
+  item (`{path, env?, ...}`, see experiments/eval.yaml for the schema) -- into
   batches of `batch_size` (default: all of them, one batch total -- eval is
   cheap enough that one task per checkpoint would waste a node's worth of
-  scheduling overhead), writes one self-contained `eval.yaml` per batch --
-  the exact `{output, defaults, runs}` shape `scripts/evaluate.py --config`
-  already reads -- and returns one `kind='eval'` Run per batch.
+  scheduling overhead), writes one self-contained `eval.yaml` per batch (the
+  exact shape `evaluate.py --config` already reads) and returns one
+  `kind='eval'` Run per batch.
 
-  `env` is deliberately not set per entry: `evaluate.py`'s own discovery reads
-  it from `<from_sweep>/<tag>/config.yaml`, the same file `materialize()`
-  wrote there when this tag was trained. A tag with no matching checkpoint (a
-  combo that was never actually trained, or trained under a different
-  `num_seeds`) surfaces as a per-checkpoint `error` entry in that batch's
-  results.json -- evaluate_entry's own isolation, not something to special-case
-  here."""
-  batches = batch_tags(tags, batch_size)
+  This is submit.py's one path from "some checkpoints to evaluate" to
+  submitted `Run`s, whichever mode built `entries`: `--eval-config` reads them
+  straight from a hand-authored file (they already carry whatever `path`/
+  `env`/overrides the user wrote); `--from-sweep` synthesizes
+  `{"path": "<from_sweep>/<tag>"}` per axis combo, one tag per entry, `env`
+  always omitted -- `evaluate.py`'s own discovery reads it from
+  `<from_sweep>/<tag>/config.yaml`, the same file `materialize()` wrote there
+  when that tag was trained. Either way, an entry with no matching checkpoint
+  (never trained, or under a different `num_seeds`) surfaces as a
+  per-checkpoint `error` in that batch's results.json -- evaluate_entry's own
+  isolation, not something to special-case here."""
+  batches = batch_tags(entries, batch_size)
 
   runs = []
   for index, batch in enumerate(batches):
@@ -311,12 +316,12 @@ def materialize_eval(tags: list[str], *, from_sweep: str, batch_size: int | None
     # still wins if given -- evaluate.py's main() takes --output over a
     # config's own `output:`).
     config = {"output": os.path.join(os.path.abspath(batch_dir), "results.json"),
-              "defaults": eval_defaults,
-              "runs": [{"path": os.path.join(os.path.abspath(from_sweep), t)} for t in batch]}
+              "defaults": eval_defaults, "runs": batch}
     with open(os.path.join(batch_dir, "eval.yaml"), "w") as f:
       yaml.safe_dump(config, f, sort_keys=False)
 
-    runs.append(Run(index=index, tag=tag, combo={"tags": batch}, dir=tag,
+    paths = [entry["path"] for entry in batch]
+    runs.append(Run(index=index, tag=tag, combo={"paths": paths}, dir=tag,
                     config=os.path.join(tag, "eval.yaml"), kind="eval"))
   return runs
 
