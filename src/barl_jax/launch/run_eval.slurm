@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #SBATCH --job-name=eval
-#SBATCH --partition=gpu_a100_il,gpu_h100_il,gpu_h100
+#SBATCH --partition=gpu_a100_short,gpu_h100_short
 
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -18,7 +18,7 @@
 
 #SBATCH --signal=B:USR1@300
 
-#SBATCH --time=02:00:00
+#SBATCH --time=00:30:00
 
 # run_rl.slurm's sibling for evaluation: one array task per *batch* of
 # checkpoints (scripts/submit.py --from-sweep groups several {algo, env}

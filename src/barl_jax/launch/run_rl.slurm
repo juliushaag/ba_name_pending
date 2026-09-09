@@ -18,7 +18,7 @@
 
 #SBATCH --signal=B:USR1@300
 
-#SBATCH --time=10:00:00
+#SBATCH --time=12:00:00
 
 # One array task per row of the manifest scripts/submit.py wrote -- i.e. one per
 # point of the grid, whatever the grid varied. Submit with that script, never
