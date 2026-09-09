@@ -1,5 +1,0 @@
-# Compare GELU and SiLU with every other SDAC setting fixed.
-axes:
-  algo: [SDAC]
-  env: [HalfCheetah]
-  model.components.actor.activation: [gelu, silu]

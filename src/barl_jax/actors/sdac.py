@@ -73,7 +73,7 @@ class DDPMActor(ActorOptim, Actor):
   # trained, not algorithm logic. See `best_of_n`/`generate_action`/`loss`
   # below.
   num_bon      = Config(8)
-  num_candidates = Config(24)
+  num_candidates = Config(12)
   softmax_temp = Config(0.25)
   explore_init = Config(0.1)
   explore_min  = Config(1.0e-3)

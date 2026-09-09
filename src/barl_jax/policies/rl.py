@@ -169,7 +169,17 @@ class MaxEntRLPolicy(RLPolicy):
   SLOT_OBJECTIVES = {"critic": "td"}
   entropy_scale     = Config(-1.0)
   entropy_in_target = Config(True)
-  alpha_granularity = Config("per_action")
+  # Docstring above: "'per_chunk' (default) ... exactly as before" -- every
+  # checkpoint saved before this knob existed trained with one scalar alpha
+  # for the whole plan, which is what 'per_chunk' reproduces. That default
+  # previously read 'per_action' here, contradicting the docstring: every new
+  # run silently trained per-action instead, and it broke loading any older
+  # checkpoint outright (config/tree.py's own snapshot-replay fallback for a
+  # key the old snapshot never saw picks *this* default -- 'per_action' backs
+  # AutotuneRegulator.log_alpha with (chunk_size,) instead of the scalar `()`
+  # shape those checkpoints actually saved it at, so orbax's restore rejects
+  # the shape mismatch outright).
+  alpha_granularity = Config("per_chunk")
 
   def __init__(self, env: gym.Env, **kwargs):
     super().__init__(env, **kwargs)

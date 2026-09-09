@@ -156,8 +156,16 @@ class ScoreContinuousActor(ActorOptim, Actor):
     rollout_key, tau_key, noise_key = jax.random.split(key, 3)
     alpha = jax.lax.stop_gradient(jnp.asarray(alpha))
 
+    # generate_action() reshapes to (B, chunk_size, action_dim) before
+    # returning -- the public Actor.generate_action contract every other
+    # actor's action also has. Everything below is internal, plan-resolution
+    # math (chunk_sum, bridge_sample, chunk_broadcast, `field`'s TimeConditio-
+    # nedField(..., self.plan_dim, ...)), all built against the flat (B,
+    # plan_dim) shape generate_action's own SDE rollout uses *before* that
+    # reshape -- so it is undone immediately, not left for the critic and the
+    # control net to each rediscover their own shape mismatch.
     X, _ = self.generate_action(obs, key=rollout_key, squash=False)
-    X = jax.lax.stop_gradient(X)
+    X = jax.lax.stop_gradient(X).reshape(X.shape[0], -1)
 
     def q_values(critic, x):
       return critic.value(obs, self.squash(x)).sum()

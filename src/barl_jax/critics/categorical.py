@@ -28,8 +28,6 @@ class CategoricalCriticBase(QCriticBase, CriticDistConfig):
     norm_kwargs={'momentum': 0.99, 'warmup_steps': 100000, 'epsilon': 0.001, 'r_max': 3.0, 'd_max': 5.0},
     dtype='bfloat16')
 
-  lr = Config(7e-4)
-
   def __init__(self, env_stats, config: ConfigMixin, q_function, support, **kwargs):
     super().__init__(env_stats, config, q_function, **kwargs)
 

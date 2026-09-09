@@ -1,0 +1,42 @@
+# Full algorithm comparison across 16 environments: 4 DeepMind Control Suite
+# locomotion tasks (HumanoidRun, HumanoidWalk, DogRun, DogTrot) plus 12
+# HumanoidBench (Sferrazza et al. 2024) tasks, chosen for variety rather than
+# difficulty alone -- one from each near-duplicate simple/hard pair, and
+# skipping H1Hand{Walk,Run,Stand} since HumanoidRun/HumanoidWalk above already
+# cover plain bipedal locomotion:
+#
+#   - Crawl, Hurdle, Maze, Stair, Slide, HighbarHard: locomotion under an
+#     added constraint (posture, obstacle, navigation, dynamic swinging)
+#     rather than flat-ground gait.
+#   - Push, Cube, Basketball, Kitchen, Package, Truck: manipulation ranging
+#     from single dexterous placement to multi-stage/multi-object tasks with
+#     sparse completion bonuses.
+#
+# Dry run:
+#   uv run python scripts/submit.py --grid experiments/dmc_hb_16env_sweep.yaml --dry-run
+#
+# Real submission:
+#   uv run python scripts/submit.py --grid experiments/dmc_hb_16env_sweep.yaml
+
+axes:
+  algo: [NCLQL, SAC, SDAC, DIME, AMDP]
+  env:
+    - HumanoidRun
+    - HumanoidWalk
+    - DogRun
+    - DogTrot
+    - H1HandCrawl
+    - H1HandHurdle
+    - H1HandMaze
+    - H1HandStair
+    - H1HandSlide
+    - H1HandHighbarHard
+    - H1HandPush
+    - H1HandCube
+    - H1HandBasketball
+    - H1HandKitchen
+    - H1HandPackage
+    - H1HandTruck
+  seed: [0]
+
+exclude: []
