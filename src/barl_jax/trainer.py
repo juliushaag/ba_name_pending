@@ -438,14 +438,7 @@ def _train(run: Run):
   # `eval_video_every: null` means never, so the render env is not built either
   # -- one fewer mujoco model resident, and no GL context to create at all.
   wants_video = cfg["eval_video_every"] is not None
-
-  # One video slot per seed (see evaluate()'s video block) -- `render=True`
-  # only for this dedicated env; every other env in this run (the reference/
-  # rollout envs in _setup, scripts/evaluate.py's, and this one when videos
-  # are off) defaults to no renderer at all.
-  eval_envs = (run.own(run.environment.get_vector_env(num_seeds)),
-               run.own(run.environment.get_vector_env(num_seeds, asynchronous=False, render=True))
-               if wants_video else None)
+  eval_env = run.own(run.environment.get_vector_env(num_seeds))
 
   tags = [run.model_name, run.env_name, "online", "jax", "multiseed"]
   if cfg["sweep_tag"]:
@@ -484,6 +477,24 @@ def _train(run: Run):
               f"({num_seeds * run.num_envs} rollout envs, "
               f"{run.num_params / 1e6:.2f}M params each)")
 
+  # One video slot per seed (see evaluate()'s video block) -- `render=True`
+  # only for this dedicated env; every other env in this run (the reference/
+  # rollout envs in _setup, scripts/evaluate.py's, and this one when videos
+  # are off) defaults to no renderer at all. Built after `log` exists (not
+  # alongside `eval_env` above) so a construction failure can be reported and
+  # the run can carry on without video -- a headless node's GL/EGL context is
+  # not required for training, only for this one optional artifact, and
+  # should never take an otherwise-healthy run down with it.
+  render_env = None
+  if wants_video:
+    try:
+      render_env = run.own(run.environment.get_vector_env(num_seeds, asynchronous=False, render=True))
+    except Exception as exc:
+      wants_video = False
+      log.message(f"WARNING: could not create the video render env ({exc!r}); "
+                  f"disabling eval videos for this run.")
+  eval_envs = (eval_env, render_env)
+
   warmup_stats = warmup(run, eval_envs, log)
 
   steps_per_iter = cfg["rollout_steps"] // run.num_envs
@@ -505,7 +516,7 @@ def _train(run: Run):
   # In evals, not env steps -- checked against run.eval_count (not restored on
   # resume, so this always restarts counting from the top, same as eval_count
   # itself) rather than a precomputed env-step threshold like next_eval's.
-  video_every = cfg["eval_video_every"]
+  video_every = cfg["eval_video_every"] if wants_video else None
   next_eval = (log.get_step("env_steps") // eval_every + 1) * eval_every
   # Resume persistence is its own cadence -- independent of eval_every, since
   # the replay dump it carries is what makes a save expensive, not the eval.
