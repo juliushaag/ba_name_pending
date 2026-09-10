@@ -34,7 +34,7 @@ class DMControlEnvironment(Environment):
   its Dict observation into a single flat Box (every Policy/MLP here assumes
   that shape). Online-only, like MuJoCoGymEnvironment."""
 
-  use_async_vector_env = True
+  use_async_vector_env = False
 
   # dime_am's tuned DMC value, `v_min: -200, v_max: 200` at `n_atoms: 101` --
   # reward in [0, 1] over a 1000-step horizon, so the discounted value is
