@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-import barl_jax.execution as execution
+import barl_jax.executors as executors
 
 
 def stack(pairs):
@@ -32,11 +32,25 @@ def unstack(graphdef, state, index: int):
   return nnx.merge(graphdef, jax.tree.map(lambda x: x[index], state))
 
 
+class SeedActor:
+  """Presents one seed's `Policy` to `run_episodes()` with an action executor
+  bound at construction -- the single-env, non-stacked analog of
+  `StackedPolicy`, for evaluating (or rendering) one seed on its own instead
+  of every seed in one vmapped pass."""
+
+  def __init__(self, policy, executor: "executors.ActionExecutor" = None):
+    self.policy, self.executor = policy, executor
+    self.chunk_size, self.action_dim = policy.chunk_size, policy.action_dim
+
+  def inference_fn(self):
+    return self.policy.inference_fn(executor=self.executor)
+
+
 class StackedPolicy:
   """Presents N stacked policies to `run_episodes()` as if they were one."""
 
   def __init__(self, graphdef, state, num_seeds: int, num_envs: int, reference,
-              *, execution_spec: "execution.ExecutionSpec" = None):
+              *, executor: "executors.ActionExecutor" = None):
     self._graphdef = graphdef
     self._state    = state
     self.num_seeds = num_seeds
@@ -46,14 +60,16 @@ class StackedPolicy:
     self.action_dim = reference.action_dim
     self.action_discrete = reference.action_discrete
     self._bounds = reference.action_bounds_numpy()
-    self._spec = execution_spec
+    self._executor = executor
 
   def action_bounds_numpy(self):
     return self._bounds
 
   def inference_fn(self):
+    is_direct = self._executor is None or self._executor.is_direct
+    executor_config = None if is_direct else self._executor.config
     return partial(_stacked_infer, _eval_graphdef(self._graphdef, self._state),
-                   self.num_seeds, self.num_envs, self._spec, self._state)
+                   self.num_seeds, self.num_envs, executor_config, self._state)
 
 
 _EVAL_GRAPHDEF: dict = {}
@@ -71,17 +87,18 @@ def _eval_graphdef(graphdef, state):
 
 
 @partial(jax.jit, static_argnums=(0, 1, 2, 3))
-def _stacked_infer(graphdef, num_seeds, num_envs, spec, state, observation, key):
+def _stacked_infer(graphdef, num_seeds, num_envs, executor_config, state, observation, key):
   obs = observation.reshape(num_seeds, num_envs, *observation.shape[1:])
   keys = jax.random.split(key, num_seeds)
 
   def one(state, obs, key):
     policy, _ = nnx.merge(graphdef, state)
-    if spec is None or spec.mode == "default":
+    if executor_config is None:
       return policy.inference_step(obs, key=key)
+    executor = executors.executor_from_config(executor_config)
     infer_step = lambda o, k: policy.inference_step(o, key=k)
-    score_fn = policy.score if spec.mode in execution.SCORE_GUIDED_MODES else None
-    return execution.act(infer_step, score_fn, obs, key, spec)
+    score_fn = policy.score if executor.needs_score else None
+    return executor.select(infer_step, score_fn, obs, key)
 
   action, extras = jax.vmap(one)(state, obs, keys)
   flat = lambda x: x.reshape(num_seeds * num_envs, *x.shape[2:])

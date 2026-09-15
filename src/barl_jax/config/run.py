@@ -18,15 +18,16 @@ from barl_jax.config.schemas import (
   ComponentsConfig,
   EnvironmentConfig,
   ModelConfig,
+  component_to_dict,
   environment_schema,
   model_schema,
   model_to_runtime_dict,
   resolve_model,
 )
 from barl_jax.config.serialization import merge as deep_merge_dataclass
-from barl_jax.execution import MODES as EXECUTION_MODES
+from barl_jax.executors import DirectExecutorConfig, ExecutorConfig
 from barl_jax.optimization import CLIP_MODES
-from barl_jax.registration import get_component
+from barl_jax.registration import available_executors, get_component, get_executor
 
 
 @dataclass(frozen=True)
@@ -69,10 +70,8 @@ class RunConfig:
   compile_cache_dir: str | None = "~/.cache/barl_jax/jax"
   resume_every: int | None = 50_000
   resume_keep: int = 2
-  collection_mode: str = "default"
-  collection_candidates: int = 1
-  eval_mode: str = "default"
-  eval_candidates: int = 1
+  collection_executor: ExecutorConfig = field(default_factory=DirectExecutorConfig)
+  eval_executor: ExecutorConfig = field(default_factory=DirectExecutorConfig)
   snapshot: dict[str, Any] | None = None
   model_config: ModelConfig = field(default_factory=lambda: model_schema("SAC")())
   env_config: EnvironmentConfig = field(default_factory=lambda: environment_schema("HalfCheetah")())
@@ -131,7 +130,8 @@ class RunConfig:
     result = base
     run_updates = {}
     for f in fields(cls):
-      if f.name in ("model", "env", "profile", "snapshot", "model_config", "env_config"):
+      if f.name in ("model", "env", "profile", "snapshot", "model_config", "env_config",
+                    "collection_executor", "eval_executor"):
         continue
       input_name = "validate" if f.name == "validate_config" else f.name
       if input_name not in mapping:
@@ -151,6 +151,13 @@ class RunConfig:
                                   else deepcopy(dict(mapping["snapshot"])))
     if run_updates:
       result = replace(result, **run_updates)
+
+    executor_updates = {}
+    for key in ("collection_executor", "eval_executor"):
+      if key in mapping:
+        executor_updates[key] = _resolve_executor_config(mapping[key], path=key)
+    if executor_updates:
+      result = replace(result, **executor_updates)
 
     if "env_metadata" in mapping:
       metadata = mapping["env_metadata"]
@@ -180,10 +187,16 @@ class RunConfig:
   def to_dict(self) -> dict[str, Any]:
     out = {}
     for f in fields(self):
-      if f.name in ("model_config", "env_config"):
+      if f.name in ("model_config", "env_config", "collection_executor", "eval_executor"):
         continue
       output_name = "validate" if f.name == "validate_config" else f.name
       out[output_name] = deepcopy(getattr(self, f.name))
+    # Plain-dict, not the live dataclass instance: `training_checkpoint.py`'s
+    # validate_resume() diffs this against a JSON-round-tripped saved copy
+    # field by field, and a dataclass instance never compares equal to the
+    # dict json.loads() hands back for the same value.
+    out["collection_executor"] = component_to_dict(self.collection_executor)
+    out["eval_executor"] = component_to_dict(self.eval_executor)
     # Keep the input section name, but write the complete effective model.  A
     # saved file can therefore be loaded without any package default tables.
     out["model_overrides"] = self.model_config.to_dict()
@@ -231,8 +244,14 @@ class RunConfig:
 
 # Run fields are retained as a plain mapping for small legacy callers.  They no
 # longer carry Config declarations and are never consulted by RunConfig.defaults.
+# collection_executor/eval_executor are `default_factory` fields -- `f.default`
+# is `dataclasses.MISSING` for those, so they're excluded from the comprehension
+# and given their real (canonical-dict) default explicitly instead.
 RUN_CONFIGS = {("validate" if f.name == "validate_config" else f.name): f.default for f in fields(RunConfig)
-               if f.name not in {"model", "env", "profile", "snapshot", "model_config", "env_config"}}
+               if f.name not in {"model", "env", "profile", "snapshot", "model_config", "env_config",
+                                 "collection_executor", "eval_executor"}}
+RUN_CONFIGS["collection_executor"] = {"class": "DirectExecutor"}
+RUN_CONFIGS["eval_executor"] = {"class": "DirectExecutor"}
 INJECTED_KEYS = frozenset({"model", "env", "profile", "model_overrides", "snapshot"})
 
 
@@ -289,6 +308,26 @@ def _normal_component_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
       raise KeyError("component override cannot contain both 'class' and 'class_name'")
     value["class_name"] = value.pop("class")
   return value
+
+
+def _resolve_executor_config(raw: Mapping[str, Any], *, path: str) -> ExecutorConfig:
+  """A `class`/`class_name`-tagged mapping -> a fresh, fully typed executor
+  config. Unlike `model_overrides.components.<slot>` (`_apply_component_override`
+  below) there is no prior instance to merge onto here -- `collection_executor`/
+  `eval_executor` are always constructed from scratch, so a mapping that names
+  the field at all must name its class too."""
+  if not isinstance(raw, Mapping):
+    raise TypeError(f"{path} must be a mapping, got {type(raw).__name__}")
+  value = _normal_component_mapping(raw)
+  if "class_name" not in value:
+    raise KeyError(f"{path}: must name a 'class' (available executors: {available_executors()})")
+  name = value.pop("class_name")
+  config_type = get_executor(name).config_type
+  from barl_jax.config.serialization import construct
+  try:
+    return construct(config_type, value, path=path)
+  except (KeyError, TypeError) as exc:
+    raise KeyError(f"{path}: cannot materialize {config_type.__name__}: {exc}") from exc
 
 
 def _selected_time_style(name: str):
@@ -380,7 +419,8 @@ def _mapping_problems(cfg: Mapping[str, Any]) -> list[str]:
   hints = get_type_hints(RunConfig)
   for key, expected in hints.items():
     input_key = "validate" if key == "validate_config" else key
-    if key in ("model_config", "env_config") or input_key not in cfg:
+    if key in ("model_config", "env_config", "collection_executor", "eval_executor") \
+       or input_key not in cfg:
       continue
     if not _is_instance(cfg[input_key], expected):
       problems.append(f"{input_key}={cfg[input_key]!r}: expected {_type_name(expected)}")
@@ -449,15 +489,13 @@ def _cross_run_problems(cfg: Mapping[str, Any]) -> list[str]:
       steps = cfg.get(key)
       if isinstance(steps, int) and not isinstance(steps, bool) and steps % num_envs:
         fail(key, steps, f"must be divisible by num_envs ({num_envs})")
-  for mode_key, n_key in (("collection_mode", "collection_candidates"),
-                          ("eval_mode", "eval_candidates")):
-    selected, count = cfg.get(mode_key), cfg.get(n_key)
-    if selected not in EXECUTION_MODES:
-      fail(mode_key, selected, f"must be one of {EXECUTION_MODES}")
-    if not isinstance(count, int) or isinstance(count, bool) or count < 1:
-      fail(n_key, count, "must be a positive int")
-    elif selected == "default" and count != 1:
-      fail(n_key, count, "must be 1 when mode is 'default'")
+  for key in ("collection_executor", "eval_executor"):
+    value = cfg.get(key)
+    if value is not None:
+      try:
+        _resolve_executor_config(value, path=key)
+      except (KeyError, TypeError, ValueError) as exc:
+        problems.append(str(exc))
   return problems
 
 

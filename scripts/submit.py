@@ -33,7 +33,8 @@ import yaml
 from barl_jax.launch import grid
 from barl_jax.launch.executors import EXECUTORS, SWEEP_NAME_FORMAT, SWEEPS_DIR, resolve
 
-EVAL_MODES = ("default", "mean", "median", "bon", "topk", "axis_shuffle", "perturb")
+EVAL_MODES = ("DirectExecutor", "MeanExecutor", "MedianExecutor", "BestOfNExecutor",
+              "TopKExecutor", "AxisShuffleExecutor", "PerturbExecutor")
 
 
 def submit_sweep(executor, runs, sweep_name, sweep_dir, head, *,
@@ -127,8 +128,8 @@ def parse_args(argv=None):
                          "total -- pass a smaller number for more parallelism).")
     ev.add_argument("--checkpoint", choices=("best", "final"), default="best",
                     help="--from-sweep only.")
-    ev.add_argument("--mode", nargs="+", choices=EVAL_MODES, default=["default"],
-                    help="--from-sweep only. Action-selection mode(s), see barl_jax.execution.")
+    ev.add_argument("--mode", nargs="+", choices=EVAL_MODES, default=["DirectExecutor"],
+                    help="--from-sweep only. Action executor class name(s), see barl_jax.executors.")
     ev.add_argument("--episodes", type=int, default=10, help="--from-sweep only.")
     ev.add_argument("--num-envs", type=int, default=8, help="--from-sweep only.")
     ev.add_argument("--num-candidates", type=int, default=8, help="--from-sweep only.")
@@ -149,7 +150,7 @@ def parse_args(argv=None):
                      "evaluate; pass only one")
     if args.batch_size is not None and not (args.eval_config or args.from_sweep):
         parser.error("--batch-size only applies with --eval-config or --from-sweep")
-    if not args.from_sweep and (args.checkpoint != "best" or args.mode != ["default"]
+    if not args.from_sweep and (args.checkpoint != "best" or args.mode != ["DirectExecutor"]
                                 or args.episodes != 10 or args.num_envs != 8
                                 or args.num_candidates != 8 or args.top_k != 2
                                 or args.sigma != 0.1 or args.seed != 0):

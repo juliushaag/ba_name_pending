@@ -167,7 +167,7 @@ class RLPolicy(Policy):
     obs = self._obs(observation)
     return self.action_chunk(self.actor.sample(obs, critic=self.critic, key=key)), {}
 
-  # ---- Best-of-N scoring (barl_jax.execution) -------------------------
+  # ---- Best-of-N scoring (barl_jax.executors) --------------------------
 
   @property
   def supports_bon(self):

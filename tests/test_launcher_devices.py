@@ -256,7 +256,7 @@ def test_submit_eval_end_to_end_through_local_executor(tmp_path):
     assert len(results) == 2
     for row in results.values():
         assert "error" not in row
-        assert math.isfinite(row["default"]["mean_return"])
+        assert math.isfinite(row["DirectExecutor"]["mean_return"])
 
 
 def test_submit_eval_config_end_to_end_through_local_executor(tmp_path):
@@ -302,4 +302,4 @@ def test_submit_eval_config_end_to_end_through_local_executor(tmp_path):
     assert set(results) == {str(p) for p in checkpoints.values()}
     for row in results.values():
         assert "error" not in row
-        assert math.isfinite(row["default"]["mean_return"])
+        assert math.isfinite(row["DirectExecutor"]["mean_return"])

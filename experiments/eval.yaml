@@ -6,7 +6,7 @@
 # run directory, or a whole sweep (every seed's checkpoint under it, same
 # discovery as the plain `scripts/evaluate.py <path>` CLI). Any key a run
 # entry omits falls back to `defaults:` below, then evaluate.py's own CLI
-# defaults (see --help): checkpoint: best, mode: [default], episodes: 10,
+# defaults (see --help): checkpoint: best, mode: [DirectExecutor], episodes: 10,
 # num_envs: 8, num_candidates: 8, top_k: 2, sigma: 0.1, seed: 0.
 #
 # `env` is optional -- omitted, it is read from the checkpoint's own saved
@@ -26,10 +26,10 @@ defaults:
 runs:
   # A sweep dir: every seed's `best` checkpoint, env read from its config.yaml.
   - path: sweeps/2026-08-27_13-23-15/SDAC_HumanoidRun_10seeds
-    mode: [default, mean, bon]
+    mode: [DirectExecutor, MeanExecutor, BestOfNExecutor]
 
   # One checkpoint saved without a config.yaml alongside it -- env is required.
   - path: checkpoints/amdp/halfcheetah/2026-08-25_11-23-21/best
     env: HalfCheetah
-    mode: [default, topk]
+    mode: [DirectExecutor, TopKExecutor]
     top_k: 3

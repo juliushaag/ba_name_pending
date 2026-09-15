@@ -30,9 +30,9 @@ from barl_jax.config.model import ModelSpec, experiment_fingerprint
 from barl_jax.config.run import RunConfig, validate_run
 from barl_jax.env import Environment
 from barl_jax.evaluation import run_episodes
-from barl_jax.execution import ExecutionSpec, validate_execution_spec
+from barl_jax.executors import executor_from_config
 from barl_jax.metrics import DEBUG, PRIMARY, to_host
-from barl_jax.multiseed import StackedPolicy, split_metrics, stack, unstack
+from barl_jax.multiseed import SeedActor, StackedPolicy, split_metrics, stack, unstack
 from barl_jax.optimization import seeded_chunk, seeded_step
 from barl_jax.policy import Policy
 from barl_jax.result import presentable, write_json_atomic
@@ -145,8 +145,7 @@ def _setup(run, *, validate_only):
       run_dir=cfg.run_dir, sweep_tag=cfg.sweep_tag, logger=cfg.logger,
       eval_every=cfg.eval_every, eval_runs=cfg.eval_runs,
       eval_video_every=cfg.eval_video_every, log_every=cfg.log_every,
-      debug_every=cfg.debug_every, eval_mode=cfg.eval_mode,
-      eval_candidates=cfg.eval_candidates,
+      debug_every=cfg.debug_every, eval_executor=cfg.eval_executor,
       resume_every=cfg.resume_every, resume_keep=cfg.resume_keep,
       compile_cache_dir=cfg.compile_cache_dir,
       wandb_finish_timeout=cfg.wandb_finish_timeout,
@@ -232,11 +231,11 @@ def _setup(run, *, validate_only):
     restore_training(run, resume_meta)
   run.num_params = run.reference.num_params()
 
-  run.collection_spec = ExecutionSpec(mode=cfg.collection_mode, num_candidates=cfg.collection_candidates)
-  run.eval_spec = ExecutionSpec(mode=cfg.eval_mode, num_candidates=cfg.eval_candidates)
-  spec_problems = [f"{label}: {p}" for label, spec in
-                   (("collection", run.collection_spec), ("eval", run.eval_spec))
-                   for p in validate_execution_spec(spec, policy=run.reference)]
+  run.collection_executor = executor_from_config(cfg.collection_executor)
+  run.eval_executor = executor_from_config(cfg.eval_executor)
+  spec_problems = [f"{label}: {p}" for label, executor in
+                   (("collection", run.collection_executor), ("eval", run.eval_executor))
+                   for p in executor.validate(policy=run.reference)]
   if spec_problems:
     raise ValueError(f"{run.model_name}: invalid execution spec, refusing to start:\n  "
                      + "\n  ".join(spec_problems))
@@ -281,7 +280,7 @@ def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
   # One slot per seed; run_episodes reuses these slots for successive rounds.
   per_run  = cfg.eval_runs
   actor = StackedPolicy(run.graphdef, run.state, run.num_seeds, 1, run.reference,
-                        execution_spec=run.eval_spec)
+                        executor=run.eval_executor)
 
   # `eval/phase` is the one thing that reaches wandb *during* an eval, and it is
   # here because a killed run uploads no term.err: without it "died before the
@@ -313,21 +312,27 @@ def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
 
   ckpt_s = time.perf_counter() - t0
 
-  # One video episode per seed, on `render_env` (sized num_seeds, synchronous
-  # -- a forked worker's render() does not survive the fork). It is an *extra*
+  # One video episode, one seed, on `render_env` (sized 1, synchronous -- a
+  # forked worker's render() does not survive the fork). It is an *extra*
   # episode rather than one of the counted `eval_runs`: it cannot join the
   # main wave above (a VectorEnv renders all its sub-envs or none, at ~140x
-  # the env step), and holding every seed to the same episode count there is
-  # what keeps the per-seed numbers comparable. Reuses `actor`, so slot i is
-  # seed i exactly as it is in the main wave.
+  # the env step). Capped at one seed rather than one-per-seed (every seed
+  # used to get its own render_env sub-env, i.e. its own offscreen EGL/GL
+  # context) -- num_seeds simultaneous contexts is what was blowing past the
+  # GPU memory `XLA_PYTHON_CLIENT_MEM_FRACTION` leaves free on the cluster
+  # (mjr_render aborting the whole process with no python traceback, sweep
+  # 2026-08-27_13-23-15). Rotates which seed gets rendered across eval
+  # rounds so every seed is sampled over the run, just not all at once.
   video_s = 0.0
   if want_video:
     log.log({}, quiet={"eval/phase": PHASE_EVAL_VIDEO})
     t0 = time.perf_counter()
     video_seed = derive_seed(run.base_seed, "eval-video", run.eval_count - 1)
-    episodes = run_episodes(actor, render_env, run.num_seeds, render=True, seed=video_seed)
-    for i, r in enumerate(episodes):
-      log.log_video("eval/video", r["frames"], seed_index=i)
+    seed_index = (run.eval_count - 1) % run.num_seeds
+    policy, _ = unstack(run.graphdef, run.state, seed_index)
+    episode = run_episodes(SeedActor(policy, run.eval_executor), render_env, 1,
+                           render=True, seed=video_seed)[0]
+    log.log_video("eval/video", episode["frames"], seed_index=seed_index)
     video_s = time.perf_counter() - t0
 
   # Eval is already per-seed -- each seed owns one slot across all rounds --
@@ -447,7 +452,7 @@ def warmup(run: Run, envs, log) -> dict:
 
   t0 = time.perf_counter()
   actor = StackedPolicy(run.graphdef, run.state, run.num_seeds, 1, run.reference,
-                        execution_spec=run.eval_spec)
+                        executor=run.eval_executor)
   probe = jnp.zeros((run.num_seeds, run.env_stats["obs_dim"]), jnp.float32)
   jax.block_until_ready(actor.inference_fn()(probe, jax.random.PRNGKey(0)))
   out["time/warmup_compile_s"] = time.perf_counter() - t0
@@ -524,18 +529,21 @@ def _train(run: Run):
               f"({num_seeds * run.num_envs} rollout envs, "
               f"{run.num_params / 1e6:.2f}M params each)")
 
-  # One video slot per seed (see evaluate()'s video block) -- `render=True`
-  # only for this dedicated env; every other env in this run (the reference/
-  # rollout envs in _setup, scripts/evaluate.py's, and this one when videos
-  # are off) defaults to no renderer at all. Built after `log` exists (not
-  # alongside `eval_env` above) so a construction failure can be reported and
-  # the run can carry on without video -- a headless node's GL/EGL context is
-  # not required for training, only for this one optional artifact, and
-  # should never take an otherwise-healthy run down with it.
+  # One video slot, one seed (see evaluate()'s video block) -- sized 1, not
+  # num_seeds: each sub-env holds its own offscreen EGL/GL context, and
+  # num_seeds of those at once is what was exceeding the GPU memory left free
+  # on the cluster (see evaluate()'s comment). `render=True` only for this
+  # dedicated env; every other env in this run (the reference/rollout envs in
+  # _setup, scripts/evaluate.py's, and this one when videos are off) defaults
+  # to no renderer at all. Built after `log` exists (not alongside `eval_env`
+  # above) so a construction failure can be reported and the run can carry on
+  # without video -- a headless node's GL/EGL context is not required for
+  # training, only for this one optional artifact, and should never take an
+  # otherwise-healthy run down with it.
   render_env = None
   if wants_video:
     try:
-      render_env = run.own(run.environment.get_vector_env(num_seeds, asynchronous=False, render=True))
+      render_env = run.own(run.environment.get_vector_env(1, asynchronous=False, render=True))
     except Exception as exc:
       wants_video = False
       log.message(f"WARNING: could not create the video render env ({exc!r}); "
@@ -586,7 +594,7 @@ def _train(run: Run):
     while log.get_step("env_steps") < cfg.total_env_steps:
       iter_start = time.perf_counter()
       actor = StackedPolicy(run.graphdef, run.state, num_seeds, run.num_envs, run.reference,
-                            execution_spec=run.collection_spec)
+                            executor=run.collection_executor)
       rollout_stats = run.collector.collect(actor, env=run.rollout_env, n_steps=steps_per_iter,
                                          seed=run.base_seed + int(run.progress.get("env_steps", 0))
                                          if run.collector.state is None else None,
@@ -762,7 +770,7 @@ def _validate(run: Run):
   train_step + optimizer step, no eval/checkpointing/wandb logging."""
   cfg = run.cfg
   actor = StackedPolicy(run.graphdef, run.state, run.num_seeds, run.num_envs, run.reference,
-                        execution_spec=run.collection_spec)
+                        executor=run.collection_executor)
   run.collector.collect(actor, env=run.rollout_env, n_steps=cfg.batch_size,
                      seed=run.base_seed, discount=actor.discount, sink=run.buffer)
 

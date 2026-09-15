@@ -25,6 +25,43 @@ import gymnasium as gym
 from barl_jax.env import Environment, register_environment
 
 
+# `humanoid_bench.wrappers` and `.envs.{reach,push,package}` each do
+# `from humanoid_bench.mjx.flax_to_torch import TorchModel, TorchPolicy` at
+# module level -- an eager `import torch` -- but only wrappers.py's
+# SingleReachWrapper/DoubleReachBaseWrapper ever construct one, and neither
+# is used by any task registered below (this file wraps Reach/Push/Package's
+# own classes directly, not those wrappers). Pre-seeding sys.modules with a
+# stub for that one submodule, before `import humanoid_bench` below ever
+# triggers the chain, keeps a second CUDA context (torch's) out of every
+# HumanoidBench run's process for two classes nothing here uses -- and makes
+# this importable at all in a venv without torch installed. Python's import
+# machinery resolves `humanoid_bench.mjx.flax_to_torch` as a full dotted
+# name straight out of sys.modules, so this never touches the real
+# `humanoid_bench.mjx` package (untouched, still real if something else
+# needs it) or `torch` itself.
+def _stub_unused_torch_dependency():
+  import sys
+  import types
+
+  name = "humanoid_bench.mjx.flax_to_torch"
+  if name in sys.modules:
+    return
+
+  class _UnusedTorchStub:
+    def __init__(self, *args, **kwargs):
+      raise RuntimeError(
+        f"{type(self).__name__} is a barl_jax stub (see "
+        "_stub_unused_torch_dependency in environments/humanoid_bench.py) -- "
+        "no task registered here uses humanoid_bench.wrappers."
+        "SingleReachWrapper/DoubleReachBaseWrapper, the only real callers. "
+        "Install torch and delete this stub if you need one of those.")
+
+  stub = types.ModuleType(name)
+  stub.TorchModel = _UnusedTorchStub
+  stub.TorchPolicy = _UnusedTorchStub
+  sys.modules[name] = stub
+
+
 def _patch_stale_mujoco_fields():
   import mujoco
   from humanoid_bench.dmc_deps import dmc_sizes
@@ -116,6 +153,7 @@ class HumanoidBenchEnvironment(Environment):
     raise NotImplementedError
 
   def get_env(self, *, render: bool = False) -> gym.Env:
+    _stub_unused_torch_dependency()
     import humanoid_bench  # noqa: F401
     _patch_stale_mujoco_fields()
     _patch_stale_gymnasium_render()

@@ -1,6 +1,6 @@
 """Evaluate saved policies from a checkpoint, run directory, or sweep.
 
-    uv run python scripts/evaluate.py sweeps/<submission> --mode default mean
+    uv run python scripts/evaluate.py sweeps/<submission> --mode DirectExecutor MeanExecutor
     uv run python scripts/evaluate.py <checkpoint> --env HalfCheetah --json
     uv run python scripts/evaluate.py --config experiments/eval.yaml
 
@@ -61,20 +61,14 @@ def environment_name(path: Path) -> str | None:
   return None
 
 
-class EvaluationActor:
-  def __init__(self, policy, spec):
-    self.policy, self.spec = policy, spec
-    self.chunk_size, self.action_dim = policy.chunk_size, policy.action_dim
-
-  def inference_fn(self):
-    return self.policy.inference_fn(spec=self.spec)
-
-
 def evaluate(path, env_name, modes, *, episodes, num_envs, num_candidates, seed, top_k=2, sigma=0.1):
+  import dataclasses
+
   from barl_jax.checkpoints import load_policy
   from barl_jax.env import Environment
   from barl_jax.evaluation import run_episodes
-  from barl_jax.execution import ExecutionSpec, validate_execution_spec
+  from barl_jax.multiseed import SeedActor
+  from barl_jax.registration import get_executor
 
   environment = Environment.make(env_name)
   single = environment.get_env()
@@ -86,15 +80,22 @@ def evaluate(path, env_name, modes, *, episodes, num_envs, num_candidates, seed,
       print(f"  {path}  env={env_name}  {episodes} episode(s) x {len(modes)} mode(s) {modes}")
       for mode in modes:
         t0 = time.perf_counter()
-        # top_k/sigma are rejected by ExecutionSpec at their non-default value
-        # under every mode but their own -- see execution.py.
+        executor_cls = get_executor(mode)
+        config_type = executor_cls.config_type
+        # Only pass the knobs this executor's config actually declares --
+        # DirectExecutorConfig has neither num_candidates/top_k/sigma, so no
+        # per-mode `if mode == ...` branch is needed to keep it from
+        # rejecting them.
+        declared = {f.name for f in dataclasses.fields(config_type)}
         kwargs = {}
-        if mode == "topk":
+        if "num_candidates" in declared:
+          kwargs["num_candidates"] = num_candidates
+        if "top_k" in declared:
           kwargs["top_k"] = top_k
-        if mode == "perturb":
+        if "sigma" in declared:
           kwargs["sigma"] = sigma
-        spec = ExecutionSpec(mode, 1 if mode == "default" else num_candidates, **kwargs)
-        problems = validate_execution_spec(spec, policy=policy)
+        executor = executor_cls(config_type(**kwargs))
+        problems = executor.validate(policy=policy)
         if problems:
           results[mode] = {"error": "; ".join(problems)}
           print(f"    [{mode}] skipped -- {'; '.join(problems)}")
@@ -105,7 +106,7 @@ def evaluate(path, env_name, modes, *, episodes, num_envs, num_candidates, seed,
         # caller only ever sees whatever `evaluate()` returns, not what it
         # built up to before raising.
         try:
-          records = run_episodes(EvaluationActor(policy, spec), vector, episodes,
+          records = run_episodes(SeedActor(policy, executor), vector, episodes,
                                  render=False, seed=seed)
           returns = np.asarray([sum(r["rewards"]) for r in records])
           results[mode] = {"mean_return": float(returns.mean()),
@@ -126,7 +127,7 @@ def evaluate(path, env_name, modes, *, episodes, num_envs, num_candidates, seed,
 # One source of truth for a run's optional keys, shared by argparse's own
 # `default=`, a `--config` entry's fallback when it omits a key, and the
 # `--config`/single-path mutual-exclusion check in main() -- see there.
-DEFAULTS = dict(checkpoint="best", mode=["default"], episodes=10, num_envs=8,
+DEFAULTS = dict(checkpoint="best", mode=["DirectExecutor"], episodes=10, num_envs=8,
                 num_candidates=8, top_k=2, sigma=0.1, seed=0)
 
 
@@ -192,13 +193,15 @@ def main():
   parser.add_argument("--env", help="Environment name; defaults to the saved run config")
   parser.add_argument("--checkpoint", choices=("best", "final"), default=DEFAULTS["checkpoint"])
   parser.add_argument("--mode", nargs="+",
-                      choices=("default", "mean", "median", "bon", "topk", "axis_shuffle", "perturb"),
+                      choices=("DirectExecutor", "MeanExecutor", "MedianExecutor", "BestOfNExecutor",
+                               "TopKExecutor", "AxisShuffleExecutor", "PerturbExecutor"),
                       default=DEFAULTS["mode"])
   parser.add_argument("--episodes", type=int, default=DEFAULTS["episodes"])
   parser.add_argument("--num-envs", type=int, default=DEFAULTS["num_envs"])
   parser.add_argument("--num-candidates", type=int, default=DEFAULTS["num_candidates"])
-  parser.add_argument("--top-k", type=int, default=DEFAULTS["top_k"], help="Only used by --mode topk")
-  parser.add_argument("--sigma", type=float, default=DEFAULTS["sigma"], help="Only used by --mode perturb")
+  parser.add_argument("--top-k", type=int, default=DEFAULTS["top_k"], help="Only used by --mode TopKExecutor")
+  parser.add_argument("--sigma", type=float, default=DEFAULTS["sigma"],
+                      help="Only used by --mode PerturbExecutor")
   parser.add_argument("--seed", type=int, default=DEFAULTS["seed"],
                       help="Shared evaluation seed for paired comparisons")
   parser.add_argument("--json", action="store_true", help="Print the combined results as JSON too")

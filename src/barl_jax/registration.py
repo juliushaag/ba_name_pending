@@ -32,6 +32,7 @@ def load_builtins(group):
     "policies": ("policies", "actors"),
     "environments": tuple(f"environments.{name}" for name in
                           ("mujoco_gym", "dm_control", "mani_skill", "humanoid_bench")),
+    "executors": ("executors",),
   }
   with _LOCK:
     if group in _LOADED:
@@ -147,3 +148,42 @@ def get_component(name: str) -> type:
 def available_components() -> list[str]:
   load_builtins("components")
   return available_names("components", _COMPONENT_REGISTRY)
+
+
+# ---------------------------------------------------------------------------
+# Executor registry -- concrete ActionExecutor classes (barl_jax.executors),
+# resolved by name the same way components are, through this module's own
+# load_builtins/resolve_named/available_names. Kept separate from
+# _COMPONENT_REGISTRY rather than folded into it: resolve_named's
+# issubclass(cls, base) gate only actually runs on the plugin-entry-point
+# path, so reusing "components" would silently let a third-party plugin
+# executor skip the ActionExecutor check every built-in executor is exempt
+# from anyway -- a dedicated group enforces it for plugins here too.
+# ---------------------------------------------------------------------------
+
+_EXECUTOR_REGISTRY: dict[str, type] = {}
+
+
+def register_executor(cls: type) -> type:
+  name = cls.__name__
+  if name in _EXECUTOR_REGISTRY:
+    raise ValueError(f"Executor {name} already registered")
+  _EXECUTOR_REGISTRY[name] = cls
+  return cls
+
+
+def get_executor(name: str) -> type:
+  load_builtins("executors")
+  if ":" in name:
+    return import_type(name)
+  from barl_jax.executors.base import ActionExecutor
+  cls = resolve_named("executors", name, _EXECUTOR_REGISTRY, ActionExecutor)
+  if cls is None:
+    raise KeyError(f"{name} not in registered executors: "
+                   f"{available_names('executors', _EXECUTOR_REGISTRY)}")
+  return cls
+
+
+def available_executors() -> list[str]:
+  load_builtins("executors")
+  return available_names("executors", _EXECUTOR_REGISTRY)

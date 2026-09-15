@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-import barl_jax.execution as execution
+import barl_jax.executors as executors
 from barl_jax.action_chunking import normalize_action_chunk
 from barl_jax.components import (
   TRAINABLE,
@@ -34,15 +34,20 @@ def _jitted_infer(graphdef, state, observation, key):
 
 
 @partial(jax.jit, static_argnums=(0, 1))
-def _jitted_infer_exec(graphdef, spec, state, observation, key):
-  """`_jitted_infer`'s counterpart for every non-default `spec.mode`. Kept
-  separate rather than folded into `_jitted_infer` so the plain default path
-  (every caller that never touches execution.py) keeps its own jit cache,
-  unperturbed by `spec` becoming part of the trace."""
+def _jitted_infer_exec(graphdef, executor_config, state, observation, key):
+  """`_jitted_infer`'s counterpart for every non-direct executor. Kept
+  separate rather than folded into `_jitted_infer` so the plain direct path
+  (every caller that never opts into an execution strategy) keeps its own
+  jit cache, unperturbed by `executor_config` becoming part of the trace.
+
+  Only `executor_config` -- a frozen, all-primitive-field dataclass, hashable
+  for free -- crosses the jit boundary as a static arg; the executor instance
+  itself never needs to (see `executors.base.executor_from_config`)."""
   policy = nnx.merge(graphdef, state)
+  executor = executors.executor_from_config(executor_config)
   infer_step = lambda obs, key: policy.inference_step(obs, key=key)
-  score_fn = policy.score if spec.mode in execution.SCORE_GUIDED_MODES else None
-  return execution.act(infer_step, score_fn, observation, key, spec)
+  score_fn = policy.score if executor.needs_score else None
+  return executor.select(infer_step, score_fn, observation, key)
 
 
 class Policy(OptimizerMixin, nnx.Module, ABC):
@@ -403,22 +408,22 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
   # function pure and lets the parameter state be captured once per rollout
   # instead of round-tripped every step.
 
-  def inference_fn(self, spec: "execution.ExecutionSpec" = None):
+  def inference_fn(self, executor: "executors.ActionExecutor" = None):
     """A pure, jitted `(observation, key) -> (action, extras)` pinned to this
     policy's *current* weights. Rebuild it after training (the rollout loop
     does, once per iteration); it deliberately does not see later updates.
-    One compile per batch shape (and, when `spec` selects `bon`/`mean`, per
-    `spec` -- mode and candidate count are static jit args, see
-    `barl_jax.execution.ExecutionSpec`).
+    One compile per batch shape (and, when `executor` is a multi-candidate
+    strategy, per its config -- every field is a static jit arg, see
+    `barl_jax.executors.base.ExecutorConfig`).
 
     The key is an argument rather than drawn from the module's own `nnx.Rngs`:
     that keeps the traced function pure, lets the parameter state be captured
     once per rollout instead of round-tripped every step, and leaves the caller
     holding the one piece of state that actually has to advance.
 
-    `spec=None` (or `ExecutionSpec()`, its default) is the original code path
-    -- unchanged, and sharing `_jitted_infer`'s compile cache with every other
-    caller that has not opted into an execution strategy.
+    `executor=None` (or a `DirectExecutor`, its default) is the original code
+    path -- unchanged, and sharing `_jitted_infer`'s compile cache with every
+    other caller that has not opted into a non-default execution strategy.
 
     Must be called from eager (non-jitted) context -- it temporarily mutates
     the module to set `use_running_average=True` on BatchNorm/BatchRenorm layers
@@ -432,18 +437,18 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
     clone.eval()
     graphdef, state = nnx.split(clone)
 
-    if spec is None or spec.mode == "default":
+    if executor is None or executor.is_direct:
       return partial(_jitted_infer, graphdef, state)
-    return partial(_jitted_infer_exec, graphdef, spec, state)
+    return partial(_jitted_infer_exec, graphdef, executor.config, state)
 
   # ------------------------------------------------------------------
-  # Best-of-N scoring (optional capability -- see execution.py)
+  # Best-of-N scoring (optional capability -- see barl_jax.executors)
   # ------------------------------------------------------------------
 
   #: Whether `score()` is a real critic-backed scorer. False by default;
   #: `RLPolicy` (SAC/AMDP/DIME/SDAC) sets this True. Checked eagerly by
-  #: `execution.validate_execution_spec` before any of `execution.SCORE_GUIDED_MODES`
-  #: is ever traced.
+  #: `ActionExecutor.validate` before any `needs_score` executor is ever
+  #: traced.
   supports_bon = False
 
   def score(self, observation, action_chunk):

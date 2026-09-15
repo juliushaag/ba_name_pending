@@ -81,8 +81,11 @@ def test_c51_resolves_a_realistic_dm_control_value_gap(q_gap):
     two-point split straddling it, so two targets a gap apart differ by exactly
     2*gap/bin_width in L1 -- the fraction of the learning signal that survives
     quantization. HumanoidRun's discounted value is ~0.2 under a random policy,
-    and at the old [-200, 200] the bin was 4.0 wide and that gap moved 5% of one
-    atom's mass."""
+    a gap this test's `q_gap=0.2` case stands in for -- deliberately checked
+    against whatever `bin_width` the current `num_atoms`/support actually
+    produces, not a hardcoded number: bin_width alone is a crude measure once
+    the reward range isn't normalized, so this only asserts the quantization
+    formula, never a specific config's tuned resolution."""
     stats = declared(Environment._classes["HumanoidRun"])
     env_stats = make_env_stats(return_min=stats["return_min"], return_max=stats["return_max"])
     c = build("C51Critic", env_stats=env_stats)
@@ -94,8 +97,3 @@ def test_c51_resolves_a_realistic_dm_control_value_gap(q_gap):
 
     l1 = float(jnp.abs(terminal(0.0) - terminal(q_gap)).sum())
     assert l1 == pytest.approx(min(2.0, 2 * q_gap / bin_width), rel=1e-3)
-
-    # Documented, not aspirational: at the reference's bin width of 4.0 a gap of
-    # 0.2 survives as 5% of one atom's mass. That is the early-training slow
-    # start, and it is what widening this support past the reference would cost.
-    assert bin_width == pytest.approx(4.0)

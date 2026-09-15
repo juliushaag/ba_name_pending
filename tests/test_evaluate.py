@@ -50,10 +50,12 @@ def test_evaluate_restores_checkpoint_and_pairs_modes(tmp_path, monkeypatch):
     env.close()
   monkeypatch.setattr(Environment, "make", lambda name: family)
   # top_k=1 too: at num_candidates=1 every mode here is bit-identical to
-  # default (execution.py's own invariant, see test_execution.py), so a real
-  # checkpoint evaluated end-to-end through the CLI should agree exactly.
+  # DirectExecutor (barl_jax.executors' own invariant, see test_executors.py),
+  # so a real checkpoint evaluated end-to-end through the CLI should agree
+  # exactly.
   kwargs = dict(episodes=2, num_envs=2, num_candidates=1, top_k=1, seed=7)
-  modes = ["default", "mean", "median", "bon", "topk", "axis_shuffle", "perturb"]
+  modes = ["DirectExecutor", "MeanExecutor", "MedianExecutor", "BestOfNExecutor",
+          "TopKExecutor", "AxisShuffleExecutor", "PerturbExecutor"]
   result = evaluate(tmp_path / "best", "short", modes, **kwargs)
   assert all(np.isfinite(row["mean_return"]) for row in result.values())
   assert len({tuple(result[m].items()) for m in modes}) == 1
@@ -73,14 +75,14 @@ defaults:
   num_candidates: 3
 runs:
   - path: a
-    mode: [default, mean]
+    mode: [DirectExecutor, MeanExecutor]
   - path: b
     episodes: 9
 """)
   output, entries = module.load_eval_config(cfg)
   assert output == "out.json"
   assert entries == [
-    {"episodes": 5, "num_candidates": 3, "path": "a", "mode": ["default", "mean"]},
+    {"episodes": 5, "num_candidates": 3, "path": "a", "mode": ["DirectExecutor", "MeanExecutor"]},
     {"episodes": 9, "num_candidates": 3, "path": "b"},
   ]
 
@@ -112,7 +114,7 @@ def test_evaluate_entry_reads_env_from_saved_config_when_omitted(tmp_path, monke
   entry = dict(path=str(run), episodes=2, num_envs=2, num_candidates=1, seed=7)
   result = module.evaluate_entry(entry)
   assert list(result) == [str(best)]
-  assert np.isfinite(result[str(best)]["default"]["mean_return"])
+  assert np.isfinite(result[str(best)]["DirectExecutor"]["mean_return"])
 
 
 def test_evaluate_entry_reports_missing_checkpoints_without_raising(tmp_path):
@@ -140,7 +142,7 @@ def test_main_writes_config_results_to_output_json(tmp_path, monkeypatch, capsys
   module.main()
 
   written = json.loads(out.read_text())
-  assert np.isfinite(written[str(best)]["default"]["mean_return"])
+  assert np.isfinite(written[str(best)]["DirectExecutor"]["mean_return"])
   assert "Wrote 1 checkpoint result(s)" in capsys.readouterr().out
 
 
@@ -156,9 +158,9 @@ def test_main_rejects_single_run_flags_alongside_config(monkeypatch):
 
 def test_evaluate_isolates_a_crashing_mode_and_keeps_the_rest(tmp_path, monkeypatch):
   """One mode raising inside run_episodes (a real crash, not an
-  ExecutionSpec-rejected mode -- see the 'skipped' path) must not lose a
-  different mode's already-computed result, and the failure must carry a
-  traceback, not just a one-line message."""
+  ActionExecutor.validate-rejected mode -- see the 'skipped' path) must not
+  lose a different mode's already-computed result, and the failure must
+  carry a traceback, not just a one-line message."""
   best = tmp_path / "best"
   family = ShortPendulum()
   env = family.get_env()
@@ -170,21 +172,22 @@ def test_evaluate_isolates_a_crashing_mode_and_keeps_the_rest(tmp_path, monkeypa
   monkeypatch.setattr(Environment, "make", lambda name: family)
 
   import barl_jax.evaluation as evaluation_module
+  from barl_jax.executors import MeanExecutor
   real_run_episodes = evaluation_module.run_episodes
 
   def flaky_run_episodes(actor, vector, episodes, *, render, seed):
-    if actor.spec.mode == "mean":
+    if isinstance(actor.executor, MeanExecutor):
       raise RuntimeError("boom")
     return real_run_episodes(actor, vector, episodes, render=render, seed=seed)
 
   monkeypatch.setattr(evaluation_module, "run_episodes", flaky_run_episodes)
 
-  result = module.evaluate(best, "short", ["default", "mean"],
+  result = module.evaluate(best, "short", ["DirectExecutor", "MeanExecutor"],
                            episodes=2, num_envs=2, num_candidates=1, seed=7)
-  assert np.isfinite(result["default"]["mean_return"])
-  assert result["mean"]["error"] == "RuntimeError: boom"
-  assert "Traceback" in result["mean"]["traceback"]
-  assert "boom" in result["mean"]["traceback"]
+  assert np.isfinite(result["DirectExecutor"]["mean_return"])
+  assert result["MeanExecutor"]["error"] == "RuntimeError: boom"
+  assert "Traceback" in result["MeanExecutor"]["traceback"]
+  assert "boom" in result["MeanExecutor"]["traceback"]
 
 
 def test_main_writes_partial_results_when_one_entry_crashes(tmp_path, monkeypatch):
@@ -211,7 +214,7 @@ def test_main_writes_partial_results_when_one_entry_crashes(tmp_path, monkeypatc
     module.main()
 
   written = json.loads(out.read_text())
-  assert np.isfinite(written[str(best)]["default"]["mean_return"])
+  assert np.isfinite(written[str(best)]["DirectExecutor"]["mean_return"])
   crashed = [row for row in written.values() if "error" in row]
   assert len(crashed) == 1
   assert "Traceback" in crashed[0]["traceback"]
@@ -219,7 +222,7 @@ def test_main_writes_partial_results_when_one_entry_crashes(tmp_path, monkeypatc
 
 def test_main_writes_nan_results_instead_of_losing_the_file(tmp_path, monkeypatch):
   monkeypatch.setattr(module, "evaluate_entry",
-                      lambda entry: {"x": {"default": {"mean_return": float("nan")}}})
+                      lambda entry: {"x": {"DirectExecutor": {"mean_return": float("nan")}}})
   cfg = tmp_path / "eval.yaml"
   out = tmp_path / "out.json"
   cfg.write_text("runs:\n  - path: whatever\n")

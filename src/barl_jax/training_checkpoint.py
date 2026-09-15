@@ -183,7 +183,7 @@ def validate_resume(cfg, num_seeds, meta):
              # each eval's own results); collection strategy is a training
              # config and is deliberately NOT in this set -- changing it
              # changes the behavior policy that produced the replay buffer.
-             "eval_mode", "eval_candidates"}
+             "eval_executor"}
   saved = meta["config"]
   current = cfg.to_dict() if isinstance(cfg, RunConfig) else dict(cfg)
   # `model_overrides`/`env_metadata`/`snapshot` carry the saved model itself;
