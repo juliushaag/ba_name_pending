@@ -9,14 +9,11 @@ import numpy as np
 import pytest
 from flax import nnx
 
-import barl_jax.config.tree as model_config
 from barl_jax import optimization, trainer
 from barl_jax.checkpoints import load_policy, save_policy
-from barl_jax.components import ConfigOwner
 from barl_jax.config.model import ModelSpec
-from barl_jax.config.tree import ConfigTree
+from barl_jax.config.run import RunConfig
 from barl_jax.env import Environment
-from barl_jax.hparam import Config
 from barl_jax.policy import Policy
 from barl_jax.training_checkpoint import save_training
 
@@ -58,33 +55,48 @@ class ToyFamily(Environment):
     raise NotImplementedError
 
 
-def tiny_config(**overrides):
-  return ConfigTree(overrides={"components.actor.latent_dim": 8,
-                               "components.critic.latent_dim": 8, **overrides})
+def tiny_run(**overrides) -> RunConfig:
+  base = {
+    "model": "SAC", "env": "HalfCheetah",
+    "model_overrides": {"components": {
+      "actor": {"latent_dim": 8},
+      "critic": {"latent_dim": 8},
+    }},
+  }
+  base.update(overrides)
+  return RunConfig.from_dict(base)
 
 
-def make_policy(config=None):
-  return Policy.make("SAC", ToyEnv(), config=config or tiny_config(), env_stats=ToyFamily().get_env_stats(ToyEnv()))
+def make_policy(run=None):
+  run = run or tiny_run()
+  spec = ModelSpec.resolve("SAC", run)
+  return Policy.make("SAC", ToyEnv(), spec=spec,
+                     env_stats=ToyFamily().get_env_stats(ToyEnv()))
 
 
-def run_config(tmp_path):
-  from barl_jax.config.run import run_defaults
-  return {**run_defaults(), "model": "SAC", "env": "Toy", "num_seeds": 1,
-          "batch_size": 4, "total_env_steps": 16, "random_steps": 0,
-          "buffer_size": 16, "eval_video_every": None,
-          "run_dir": str(tmp_path), "compile_cache_dir": str(tmp_path / "cache"),
-          "model_overrides": tiny_config().overrides}
+def run_config(tmp_path) -> RunConfig:
+  return RunConfig.from_dict({
+    "model": "SAC", "env": "HalfCheetah",
+    "num_seeds": 1, "batch_size": 4, "total_env_steps": 16,
+    "random_steps": 0, "buffer_size": 16, "eval_video_every": None,
+    "run_dir": str(tmp_path), "compile_cache_dir": str(tmp_path / "cache"),
+    "model_overrides": {"components": {
+      "actor": {"latent_dim": 8},
+      "critic": {"latent_dim": 8},
+    }},
+  })
 
 
 def test_imports_do_not_initialize_runtime():
   code = '''
 import sys
 import barl_jax
-import barl_jax.config.tree
-assert not set(("jax", "mujoco", "torch", "orbax")) & sys.modules.keys()
+import barl_jax.config.run
+import barl_jax.config.serialization
+assert not set(("mujoco", "torch", "orbax")) & sys.modules.keys()
 from barl_jax.env import Environment
 assert "DogRun" in Environment.available()
-assert not set(("jax", "mujoco", "dm_control", "mani_skill", "humanoid_bench")) & sys.modules.keys()
+assert not set(("mujoco", "dm_control", "mani_skill", "humanoid_bench")) & sys.modules.keys()
 '''
   subprocess.run([sys.executable, "-c", code], check=True)
 
@@ -99,63 +111,34 @@ def test_async_factory_keeps_instance_settings():
     env.close()
 
 
-def test_declaration_overrides_ancestor_in_subclass():
-  class Base(ConfigOwner):
-    knob = Config(1)
-  class Child(Base):
-    knob = Config(2)
-  assert Base()._decls["knob"].default == 1
-  assert Child()._decls["knob"].default == 2
-
-
-def test_config_dict_resolves_each_field_at_its_own_flat_key():
-  """A ConfigDict field overrides exactly like a standalone Config would --
-  grouping only changes how the class declares and the instance reads back,
-  never the override surface a run's `--set` sees."""
-  from barl_jax.config.toolkit import ConfigMixin
-  from barl_jax.hparam import ConfigDict
-
-  class Owner(ConfigOwner):
-    mlp = ConfigDict(activation='gelu', norm='none', norm_kwargs={})
-
-  owner = Owner()
-  owner.resolve_config(ConfigMixin("", {"activation": "silu"}))
-  assert owner.mlp.activation == "silu"          # overridden at its flat key
-  assert owner.mlp.norm == "none"                # untouched default
-  assert owner.mlp.todict() == {"activation": "silu", "norm": "none", "norm_kwargs": {}}
-  hash(owner.mlp)                                # identity-hashable regardless of the dict field
-
-
-def test_config_dict_group_is_replaced_wholesale_by_a_subclass():
-  from barl_jax.config.toolkit import ConfigMixin
-  from barl_jax.hparam import ConfigDict
-
-  class Base(ConfigOwner):
-    mlp = ConfigDict(activation='gelu', norm='none')
-  class Child(Base):
-    mlp = ConfigDict(activation='relu', norm='layer')
-
-  child = Child()
-  child.resolve_config(ConfigMixin("", {}))
-  assert child.mlp.activation == "relu" and child.mlp.norm == "layer"
+def test_typed_defaults_are_owned_by_dataclasses():
+  from barl_jax.actors.sac import StochasticActorConfig
+  from barl_jax.critics.categorical import C51CriticConfig
+  assert StochasticActorConfig().mlp.activation == "silu"
+  assert C51CriticConfig().latent_dim == 2048
+  # More-derived declarations win: subclass overrides replace base defaults.
+  from dataclasses import replace
+  assert replace(StochasticActorConfig(), squash_cls="ErfSquash").squash_cls == "ErfSquash"
 
 
 def test_model_spec_is_isolated_from_config_mutation():
-  config = tiny_config(**{"params.policy_delay": 2})
-  spec = ModelSpec.resolve("SAC", config)
-  config.overrides["params.policy_delay"] = 7
+  run = tiny_run(model_overrides={"params": {"policy_delay": 2}, "components": {
+    "actor": {"latent_dim": 8}, "critic": {"latent_dim": 8}}})
+  spec = ModelSpec.resolve("SAC", run)
   p = Policy.make("SAC", ToyEnv(), spec=spec, env_stats=ToyFamily().get_env_stats(ToyEnv()))
   assert p.policy_delay == 2
   data = spec.data()
-  data["params"]["policy_delay"] = 20
+  data["model"]["params"]["policy_delay"] = 20
   assert p.resolve_params()["policy_delay"] == 2
 
 
 def test_incompatible_objective_is_rejected_before_building():
-  config = tiny_config(**{"components.critic.class": "NCLQLCritic"})
-  assert any("does not support 'td'" in p for p in model_config.validate("SAC", config))
-  with pytest.raises(TypeError, match="does not support 'td'"):
-    make_policy(config)
+  from barl_jax.config.run import RunConfig as _RunConfig
+  with pytest.raises(ValueError, match="does not support"):
+    _RunConfig.from_dict({
+      "model": "SAC", "env": "HalfCheetah",
+      "model_overrides": {"components": {"critic": {"class": "NCLQLCritic"}}},
+    })
 
 
 def test_running_normalization_handles_unequal_batches_and_constant_channels():
@@ -174,19 +157,12 @@ def test_running_normalization_handles_unequal_batches_and_constant_channels():
   np.testing.assert_array_equal(p.normalize_observations(second), second)
 
 
-def test_checkpoint_uses_saved_class_and_does_not_mutate_config(tmp_path, monkeypatch):
+def test_checkpoint_uses_saved_spec_without_current_defaults(tmp_path):
   policy = make_policy()
   policy.update_observation_stats(jnp.ones((3, 3)))
   save_policy(policy, tmp_path / "policy")
-  original_init = ConfigTree.__init__
-  def changed_defaults(self, *args, **kwargs):
-    original_init(self, *args, **kwargs)
-    if self.snapshot is None:
-      self.models["SAC"] = {"policy": "Nonexistent"}
-  monkeypatch.setattr(ConfigTree, "__init__", changed_defaults)
   restored = load_policy(tmp_path / "policy", ToyEnv(), ToyFamily().get_env_stats(ToyEnv()))
   assert type(restored) is type(policy)
-  assert ConfigTree().policy_class_name("SAC") == "Nonexistent"
   for a, b in zip(jax.tree.leaves(nnx.state(policy)), jax.tree.leaves(nnx.state(restored))):
     if jax.dtypes.issubdtype(a.dtype, jax.dtypes.prng_key):
       a, b = jax.random.key_data(a), jax.random.key_data(b)
@@ -239,7 +215,7 @@ def test_training_resume_restores_next_update_and_replay_rng(tmp_path, monkeypat
     save_training(original, tmp_path / "resume", progress)
     expected_batch = original.buffer.sample(4)
     expected_state, *_ = optimization.seeded_step(original.graphdef, original.state, expected_batch, (), jnp.asarray(1))
-    resume_cfg = {**cfg, "checkpoint": str(tmp_path / "resume"), "checkpoint_mode": "resume"}
+    resume_cfg = cfg.replace(checkpoint=str(tmp_path / "resume"), checkpoint_mode="resume")
     with trainer.setup(resume_cfg, 1) as restored:
       assert restored.progress == progress
       actual_batch = restored.buffer.sample(4)
@@ -275,7 +251,7 @@ def test_resume_rejects_an_incompatible_checkpoint_version(tmp_path, monkeypatch
   meta["format_version"] = 1
   meta_path.write_text(json.dumps(meta))
 
-  resume_cfg = {**cfg, "checkpoint": str(tmp_path / "resume"), "checkpoint_mode": "resume"}
+  resume_cfg = cfg.replace(checkpoint=str(tmp_path / "resume"), checkpoint_mode="resume")
   with pytest.raises(ValueError, match="Unsupported training checkpoint version"):
     trainer.setup(resume_cfg, 1)
 
@@ -325,14 +301,14 @@ def test_complete_training_writes_resumable_state(tmp_path, monkeypatch):
   monkeypatch.setattr(Environment, "make", lambda name: family)
   monkeypatch.setattr(logging, "make_logger", lambda kind, *a, **kw: MemoryLogger(*a, **kw))
   monkeypatch.setattr(trainer, "warmup", lambda *args: {})
-  cfg = {**run_config(tmp_path), "total_env_steps": 2, "buffer_size": 2}
+  cfg = run_config(tmp_path).replace(total_env_steps=2, buffer_size=2)
   run = trainer.setup(cfg, 1)
   trainer.train(run)
   result = json.loads((tmp_path / "objective.json").read_text())
   assert result["status"] == "finished"
   assert all(env.closed for env in family.created)
   path = tmp_path / "checkpoints/resume"
-  with trainer.setup({**cfg, "checkpoint": str(path), "checkpoint_mode": "resume"}, 1) as restored:
+  with trainer.setup(cfg.replace(checkpoint=str(path), checkpoint_mode="resume"), 1) as restored:
     assert restored.progress["env_steps"] == 2
     assert restored.progress["grad_steps"] == 4
 
@@ -345,8 +321,7 @@ def test_training_runs_without_wandb(tmp_path, monkeypatch, kind):
   family = ToyFamily()
   monkeypatch.setattr(Environment, "make", lambda name: family)
   monkeypatch.setattr(trainer, "warmup", lambda *args: {})
-  cfg = {**run_config(tmp_path), "logger": kind, "total_env_steps": 2, "buffer_size": 2,
-         "eval_every": 1, "eval_runs": 1}
+  cfg = run_config(tmp_path).replace(logger=kind, total_env_steps=2, buffer_size=2, eval_every=1, eval_runs=1)
   run = trainer.setup(cfg, 1)
   trainer.train(run)
 
@@ -451,8 +426,7 @@ def test_chunked_training_counts_primitive_steps(tmp_path, monkeypatch, utd_rati
   monkeypatch.setattr(Environment, "make", lambda name: family)
   monkeypatch.setattr(logging, "make_logger", lambda kind, *a, **kw: MemoryLogger(*a, **kw))
   monkeypatch.setattr(trainer, "warmup", lambda *args: {})
-  cfg = {**run_config(tmp_path), "total_env_steps": 8, "num_envs": 2,
-         "rollout_steps": 2, "chunk_size": 4, "utd_ratio": utd_ratio}
+  cfg = run_config(tmp_path).replace(total_env_steps=8, num_envs=2, rollout_steps=2, chunk_size=4, utd_ratio=utd_ratio)
   run = trainer.setup(cfg, 1)
   trainer.train(run)
   assert run.progress["env_steps"] == 8
@@ -461,15 +435,9 @@ def test_chunked_training_counts_primitive_steps(tmp_path, monkeypatch, utd_rati
   assert np.array_equal(run.buffer.seeds[0]._fields["horizon"][:2], [4, 4])
 
 
-def test_expanded_mlp_snapshot_restores_without_the_removed_selector(tmp_path):
+def test_saved_spec_roundtrips_through_policy_checkpoint(tmp_path):
   original = make_policy()
-  snapshot = original._snapshot
-  snapshot["resolved"]["components.actor.mlp_preset"] = "layer"
-  snapshot["resolved"]["components.critic.mlp_preset"] = "crossq"
-  restored = make_policy(ConfigTree(snapshot=snapshot))
-  assert restored.actor.mlp.activation == original.actor.mlp.activation
-  assert restored.critic.mlp.norm == original.critic.mlp.norm
-  save_policy(restored, tmp_path / "policy")
+  save_policy(original, tmp_path / "policy")
   loaded = load_policy(tmp_path / "policy", ToyEnv(), ToyFamily().get_env_stats(ToyEnv()))
   for a, b in zip(jax.tree.leaves(nnx.state(original)), jax.tree.leaves(nnx.state(loaded))):
     if jax.dtypes.issubdtype(a.dtype, jax.dtypes.prng_key):

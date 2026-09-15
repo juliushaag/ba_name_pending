@@ -51,11 +51,8 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"wandb\..
 
 import jax
 
-from barl_jax.config.run import load_config
-from barl_jax.config.toolkit import CONFIG_DIR
+from barl_jax.config import from_yaml
 from barl_jax.trainer import setup, train, validate
-
-DEFAULT_CONFIG = str(CONFIG_DIR / "experiments" / "online_learning.yaml")
 
 
 def require_accelerator() -> None:
@@ -85,16 +82,12 @@ def require_accelerator() -> None:
 
 if __name__ == "__main__":
   args = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-  args.add_argument("--config", default=DEFAULT_CONFIG,
-                    help="Path to a YAML experiment config (see src/barl_jax/defaults/experiments/online_learning.yaml). "
-                         "Lists one or more {model, env, ...} runs, executed in series.")
+  args.add_argument("--config", required=True,
+                    help="Path to one YAML run mapping with required model and env selectors.")
   args.add_argument("--seeds", type=int, default=None,
-                    help="How many seeds to run vmapped in this process. "
-                         "Overrides `num_seeds` in the config.")
+                    help="How many seeds to run vmapped in this process. Overrides num_seeds.")
   args.add_argument("--run-dir", default=None,
-                    help="Where this run writes its checkpoints, overriding the config's "
-                         "`run_dir`. A batch task points it at node-local scratch and copies "
-                         "the tree back on exit, so the config itself stays the shared one.")
+                    help="Where this run writes checkpoints, overriding run_dir in the YAML.")
   kwargs = args.parse_args()
 
   if kwargs.seeds is not None and kwargs.seeds < 1:
@@ -102,18 +95,16 @@ if __name__ == "__main__":
 
   require_accelerator()
   print(f"Accelerator: {jax.devices()}")
+  config = from_yaml(kwargs.config)
+  if kwargs.run_dir is not None:
+    config = config.replace(run_dir=os.path.abspath(kwargs.run_dir))
+  num_seeds = kwargs.seeds if kwargs.seeds is not None else config.num_seeds
+  print(f"Loaded one run from {kwargs.config}")
+  print(f"=== Run: {config.model} on {config.env}, "
+        f"{num_seeds} seed{'s' if num_seeds != 1 else ''} vmapped ===")
 
-  runs = load_config(kwargs.config)
-  print(f"Loaded {len(runs)} run{'s' if len(runs) != 1 else ''} from {kwargs.config}")
-  for i, cfg in enumerate(runs):
-    if kwargs.run_dir is not None:
-      cfg["run_dir"] = os.path.abspath(kwargs.run_dir)
-    num_seeds = kwargs.seeds if kwargs.seeds is not None else cfg["num_seeds"]
-    print(f"=== Run {i + 1}/{len(runs)}: {cfg['model']} on {cfg['env']}, "
-          f"{num_seeds} seed{'s' if num_seeds != 1 else ''} vmapped ===")
-
-    only_validate = bool(cfg["validate"])
-    t0 = time.perf_counter()
-    run = setup(cfg, num_seeds, validate_only=only_validate)
-    (validate if only_validate else train)(run)
-    print(f"=== Run {i + 1}/{len(runs)} done in {(time.perf_counter() - t0) / 60:.1f} min ===")
+  only_validate = bool(config.validate_config)
+  t0 = time.perf_counter()
+  run = setup(config, num_seeds, validate_only=only_validate)
+  (validate if only_validate else train)(run)
+  print(f"=== Run done in {(time.perf_counter() - t0) / 60:.1f} min ===")

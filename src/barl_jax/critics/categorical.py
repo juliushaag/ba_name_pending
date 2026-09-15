@@ -1,38 +1,50 @@
 import math
+from dataclasses import asdict, dataclass, field
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 
 from barl_jax.components import Buffer
-from barl_jax.config.toolkit import ConfigMixin
-from barl_jax.hparam import Config, ConfigDict
+from barl_jax.networks.mlp import MLPConfig
 from barl_jax.registration import register_component
 
-from .base import ConcatQ, QCriticBase, n_step_discount
+from .base import ConcatQ, CriticConfig, QCriticBase, crossq_mlp, n_step_discount
 
 
-class CriticDistConfig:
-  num_atoms          = Config(100)
-  num_bins           = Config(100)
-  sigma_to_bin_ratio = Config(0.75)
-  entropy_coef       = Config(0.0)
-  rho                = Config(0.0)
+@dataclass(frozen=True)
+class CategoricalCriticConfig(CriticConfig):
+  num_atoms: int = 100
+  num_bins: int = 100
+  sigma_to_bin_ratio: float = 0.75
+  entropy_coef: float = 0.0
+  rho: float = 0.0
+  latent_dim: int = 2048
+  layers: int = 1
+  n_models: int = 2
+  mlp: MLPConfig = field(default_factory=crossq_mlp)
+  v_min: float | None = None
+  v_max: float | None = None
 
 
-class CategoricalCriticBase(QCriticBase, CriticDistConfig):
+@dataclass(frozen=True)
+class C51CriticConfig(CategoricalCriticConfig):
+  class_name: str = "C51Critic"
+  entropy_coef: float = 0.005
 
-  mlp = ConfigDict(
-    activation='relu', norm='batchrenorm', norm_stem=True, norm_input=True,
-    norm_after_act=True, dropout=0.0, final_activation=False, residual=False,
-    norm_kwargs={'momentum': 0.99, 'warmup_steps': 100000, 'epsilon': 0.001, 'r_max': 3.0, 'd_max': 5.0},
-    dtype='bfloat16')
 
-  def __init__(self, env_stats, config: ConfigMixin, q_function, support, **kwargs):
+@dataclass(frozen=True)
+class HLGaussCriticConfig(CategoricalCriticConfig):
+  class_name: str = "HLGaussCritic"
+
+
+class CategoricalCriticBase(QCriticBase):
+  config_type = CategoricalCriticConfig
+
+  def __init__(self, env_stats, config, q_function, support, **kwargs):
     super().__init__(env_stats, config, q_function, **kwargs)
-
     self.support = Buffer(support)
-    self.n_models = config.get("n_models", int)
+    self.n_models = config.n_models
 
   def probs(self, raw):
     return jax.nn.softmax(raw.astype(jnp.float32), axis=-1)
@@ -43,7 +55,7 @@ class CategoricalCriticBase(QCriticBase, CriticDistConfig):
   def reduce_value(self, raw):
     exp = self.expectation_from_raw(raw).astype(jnp.float32)
     std = jnp.sqrt(jnp.maximum(exp.var(axis=0), 1e-8))
-    return exp.mean(axis=0) - self.rho * std
+    return exp.mean(axis=0) - self.config.rho * std
 
   def target_from_raw(self, raw):
     return jax.lax.stop_gradient(self.probs(raw).mean(axis=0))
@@ -55,8 +67,9 @@ class CategoricalCriticBase(QCriticBase, CriticDistConfig):
     reduce = lambda x: x.sum(axis=-1).mean(axis=-1).sum()
 
     loss = reduce(-(tgt * logp))
-    if self.entropy_coef:
-      loss += self.entropy_coef * reduce(jnp.exp(logp) * logp)
+    entropy_coef = self.config.entropy_coef
+    if entropy_coef:
+      loss += entropy_coef * reduce(jnp.exp(logp) * logp)
     return loss
 
   def record(self, raw, target) -> None:
@@ -107,36 +120,36 @@ def categorical_projection(next_probs, atoms, chunk_return, terminated, horizon,
 @register_component
 class C51Critic(CategoricalCriticBase):
   kind = "critic"
-  entropy_coef = Config(0.005)
+  config_type = C51CriticConfig
 
-  def __init__(self, env_stats, config: ConfigMixin, *, rngs: nnx.Rngs, **kwargs):
-    self.resolve_config(config, env_stats=env_stats)
-    n_models = config.get("n_models", int)
-    v_min = config.get("v_min", float, default=env_stats["return_min"])
-    v_max = config.get("v_max", float, default=env_stats["return_max"])
+  def __init__(self, env_stats, config, *, rngs: nnx.Rngs, **kwargs):
+    self.mlp_norm = config.mlp.norm
+    n_models = config.n_models
+    v_min = env_stats["return_min"] if config.v_min is None else config.v_min
+    v_max = env_stats["return_max"] if config.v_max is None else config.v_max
 
-    q_function = ConcatQ(env_stats["obs_dim"] + env_stats["act_dim"], self.num_atoms,
-                         config.get("latent_dim", int), config.get("layers", int),
-                         n_models=n_models, rngs=rngs, **self.mlp.todict())
+    q_function = ConcatQ(env_stats["obs_dim"] + env_stats["act_dim"], config.num_atoms,
+                         config.latent_dim, config.layers,
+                         n_models=n_models, rngs=rngs, **asdict(config.mlp))
 
     super().__init__(env_stats, config, q_function,
-                     jnp.linspace(v_min, v_max, self.num_atoms, dtype=jnp.float32), **kwargs)
+                     jnp.linspace(v_min, v_max, config.num_atoms, dtype=jnp.float32), **kwargs)
 
     self.v_min, self.v_max = v_min, v_max
 
   def derived(self) -> dict:
     return {"v_min": self.v_min, "v_max": self.v_max,
-            "bin_width": (self.v_max - self.v_min) / (self.num_atoms - 1)}
+            "bin_width": (self.v_max - self.v_min) / (self.config.num_atoms - 1)}
 
   def bootstrap_from_raw(self, next_raw):
     return jax.lax.stop_gradient(self.probs(next_raw))
 
   def bellman_target(self, chunk_return, terminated, horizon, bootstrap, entropy_bonus=0.0):
-    if self.pessimistic_target:
+    if self.config.pessimistic_target:
       exp = (bootstrap * self.support[...]).sum(axis=-1, keepdims=True)
       bootstrap = jnp.take_along_axis(bootstrap, jnp.argmin(exp, axis=0, keepdims=True), axis=0)
     projected = categorical_projection(bootstrap, self.support[...], chunk_return, terminated,
-                                       horizon, self.gamma, self.v_min, self.v_max,
+                                       horizon, self.config.gamma, self.v_min, self.v_max,
                                        entropy_bonus=entropy_bonus)
     return projected.mean(axis=0)
 
@@ -144,28 +157,29 @@ class C51Critic(CategoricalCriticBase):
 @register_component
 class HLGaussCritic(CategoricalCriticBase):
   kind = "critic"
+  config_type = HLGaussCriticConfig
 
-  def __init__(self, env_stats, config: ConfigMixin, *, rngs: nnx.Rngs, **kwargs):
-    self.resolve_config(config, env_stats=env_stats)
-    n_models = config.get("n_models", int)
+  def __init__(self, env_stats, config, *, rngs: nnx.Rngs, **kwargs):
+    self.mlp_norm = config.mlp.norm
+    n_models = config.n_models
 
-    v_min = config.get("v_min", float, default=env_stats["return_min"])
-    v_max = config.get("v_max", float, default=env_stats["return_max"])
-    edges = jnp.linspace(v_min, v_max, self.num_bins + 1, dtype=jnp.float32)
+    v_min = env_stats["return_min"] if config.v_min is None else config.v_min
+    v_max = env_stats["return_max"] if config.v_max is None else config.v_max
+    edges = jnp.linspace(v_min, v_max, config.num_bins + 1, dtype=jnp.float32)
 
-    q_function = ConcatQ(env_stats["obs_dim"] + env_stats["act_dim"], self.num_bins,
-                         config.get("latent_dim", int), config.get("layers", int),
-                         n_models=n_models, rngs=rngs, **self.mlp.todict())
+    q_function = ConcatQ(env_stats["obs_dim"] + env_stats["act_dim"], config.num_bins,
+                         config.latent_dim, config.layers,
+                         n_models=n_models, rngs=rngs, **asdict(config.mlp))
 
     super().__init__(env_stats, config, q_function, (edges[:-1] + edges[1:]) / 2, **kwargs)
 
     self.v_min, self.v_max = v_min, v_max
-    self.sigma    = self.sigma_to_bin_ratio * (self.v_max - self.v_min) / self.num_bins
+    self.sigma    = config.sigma_to_bin_ratio * (self.v_max - self.v_min) / config.num_bins
     self.edges    = Buffer(edges)
 
   def derived(self) -> dict:
     return {"v_min": self.v_min, "v_max": self.v_max, "sigma": float(self.sigma),
-            "bin_width": (self.v_max - self.v_min) / self.num_bins}
+            "bin_width": (self.v_max - self.v_min) / self.config.num_bins}
 
   def _to_histogram(self, value):
     value = jnp.clip(value.reshape(-1, 1), self.v_min, self.v_max)

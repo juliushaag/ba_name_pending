@@ -9,6 +9,8 @@ than a recorded value, so the tolerances are derived, not tuned.
 Nothing here trains anything: every law below is exact at initialization.
 """
 
+from dataclasses import replace
+
 import jax.numpy as jnp
 import pytest
 from conftest import BATCH, CRITICS, build, built, critic_action, finite, target_expectation
@@ -46,7 +48,7 @@ def two_point(c, half_width: int):
 
 
 def bin_width(c):
-    return (c.v_max - c.v_min) / c.num_bins
+    return (c.v_max - c.v_min) / c.config.num_bins
 
 
 # ----------------------------------------------------------------------
@@ -66,8 +68,8 @@ def test_categorical_target_transports_the_spread(name, half_width):
     target = c.bellman_target(jnp.zeros((1,)), jnp.zeros((1,)), ONE, boot)
     mean, std = moments(c.support[...], target)
 
-    assert float(mean[0]) == pytest.approx(c.gamma * boot_mean, abs=1e-3)
-    assert float(std[0]) == pytest.approx(c.gamma * boot_std, rel=5e-3)
+    assert float(mean[0]) == pytest.approx(c.config.gamma * boot_mean, abs=1e-3)
+    assert float(std[0]) == pytest.approx(c.config.gamma * boot_std, rel=5e-3)
 
 
 @pytest.mark.parametrize("boot_value", [0.0, 2.0, -4.0])
@@ -83,7 +85,7 @@ def test_histogram_target_discards_the_spread(name, boot_value):
     mean, std = moments(c.support[...], target)
 
     smoothing = jnp.sqrt(c.sigma ** 2 + bin_width(c) ** 2 / 12)
-    assert float(mean[0]) == pytest.approx(c.gamma * boot_value, abs=1e-3)
+    assert float(mean[0]) == pytest.approx(c.config.gamma * boot_value, abs=1e-3)
     assert float(std[0]) == pytest.approx(float(smoothing), rel=1e-3)
 
 
@@ -219,7 +221,7 @@ def test_the_two_pessimism_axes_are_independent(name, obs, act):
 
     # ... and each knob does reach its own.
     assert float(lift(on).mean()) < float(lift(off).mean()) - 1e-4
-    assert jnp.allclose(lift(off), c.gamma * mean_exp.squeeze(-1), atol=1e-3)
+    assert jnp.allclose(lift(off), c.config.gamma * mean_exp.squeeze(-1), atol=1e-3)
 
 
 def test_pessimistic_target_transports_the_lower_heads_distribution():
@@ -231,7 +233,7 @@ def test_pessimistic_target_transports_the_lower_heads_distribution():
     boot = jnp.concatenate([_one_head(11, 8), _one_head(11, 2)], axis=0)   # E = +0.6, -0.6
 
     target = c.bellman_target(jnp.zeros((1,)), NO_TERM, ONE, boot)
-    assert float(moments(support, target)[0][0]) == pytest.approx(c.gamma * -0.6, abs=1e-4)
+    assert float(moments(support, target)[0][0]) == pytest.approx(c.config.gamma * -0.6, abs=1e-4)
 
 
 def test_averaging_target_takes_both_heads():
@@ -281,7 +283,7 @@ def test_smoothing_coefficient_is_actually_wired_in(name, obs, act, key):
     c = build(name)                     # one build, two coefficients -- it is a plain float
 
     def loss_at(coef):
-        c.smoothing_coef = coef
+        c.config = replace(c.config, smoothing_coef=coef)
         losses = c.noise_td_loss(obs, act, obs[::-1], act, jnp.zeros((BATCH,)),
                                  jnp.zeros((BATCH,)), jnp.ones((BATCH,)), sigmas, key)
         assert set(losses) == {"critic"}
@@ -329,7 +331,7 @@ def test_every_critic_prices_no_higher_than_its_own_expectation(name, obs, act):
     c = built(name)
     gap = float(c.pessimism_gap(c.raw(obs, critic_action(c, act))).mean())
     assert gap >= -1e-4
-    assert (gap > 1e-3) == (c.rho > 0.0)
+    assert (gap > 1e-3) == (c.config.rho > 0.0)
 
 
 def test_metric_families_separate_the_two_spreads(obs, act):

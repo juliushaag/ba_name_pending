@@ -7,11 +7,16 @@ dual fed the bootstrap's entropy. What differed was four things -- obs
 normalisation, the gate's cadence, the name of the actor's generator, and
 whether the dual is fed anything at all -- and none of those is an algorithm.
 
-`RLPolicy` states that shared step once; `MaxEntRLPolicy` adds the dual. An
-algorithm becomes a `POLICY` dictionary on its actor naming a `policy:`, an
-`actor:` class and a `critic:` class -- not a Python subclass -- which is what
-lets SAC, AMDP, DIME and SDAC (once its actor owns best-of-N and exploration,
-see `actors`) share these two classes entirely."""
+`RLPolicy` states that shared step once; `MaxEntRLPolicy` adds the dual. Every
+algorithm reuses this template entirely: `SAC`, `AMDP`, `DIME` and `SDAC`
+(each beside its actor, in `barl_jax.actors.*`) are thin `MaxEntRLPolicy`
+subclasses that pin `actor_cls`, the actor-policy integration binding for that
+algorithm; `NCLQL` pins one on `RLPolicy` directly (no entropy dual). None of
+them override a single method here -- the algorithm difference is entirely in
+which actor/critic/params a model variant's `ModelConfig` selects, never in a
+second copy of this training step."""
+
+from dataclasses import dataclass
 
 import gymnasium as gym
 import jax
@@ -19,10 +24,27 @@ import jax.numpy as jnp
 
 from barl_jax.components import ActionSampler
 from barl_jax.critics import QCriticBase
-from barl_jax.hparam import Config
 from barl_jax.networks.regulator import AutotuneRegulator
 from barl_jax.optimization import gated_losses
 from barl_jax.policy import Policy, register_policy
+
+ALPHA_GRANULARITIES = ("per_chunk", "per_action")
+
+
+@dataclass(frozen=True)
+class PolicyConfig:
+  """Params every off-policy actor-critic policy owns."""
+
+  chunk_size: int = 1
+  normalize_obs: bool = True
+  policy_delay: int = 1
+
+
+@dataclass(frozen=True)
+class MaxEntPolicyConfig(PolicyConfig):
+  entropy_scale: float = -1.0
+  entropy_in_target: bool = True
+  alpha_granularity: str = "per_chunk"
 
 
 @register_policy
@@ -40,18 +62,32 @@ class RLPolicy(Policy):
       return cls.SLOT_OBJECTIVES.get(slot, actor_cls.critic_objective)
     return super().slot_objective(slot, actor_cls)
 
-  policy_delay = Config(1)   # grad steps between actor/dual updates (critic steps every step)
-  normalize_obs = Config(True)
+  # Grad steps between actor/dual updates (critic steps every step).
+  policy_delay: int = 1
+
+  # The actor-policy integration binding: a per-algorithm subclass (`SAC`,
+  # `AMDP`, `DIME`, `SDAC`, `NCLQL`, each beside its actor implementation) sets
+  # this to its concrete actor class, tightening build_component's gate from
+  # the generic ActionSampler ABC. A `components.actor.class` mismatch then
+  # fails at construction with a clear error naming both classes, instead of
+  # silently accepting whatever the config named.
+  actor_cls: type = ActionSampler
 
   def __init__(self, env: gym.Env, **kwargs):
     super().__init__(env, **kwargs)
+    # Params arrive merged from the spec; explicit constructor kwargs win.
+    # `policy_delay` is the only RLPolicy-owned param beyond the base's
+    # `chunk_size`/`normalize_obs`.
+    params = self.resolve_params()
+    self.policy_delay = int(params.get("policy_delay", 1))
+    self.normalize_obs = bool(params.get("normalize_obs", self.normalize_obs))
 
     assert isinstance(env.action_space, gym.spaces.Box)
 
     chunked = self.env_stats.derive(act_dim=self.env_stats["chunked_act_dim"])
     self.critic: QCriticBase = self.build_component("critic", QCriticBase,
                                                     env_stats=chunked)
-    self.actor: ActionSampler = self.build_component("actor", ActionSampler)
+    self.actor: ActionSampler = self.build_component("actor", self.actor_cls)
     # No cadence/optimizer-key guard here: `self.optimizer_cadence()` is a
     # virtual call, and a MaxEntRLPolicy subclass hasn't built `self.entropy`
     # yet at this point in `super().__init__()` -- the check belongs at the
@@ -78,11 +114,12 @@ class RLPolicy(Policy):
 
   @property
   def discount(self):
-    return self.critic.gamma
+    return self.critic.config.gamma
 
   def train_step(self, batch):
     obs          = self._obs(batch["obs"])
     next_obs     = self._obs(batch["next_obs"])
+    
     action       = batch["act"]
     chunk_return = batch["chunk_return"]
     terminated   = batch["term"]
@@ -167,22 +204,19 @@ class MaxEntRLPolicy(RLPolicy):
 
   SLOTS = ("critic", "actor", "entropy")
   SLOT_OBJECTIVES = {"critic": "td"}
-  entropy_scale     = Config(-1.0)
-  entropy_in_target = Config(True)
   # Docstring above: "'per_chunk' (default) ... exactly as before" -- every
   # checkpoint saved before this knob existed trained with one scalar alpha
-  # for the whole plan, which is what 'per_chunk' reproduces. That default
-  # previously read 'per_action' here, contradicting the docstring: every new
-  # run silently trained per-action instead, and it broke loading any older
-  # checkpoint outright (config/tree.py's own snapshot-replay fallback for a
-  # key the old snapshot never saw picks *this* default -- 'per_action' backs
-  # AutotuneRegulator.log_alpha with (chunk_size,) instead of the scalar `()`
-  # shape those checkpoints actually saved it at, so orbax's restore rejects
-  # the shape mismatch outright).
-  alpha_granularity = Config("per_chunk")
+  # for the whole plan, which is what 'per_chunk' reproduces.
+  entropy_scale: float = -1.0
+  entropy_in_target: bool = True
+  alpha_granularity: str = "per_chunk"
 
   def __init__(self, env: gym.Env, **kwargs):
     super().__init__(env, **kwargs)
+    params = self.resolve_params()
+    self.entropy_scale = float(params.get("entropy_scale", -1.0))
+    self.entropy_in_target = bool(params.get("entropy_in_target", True))
+    self.alpha_granularity = str(params.get("alpha_granularity", "per_chunk"))
 
     assert self.alpha_granularity in ("per_chunk", "per_action"), (
       f"{self.model_name}: alpha_granularity must be 'per_chunk' or "

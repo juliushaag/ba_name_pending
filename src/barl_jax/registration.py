@@ -25,7 +25,11 @@ _PLUGINS: dict[str, dict] = {}
 def load_builtins(group):
   modules = {
     "components": ("critics", "actors", "networks.squash", "networks.regulator", "networks.schedule"),
-    "policies": ("policies",),
+    # Per-algorithm Policy classes (AMDP, DIME, NCLQL, SAC, SDAC) and their
+    # ModelConfig schemas live beside their actor -- importing "actors" is
+    # what makes both `Policy._classes` and `config.schemas.MODEL_SCHEMAS`
+    # complete.
+    "policies": ("policies", "actors"),
     "environments": tuple(f"environments.{name}" for name in
                           ("mujoco_gym", "dm_control", "mani_skill", "humanoid_bench")),
   }

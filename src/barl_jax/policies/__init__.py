@@ -1,5 +1,5 @@
-# SAC, AMDP, DIME and SDAC are all `rl.MaxEntRLPolicy` configs now -- there are
-# no per-algorithm policy classes left. The actor classes each still names are
-# registered from barl_jax.actors (which barl_jax/__init__ imports);
-# importing this package is what registers the two policies below.
+# The two shared training templates. Each per-algorithm Policy class (SAC,
+# AMDP, DIME, SDAC, NCLQL) is a thin subclass of one of these, registered
+# beside its actor in barl_jax.actors -- see registration.load_builtins's
+# "policies" group, which imports both this package and barl_jax.actors.
 from barl_jax.policies.rl import MaxEntRLPolicy, RLPolicy  # noqa: F401

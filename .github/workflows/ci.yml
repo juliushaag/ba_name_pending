@@ -45,7 +45,7 @@ jobs:
       - run: uv build src/barl_jax --wheel --out-dir /tmp/barl-dist
       - run: uv venv /tmp/barl-wheel
       - run: uv pip install --python /tmp/barl-wheel/bin/python /tmp/barl-dist/*.whl
-      - run: cd /tmp && /tmp/barl-wheel/bin/python -c "from barl_jax.config.tree import ConfigTree; from barl_jax.launch import grid; assert ConfigTree().available_models(); assert grid.default_num_seeds() > 0"
+      - run: cd /tmp && /tmp/barl-wheel/bin/python -c "from barl_jax.policy import Policy; from barl_jax.launch import grid; assert Policy.available(); assert grid.default_num_seeds() > 0"
 
   cpu-example:
     runs-on: ubuntu-latest

@@ -187,7 +187,7 @@ def test_eval_config_rejects_from_sweep_only_flags():
 def test_grid_rejects_ignored_base_config(tmp_path):
     spec = tmp_path / "grid.yaml"
     spec.write_text("base: ignored.yaml\naxes: {algo: [SAC], env: [HalfCheetah]}\n")
-    with pytest.raises(SystemExit, match="use run"):
+    with pytest.raises(SystemExit, match="not supported"):
         grid.build_axes(grid=str(spec))
 
 
@@ -199,14 +199,19 @@ def test_grid_tag_uses_seed_axis_override():
 def test_grid_materialization_freezes_overrides(tmp_path):
     import yaml
 
+    from barl_jax.config import from_yaml
     combo = {"algo": "SAC", "env": "HalfCheetah", "seed": 7,
              "run.batch_size": 32, "model.params.entropy_scale": -0.5}
     runs = grid.materialize([combo], ["run"], defaults={}, sweep_dir=str(tmp_path), num_seeds=1)
     data = yaml.safe_load((tmp_path / runs[0].config).read_text())
-    assert data["runs"][0]["seed"] == 7
-    assert data["runs"][0]["batch_size"] == 32
-    assert data["runs"][0]["num_seeds"] == 1
-    assert data["snapshot"]["resolved"]["params.entropy_scale"] == -0.5
+    # Single-run mapping, loadable by the training CLI.
+    assert data["model"] == "SAC" and data["env"] == "HalfCheetah"
+    assert data["seed"] == 7
+    assert data["batch_size"] == 32
+    assert data["num_seeds"] == 1
+    assert data["model_overrides"]["params"]["entropy_scale"] == -0.5
+    # The exact emitted file round-trips through the public loader.
+    assert from_yaml(tmp_path / runs[0].config).model == "SAC"
 
 
 def test_submit_eval_end_to_end_through_local_executor(tmp_path):

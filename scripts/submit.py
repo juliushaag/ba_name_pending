@@ -2,8 +2,7 @@
 
 """Expand a grid and launch it through Slurm, tmux, or local workers.
 
-    uv run python scripts/submit.py --algos SAC DIME --envs HalfCheetah --seeds 5
-    uv run python scripts/submit.py --grid src/barl_jax/defaults/experiments/sweep_grid.yaml --dry-run
+    uv run python scripts/submit.py --algos SAC DIME --envs HalfCheetah --seeds 5 --dry-run
     uv run python scripts/submit.py --algos SAC --envs HalfCheetah --executor local --validate
     uv run python scripts/submit.py --eval-config experiments/eval.yaml --executor local
     uv run python scripts/submit.py --algos SAC DIME --envs HalfCheetah --from-sweep sweeps/<earlier>
@@ -57,7 +56,7 @@ def parse_args(argv=None):
         description=__doc__.split("\n\n")[0],
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Axes: algo/env/seed, plus model.<dotted path> (a model override, e.g. "
-               "model.components.critic.tier) and run.<key> (a run-config key, e.g. "
+               "model.components.critic.latent_dim) and run.<key> (a run-config key, e.g. "
                "run.utd_ratio). Seeds are not an axis -- --seeds N vmaps N of them inside "
                "each run, so `--algos SAC DIME --seeds 5` is 2 runs of 5 seeds, not 10 runs.")
 
@@ -70,7 +69,7 @@ def parse_args(argv=None):
                            "declares one.")
     what.add_argument("--set", action="append", metavar="AXIS=VALUE", dest="sets",
                       help="Pin one axis to a single value across the sweep, e.g. "
-                           "--set model.components.critic.tier=large --set run.batch_size=512. "
+                           "--set model.components.critic.latent_dim=1024 --set run.batch_size=512. "
                            "Repeatable.")
     what.add_argument("--grid", default=None,
                       help="YAML sweep spec: {axes: {name: [values]}, "

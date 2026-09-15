@@ -1,5 +1,5 @@
 """barl_jax.config.run.validate_run -- the run-level half of preflight
-validation (barl_jax.config.tree.validate covers the model half). Each case
+validation (model validation lives alongside it in config/run.py). Each case
 is a run config invalid in exactly one way, checked in isolation against a
 baseline that is otherwise valid."""
 

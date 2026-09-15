@@ -26,4 +26,4 @@ packages = ["barl_jax", "barl_jax.actors", "barl_jax.critics", "barl_jax.config"
             "barl_jax.launch", "barl_jax.environments", "barl_jax.networks", "barl_jax.policies"]
 
 [tool.setuptools.package-data]
-barl_jax = ["defaults/**/*.yaml", "launch/*.slurm"]
+barl_jax = ["launch/*.slurm"]

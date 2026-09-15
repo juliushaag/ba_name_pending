@@ -141,11 +141,45 @@ if __name__ == "__main__":
 
   data = report(run_probes=kwargs.probes)
   if kwargs.model:
-    from barl_jax.config.toolkit import parse_set_overrides
-    from barl_jax.config.tree import ConfigTree, validate
-    tree = ConfigTree(overrides=parse_set_overrides(kwargs.set))
-    data["model"] = tree.resolved(kwargs.model)
-    data["config_problems"] = validate(kwargs.model, tree)
+    import yaml as _yaml
+
+    from barl_jax.config.run import RunConfig as _RunConfig
+    _overrides: dict = {}
+    _run_updates: dict = {}
+    for _assignment in kwargs.set or []:
+      _path, _sep, _value = _assignment.partition("=")
+      if not _sep:
+        args.error(f"--set {_assignment!r} is not of the form path=value")
+      _path = _path.strip()
+      _parsed = _yaml.safe_load(_value)
+      # Accept both `components.<slot>...` and `model.components...`; strip a
+      # leading `model.` for the nested override shape. Bare `params.*` also
+      # maps into model overrides; anything else is a run key.
+      if _path.startswith("model."):
+        _path = _path.removeprefix("model.")
+      if _path.startswith("components.") or _path.startswith("params."):
+        _node = _overrides
+        _parts = _path.split(".")
+        for _part in _parts[:-1]:
+          _child = _node.setdefault(_part, {})
+          if not isinstance(_child, dict):
+            args.error(f"--set {_assignment!r} collides at {_part!r}")
+          _node = _child
+        _node[_parts[-1]] = _parsed
+      else:
+        _run_updates[_path] = _parsed
+    try:
+      _payload: dict = {"model": kwargs.model, "env": "HalfCheetah"}
+      _payload.update(_run_updates)
+      if _overrides:
+        _payload["model_overrides"] = _overrides
+      _run = _RunConfig.from_dict(_payload)
+      from barl_jax.config.serialization import to_dict as _to_dict
+      data["model"] = _to_dict(_run.model_config)
+      data["config_problems"] = _run.problems()
+    except Exception as exc:
+      data["model"] = {}
+      data["config_problems"] = [f"{type(exc).__name__}: {exc}"]
 
   if kwargs.json:
     print(json.dumps(data, indent=2, sort_keys=True))

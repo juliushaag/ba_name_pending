@@ -4,87 +4,85 @@ algo/env/seed select each run; model.<path> and run.<key> override its settings.
 All runs are materialized before an executor starts any tasks."""
 
 import itertools
-import json
 import os
 import re
 import shlex
 import shutil
-import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
 
 import yaml
 
-from barl_jax.config.toolkit import CONFIG_DIR, resolve_includes
-from barl_jax.config.tree import ConfigTree
+from barl_jax.config import from_yaml
+from barl_jax.config.run import RunConfig
 
-RESERVED_AXES = ("algo", "env", "seed")
+RESERVED_AXES = ("algo", "env", "profile", "seed")
+
+
+def _config_dict(config) -> dict:
+  """Return the canonical detached mapping emitted by a typed config."""
+  return config.to_dict()
+
+
+def _config_validate(config, *, context: str = "run") -> None:
+  """Validate one candidate before it is written or submitted."""
+  try:
+    config.validate()
+  except Exception as exc:
+    raise ValueError(f"{context}: invalid configuration: {exc}") from exc
+
+
+def _nested_set(mapping: dict, dotted: str, value) -> None:
+  """Set one dotted model axis in the canonical nested override shape."""
+  node = mapping
+  parts = dotted.split(".")
+  for part in parts[:-1]:
+    child = node.setdefault(part, {})
+    if not isinstance(child, dict):
+      raise ValueError(f"model override {dotted!r} collides with a scalar at {part!r}")
+    node = child
+  node[parts[-1]] = value
+
+
+def _materialize_candidate(combo: dict, *, defaults: dict | None = None):
+  """Build and validate one expanded point from Python values."""
+  model, env = combo["algo"], combo["env"]
+  payload = {"model": model, "env": env}
+  if combo.get("profile") is not None:
+    payload["profile"] = combo["profile"]
+  payload.update({key.partition(".")[2]: value for key, value in combo.items()
+                 if key.startswith("run.")})
+  if "seed" in combo:
+    payload["seed"] = combo["seed"]
+  payload.update(defaults or {})
+  model_overrides = {}
+  for key, value in combo.items():
+    if key.startswith("model."):
+      _nested_set(model_overrides, key.removeprefix("model."), value)
+  if model_overrides:
+    payload["model_overrides"] = model_overrides
+  RunConfig.defaults(model=model, env=env, profile=payload.get("profile"))
+  config = RunConfig.from_dict(payload)
+  _config_validate(config, context=f"{model} on {env}")
+  return config
 
 
 def default_num_seeds() -> int:
-  """Default vmapped seed count from the run declarations."""
-  return int(ConfigTree(CONFIG_DIR).run["num_seeds"])
-
-
-#: The check itself, run as a program in a child process. Everything it needs
-#: is on stdin; what it found comes back through the file named by argv[1],
-#: which import chatter on stdout cannot corrupt.
-CHECK_PROGRAM = """
-import importlib, json, sys
-
-algos, envs = json.load(sys.stdin)
-
-model_config = importlib.import_module("barl_jax.config.tree")
-from barl_jax.env import Environment
-
-known_envs = set(Environment.available())
-problems = [f"{env!r} is not a registered environment"
-            for env in envs if env not in known_envs]
-
-for algo in algos:
-    try:
-        problems += [f"{algo}: {p}" for p in model_config.validate(algo, model_config.ConfigTree())]
-    except Exception as exc:  # an unresolvable name raises rather than reporting
-        problems.append(f"{algo}: {type(exc).__name__}: {exc}")
-
-with open(sys.argv[1], "w") as out:
-    json.dump(problems, out)
-"""
+  """Default vmapped seed count owned by ``RunConfig``."""
+  return int(RunConfig.defaults(model="SAC", env="HalfCheetah").num_seeds)
 
 
 def check_config(algos: list[str], envs: list[str]) -> list[str]:
-  """Everything an array of 40 tasks would otherwise discover 40 times, at the
-  point where it is still one error message: unregistered env or algo names,
-  and anything `model_config.validate()` rejects (an override that lands on no
-  slot, a kwarg no component accepts, a slot missing its `tier:`).
-
-  Resolution only: no env is built, no weights are allocated, nothing touches
-  a device."""
-  # In a child process, and that is the whole point. The check wants
-  # JAX_PLATFORMS=cpu -- a login node has no GPU to spend -- while every
-  # executor hands *this* process's environment to the runs (LocalExecutor's
-  # `env=`, sbatch's `--export=ALL`, tmux's `-e`). A JAX_PLATFORMS=cpu left in
-  # os.environ here does not just slow the check down: it trains every run of
-  # the sweep on the CPU, ~160x slower per gradient step and indistinguishable
-  # from a hang. Setting it only in the child is what makes that unleakable,
-  # for this variable and any other the check ever needs -- and it keeps jax
-  # and mujoco out of the launcher process entirely.
-  env = {**os.environ, "MUJOCO_GL": "egl", "JAX_PLATFORMS": "cpu"}
-
-  with tempfile.TemporaryDirectory() as tmp:
-    found = os.path.join(tmp, "problems.json")
-    proc = subprocess.run([sys.executable, "-c", CHECK_PROGRAM, found],
-                          input=json.dumps([list(algos), list(envs)]),
-                          text=True, capture_output=True, env=env)
-
-    if proc.returncode != 0 or not os.path.exists(found):
-      tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-5:]
-      return ["the config check could not run:", *(f"  {line}" for line in tail)]
-
-    with open(found) as f:
-      return json.load(f)
+  """Resolve and validate every model/environment pair before submission."""
+  problems = []
+  for algo in algos:
+    for env in envs:
+      try:
+        config = RunConfig.defaults(model=algo, env=env)
+        config.validate()
+      except Exception as exc:
+        problems.append(f"{algo} on {env}: {type(exc).__name__}: {exc}")
+  return problems
 
 
 # ---------------------------------------------------------------------------
@@ -93,23 +91,24 @@ def check_config(algos: list[str], envs: list[str]) -> list[str]:
 
 def build_axes(*, grid: str = None, algos: list = None, envs: list = None,
                sets: list = None) -> tuple[dict, list[dict]]:
-  """Combine a grid spec with CLI axes and pins; return (axes, exclude)."""
+  """Read a tiny ``{axes, exclude}`` grid document and merge CLI pins."""
   axes, exclude = {}, []
-
   if grid:
     with open(grid) as f:
       spec = yaml.safe_load(f) or {}
-    spec = resolve_includes(spec, Path(grid).resolve().parent, Path(CONFIG_DIR))
+    if not isinstance(spec, dict):
+      raise SystemExit(f"{grid}: grid document must be a mapping")
     if "base" in spec:
-      raise SystemExit("grid base: is no longer supported; use run.<key> axes for run settings")
+      raise SystemExit(f"{grid}: `base` is not supported; declare only `axes` and `exclude`")
+    unknown = sorted(set(spec) - {"axes", "exclude"})
+    if unknown:
+      raise SystemExit(f"{grid}: unknown grid key(s): {', '.join(unknown)}")
     axes = dict(spec.get("axes") or {})
     exclude = list(spec.get("exclude") or [])
-
   if algos:
     axes["algo"] = list(algos)
   if envs:
     axes["env"] = list(envs)
-
   for assignment in sets or []:
     key, sep, value = assignment.partition("=")
     if not sep:
@@ -121,24 +120,18 @@ def build_axes(*, grid: str = None, algos: list = None, envs: list = None,
       raise SystemExit(f"axis {name!r} must be a non-empty list of values, got {values!r}")
     if name not in RESERVED_AXES and not name.startswith(("model.", "run.")):
       raise SystemExit(f"axis {name!r} must be one of {RESERVED_AXES}, or be prefixed "
-                       f"'model.' (a dotted model override) or 'run.' (a run-config key)")
-    if name in ("run.model", "run.env", "run.seed"):
+                       "'model.' (a model override) or 'run.' (a run-config key)")
+    if name in ("run.model", "run.env", "run.profile", "run.seed"):
       bare = name.partition(".")[2]
-      raise SystemExit(f"axis {name!r} would fight the {bare!r} the run entry already gets -- "
-                       f"use the {bare.replace('model', 'algo')!r} axis instead")
-
+      raise SystemExit(f"axis {name!r} would fight the {bare!r} selector; use the "
+                       f"{bare.replace('model', 'algo')} axis instead")
   for required in ("algo", "env"):
     if not axes.get(required):
       raise SystemExit(f"no {required!r} axis -- pass --{required}s or declare one in --grid")
   axes.setdefault("seed", [0])
-
-  # Checked only once the CLI axes are in, since an exclude may well name an axis
-  # the grid file leaves to --algos/--envs.
-  unknown = [k for ex in exclude for k in ex if k not in axes]
+  unknown = [key for ex in exclude for key in ex if key not in axes]
   if unknown:
-    raise SystemExit(f"{grid}: exclude names non-axis key(s) {unknown} -- it would never match "
-                     f"anything. Axes are: {', '.join(axes)}")
-
+    raise SystemExit(f"{grid}: exclude names non-axis key(s) {unknown} -- axes: {', '.join(axes)}")
   return axes, exclude
 
 
@@ -158,7 +151,7 @@ def name_combos(combos: list[dict], axes: dict, num_seeds: int) -> list[str]:
   is declared, the base seed when that axis varies, and key=value for every
   *varying* non-reserved axis (a fixed --set value is the same in every run, so
   it only clutters the name -- it is recorded in the per-run YAML)."""
-  varying = [k for k, v in axes.items() if k not in RESERVED_AXES and len(v) > 1]
+  varying = [k for k, v in axes.items() if k not in ("algo", "env", "seed") and len(v) > 1]
 
   short = {k: k.rpartition(".")[2] for k in varying}
   for k, s in list(short.items()):
@@ -234,41 +227,35 @@ class Run:
     return command_for(self.kind, os.path.join(sweep_dir, self.config), run_dir=run_dir)
 
 
-def materialize(combos: list[dict], tags: list[str], *, defaults: dict, sweep_dir: str,
+def materialize(combos: list[dict], tags: list[str], *, defaults: dict = None, sweep_dir: str,
                 num_seeds: int | None) -> list[Run]:
-  """Writes every run's self-contained `config.yaml` and returns the runs.
+  """Write one strict, self-contained training YAML per expanded point.
 
-  This is the step that makes the rest of the system simple: after it, a run is
-  a config path, and the grid it came from is nobody else's business. Each config
-  carries a fully resolved `snapshot:` taken *under that run's own overrides*, so
-  it replays exactly regardless of what config/ says later."""
+  The grid file is only an axis specification. Every point is materialized by
+  ``RunConfig`` in Python, validated before it is written, and serialized as a
+  single mapping accepted by ``from_yaml``.
+  """
   runs = []
   for index, (combo, tag) in enumerate(zip(combos, tags)):
-    # `seed` is the base the run's `num_seeds` vmapped seeds count up from
-    # (barl_jax.trainer.Run: base_seed + i), not one seed per process.
-    entry = {"model": combo["algo"], "env": combo["env"], "seed": combo["seed"]}
+    metadata = dict(defaults or {})
     if num_seeds is not None:
-      entry["num_seeds"] = num_seeds
-    entry.update({k.partition(".")[2]: v for k, v in combo.items() if k.startswith("run.")})
+      metadata["num_seeds"] = num_seeds
+    config = _materialize_candidate(combo, defaults=metadata)
 
-    overrides = {k.partition(".")[2]: v for k, v in combo.items() if k.startswith("model.")}
-    if overrides:
-      entry["model_overrides"] = overrides
-
-    # Everything this run produces lands under one directory: the config it ran
-    # with, its log, and (via `run_dir`, which trainer.train() checkpoints into)
-    # its weights. A sweep is then self-contained -- no hunting through a global
-    # checkpoints/ tree for which run made which file.
     run_dir = os.path.join(sweep_dir, tag)
+    config = config.replace(run_dir=os.path.abspath(run_dir))
+    _config_validate(config, context=f"{combo['algo']} on {combo['env']}")
+
     os.makedirs(run_dir, exist_ok=True)
-    entry["run_dir"] = os.path.abspath(run_dir)
+    path = os.path.join(run_dir, "config.yaml")
+    with open(path, "w") as f:
+      yaml.safe_dump(_config_dict(config), f, sort_keys=False)
+    # Validate the exact emitted mapping with the public loader. This catches
+    # serializers that accidentally omit selector metadata or nested values.
+    from_yaml(path)
 
-    snapshot = ConfigTree(CONFIG_DIR, overrides=overrides).snapshot_for(combo["algo"])
-    with open(os.path.join(run_dir, "config.yaml"), "w") as f:
-      yaml.safe_dump({"defaults": defaults, "runs": [entry], "snapshot": snapshot}, f)
-
-    runs.append(Run(index=index, tag=tag, combo=combo,
-                    dir=tag, config=os.path.join(tag, "config.yaml")))
+    runs.append(Run(index=index, tag=tag, combo=combo, dir=tag,
+                    config=os.path.join(tag, "config.yaml")))
   return runs
 
 
@@ -293,9 +280,6 @@ def materialize_eval(entries: list[dict], *, batch_size: int | None,
   `kind='eval'` Run per batch.
 
   This is submit.py's one path from "some checkpoints to evaluate" to
-  submitted `Run`s, whichever mode built `entries`: `--eval-config` reads them
-  straight from a hand-authored file (they already carry whatever `path`/
-  `env`/overrides the user wrote); `--from-sweep` synthesizes
   `{"path": "<from_sweep>/<tag>"}` per axis combo, one tag per entry, `env`
   always omitted -- `evaluate.py`'s own discovery reads it from
   `<from_sweep>/<tag>/config.yaml`, the same file `materialize()` wrote there

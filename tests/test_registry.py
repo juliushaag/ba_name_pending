@@ -1,21 +1,11 @@
-"""The registry and config/components.yaml agreeing with the classes.
-
-These are the cheap checks that catch config drift: an entry whose class no
-longer exists, a kwarg no `__init__` in the MRO accepts (the `**kwargs`
-catch-all every component has would otherwise swallow it silently), and a class
-that cannot be constructed from its own baseline at all.
-"""
+"""The registry agreeing with itself -- every registered component builds and
+constructs its own `config_type` from bare defaults."""
 
 import pytest
 from conftest import ACTORS, ALL, CRITICS, SCHEDULES, SQUASHES, built
 
-import barl_jax.config.tree as model_config
 from barl_jax.components import Component
 from barl_jax.registration import get_component
-
-# components.yaml entries with no class in the registry. Both are leftovers from
-# the torch port; listed so a *new* one still fails this test.
-KNOWN_UNREGISTERED = {"DistilledFlowActor", "FlowBCActor"}
 
 
 def test_registry_is_partitioned():
@@ -35,12 +25,16 @@ def test_constructs_from_its_baseline(name):
     assert isinstance(built(name), Component)
 
 
-def test_components_yaml_entries_are_registered():
-    """Every entry in config/components/ has to name a class the registry can
-    resolve -- a typo's baseline kwargs would otherwise silently never apply."""
-    entries = set(model_config.ConfigTree().components)
-    stale = sorted(entries - set(ALL) - KNOWN_UNREGISTERED)
-    assert not stale, f"components.yaml entries with no registered class: {stale}"
+@pytest.mark.parametrize("name", ALL)
+def test_config_type_constructs_from_its_own_defaults(name):
+    """Every component's `config_type` (if it declares one) is a real, usable
+    dataclass -- construction from bare defaults is what `Policy.build_component`
+    does before applying any override. There is one registry now (the runtime
+    class itself), so a schema can no longer drift out of sync with it -- see
+    `config_type` beside each implementation."""
+    config_type = get_component(name).config_type
+    if config_type is not None:
+        assert config_type()  # constructs without raising
 
 
 @pytest.mark.parametrize("name", ALL)

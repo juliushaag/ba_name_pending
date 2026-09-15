@@ -8,6 +8,8 @@ Grouped a few assertions to a test on purpose: an eager `Ensemble` forward costs
 real time, so each test re-uses one `raw()` rather than paying for its own.
 """
 
+from dataclasses import replace
+
 import jax
 import jax.numpy as jnp
 import pytest
@@ -86,7 +88,7 @@ def test_bellman_contract(name, obs, act):
     one_step = target_expectation(c, c.bellman_target(jnp.zeros((BATCH,)), live, ONE, boot))
     two_step = target_expectation(
         c, c.bellman_target(jnp.zeros((BATCH,)), live, jnp.full((BATCH,), 2), boot))
-    assert jnp.allclose(two_step, c.gamma * one_step, atol=0.05)
+    assert jnp.allclose(two_step, c.config.gamma * one_step, atol=0.05)
 
     # `bellman_target` and `regression_loss` live in different classes; this is
     # the coupling between them. `target_from_raw` is the same lift applied to
@@ -106,7 +108,7 @@ def test_bellman_target_matches_hand_computed_chunk_return(name):
     if hasattr(c, "support"):
         pytest.skip("categorical critics build the transformed support instead -- see "
                     "test_categorical_projection_matches_scalar_discount in test_critic_stats.py")
-    c.gamma = 0.5
+    c.config = replace(c.config, gamma=0.5)
     target = c.bellman_target(jnp.array([2.75]), jnp.array([0.0]), jnp.array([3]),
                               jnp.array([[8.0]]))
     assert jnp.allclose(target, jnp.array([[3.75]]), atol=1e-5)
@@ -119,7 +121,7 @@ def test_bellman_target_k1_matches_one_step(name):
     c = build(name)
     if hasattr(c, "support"):
         pytest.skip("categorical: see test_categorical_projection_matches_scalar_discount")
-    c.gamma = 0.5
+    c.config = replace(c.config, gamma=0.5)
     target = c.bellman_target(jnp.array([1.0]), jnp.array([0.0]), jnp.array([1]), jnp.array([[8.0]]))
     assert jnp.allclose(target, jnp.array([[1.0 + 0.5 * 8.0]]), atol=1e-5)
 
@@ -132,7 +134,7 @@ def test_bellman_target_terminated_drops_bootstrap(name):
     c = build(name)
     if hasattr(c, "support"):
         pytest.skip("categorical: see test_categorical_projection_matches_scalar_discount")
-    c.gamma = 0.5
+    c.config = replace(c.config, gamma=0.5)
     target = c.bellman_target(jnp.array([2.0]), jnp.array([1.0]), jnp.array([2]), jnp.array([[100.0]]))
     assert jnp.allclose(target, jnp.array([[2.0]]), atol=1e-5)
 
@@ -144,7 +146,7 @@ def test_entropy_bonus_sign_and_discount(name):
     c = build(name)
     if hasattr(c, "support"):
         pytest.skip("categorical: see test_categorical_projection_matches_scalar_discount")
-    c.gamma = 0.5
+    c.config = replace(c.config, gamma=0.5)
     with_bonus = c.bellman_target(jnp.array([0.0]), jnp.array([0.0]), jnp.array([2]),
                                   jnp.array([[0.0]]), entropy_bonus=jnp.array([[1.0]]))
     without = c.bellman_target(jnp.array([0.0]), jnp.array([0.0]), jnp.array([2]), jnp.array([[0.0]]))
@@ -206,7 +208,7 @@ def test_polyak_target_tracks_the_live_net(name, obs, act):
 
     c.after_step()
 
-    expected = jax.tree.map(lambda b, l: b + c.polyak_tau * (l - b), before, live)
+    expected = jax.tree.map(lambda b, l: b + c.config.polyak_tau * (l - b), before, live)
     for got, want in zip(jax.tree.leaves(nnx.state(c.critic_target, nnx.Param)),
                          jax.tree.leaves(expected)):
         assert jnp.allclose(got, want, atol=1e-5)
@@ -215,5 +217,5 @@ def test_polyak_target_tracks_the_live_net(name, obs, act):
 def test_bfloat16_heads_still_price(obs, act):
     """The shipped dtype for most of these, and the one SDAC runs. The contracts
     above are checked in float32; this only asserts low precision stays finite."""
-    c = build("C51Critic", dtype="bfloat16")
+    c = build("C51Critic", mlp={"dtype": "bfloat16"})
     assert finite(c.value(obs, critic_action(c, act)))

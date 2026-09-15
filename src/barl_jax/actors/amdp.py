@@ -1,17 +1,47 @@
 import math
+from dataclasses import asdict, dataclass, field
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from barl_jax.actors.policy_dict import maxent_actor_policy
-from barl_jax.components import Actor, Buffer, Critic, frozen
-from barl_jax.config.toolkit import ConfigMixin
-from barl_jax.hparam import Config, ConfigDict
+from barl_jax.components import Actor, Buffer, Critic, _Static, frozen
+from barl_jax.config.schemas import ComponentsConfig, ModelConfig, register_model
+from barl_jax.critics.categorical import C51CriticConfig
 from barl_jax.networks.diffusion import TimeConditionedField, controlled_sde
-from barl_jax.networks.time_embedding import TIME_STYLES
+from barl_jax.networks.mlp import MLPConfig
+from barl_jax.networks.regulator import AutotuneRegulatorConfig
+from barl_jax.networks.time_embedding import TimeEmbeddingConfig
 from barl_jax.optimization import ActorOptim
+from barl_jax.policies.rl import MaxEntPolicyConfig, MaxEntRLPolicy
+from barl_jax.policy import register_policy
 from barl_jax.registration import get_component, register_component
+
+
+@dataclass(frozen=True)
+class ScoreContinuousActorConfig:
+  class_name: str = "ScoreContinuousActor"
+  latent_dim: int = 256
+  layers: int = 2
+  mlp: MLPConfig = field(default_factory=lambda: MLPConfig(activation="gelu", norm="none", dtype="float32"))
+  time_emb: str = "ctrl"
+  time: TimeEmbeddingConfig = field(default_factory=lambda: TimeEmbeddingConfig(
+    kind="fourier", time_dim=16, num_freqs=16, hidden=32, concat_input=True))
+  squash_cls: str = "ErfSquash"
+  sigma_min: float = 0.01
+  sigma_max: float = 2.0
+  tau_min: float = 0.0
+  tau_max: float = 1.0
+  max_steps: int = 16
+  out_clip: float = 10000.0
+  q_score_max_norm: float = 5.0
+  q_score_max_percentile: float = 95.0
+  batch_rep: int = 1
+  lr: float = 3.0e-4
+  adam_b1: float = 0.9
+  grad_clip: float = 1.0
+  grad_clip_mode: str = "element"
 
 
 def clip_score(score, max_norm: float, percentile: float):
@@ -28,44 +58,28 @@ class ScoreContinuousActor(ActorOptim, Actor):
   `mlp`; time_emb selects the time coder.
   Only the SDE and score-clipping knobs are this class's own."""
 
-  POLICY = maxent_actor_policy(policy_delay=3, normalize_obs=False)
-
   kind = "actor"
-  mlp = ConfigDict(activation='gelu', norm='none', norm_stem=False, norm_input=False,
-                   norm_after_act=True, dropout=0.0, final_activation=False,
-                   residual=False, norm_kwargs={}, dtype='float32')
+  config_type = ScoreContinuousActorConfig
 
-  time_emb  = Config("ctrl", style=TIME_STYLES)
-  squash_cls = Config("ErfSquash")   # `erf_k` is derived from the noise schedule below
-  sigma_min    = Config(0.01)
-  sigma_max    = Config(2.0)
-  tau_min      = Config(0.0)
-  tau_max      = Config(1.0)
-  max_steps    = Config(32)
-  out_clip     = Config(10000.0)   # ctrl_net.py's `outer_clip`
+  def __init__(self, env_stats, config: ScoreContinuousActorConfig, *, rngs: nnx.Rngs, **kwargs):
+    time_values = config.time.to_runtime_dict()
+    self.time_dim, self.time_embed = time_values["time_dim"], time_values["time_embed"]
+    self._static_config = _Static({"time_kwargs": time_values["time_kwargs"]})
+    super().__init__(env_stats, config, **kwargs)
 
-  q_score_max_norm       = Config(5.0)
-  q_score_max_percentile = Config(95.0)
+    self._log_r    = math.log(self.config.sigma_max / self.config.sigma_min)
+    self._int_base = float(self._raw_int(jnp.asarray(self.config.tau_min, jnp.float32)))
 
-  batch_rep = Config(1)
-
-  def __init__(self, env_stats, config: ConfigMixin, *, rngs: nnx.Rngs, **kwargs):
-    self.resolve_config(config, env_stats=env_stats)
-
-    self._log_r    = math.log(self.sigma_max / self.sigma_min)
-    self._int_base = float(self._raw_int(jnp.asarray(self.tau_min, jnp.float32)))
-
-    # latent_dim/layers are tier-ladder-owned.
-    latent_dim, layers = config.get("latent_dim", int), config.get("layers", int)
+    latent_dim, layers = config.latent_dim, config.layers
 
     self.field = TimeConditionedField(
       self.obs_dim, self.plan_dim, latent_dim=latent_dim, layers=layers,
       time_dim=self.time_dim, time_embed=self.time_embed, time_kwargs=self.static("time_kwargs"),
-      rngs=rngs, **self.mlp.todict())
+      rngs=rngs, **asdict(config.mlp))
 
     self.field.zero_init_head()   # u ~ 0 at the beginning
 
-    taus   = jnp.linspace(self.tau_min, self.tau_max, self.max_steps + 1, dtype=jnp.float32)
+    taus   = jnp.linspace(self.config.tau_min, self.config.tau_max, self.config.max_steps + 1, dtype=jnp.float32)
     sig_sq = self.sigma_sq_int_fn(taus)                        # exact, rebased to tau_min
     self.taus     = Buffer(taus)
     self.step_var = Buffer(jnp.maximum(sig_sq[1:] - sig_sq[:-1], 0.0))
@@ -73,16 +87,16 @@ class ScoreContinuousActor(ActorOptim, Actor):
 
     self._terminal_var = float(self.step_var[...].sum())
 
-    self.squash = get_component(self.squash_cls)(
-      env_stats, ConfigMixin(), erf_k=(2 * self._terminal_var) ** -0.5)
+    self.squash = get_component(self.config.squash_cls)(
+      env_stats, None, erf_k=(2 * self._terminal_var) ** -0.5)
 
   def sigma_fn(self, tau):
-    r = self.sigma_max / self.sigma_min
-    return self.sigma_min * r ** (1.0 - tau) * math.sqrt(2.0 * self._log_r)
+    r = self.config.sigma_max / self.config.sigma_min
+    return self.config.sigma_min * r ** (1.0 - tau) * math.sqrt(2.0 * self._log_r)
 
   def _raw_int(self, tau):
-    r = self.sigma_max / self.sigma_min
-    return self.sigma_max ** 2 * (1.0 - r ** (-2.0 * tau))
+    r = self.config.sigma_max / self.config.sigma_min
+    return self.config.sigma_max ** 2 * (1.0 - r ** (-2.0 * tau))
 
   def sigma_sq_int_fn(self, tau):
     """int_{tau_min}^{tau} sigma^2(t) dt -- matches what the sampler injects."""
@@ -111,7 +125,7 @@ class ScoreContinuousActor(ActorOptim, Actor):
 
   def control(self, obs, x, tau):
     u = self.field(obs, x, self.scaled_time(tau))
-    return jnp.clip(u, -self.out_clip, self.out_clip)
+    return jnp.clip(u, -self.config.out_clip, self.config.out_clip)
 
   def scaled_time(self, tau):
     """The level the control net conditions on. The reference scales it into
@@ -138,7 +152,7 @@ class ScoreContinuousActor(ActorOptim, Actor):
 
     X = jnp.zeros((B, self.plan_dim), jnp.float32)
     X, log_w = controlled_sde(lambda x, i, k: self.euler_step(obs, x, i, k),
-                              X, self.max_steps, key,
+                              X, self.config.max_steps, key,
                               aux=jnp.zeros((B, self.chunk_size), jnp.float32))
 
     log_w = log_w + self.prior_surprisal(X)
@@ -156,14 +170,7 @@ class ScoreContinuousActor(ActorOptim, Actor):
     rollout_key, tau_key, noise_key = jax.random.split(key, 3)
     alpha = jax.lax.stop_gradient(jnp.asarray(alpha))
 
-    # generate_action() reshapes to (B, chunk_size, action_dim) before
-    # returning -- the public Actor.generate_action contract every other
-    # actor's action also has. Everything below is internal, plan-resolution
-    # math (chunk_sum, bridge_sample, chunk_broadcast, `field`'s TimeConditio-
-    # nedField(..., self.plan_dim, ...)), all built against the flat (B,
-    # plan_dim) shape generate_action's own SDE rollout uses *before* that
-    # reshape -- so it is undone immediately, not left for the critic and the
-    # control net to each rediscover their own shape mismatch.
+
     X, _ = self.generate_action(obs, key=rollout_key, squash=False)
     X = jax.lax.stop_gradient(X).reshape(X.shape[0], -1)
 
@@ -171,18 +178,18 @@ class ScoreContinuousActor(ActorOptim, Actor):
       return critic.value(obs, self.squash(x)).sum()
 
     x_score = nnx.grad(q_values, argnums=1)(frozen(critic), X)
-    x_score, clipped_frac = clip_score(x_score, self.q_score_max_norm, self.q_score_max_percentile)
+    x_score, clipped_frac = clip_score(x_score, self.config.q_score_max_norm, self.config.q_score_max_percentile)
 
     def terminal_entropy(actor, x):
       return (alpha * (actor.prior_surprisal(x) + actor.squash_correction(x))).sum()
 
     entropy_score = nnx.grad(terminal_entropy, argnums=1)(frozen(self), X)
 
-    score = jnp.repeat(x_score + entropy_score, self.batch_rep, axis=0)
-    obs_r = jnp.repeat(obs, self.batch_rep, axis=0)
-    X_r   = jnp.repeat(X, self.batch_rep, axis=0)
+    score = jnp.repeat(x_score + entropy_score, self.config.batch_rep, axis=0)
+    obs_r = jnp.repeat(obs, self.config.batch_rep, axis=0)
+    X_r   = jnp.repeat(X, self.config.batch_rep, axis=0)
 
-    tau   = jax.random.uniform(tau_key, (X_r.shape[0], 1), minval=self.tau_min, maxval=self.tau_max)
+    tau   = jax.random.uniform(tau_key, (X_r.shape[0], 1), minval=self.config.tau_min, maxval=self.config.tau_max)
     noise = jax.random.normal(noise_key, X_r.shape)
     a_t   = self.bridge_sample(X_r, tau, noise)
     u_tilde   = self.control(obs_r, a_t, tau)
@@ -199,3 +206,23 @@ class ScoreContinuousActor(ActorOptim, Actor):
     critic.metrics.vec("score", x_score)
 
     return { "actor" : loss }
+
+
+@register_policy
+class AMDP(MaxEntRLPolicy):
+  """Binds ScoreContinuousActor into the shared max-entropy actor-critic
+  template -- the actor-policy integration for this algorithm."""
+
+  actor_cls = ScoreContinuousActor
+
+
+@register_model
+@dataclass(frozen=True)
+class AMDPModelConfig(ModelConfig):
+  schema_name: ClassVar[str] = "AMDP"
+  policy_class: str = "AMDP"
+  params: MaxEntPolicyConfig = field(default_factory=lambda: MaxEntPolicyConfig(
+    normalize_obs=False, policy_delay=3))
+  components: ComponentsConfig = field(default_factory=lambda: ComponentsConfig(
+    actor=ScoreContinuousActorConfig(), critic=C51CriticConfig(),
+    entropy=AutotuneRegulatorConfig()))

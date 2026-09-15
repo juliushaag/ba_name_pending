@@ -132,7 +132,7 @@ def save_training(run, root, progress, *, keep: int = 2) -> None:
       replay.append(meta)
     meta = {
       "format_version": VERSION,
-      "config": {**run.cfg, "snapshot": run.reference._snapshot},
+      "config": run.cfg.to_dict(),
       "num_seeds": run.num_seeds,
       "capacity": run.buffer.max_transitions,
       "progress": progress,
@@ -172,6 +172,7 @@ def read_training(root) -> dict:
 
 
 def validate_resume(cfg, num_seeds, meta):
+  from barl_jax.config.run import RunConfig
   if num_seeds != meta["num_seeds"]:
     raise ValueError("Resume requires the saved num_seeds")
   mutable = {"checkpoint", "checkpoint_mode", "run_dir", "sweep_tag", "validate",
@@ -182,15 +183,22 @@ def validate_resume(cfg, num_seeds, meta):
              # each eval's own results); collection strategy is a training
              # config and is deliberately NOT in this set -- changing it
              # changes the behavior policy that produced the replay buffer.
-             "eval_mode", "eval_candidates",
-             "snapshot", "model_overrides"}
-  changed = [key for key, value in meta["config"].items()
-             if key not in mutable and cfg.get(key) != value]
+             "eval_mode", "eval_candidates"}
+  saved = meta["config"]
+  current = cfg.to_dict() if isinstance(cfg, RunConfig) else dict(cfg)
+  # `model_overrides`/`env_metadata`/`snapshot` carry the saved model itself;
+  # the run already reuses the saved model (see trainer._setup), so exclude
+  # them from the "did training config change" comparison -- otherwise every
+  # resume would report its own model as changed.
+  for key in ("model_overrides", "env_metadata", "snapshot"):
+    saved.pop(key, None) if isinstance(saved, dict) else None
+    current.pop(key, None)
+  def _cfg_get(mapping, key):
+    return mapping.get(key) if isinstance(mapping, dict) else getattr(mapping, key, None)
+  changed = [key for key, value in (saved.items() if isinstance(saved, dict) else [])
+             if key not in mutable and _cfg_get(current, key) != value]
   if changed:
     raise ValueError(f"Resume changes training configuration: {', '.join(sorted(changed))}")
-  for key in ("snapshot", "model_overrides"):
-    if cfg.get(key) and cfg[key] != meta["config"].get(key):
-      raise ValueError(f"Resume must use the saved {key}")
 
 
 def restore_training(run, meta) -> None:

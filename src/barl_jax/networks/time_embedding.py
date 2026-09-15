@@ -1,4 +1,5 @@
 import math
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
@@ -6,35 +7,24 @@ from flax import nnx
 
 from barl_jax.components import Buffer
 
-# ---------------------------------------------------------------------------
-# TIME_STYLES -- the named time/level-embedding surfaces a component *selects*
-# from (`time_emb = Config("fourier", style=TIME_STYLES)`).
-# ---------------------------------------------------------------------------
 
-_TIME_SIN_16 = dict(time_dim=8, time_embed="sin",
-                    time_kwargs={"num_freqs": 16, "freq_min": 0.1, "freq_max": 100.0,
-                                 "hidden": 32, "concat_input": True, "spacing": "geometric"})
+@dataclass(frozen=True)
+class TimeEmbeddingConfig:
+  kind: str = "sin"
+  time_dim: int = 8
+  num_freqs: int = 16
+  freq_min: float = 0.1
+  freq_max: float = 100.0
+  hidden: int = 32
+  concat_input: bool = True
+  spacing: str = "geometric"
 
-TIME_STYLES = {
-  "sin_16": _TIME_SIN_16,
-  "sin_20": {**_TIME_SIN_16,
-             "time_kwargs": {**_TIME_SIN_16["time_kwargs"], "num_freqs": 20}},
-  # dime_am's FeatureProjector -- 16 geometric frequencies and a trainable
-  # zero-init phase, Dense -> gelu -> Dense out to time_dim 16. The NC-LQL
-  # level coder.
-  "fourier": {**_TIME_SIN_16, "time_dim": 16, "time_embed": "fourier"},
-  # The AM control net's coder (ctrl_net.py FeatureProjector at
-  # configs/alg/am.yaml).
-  "ctrl":    dict(time_dim=16, time_embed="fourier",
-                  time_kwargs={"num_freqs": 16, "freq_min": 0.1, "freq_max": 100.0,
-                               "hidden": 32, "concat_input": True, "spacing": "geometric"}),
-  # PISGRADNet's coder -- 256 *linearly* spaced frequencies, a trainable
-  # zero-init phase, sin/cos with no raw `t`, out to time_dim 256.
-  "pisgrad": dict(time_dim=256, time_embed="fourier",
-                  time_kwargs={"num_freqs": 256, "freq_min": 0.1, "freq_max": 100.0,
-                               "hidden": 256, "concat_input": False, "spacing": "linear"}),
-}
-
+  def to_runtime_dict(self) -> dict:
+    return {"time_dim": self.time_dim, "time_embed": self.kind,
+            "time_kwargs": {"num_freqs": self.num_freqs,
+                             "freq_min": self.freq_min, "freq_max": self.freq_max,
+                             "hidden": self.hidden, "concat_input": self.concat_input,
+                             "spacing": self.spacing}}
 
 def sinusoidal_emb(t, time_dim: int):
   shape = t.shape[:-1]
@@ -47,6 +37,7 @@ def sinusoidal_emb(t, time_dim: int):
 
 
 class TimeEmbedding(nnx.Module):
+  config_type = TimeEmbeddingConfig
   """A scalar time/level `(B, 1)` -> `(B, time_dim)`, in one of three kinds.
 
   * `sin` -- `sinusoidal_emb`: fixed transformer-style frequencies, no

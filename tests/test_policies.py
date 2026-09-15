@@ -19,15 +19,15 @@ from conftest import ACT_DIM, BATCH, OBS_DIM, make_env_stats
 from flax import nnx
 
 from barl_jax.components import TRAINABLE
-from barl_jax.config.tree import ConfigTree
+from barl_jax.config.run import RunConfig
 from barl_jax.metrics import PRIMARY
 from barl_jax.optimization import train_step
 from barl_jax.policies.rl import MaxEntRLPolicy
 from barl_jax.policy import Policy
 
-MODELS = sorted(ConfigTree().available_models())
+MODELS = sorted(Policy.available())
 MAXENT_MODELS = [n for n in MODELS
-                 if issubclass(Policy.class_for(ConfigTree().policy_class_name(n)), MaxEntRLPolicy)]
+                 if issubclass(Policy.class_for(RunConfig.defaults(model=n, env="HalfCheetah").policy), MaxEntRLPolicy)]
 
 
 class FakeEnv:
@@ -111,9 +111,17 @@ def test_per_action_alpha_gives_one_alpha_per_chunk_position(name, chunk_size):
   already decomposed at that resolution (`Component.chunk_sum`), so this has
   to hold for every one of them, at chunk_size 1 (where it must degenerate to
   the same shape `per_chunk` uses) and above."""
-  config = ConfigTree(overrides={"params.alpha_granularity": "per_action",
-                                 "params.chunk_size": chunk_size})
-  policy = Policy.make(name, FakeEnv(), config=config, env_stats=make_env_stats(), seed=0)
+  from barl_jax.config.model import ModelSpec
+  run = RunConfig.from_dict({
+    "model": name, "env": "HalfCheetah",
+    "chunk_size": chunk_size,
+    "model_overrides": {"params": {"alpha_granularity": "per_action"}},
+  })
+  # Trainer passes run chunk_size as an explicit constructor kwarg, winning
+  # over the model default -- mirror that here.
+  spec = ModelSpec.resolve(name, run)
+  policy = Policy.make(name, FakeEnv(), spec=spec, env_stats=make_env_stats(),
+                       seed=0, chunk_size=chunk_size)
   assert policy.chunk_size == chunk_size
   assert policy.alpha().shape == (chunk_size,)
 
@@ -134,7 +142,7 @@ def test_per_action_alpha_gives_one_alpha_per_chunk_position(name, chunk_size):
 METRIC_KEYS = {
   "AMDP": ['actor/action/dim_std_mean', 'actor/action/frac_at_limit', 'actor/action/norm_mean', 'actor/entropy/edge_sat', 'actor/entropy/max', 'actor/entropy/mean', 'actor/entropy/min', 'actor/entropy/std', 'actor/grad_norm', 'actor/loss', 'actor/score_clipped_frac', 'actor/score_loss', 'actor/score_target/edge_sat', 'actor/score_target/max', 'actor/score_target/mean', 'actor/score_target/min', 'actor/score_target/std', 'actor/u/dim_std_mean', 'actor/u/norm_mean', 'batch/action/edge_sat', 'batch/action/max', 'batch/action/mean', 'batch/action/min', 'batch/action/std', 'batch/reward/edge_sat', 'batch/reward/max', 'batch/reward/mean', 'batch/reward/min', 'batch/reward/std', 'critic/critic/edge_sat', 'critic/critic/max', 'critic/critic/mean', 'critic/critic/min', 'critic/critic/std', 'critic/ensemble/disagreement', 'critic/ensemble/pessimism_gap', 'critic/grad_norm', 'critic/loss', 'critic/q_target/edge_sat', 'critic/q_target/max', 'critic/q_target/mean', 'critic/q_target/min', 'critic/q_target/std', 'critic/return_std/edge_sat', 'critic/return_std/max', 'critic/return_std/mean', 'critic/return_std/min', 'critic/return_std/std', 'critic/score/dim_std_mean', 'critic/score/norm_mean', 'entropy/alpha', 'entropy/grad_norm', 'entropy/loss', 'entropy/target', 'entropy/value/edge_sat', 'entropy/value/max', 'entropy/value/mean', 'entropy/value/min', 'entropy/value/std', 'entropy/value_scaled/edge_sat', 'entropy/value_scaled/max', 'entropy/value_scaled/mean', 'entropy/value_scaled/min', 'entropy/value_scaled/std'],
   "DIME": ['actor/action/dim_std_mean', 'actor/action/frac_at_limit', 'actor/action/norm_mean', 'actor/entropy/edge_sat', 'actor/entropy/max', 'actor/entropy/mean', 'actor/entropy/min', 'actor/entropy/std', 'actor/grad_norm', 'actor/loss', 'batch/action/edge_sat', 'batch/action/max', 'batch/action/mean', 'batch/action/min', 'batch/action/std', 'batch/reward/edge_sat', 'batch/reward/max', 'batch/reward/mean', 'batch/reward/min', 'batch/reward/std', 'critic/critic/edge_sat', 'critic/critic/max', 'critic/critic/mean', 'critic/critic/min', 'critic/critic/std', 'critic/ensemble/disagreement', 'critic/ensemble/pessimism_gap', 'critic/grad_norm', 'critic/loss', 'critic/q_target/edge_sat', 'critic/q_target/max', 'critic/q_target/mean', 'critic/q_target/min', 'critic/q_target/std', 'critic/return_std/edge_sat', 'critic/return_std/max', 'critic/return_std/mean', 'critic/return_std/min', 'critic/return_std/std', 'entropy/alpha', 'entropy/grad_norm', 'entropy/loss', 'entropy/target', 'entropy/value/edge_sat', 'entropy/value/max', 'entropy/value/mean', 'entropy/value/min', 'entropy/value/std', 'entropy/value_scaled/edge_sat', 'entropy/value_scaled/max', 'entropy/value_scaled/mean', 'entropy/value_scaled/min', 'entropy/value_scaled/std'],
-  "NCLQL": ['batch/action/edge_sat', 'batch/action/max', 'batch/action/mean', 'batch/action/min', 'batch/action/std', 'batch/reward/edge_sat', 'batch/reward/max', 'batch/reward/mean', 'batch/reward/min', 'batch/reward/std', 'critic/critic/edge_sat', 'critic/critic/max', 'critic/critic/mean', 'critic/critic/min', 'critic/critic/std', 'critic/ensemble/disagreement', 'critic/ensemble/pessimism_gap', 'critic/grad_norm', 'critic/loss', 'critic/q_target/edge_sat', 'critic/q_target/max', 'critic/q_target/mean', 'critic/q_target/min', 'critic/q_target/std', 'critic/return_std/edge_sat', 'critic/return_std/max', 'critic/return_std/mean', 'critic/return_std/min', 'critic/return_std/std', 'critic/smoothing_loss', 'critic/td_loss', 'nclql/action/dim_std_mean', 'nclql/action/frac_at_limit', 'nclql/action/norm_mean', 'nclql/score_norm'],
+  "NCLQL": ['actor/action/dim_std_mean', 'actor/action/frac_at_limit', 'actor/action/norm_mean', 'actor/score_norm', 'batch/action/edge_sat', 'batch/action/max', 'batch/action/mean', 'batch/action/min', 'batch/action/std', 'batch/reward/edge_sat', 'batch/reward/max', 'batch/reward/mean', 'batch/reward/min', 'batch/reward/std', 'critic/critic/edge_sat', 'critic/critic/max', 'critic/critic/mean', 'critic/critic/min', 'critic/critic/std', 'critic/ensemble/disagreement', 'critic/ensemble/pessimism_gap', 'critic/grad_norm', 'critic/loss', 'critic/q_target/edge_sat', 'critic/q_target/max', 'critic/q_target/mean', 'critic/q_target/min', 'critic/q_target/std', 'critic/return_std/edge_sat', 'critic/return_std/max', 'critic/return_std/mean', 'critic/return_std/min', 'critic/return_std/std', 'critic/smoothing_loss', 'critic/td_loss'],
   "SAC": ['actor/action/dim_std_mean', 'actor/action/frac_at_limit', 'actor/action/norm_mean', 'actor/entropy/edge_sat', 'actor/entropy/max', 'actor/entropy/mean', 'actor/entropy/min', 'actor/entropy/std', 'actor/grad_norm', 'actor/loss', 'batch/action/edge_sat', 'batch/action/max', 'batch/action/mean', 'batch/action/min', 'batch/action/std', 'batch/reward/edge_sat', 'batch/reward/max', 'batch/reward/mean', 'batch/reward/min', 'batch/reward/std', 'critic/critic/edge_sat', 'critic/critic/max', 'critic/critic/mean', 'critic/critic/min', 'critic/critic/std', 'critic/ensemble/disagreement', 'critic/ensemble/pessimism_gap', 'critic/grad_norm', 'critic/loss', 'critic/q_target/edge_sat', 'critic/q_target/max', 'critic/q_target/mean', 'critic/q_target/min', 'critic/q_target/std', 'critic/return_std/edge_sat', 'critic/return_std/max', 'critic/return_std/mean', 'critic/return_std/min', 'critic/return_std/std', 'entropy/alpha', 'entropy/grad_norm', 'entropy/loss', 'entropy/target', 'entropy/value/edge_sat', 'entropy/value/max', 'entropy/value/mean', 'entropy/value/min', 'entropy/value/std', 'entropy/value_scaled/edge_sat', 'entropy/value_scaled/max', 'entropy/value_scaled/mean', 'entropy/value_scaled/min', 'entropy/value_scaled/std'],
   # SDAC's keys changed under the actor-template refactor (REFACTOR.md): the
   # actor now owns two optimizer keys ("actor", "explore"), so metrics_key's
@@ -167,15 +175,20 @@ def test_critics_declare_supported_objectives():
 
 def test_resolved_style_surface_is_the_surface_that_gets_built():
   policy = make("SDAC")
-  resolved = ConfigTree().resolve_slot("SDAC", "actor", None)[1]
-  assert policy.actor.mlp.activation.lower() == resolved["activation"].lower()
-  assert policy.actor.field.net.act is getattr(jax.nn, resolved["activation"].lower())
+  from barl_jax.config.model import ModelSpec
+  spec = ModelSpec.resolve("SDAC", None)
+  _, mapping = spec.component("actor")
+  # Canonical mapping uses `class`; the MLP activation lives nested.
+  activation = mapping["mlp"]["activation"] if "mlp" in mapping else mapping["activation"]
+  assert policy.actor.field.net.act is getattr(jax.nn, activation.lower())
 
 
 def test_unknown_component_override_is_rejected_at_construction():
-  config = ConfigTree(overrides={"components.actor.activaton": "relu"})
-  with pytest.raises(KeyError, match="unused config keys.*activaton"):
-    Policy.make("SAC", FakeEnv(), config=config, env_stats=make_env_stats())
+  with pytest.raises((KeyError, TypeError), match="activaton"):
+    RunConfig.from_dict({
+      "model": "SAC", "env": "HalfCheetah",
+      "model_overrides": {"components": {"actor": {"activaton": "relu"}}},
+    })
 
 
 def test_duplicate_optimizer_keys_are_rejected(monkeypatch):

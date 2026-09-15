@@ -1,222 +1,550 @@
-"""Run-config declarations and loading."""
+"""Typed training-run configuration and the deliberately small YAML loader."""
+
+from __future__ import annotations
 
 import math
+from copy import deepcopy
+from dataclasses import dataclass, field, fields, replace
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Mapping, get_type_hints
 
-from barl_jax.config.toolkit import CONFIG_DIR, load_yaml_with_includes
-from barl_jax.hparam import Config
+if TYPE_CHECKING:
+  from barl_jax.policies.rl import PolicyConfig
 
-RUN_CONFIGS: dict[str, Config] = {
-  "checkpoint": Config(None),
-  "checkpoint_mode": Config("weights"),
-  "seed": Config(0),
-  "num_seeds": Config(3),
-  "validate": Config(False),
-  "run_dir": Config(None),
-  "sweep_tag": Config(None),
-  "logger": Config("wandb"),
-  "total_env_steps": Config(1_000_000),
-  "random_steps": Config(5000),
-  "rollout_steps": Config(1),
-  "num_envs": Config(1),
-  "chunk_size": Config(1),
-  "buffer_size": Config(1_000_000),
-  "batch_size": Config(256),
-  "utd_ratio": Config(2.0),
-  "lr_warmup_steps": Config(0),
-  "lr_decay": Config("constant"),
-  "eval_every": Config(25000),
-  "eval_runs": Config(10),
-  # Every Nth eval (not an env-step count) captures one video episode per
-  # seed -- see trainer.py's `evaluate()`. null means never.
-  "eval_video_every": Config(4),
-  "log_every": Config(250),
-  "debug_every": Config(1000),
-  "wandb_finish_timeout": Config(300),
-  "compile_cache_dir": Config("~/.cache/barl_jax/jax"),
-  # Resume persistence is its own cadence, independent of eval_every: the
-  # replay dump it carries can be gigabytes, so it should not fire more often
-  # than a run actually needs recoverability -- see training_checkpoint.py.
-  "resume_every": Config(50_000),
-  "resume_keep": Config(2),
-  # Policy-independent action selection at inference time -- see execution.py.
-  # Collection and evaluation choose independently: changing evaluation's
-  # strategy does not touch the behavior policy collection actually used.
-  "collection_mode": Config("default"),
-  "collection_candidates": Config(1),
-  "eval_mode": Config("default"),
-  "eval_candidates": Config(1),
-}
-
-INJECTED_KEYS = frozenset({
-  "model", "env",
-  "model_overrides",
-  "snapshot",
-})
+from barl_jax.config.schemas import (
+  CHECKPOINT_MODES,
+  LOGGER_KINDS,
+  LR_DECAYS,
+  ComponentsConfig,
+  EnvironmentConfig,
+  ModelConfig,
+  environment_schema,
+  model_schema,
+  model_to_runtime_dict,
+  resolve_model,
+)
+from barl_jax.config.serialization import merge as deep_merge_dataclass
+from barl_jax.execution import MODES as EXECUTION_MODES
+from barl_jax.optimization import CLIP_MODES
+from barl_jax.registration import get_component
 
 
-def run_defaults() -> dict:
-  return {name: cfg.default for name, cfg in RUN_CONFIGS.items()}
+@dataclass(frozen=True)
+class RunConfig:
+  """One complete immutable training run.
+
+  ``model_config`` is materialized from a schema class and contains all model
+  values, including values hidden behind tier/style selectors.  The public
+  input spelling is ``model_overrides``; its canonical output is the complete
+  nested model object so a serialized run is self-contained.
+  """
+
+  model: str
+  env: str
+  profile: str | None = None
+  checkpoint: str | None = None
+  checkpoint_mode: str = "weights"
+  seed: int = 0
+  num_seeds: int = 3
+  validate_config: bool = False
+  run_dir: str | None = None
+  sweep_tag: str | None = None
+  logger: str = "wandb"
+  total_env_steps: int = 1_000_000
+  random_steps: int = 5000
+  rollout_steps: int = 1
+  num_envs: int = 1
+  chunk_size: int = 1
+  buffer_size: int = 1_000_000
+  batch_size: int = 256
+  utd_ratio: float = 2.0
+  lr_warmup_steps: int = 0
+  lr_decay: str = "constant"
+  eval_every: int = 25_000
+  eval_runs: int = 10
+  eval_video_every: int | None = 4
+  log_every: int = 250
+  debug_every: int = 1000
+  wandb_finish_timeout: int = 300
+  compile_cache_dir: str | None = "~/.cache/barl_jax/jax"
+  resume_every: int | None = 50_000
+  resume_keep: int = 2
+  collection_mode: str = "default"
+  collection_candidates: int = 1
+  eval_mode: str = "default"
+  eval_candidates: int = 1
+  snapshot: dict[str, Any] | None = None
+  model_config: ModelConfig = field(default_factory=lambda: model_schema("SAC")())
+  env_config: EnvironmentConfig = field(default_factory=lambda: environment_schema("HalfCheetah")())
+
+  @classmethod
+  def defaults(cls, model: str, env: str, profile: str | None = None) -> "RunConfig":
+    selected, alias_profile, model_cls = resolve_model(model)
+    if profile is not None and alias_profile is not None and profile != alias_profile:
+      raise ValueError(f"model {model!r} selects profile {alias_profile!r}, "
+                       f"cannot also use profile {profile!r}")
+    profile = profile if profile is not None else alias_profile
+    try:
+      env_cls = environment_schema(env)
+    except KeyError:
+      # External environments (`module:Class` paths, e.g. the CPU quickstart's
+      # tiny pendulum) have no static benchmark metadata; they still get a
+      # complete run object with empty defaults. Live spaces/dimensions are
+      # runtime facts from EnvStats, never config defaults.
+      if ":" not in env:
+        raise
+      from barl_jax.config.schemas import EnvironmentConfig as _EnvConfig
+      env_cls = _EnvConfig
+      return cls(model=model, env=env, profile=profile,
+                 model_config=model_cls() if profile is None else _profile_model(selected, model_cls(), profile),
+                 env_config=_EnvConfig(name=env))
+    # A schema class is the only source of built-in model defaults.  Calling it
+    # allocates ordinary Python dataclasses only; it does not touch JAX or a
+    # simulator registry.
+    model_value = model_cls()
+    if profile is not None:
+      model_value = _profile_model(selected, model_value, profile)
+    return cls(model=model, env=env, profile=profile,
+               model_config=model_value, env_config=env_cls())
+
+  @classmethod
+  def from_dict(cls, mapping: Mapping[str, Any]) -> "RunConfig":
+    if not isinstance(mapping, Mapping):
+      raise TypeError(f"run config must be a mapping, got {type(mapping).__name__}")
+    if "runs" in mapping or "defaults" in mapping:
+      raise ValueError("training config must describe one run; `runs` and `defaults` "
+                       "envelopes are not supported")
+    for key in ("model", "env"):
+      if key not in mapping:
+        raise KeyError(f"run config is missing required selector {key!r}")
+    if not isinstance(mapping["model"], str) or not isinstance(mapping["env"], str):
+      raise TypeError("model and env selectors must be strings")
+
+    base = cls.defaults(mapping["model"], mapping["env"], mapping.get("profile"))
+    allowed = {f.name for f in fields(cls)} - {"model_config", "env_config", "validate_config"}
+    allowed |= {"validate", "model_overrides", "env_metadata"}
+    unknown = sorted(set(mapping) - allowed)
+    if unknown:
+      available = sorted(allowed - {"model_overrides"}) + ["model_overrides"]
+      raise KeyError(f"run config: unknown keys {unknown}; available keys: {available}")
+
+    result = base
+    run_updates = {}
+    for f in fields(cls):
+      if f.name in ("model", "env", "profile", "snapshot", "model_config", "env_config"):
+        continue
+      input_name = "validate" if f.name == "validate_config" else f.name
+      if input_name not in mapping:
+        continue
+      value = mapping[input_name]
+      expected = get_type_hints(cls)[f.name]
+      from barl_jax.config.serialization import is_instance as _is_instance
+      from barl_jax.config.serialization import type_name as _type_name
+      if not _is_instance(value, expected):
+        raise TypeError(f"{input_name} has wrong type: expected {_type_name(expected)}, "
+                        f"got {type(value).__name__} = {value!r}")
+      run_updates[f.name] = deepcopy(value)
+    if "snapshot" in mapping:
+      if mapping["snapshot"] is not None and not isinstance(mapping["snapshot"], Mapping):
+        raise TypeError("snapshot must be a mapping or null")
+      run_updates["snapshot"] = (None if mapping["snapshot"] is None
+                                  else deepcopy(dict(mapping["snapshot"])))
+    if run_updates:
+      result = replace(result, **run_updates)
+
+    if "env_metadata" in mapping:
+      metadata = mapping["env_metadata"]
+      if not isinstance(metadata, Mapping):
+        raise TypeError("env_metadata must be a mapping")
+    overrides = mapping.get("model_overrides")
+    if overrides is not None:
+      if not isinstance(overrides, Mapping):
+        raise TypeError("model_overrides must be a mapping")
+      result = replace(result, model_config=_apply_model_overrides(
+        result.model_config, overrides))
+    result.validate()
+    return result
+
+  @property
+  def params(self) -> PolicyConfig:
+    return self.model_config.params
+
+  @property
+  def components(self) -> ComponentsConfig:
+    return self.model_config.components
+
+  @property
+  def policy(self) -> str:
+    return self.model_config.policy_class
+
+  def to_dict(self) -> dict[str, Any]:
+    out = {}
+    for f in fields(self):
+      if f.name in ("model_config", "env_config"):
+        continue
+      output_name = "validate" if f.name == "validate_config" else f.name
+      out[output_name] = deepcopy(getattr(self, f.name))
+    # Keep the input section name, but write the complete effective model.  A
+    # saved file can therefore be loaded without any package default tables.
+    out["model_overrides"] = self.model_config.to_dict()
+    out["env_metadata"] = {
+      "name": self.env_config.name,
+      "return_min": self.env_config.return_min,
+      "return_max": self.env_config.return_max,
+      "defaults": deepcopy(self.env_config.defaults),
+    }
+    return deepcopy(out)
+
+  def to_runtime_dict(self) -> dict[str, Any]:
+    out = {k: deepcopy(v) for k, v in self.to_dict().items()
+           if k not in ("model_overrides", "env_metadata")}
+    out.update(model_to_runtime_dict(self.model_config))
+    out["model_overrides"] = self.model_config.to_dict()
+    return deepcopy(out)
+
+  def flat_model(self) -> dict[str, Any]:
+    return model_to_runtime_dict(self.model_config)
+
+  def validate(self) -> None:
+    problems = _problems(self)
+    if problems:
+      raise ValueError("invalid run config\n" + "\n".join(f"- {p}" for p in problems))
+
+  def problems(self) -> list[str]:
+    return _problems(self)
+
+  def replace(self, **changes) -> "RunConfig":
+    """Dataclass replacement with selector-aware rebuilding."""
+    selectors = {k for k in ("model", "env", "profile") if k in changes}
+    if selectors:
+      selected_model = changes.get("model", self.model)
+      selected_env = changes.get("env", self.env)
+      selected_profile = changes.get("profile", self.profile)
+      rebuilt = type(self).defaults(selected_model, selected_env, selected_profile)
+      for f in fields(self):
+        if f.name not in selectors and f.name not in ("model_config", "env_config"):
+          changes.setdefault(f.name, getattr(self, f.name))
+      changes.setdefault("model_config", rebuilt.model_config)
+      changes.setdefault("env_config", rebuilt.env_config)
+    return replace(self, **changes)
 
 
-# Keys read as a modulo denominator or a `// ` divisor somewhere in trainer.py
-# -- zero there is not "off", it is a ZeroDivisionError or a silent 0-length
-# iteration, so these must be >= 1 rather than merely >= 0.
-_POSITIVE_INT_KEYS = ("total_env_steps", "rollout_steps", "num_envs", "chunk_size",
-                      "buffer_size", "batch_size", "eval_every", "eval_runs",
-                      "log_every", "debug_every", "resume_keep")
-# Explicitly allowed to be zero -- see each key's own comment in RUN_CONFIGS'
-# consumers (e.g. random_steps: 0 skips the warmup fill; lr_warmup_steps: 0 is
-# no warmup).
-_NONNEGATIVE_INT_KEYS = ("random_steps", "lr_warmup_steps", "wandb_finish_timeout")
-# `None` means "never" for these (see trainer.py's `_train`); a stated value
-# still goes through the same >= 1 rule as the always-on cadence keys above.
-_POSITIVE_OR_NONE_INT_KEYS = ("eval_video_every", "resume_every")
-
-LOGGER_KINDS = ("wandb", "local", "none")
+# Run fields are retained as a plain mapping for small legacy callers.  They no
+# longer carry Config declarations and are never consulted by RunConfig.defaults.
+RUN_CONFIGS = {("validate" if f.name == "validate_config" else f.name): f.default for f in fields(RunConfig)
+               if f.name not in {"model", "env", "profile", "snapshot", "model_config", "env_config"}}
+INJECTED_KEYS = frozenset({"model", "env", "profile", "model_overrides", "snapshot"})
 
 
-def validate_run(cfg: dict, *, num_seeds: int = None) -> list[str]:
-  """Preflight checks over a resolved run config, independent of the model it
-  names (barl_jax.config.tree.validate covers that half) -- the boundary both
-  YAML/CLI-loaded configs and every direct `trainer.setup()` caller share, so
-  a bad run config fails before `_setup` allocates an environment, a policy,
-  or a JAX device buffer. Each problem names the key, the value, and the
-  relation it violates."""
-  problems = []
+def run_defaults() -> dict[str, Any]:
+  return deepcopy(RUN_CONFIGS)
 
+
+def run_keys(root=None) -> set[str]:
+  return set(RUN_CONFIGS)
+
+
+def validate_run(cfg: RunConfig | Mapping[str, Any], *, num_seeds: int | None = None) -> list[str]:
+  """Return diagnostics for callers that aggregate preflight errors."""
+  if isinstance(cfg, RunConfig):
+    problems = cfg.problems()
+  else:
+    problems = _mapping_problems(cfg)
+  if num_seeds is not None:
+    if not isinstance(num_seeds, int) or isinstance(num_seeds, bool) or num_seeds < 1:
+      problems.append(f"num_seeds={num_seeds!r}: must be an int >= 1")
+  return problems
+
+
+def load_config(path: str | Path, root=None) -> list[dict[str, Any]]:
+  """Compatibility boundary returning one runtime mapping for one YAML run."""
+  from barl_jax.config import from_yaml
+  run = from_yaml(path)
+  return [run.to_runtime_dict()]
+
+
+def _profile_model(name: str, value: ModelConfig, profile: str) -> ModelConfig:
+  """Resolve a typed profile class if a plugin registered one.
+
+  Built-ins currently have no profiles.  A model schema can expose
+  ``profiles`` as a class-level mapping of profile names to schema classes;
+  this keeps profile lookup class-owned instead of adding a defaults table.
+  """
+  profiles = getattr(type(value), "profiles", {})
+  if profile not in profiles:
+    available = sorted(profiles)
+    raise KeyError(f"model {name!r} has no profile {profile!r}; available profiles: {available}")
+  profile_schema = profiles[profile]
+  if isinstance(profile_schema, type) and issubclass(profile_schema, ModelConfig):
+    return profile_schema()
+  if isinstance(profile_schema, ModelConfig):
+    return deepcopy(profile_schema)
+  raise TypeError(f"profile {profile!r} for {name!r} is not a ModelConfig schema")
+
+
+def _normal_component_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
+  value = dict(value)
+  if "class" in value:
+    if "class_name" in value:
+      raise KeyError("component override cannot contain both 'class' and 'class_name'")
+    value["class_name"] = value.pop("class")
+  return value
+
+
+def _selected_time_style(name: str):
+  """A named time-coder preset as a complete `TimeEmbeddingConfig` -- the
+  `time_emb:` override shortcut. Lazily imported: only an override that
+  actually names a `time_emb` style needs the (jax-touching) time-embedding
+  module at all."""
+  from barl_jax.networks.time_embedding import TimeEmbeddingConfig
+  styles = {
+    "sin_16": TimeEmbeddingConfig(kind="sin", time_dim=8, num_freqs=16),
+    "sin_20": TimeEmbeddingConfig(kind="sin", time_dim=8, num_freqs=20),
+    "fourier": TimeEmbeddingConfig(kind="fourier", time_dim=16),
+    "ctrl": TimeEmbeddingConfig(kind="fourier", time_dim=16),
+    "pisgrad": TimeEmbeddingConfig(kind="fourier", time_dim=256, hidden=256,
+                                    num_freqs=256, concat_input=False, spacing="linear"),
+  }
+  try:
+    return styles[name]
+  except KeyError as exc:
+    raise KeyError(f"unknown time_emb {name!r}; available styles: {list(styles)}") from exc
+
+
+def _apply_component_override(base: Any, override: Mapping[str, Any], *, path: str) -> Any:
+  if not isinstance(override, Mapping):
+    raise TypeError(f"{path} must be a mapping")
+  raw = _normal_component_mapping(override)
+  selected_name = raw.get("class_name", base.class_name)
+  # A class selector is resolved first, from its own config_type -- the same
+  # typed default a fresh Policy.build_component() would materialize.
+  if selected_name != base.class_name:
+    base = get_component(selected_name).config_type()
+  if "time_emb" in raw:
+    raw_time = _selected_time_style(raw["time_emb"])
+    if hasattr(base, "time"):
+      base = replace(base, time=raw_time)
+  # Selector keys are now represented by the selected dataclass.  Apply the
+  # ordinary nested override after selector surfaces have been expanded.
+  raw.pop("class_name", None)
+  result = deep_merge_dataclass(base, raw, path=path)
+  return result
+
+
+def _apply_model_overrides(base: ModelConfig, overrides: Mapping[str, Any]) -> ModelConfig:
+  unknown = sorted(set(overrides) - {"policy", "policy_class", "params", "components"})
+  if unknown:
+    raise KeyError(f"model_overrides: unknown keys {unknown}; available keys: "
+                   "['policy', 'params', 'components']")
+  if "policy" in overrides and overrides["policy"] != base.policy_class:
+    raise ValueError(f"model_overrides.policy={overrides['policy']!r} does not match "
+                     f"selected policy {base.policy_class!r}")
+  if "policy_class" in overrides and overrides["policy_class"] != base.policy_class:
+    raise ValueError(f"model_overrides.policy_class={overrides['policy_class']!r} does not match "
+                     f"selected policy {base.policy_class!r}")
+  result = base
+  if "params" in overrides:
+    if not isinstance(overrides["params"], Mapping):
+      raise TypeError("model_overrides.params must be a mapping")
+    result = replace(result, params=deep_merge_dataclass(
+      result.params, overrides["params"], path="model_overrides.params"))
+  if "components" in overrides:
+    entries = overrides["components"]
+    if not isinstance(entries, Mapping):
+      raise TypeError("model_overrides.components must be a mapping")
+    slots = {f.name for f in fields(result.components)}
+    unknown_slots = sorted(set(entries) - slots)
+    if unknown_slots:
+      raise KeyError(f"model_overrides.components: unknown slots {unknown_slots}; "
+                     f"available slots: {sorted(slots)}")
+    component_values = {}
+    for slot, override in entries.items():
+      current = getattr(result.components, slot)
+      if current is None:
+        raise KeyError(f"model_overrides.components.{slot}: slot is not present in {base.schema_name}")
+      component_values[slot] = _apply_component_override(
+        current, override, path=f"model_overrides.components.{slot}")
+    if component_values:
+      result = replace(result, components=replace(result.components, **component_values))
+  return result
+
+
+def _mapping_problems(cfg: Mapping[str, Any]) -> list[str]:
+  if not isinstance(cfg, Mapping):
+    return [f"config has type {type(cfg).__name__}, expected mapping"]
+  # A mapping passed by an older direct trainer caller cannot carry a typed
+  # model object, but run-level diagnostics remain useful and side-effect free.
+  problems: list[str] = []
+  from barl_jax.config.serialization import is_instance as _is_instance
+  from barl_jax.config.serialization import type_name as _type_name
+  hints = get_type_hints(RunConfig)
+  for key, expected in hints.items():
+    input_key = "validate" if key == "validate_config" else key
+    if key in ("model_config", "env_config") or input_key not in cfg:
+      continue
+    if not _is_instance(cfg[input_key], expected):
+      problems.append(f"{input_key}={cfg[input_key]!r}: expected {_type_name(expected)}")
+  problems.extend(_cross_run_problems(dict(cfg)))
+  return problems
+
+
+def _problems(config: RunConfig) -> list[str]:
+  problems = _mapping_problems(config.to_runtime_dict())
+  # to_runtime_dict includes flat model keys that _mapping_problems ignores;
+  # validate the selected model and nested config directly here.
+  try:
+    resolve_model(config.model)
+  except KeyError as exc:
+    problems.append(str(exc))
+  if ":" not in config.env:
+    try:
+      environment_schema(config.env)
+    except KeyError as exc:
+      problems.append(str(exc))
+  problems.extend(_model_problems(config.model_config))
+  return problems
+
+
+def _cross_run_problems(cfg: Mapping[str, Any]) -> list[str]:
+  problems: list[str] = []
   def fail(key, value, relation):
     problems.append(f"{key}={value!r}: {relation}")
-
-  for key, decl in RUN_CONFIGS.items():
-    if key not in cfg:
-      continue
-    value = cfg[key]
-    # A default of None (checkpoint, run_dir, sweep_tag, ...) infers
-    # `type(None)`, i.e. "no declared type" -- these are validated by their
-    # own specific rules below instead, not by Config.coerce().
-    if decl.default is None:
-      continue
-    # bool is an int subclass -- Config.coerce()'s isinstance check would
-    # accept True/False for an int-typed key silently.
-    if decl.type in (int, float) and isinstance(value, bool):
-      fail(key, value, f"must be a {decl.type.__name__}, not bool")
-      continue
-    try:
-      decl.coerce(value)
-    except TypeError as e:
-      fail(key, value, str(e))
-
-  for key in _POSITIVE_INT_KEYS:
-    if key in cfg and isinstance(cfg[key], int) and not isinstance(cfg[key], bool) and cfg[key] < 1:
-      fail(key, cfg[key], "must be >= 1")
-  for key in _NONNEGATIVE_INT_KEYS:
-    if key in cfg and isinstance(cfg[key], int) and not isinstance(cfg[key], bool) and cfg[key] < 0:
-      fail(key, cfg[key], "must be >= 0")
-  for key in _POSITIVE_OR_NONE_INT_KEYS:
-    v = cfg.get(key)
-    if v is not None and isinstance(v, int) and not isinstance(v, bool) and v < 1:
-      fail(key, v, "must be >= 1 or null")
-
+  positive = ("total_env_steps", "rollout_steps", "num_envs", "chunk_size",
+              "buffer_size", "batch_size", "eval_every", "eval_runs",
+              "log_every", "debug_every", "resume_keep")
+  nonnegative = ("random_steps", "lr_warmup_steps", "wandb_finish_timeout")
+  optional_positive = ("eval_video_every", "resume_every")
+  for key in positive:
+    value = cfg.get(key)
+    if isinstance(value, int) and not isinstance(value, bool) and value < 1:
+      fail(key, value, "must be >= 1")
+  for key in nonnegative:
+    value = cfg.get(key)
+    if isinstance(value, int) and not isinstance(value, bool) and value < 0:
+      fail(key, value, "must be >= 0")
+  for key in optional_positive:
+    value = cfg.get(key)
+    if value is not None and isinstance(value, int) and not isinstance(value, bool) and value < 1:
+      fail(key, value, "must be >= 1 or null")
   utd = cfg.get("utd_ratio")
-  if utd is not None and isinstance(utd, (int, float)) and not isinstance(utd, bool):
-    if not math.isfinite(utd) or utd <= 0:
-      fail("utd_ratio", utd, "must be a finite number > 0")
-
+  if isinstance(utd, (int, float)) and not isinstance(utd, bool) and (not math.isfinite(utd) or utd <= 0):
+    fail("utd_ratio", utd, "must be a finite number > 0")
   mode = cfg.get("checkpoint_mode", "weights")
-  if mode not in ("weights", "resume"):
-    fail("checkpoint_mode", mode, "must be 'weights' or 'resume'")
+  if mode not in CHECKPOINT_MODES:
+    fail("checkpoint_mode", mode, f"must be one of {CHECKPOINT_MODES}")
   elif mode == "resume" and not cfg.get("checkpoint"):
     fail("checkpoint_mode", mode, "requires a non-null 'checkpoint'")
-
-  decay = cfg.get("lr_decay")
-  if decay is not None:
-    from barl_jax.optimization import OptimizerMixin
-    if decay not in OptimizerMixin.DECAYS:
-      fail("lr_decay", decay, f"must be one of {sorted(OptimizerMixin.DECAYS)}")
-
-  logger_kind = cfg.get("logger", "wandb")
-  if logger_kind not in LOGGER_KINDS:
-    fail("logger", logger_kind, f"must be one of {LOGGER_KINDS}")
-
-  seeds = num_seeds if num_seeds is not None else cfg.get("num_seeds")
+  logger = cfg.get("logger", "wandb")
+  if logger not in LOGGER_KINDS:
+    fail("logger", logger, f"must be one of {LOGGER_KINDS}")
+  decay = cfg.get("lr_decay", "constant")
+  if decay not in LR_DECAYS:
+    fail("lr_decay", decay, f"must be one of {LR_DECAYS}")
+  seeds = cfg.get("num_seeds")
   if seeds is not None and (not isinstance(seeds, int) or isinstance(seeds, bool) or seeds < 1):
     fail("num_seeds", seeds, "must be an int >= 1")
-
-  # Each vector step executes one primitive action in every environment.
-  # Require exact batches so requested and collected interaction counts agree.
   num_envs = cfg.get("num_envs")
   if isinstance(num_envs, int) and not isinstance(num_envs, bool) and num_envs >= 1:
     for key in ("rollout_steps", "random_steps"):
       steps = cfg.get(key)
       if isinstance(steps, int) and not isinstance(steps, bool) and steps % num_envs:
         fail(key, steps, f"must be divisible by num_envs ({num_envs})")
-
-  # Syntax only -- an unknown mode or a bad candidate count. Capability
-  # checks (mode='bon' needs a scorer, mode='mean' needs continuous actions)
-  # need a constructed policy and run at the start of trainer._setup, in
-  # execution.validate_execution_spec.
-  from barl_jax.execution import MODES
   for mode_key, n_key in (("collection_mode", "collection_candidates"),
                           ("eval_mode", "eval_candidates")):
-    mode, n = cfg.get(mode_key), cfg.get(n_key)
-    if mode is not None and mode not in MODES:
-      fail(mode_key, mode, f"must be one of {MODES}")
-    if n is not None and (not isinstance(n, int) or isinstance(n, bool) or n < 1):
-      fail(n_key, n, "must be a positive int")
-    elif mode == "default" and isinstance(n, int) and n != 1:
-      fail(n_key, n, "must be 1 when mode is 'default'")
-
+    selected, count = cfg.get(mode_key), cfg.get(n_key)
+    if selected not in EXECUTION_MODES:
+      fail(mode_key, selected, f"must be one of {EXECUTION_MODES}")
+    if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+      fail(n_key, count, "must be a positive int")
+    elif selected == "default" and count != 1:
+      fail(n_key, count, "must be 1 when mode is 'default'")
   return problems
 
 
-def run_keys(root=CONFIG_DIR) -> set:
-  from barl_jax.config.tree import ConfigTree
-  return set(ConfigTree(root).run)
-
-
-def _env_defaults(env_name: str) -> dict:
-  from barl_jax.env import Environment
+def _model_problems(model: ModelConfig) -> list[str]:
+  problems: list[str] = []
+  params = model.params
+  if hasattr(params, "alpha_granularity"):
+    from barl_jax.policies.rl import ALPHA_GRANULARITIES
+    if params.alpha_granularity not in ALPHA_GRANULARITIES:
+      problems.append(f"params.alpha_granularity={params.alpha_granularity!r}: must be one of {ALPHA_GRANULARITIES}")
+  # Slot-objective compatibility (e.g. SAC's `td` critic vs NCLQL's `noise_td`).
+  # Needs runtime classes for `learning_objective`/`SLOT_OBJECTIVES`; keep it
+  # best-effort here so RunConfig stays importable without the registry.
   try:
-    cls = Environment.class_for(env_name)
-  except KeyError:
-    cls = None
-  return cls.merged_defaults() if cls is not None else {}
+    from barl_jax.policy import Policy as _Policy
+    from barl_jax.registration import get_component as _get_component
+    _policy_cls = _Policy.class_for(model.policy_class)
+    _actor_cls = None
+    try:
+      _actor_cls, _ = _get_component(model.components.actor.class_name), None
+    except Exception:
+      _actor_cls = None
+    for _slot in ("actor", "critic", "entropy"):
+      _comp = getattr(model.components, _slot, None)
+      if _comp is None:
+        continue
+      try:
+        _cls = _get_component(_comp.class_name)
+      except Exception as exc:
+        problems.append(str(exc)); continue
+      _objective = _policy_cls.slot_objective(
+        _slot, _actor_cls if "actor" in getattr(_policy_cls, "SLOTS", ()) else None)
+      if _objective is not None and getattr(_cls, "learning_objective", None) != _objective:
+        problems.append(f"{model.policy_class}.{_slot}: {_cls.__name__} does not support {_objective!r}")
+  except Exception:
+    pass
+  for slot, component in (("actor", model.components.actor),
+                          ("critic", model.components.critic),
+                          ("entropy", model.components.entropy)):
+    if component is None:
+      continue
+    try:
+      schema = get_component(component.class_name).config_type
+    except KeyError as exc:
+      problems.append(str(exc)); continue
+    if schema is not None and not isinstance(component, schema):
+      problems.append(f"components.{slot}.class={component.class_name!r}: "
+                     f"materialized value is {type(component).__name__}, expected {schema.__name__}")
+    mlp = getattr(component, "mlp", None)
+    if mlp is not None:
+      if mlp.activation not in {"silu", "relu", "gelu", "tanh", "relu6", "leakyrelu", "mish"}:
+        problems.append(f"components.{slot}.mlp.activation={mlp.activation!r}: unknown activation")
+      if mlp.dtype not in {"float32", "bfloat16", "float16"}:
+        problems.append(f"components.{slot}.mlp.dtype={mlp.dtype!r}: unknown dtype")
+    time_name = getattr(component, "time_emb", None)
+    if time_name is not None:
+      try:
+        _selected_time_style(time_name)
+      except KeyError as exc:
+        problems.append(str(exc))
+    from barl_jax.networks.schedule import Schedule as _Schedule
+    def _is_schedule(name: str) -> bool:
+      try:
+        return issubclass(get_component(name), _Schedule)
+      except KeyError:
+        return False
+    schedule = getattr(component, "noise_schedule", None)
+    if schedule is not None:
+      if not _is_schedule(schedule.class_name):
+        problems.append(f"components.{slot}.noise_schedule.class={schedule.class_name!r}: unknown schedule")
+      if schedule.steps < 1 or schedule.warmup < 0 or schedule.warmup >= schedule.steps:
+        problems.append(f"components.{slot}.noise_schedule: steps must be >= 1 and warmup in [0, steps)")
+    if hasattr(component, "ladder_cls") and not _is_schedule(component.ladder_cls):
+      problems.append(f"components.{slot}.ladder_cls={component.ladder_cls!r}: unknown schedule")
+    if hasattr(component, "ladder_kind"):
+      from barl_jax.actors.sdac import LADDER_KINDS
+      if component.ladder_kind not in LADDER_KINDS:
+        problems.append(f"components.{slot}.ladder_kind={component.ladder_kind!r}: must be one of {LADDER_KINDS}")
+    if hasattr(component, "flow_steps") and component.flow_steps < 1:
+      problems.append(f"components.{slot}.flow_steps={component.flow_steps!r}: must be >= 1")
+    if hasattr(component, "num_bins") and component.num_bins < 2:
+      problems.append(f"components.{slot}.num_bins={component.num_bins!r}: must be >= 2")
+    mode = getattr(component, "grad_clip_mode", None)
+    if mode is not None and mode not in CLIP_MODES:
+      problems.append(f"components.{slot}.grad_clip_mode={mode!r}: unknown clip mode")
+  return problems
 
 
-def load_config(path: str, root=CONFIG_DIR) -> list[dict]:
-  from barl_jax.config.tree import ConfigTree
-  raw = load_yaml_with_includes(path, config_root=root)
-
-  snapshot = raw.get("snapshot")
-  runs = raw.get("runs")
-  if not runs:
-    raise ValueError(f"{path}: no `runs` entries -- need at least one {{model, env}} run spec")
-
-  tree = ConfigTree(root, snapshot=snapshot)
-  declared = set(tree.run)
-
-  resolved = []
-  for i, run in enumerate(runs):
-    if "model" not in run or "env" not in run:
-      raise ValueError(f"{path}: runs[{i}] is missing a required 'model' or 'env' key")
-
-    levels = [tree.run, raw.get("defaults") or {}, tree.resolve_training(run["model"]),
-              _env_defaults(run["env"]), run]
-
-    entry = {k: v for level in levels for k, v in level.items()}
-    overrides = {k: v for level in levels for k, v in (level.get("model_overrides") or {}).items()}
-    if overrides:
-      entry["model_overrides"] = overrides
-    if snapshot:
-      entry["snapshot"] = snapshot
-
-    unknown = sorted(set(entry) - declared - INJECTED_KEYS)
-    if unknown:
-      raise ValueError(
-        f"{path}: runs[{i}] resolves keys declared nowhere in config/run/defaults.yaml: "
-        f"{', '.join(unknown)} -- add them there (a run key with no declaration would be a "
-        f"silent no-op, and would never appear in the run's wandb config)")
-
-    resolved.append(entry)
-
-  return resolved
+__all__ = ["RunConfig", "RUN_CONFIGS", "INJECTED_KEYS", "run_defaults", "run_keys",
+           "validate_run", "load_config"]

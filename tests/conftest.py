@@ -1,14 +1,12 @@
 """Shared scaffolding for the component suite.
 
-Every registered component is built from its real `config/components/` entry
--- presets expanded and at the smallest tier, exactly as a run's first layers
-resolve it -- narrowed by `TINY` -- so a required kwarg that gets renamed or dropped
-from that file fails here, while the whole suite still runs in seconds. `TINY`
-only replaces keys the entry already has, so it never injects a kwarg a class
-does not declare (every component has a `**kwargs` catch-all that would swallow
-one silently).
+Every registered component is built from its typed `config_type` defaults --
+narrowed by `TINY` -- so a required field that gets renamed or dropped fails
+here, while the whole suite still runs in seconds. `TINY` only replaces fields
+the schema already has, so it never injects a kwarg a class does not declare.
 """
 
+import dataclasses
 import functools
 import os
 import pathlib
@@ -37,9 +35,7 @@ import pytest
 from flax import nnx
 
 import barl_jax  # noqa: F401  -- import side effects populate the registry
-import barl_jax.config.tree as model_config
 from barl_jax.components import Actor, Critic
-from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.env import EnvStats
 from barl_jax.networks.schedule import Schedule
 from barl_jax.networks.squash import Squash
@@ -92,29 +88,57 @@ POLICY_SUPPLIED = {
 
 
 def tiny_kwargs(name: str, **extra) -> dict:
-    base = model_config.ConfigTree().component_kwargs(name)
-    if issubclass(get_component(name), Schedule):
-        base.update(SCHEDULE_KWARGS)
-    base.update({k: v for k, v in TINY.items() if k in base})
-    base.update(extra)
-    return base
+    # Legacy helper retained for introspection; new code builds typed configs
+    # via `typed_config`. Returns flat overrides only.
+    out = dict(TINY)
+    out.update(extra)
+    return out
+
+
+def typed_config(name: str, **extra):
+  """Materialize a component's `config_type` defaults with overrides.
+
+  `TINY` narrows width where the schema has it; `extra` supplies test-specific
+  fields (e.g. `flow_steps=2`). Schedule standalone builds supply their ladder
+  via `SCHEDULE_KWARGS` defaults.
+  """
+  from barl_jax.config.serialization import merge
+  cls = get_component(name)
+  config_type = getattr(cls, "config_type", None)
+  if config_type is None:
+    return None
+  values: dict = {}
+  if issubclass(cls, Schedule):
+    values.update(SCHEDULE_KWARGS)
+  declared = {f.name for f in dataclasses.fields(config_type)}
+  values.update({k: v for k, v in TINY.items() if k in declared})
+  values.update(extra)
+  unknown = set(values) - declared
+  if unknown:
+    raise KeyError(f"{name}: unknown config fields {sorted(unknown)}; "
+                   f"available: {sorted(declared)}")
+  return merge(config_type(), values)
+
+
+def _merge_nested(config_type, values: dict):
+  """Apply overrides that may include nested dataclass fields."""
+  from barl_jax.config.serialization import merge
+  return merge(config_type(), values)
 
 
 def build(name: str, *, seed: int = 0, env_stats: EnvStats = None, **extra):
-    """`extra` overrides `tiny_kwargs`'s config dict, except for the keys
+    """`extra` overrides the typed config, except for the keys
     `POLICY_SUPPLIED` names for this class -- those are real plumbing kwargs
-    (a Policy passes them explicitly, never through config/), so an override
+    (a Policy passes them explicitly, never through config), so an override
     of one (e.g. `build("AutotuneRegulator", target=-1.0)`) routes there
-    instead of into the resolved config dict."""
+    instead of into the typed config."""
     stats = make_env_stats() if env_stats is None else env_stats
     plumbing_keys = set(POLICY_SUPPLIED.get(name, {}))
     plumbing = {**POLICY_SUPPLIED.get(name, {}),
                 **{k: v for k, v in extra.items() if k in plumbing_keys}}
     config_extra = {k: v for k, v in extra.items() if k not in plumbing_keys}
-    config = ConfigMixin("", tiny_kwargs(name, **config_extra), config_path=name)
-    component = get_component(name)(stats, config, rngs=nnx.Rngs(seed), **plumbing)
-    config.assert_all_consumed(owner=name)
-    return component
+    config = typed_config(name, **config_extra)
+    return get_component(name)(stats, config, rngs=nnx.Rngs(seed), **plumbing)
 
 
 @functools.lru_cache(maxsize=None)

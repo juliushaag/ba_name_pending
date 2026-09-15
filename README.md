@@ -80,6 +80,18 @@ uv run python scripts/debug.py --model SAC --json
 uv run python scripts/submit.py --config sweeps/<submission>/<run>/config.yaml
 ```
 
+### Flow-matching critic (floq)
+
+The optional `FloqCritic` implements the scalar flow-matching critic from [arXiv:2509.06863](https://arxiv.org/abs/2509.06863). Select it for SAC, AMDP, DIME, or SDAC with a model override; the existing actor, replay, and policy interfaces remain unchanged. The default uses 8 Euler flow steps, 8 random target-noise samples, a 51-edge HL-Gauss (50 histogram features) interpolant encoding with `sigma=16.0`, and a 64-dimensional Fourier time encoding. See [docs/floq.md](docs/floq.md) for equations, adaptation details, defaults, and validation requirements.
+
+```bash
+uv run python scripts/submit.py --algos SAC --envs HalfCheetah --seeds 3 --set model.components.critic.class=FloqCritic
+uv run python scripts/submit.py --algos AMDP --envs HalfCheetah --seeds 3 --set model.components.critic.class=FloqCritic --set model.components.critic.flow_steps=4
+uv run python scripts/debug.py --model SAC --json --set components.critic.class=FloqCritic
+```
+
+The flow critic differentiates through its Euler chain during SAC and AMDP actor updates, so actor cost grows with `flow_steps`. Compare 4, 8, and 16 at matched seeds and report wall-clock cost; larger flow budgets can have diminishing returns.
+
 The training CLI requires an accelerator. Set `BARL_ALLOW_CPU=1` for intentional
 CPU smoke tests. Rendering uses EGL by default in the training CLI.
 
@@ -97,15 +109,16 @@ imports the `wandb` package. A run's `objective.json` (`trainer._write_objective
 completed evaluation is `null` there, not a non-finite float, with
 `objective_reason` saying why.
 
-Algorithm defaults live in each actor's `POLICY` dictionary under
-`src/barl_jax/actors/`; policy YAML files are no longer required. MLP settings
-are grouped under one `mlp = ConfigDict(...)` declaration on actors and
-critics, read back as `self.mlp.activation`/`self.mlp.norm`/...; each field
-still overrides at its own flat key, same as a standalone `Config`. Capacity
-tiers live in `src/barl_jax/networks/mlp.py` (`MLP_TIERS`). For example,
-change an activation with `--set model.components.actor.activation=silu`.
-Set `BARL_CONFIG_DIR` before importing config tools, or pass an explicit root to
-`ConfigTree`/`load_config`, to use another configuration directory.
+Algorithm defaults live in typed dataclasses beside their implementations
+(`StochasticActorConfig`, `C51CriticConfig`, ... with `config_type`, the
+single source of truth for that component -- `config/schemas.py` stays
+generic run/environment scaffolding and never redeclares them); policy YAML
+files are no longer required. MLP settings are grouped under one nested `mlp`
+dataclass on actors and critics, read back as
+`self.config.mlp.activation`/`self.config.mlp.norm`/... There is no capacity-tier
+selector; set width/depth directly. For example, change an activation with
+`--set model.components.actor.mlp.activation=silu`, or widen a critic with
+`--set model.components.critic.latent_dim=1024`.
 
 ### Action selection at inference time
 
@@ -214,11 +227,14 @@ For independent in-process experiments, pass configuration explicitly:
 
 ```python
 from barl_jax.config.model import ModelSpec
-from barl_jax.config.tree import ConfigTree
+from barl_jax.config.run import RunConfig
 from barl_jax.policy import Policy
 
-config = ConfigTree(overrides={"params.policy_delay": 2})
-spec = ModelSpec.resolve("SAC", config)
+run = RunConfig.from_dict({
+  "model": "SAC", "env": "HalfCheetah",
+  "model_overrides": {"params": {"policy_delay": 2}},
+})
+spec = ModelSpec.resolve("SAC", run)
 policy = Policy.make("SAC", env, env_stats=env_stats, spec=spec)
 ```
 

@@ -1,44 +1,77 @@
+from dataclasses import dataclass, field
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from barl_jax.components import Buffer, ConfigOwner
-from barl_jax.config.toolkit import ConfigMixin
-from barl_jax.hparam import Config, ConfigDict
-from barl_jax.networks.schedule import Schedule
-from barl_jax.networks.time_embedding import TIME_STYLES, TimeEmbedding
+from barl_jax.components import Buffer, _Static
+from barl_jax.networks.mlp import MLPConfig
+from barl_jax.networks.schedule import Schedule, ScheduleConfig
+from barl_jax.networks.time_embedding import TimeEmbedding, TimeEmbeddingConfig
 from barl_jax.registration import get_component, register_component
 
-from .base import Polyak
-from .categorical import C51Critic, HLGaussCritic
-from .ensemble import EnsembleCritic
+from .base import CriticConfig, target_mlp
+from .categorical import C51Critic, C51CriticConfig, HLGaussCritic, HLGaussCriticConfig
+from .ensemble import EnsembleCritic, EnsembleCriticConfig
 
 
-class NoiseConditionedCritic(ConfigOwner):
+@dataclass(frozen=True)
+class NoiseConditionedCriticConfig(CriticConfig):
+  """Fields shared by every noise-conditioned TD critic (NCLQL's clean+smoothing
+  objective on top of a plain critic's value head) -- mixed in ahead of the
+  value-head-specific config so each `NCLQL*CriticConfig` below only states
+  what actually differs from its non-noise-conditioned counterpart."""
+  reward_scale: float = 1.0
+  noise_schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
+  time_emb: str = "fourier"
+  time: TimeEmbeddingConfig = field(default_factory=lambda: TimeEmbeddingConfig(
+    kind="fourier", time_dim=16, num_freqs=16, hidden=32, concat_input=True))
+  smoothing_coef: float = 1.0
+  polyak_tau: float = 0.005
+  mlp: MLPConfig = field(default_factory=target_mlp)
+
+
+@dataclass(frozen=True)
+class NCLQLCriticConfig(NoiseConditionedCriticConfig, EnsembleCriticConfig):
+  class_name: str = "NCLQLCritic"
+
+
+@dataclass(frozen=True)
+class NCLQLC51CriticConfig(NoiseConditionedCriticConfig, C51CriticConfig):
+  class_name: str = "NCLQLC51Critic"
+  rho: float = 1.0
+  pessimistic_target: bool = True
+
+
+@dataclass(frozen=True)
+class NCLQLHLGaussCriticConfig(NoiseConditionedCriticConfig, HLGaussCriticConfig):
+  class_name: str = "NCLQLHLGaussCritic"
+  rho: float = 1.0
+  pessimistic_target: bool = True
+
+
+class NoiseConditionedCritic:
   learning_objective = "noise_td"
   supports_bon = False
-  reward_scale = Config(5.0)
-  noise_schedule = Config({"class": "ExponentialSchedule", "start": 0.1,
-                           "end": 0.001, "steps": 10})
 
-  time_emb  = Config("fourier", style=TIME_STYLES)
-  smoothing_coef = Config(1.0)
+  def __init__(self, env_stats, config, *args, rngs: nnx.Rngs, **kwargs):
+    time_values = config.time.to_runtime_dict()
+    self.time_emb = config.time_emb
+    self.time_dim = time_values["time_dim"]
+    self.time_embed = time_values["time_embed"]
+    self._static_config = _Static({"time_kwargs": time_values["time_kwargs"]})
 
-  def __init__(self, env_stats, config: ConfigMixin, *args, rngs: nnx.Rngs, **kwargs):
-    self.resolve_config(config, env_stats=env_stats)
-    schedule_config = dict(self.static("noise_schedule"))
-    schedule_cls = get_component(schedule_config.pop("class"))
+    schedule_config = config.noise_schedule
+    schedule_cls = get_component(schedule_config.class_name)
     if not issubclass(schedule_cls, Schedule):
       raise TypeError("noise_schedule must name a Schedule")
-    schedule_config = ConfigMixin("", schedule_config)
     self.sigmas_schedule = schedule_cls(env_stats, schedule_config)
-    schedule_config.assert_all_consumed(owner="noise_schedule")
     self.sigmas = Buffer(self.sigmas_schedule.ladder())
     if self.sigmas.shape[0] < 2:
       raise ValueError("Noise-conditioned TD requires at least two noise levels")
     if env_stats.get("return_min") is not None:
-      env_stats = env_stats.derive(return_min=env_stats["return_min"] * self.reward_scale,
-                                   return_max=env_stats["return_max"] * self.reward_scale)
+      env_stats = env_stats.derive(return_min=env_stats["return_min"] * config.reward_scale,
+                                   return_max=env_stats["return_max"] * config.reward_scale)
     self.encoder = TimeEmbedding(time_dim=self.time_dim, kind=self.time_embed,
                                  rngs=rngs, **self.static("time_kwargs"))
 
@@ -56,7 +89,7 @@ class NoiseConditionedCritic(ConfigOwner):
     if key is None:
       raise ValueError("Noise-conditioned TD requires an explicit random key")
     return self.noise_td_loss(obs, action, next_obs, next_action,
-                              chunk_return * self.reward_scale, terminated, horizon,
+                              chunk_return * self.config.reward_scale, terminated, horizon,
                               self.sigmas[...], key, entropy_bonus=entropy_bonus)
 
   def noise_td_loss(self, obs, action, next_obs, next_action, chunk_return, terminated, horizon,
@@ -86,7 +119,7 @@ class NoiseConditionedCritic(ConfigOwner):
     self.record(pred_clean, td_target)
     self.metrics.scalar("td_loss", td_loss)
     self.metrics.scalar("smoothing_loss", smoothing_loss)
-    return {"critic": td_loss + self.smoothing_coef * smoothing_loss}
+    return {"critic": td_loss + self.config.smoothing_coef * smoothing_loss}
 
   def augment(self, act, level, target: bool = False):
     if not isinstance(level, jax.Array):
@@ -96,31 +129,19 @@ class NoiseConditionedCritic(ConfigOwner):
     return jnp.concatenate([act, embed(level.astype(jnp.float32)[:, None])], axis=-1)
 
 
-
-
-_NCLQL_MLP = dict(activation='mish', norm='none', norm_stem=False, norm_input=False,
-                  norm_after_act=True, dropout=0.0, final_activation=False,
-                  residual=False, norm_kwargs={}, dtype='bfloat16')
+@register_component
+class NCLQLCritic(NoiseConditionedCritic, EnsembleCritic):
+  kind = "critic"
+  config_type = NCLQLCriticConfig
 
 
 @register_component
-class NCLQLCritic(Polyak, NoiseConditionedCritic, EnsembleCritic):
+class NCLQLC51Critic(NoiseConditionedCritic, C51Critic):
   kind = "critic"
-  mlp = ConfigDict(**_NCLQL_MLP)
-  rho                = Config(1.0)
-  pessimistic_target = Config(True)
+  config_type = NCLQLC51CriticConfig
 
 
 @register_component
-class NCLQLC51Critic(Polyak, NoiseConditionedCritic, C51Critic):
+class NCLQLHLGaussCritic(NoiseConditionedCritic, HLGaussCritic):
   kind = "critic"
-  mlp = ConfigDict(**_NCLQL_MLP)
-  entropy_coef    = Config(0.005)
-  rho             = Config(1.0)
-  pessimistic_target = Config(True)
-
-
-@register_component
-class NCLQLHLGaussCritic(Polyak, NoiseConditionedCritic, HLGaussCritic):
-  kind = "critic"
-  mlp = ConfigDict(**_NCLQL_MLP)
+  config_type = NCLQLHLGaussCriticConfig

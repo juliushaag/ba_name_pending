@@ -1,18 +1,59 @@
 import math
+from dataclasses import asdict, dataclass, field
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from barl_jax.actors.policy_dict import maxent_actor_policy
-from barl_jax.components import Actor, Buffer, Critic, frozen
-from barl_jax.config.toolkit import ConfigMixin
-from barl_jax.hparam import Config, ConfigDict
+from barl_jax.components import Actor, Buffer, Critic, _Static, frozen
+from barl_jax.config.schemas import ComponentsConfig, ModelConfig, register_model
+from barl_jax.critics.categorical import C51CriticConfig
 from barl_jax.networks.diffusion import TimeConditionedField, reverse_chain
+from barl_jax.networks.mlp import MLPConfig
+from barl_jax.networks.regulator import AutotuneRegulatorConfig
 from barl_jax.networks.schedule import Schedule
-from barl_jax.networks.time_embedding import TIME_STYLES
+from barl_jax.networks.time_embedding import TimeEmbeddingConfig
 from barl_jax.optimization import ActorOptim, adam
+from barl_jax.policies.rl import MaxEntPolicyConfig, MaxEntRLPolicy
+from barl_jax.policy import register_policy
 from barl_jax.registration import get_component, register_component
+
+# `ladder_kind` names which space DDPMActorConfig.ladder_cls's curve lives in
+# -- see _build_ladder below.
+LADDER_KINDS = ("beta", "alpha_bar")
+
+
+@dataclass(frozen=True)
+class DDPMActorConfig:
+  class_name: str = "DDPMActor"
+  latent_dim: int = 256
+  layers: int = 2
+  mlp: MLPConfig = field(default_factory=lambda: MLPConfig(activation="gelu", norm="none", dtype="bfloat16"))
+  time_emb: str = "ctrl"
+  time: TimeEmbeddingConfig = field(default_factory=lambda: TimeEmbeddingConfig(
+    kind="fourier", time_dim=16, num_freqs=16, hidden=32, concat_input=True))
+  squash_cls: str = "TanhSquash"
+  num_steps: int = 20
+  clip_denoised: bool = True
+  prior_scale: float = 0.5
+  ladder_cls: str = "LinearSchedule"
+  ladder_kind: str = "beta"
+  ladder_start: float = 3.0e-5
+  ladder_end: float = 0.2997
+  ladder_kwargs: dict = field(default_factory=dict)
+  num_bon: int = 8
+  num_candidates: int = 12
+  softmax_temp: float = 0.25
+  explore_init: float = 0.1
+  explore_min: float = 1.0e-3
+  explore_max: float = 1.0
+  explore_raw_limit: float = 10.0
+  explore_lr: float = 1.0e-2
+  lr: float = 3.0e-4
+  adam_b1: float = 0.9
+  grad_clip: float = 1.0
+  grad_clip_mode: str = "element"
 
 
 def _inv_sigmoid(y: float) -> float:
@@ -45,66 +86,40 @@ class DDPMActor(ActorOptim, Actor):
   be differentiated through, so the draws have to be ordinary values in the graph
   rather than a side effect on the module."""
 
-  POLICY = maxent_actor_policy(entropy_scale=-0.9, entropy_in_target=False)
-
   kind = "actor"
-  # GELU MLP with a 20-frequency sinusoidal time coder.
-  # Vary mlp.activation directly for GELU/SiLU comparisons.
-  mlp = ConfigDict(activation='gelu', norm='none', norm_stem=False, norm_input=False,
-                   norm_after_act=True, dropout=0.0, final_activation=False,
-                   residual=False, norm_kwargs={}, dtype='bfloat16')
-  time_emb  = Config("sin_20", style=TIME_STYLES)
-  squash_cls = Config("TanhSquash")
-  num_steps    = Config(20)
-  clip_denoised = Config(True)
-  prior_scale  = Config(0.5)
-  # The noise ladder's *shape* is a Schedule named by class, with its endpoints
-  # searchable; the selector and the kwargs dict are structural.
-  ladder_cls   = Config("LinearSchedule")
+  config_type = DDPMActorConfig
 
-  ladder_kind  = Config("beta")
-  ladder_start = Config(3.0e-5)
-  ladder_end   = Config(0.2997)
-  ladder_kwargs = Config({})
+  def __init__(self, env_stats, config: DDPMActorConfig, *, rngs: nnx.Rngs, **kwargs):
+    super().__init__(env_stats, config, **kwargs)
+    time_values = config.time.to_runtime_dict()
+    self.time_dim, self.time_embed = time_values["time_dim"], time_values["time_embed"]
+    # Mutable mappings stay out of the GraphDef via _Static (a plain dict
+    # attribute would make it unhashable). `ladder_kwargs` only builds the
+    # ladder below.
+    self._static_config = _Static({"time_kwargs": time_values["time_kwargs"],
+                                   "ladder_kwargs": dict(config.ladder_kwargs)})
+    ladder_kwargs = self.static("ladder_kwargs")
 
-  # Best-of-N and softmax weighting for the soft-DSM loss (SDAC), and the
-  # additive exploration noise on top of it -- all of it lives here rather
-  # than on the owning Policy, since it is how *this* actor acts and is
-  # trained, not algorithm logic. See `best_of_n`/`generate_action`/`loss`
-  # below.
-  num_bon      = Config(8)
-  num_candidates = Config(12)
-  softmax_temp = Config(0.25)
-  explore_init = Config(0.1)
-  explore_min  = Config(1.0e-3)
-  explore_max  = Config(1.0)
-  explore_raw_limit = Config(10.0)
-  explore_lr   = Config(1.0e-2)   # its own optimizer, separate from the actor's
-
-  def __init__(self, env_stats, config: ConfigMixin, *, rngs: nnx.Rngs, **kwargs):
-    self.resolve_config(config, env_stats=env_stats)
-
-    # latent_dim/layers are tier-ladder-owned.
-    latent_dim, layers = config.get("latent_dim", int), config.get("layers", int)
+    latent_dim, layers = config.latent_dim, config.layers
 
     self.field = TimeConditionedField(
       self.obs_dim, self.plan_dim, latent_dim=latent_dim, layers=layers,
       time_dim=self.time_dim, time_embed=self.time_embed, time_kwargs=self.static("time_kwargs"),
-      rngs=rngs, **self.mlp.todict())
+      rngs=rngs, **asdict(config.mlp))
 
-    self.tau_table = Buffer(jnp.arange(self.num_steps + 1, dtype=jnp.float32) / self.num_steps)
+    self.tau_table = Buffer(jnp.arange(self.config.num_steps + 1, dtype=jnp.float32) / self.config.num_steps)
     self.alpha_bar = Buffer(self._build_ladder(
-      self.ladder_cls, self.ladder_start, self.ladder_end, self.static("ladder_kwargs"),
-      self.ladder_kind, self.num_steps))
-    self.squash = get_component(self.squash_cls)(env_stats, ConfigMixin())
+      self.config.ladder_cls, self.config.ladder_start, self.config.ladder_end, ladder_kwargs,
+      self.config.ladder_kind, self.config.num_steps))
+    self.squash = get_component(self.config.squash_cls)(env_stats, None)
     self.rngs = rngs
 
     # The exploration std lives here, not on the owning Policy: it is trained
     # by its own optimizer key (see create_optimizer/param_labels) but it is
     # part of how this actor plays an action, not algorithm-level state.
-    lo, hi = self.explore_min, self.explore_max
+    lo, hi = self.config.explore_min, self.config.explore_max
     self.explore_raw = nnx.Param(jnp.full(
-      (self.plan_dim,), _inv_sigmoid((self.explore_init - lo) / (hi - lo)), jnp.float32))
+      (self.plan_dim,), _inv_sigmoid((self.config.explore_init - lo) / (hi - lo)), jnp.float32))
 
   def _plan(self, flat):
     return flat.reshape(flat.shape[0], self.chunk_size, self.action_dim)
@@ -130,8 +145,10 @@ class DDPMActor(ActorOptim, Actor):
       f"DDPMActor: ladder_cls names {cls.__name__}, which is not a Schedule.")
 
     points = num_steps + 1 if kind == "alpha_bar" else num_steps
-    ladder_config = ConfigMixin(
-      "", {"start": start, "end": end, "steps": points, "warmup": 0, **(ladder_kwargs or {})})
+    from barl_jax.networks.schedule import ScheduleConfig
+    values = dict(ladder_kwargs or {})
+    ladder_config = ScheduleConfig(class_name=ladder_cls, start=start, end=end,
+                                    steps=points, warmup=0, **values)
     curve = cls(config=ladder_config).ladder()
 
     if kind == "alpha_bar":
@@ -148,7 +165,7 @@ class DDPMActor(ActorOptim, Actor):
 
   def prior_sample(self, batch: int, key):
     noise = jax.random.normal(key, (batch, self.plan_dim), jnp.float32)
-    return self.prior_scale * noise if self.prior_scale != 1.0 else noise
+    return self.config.prior_scale * noise if self.config.prior_scale != 1.0 else noise
 
   def diffuse(self, x0, n, key):
     g, nu = self.marginal_coef(n)
@@ -194,7 +211,7 @@ class DDPMActor(ActorOptim, Actor):
     a_t    = ab_t / ab_prev
     beta_t = 1.0 - a_t
 
-    if self.clip_denoised:
+    if self.config.clip_denoised:
       # x0 form, because the clip is a projection onto the action box that has
       # no expression in terms of the score alone.
       x0   = jnp.clip(self.x0_from_eps(x, self.predict_eps(obs, x, n), n), -1.0, 1.0)
@@ -225,7 +242,7 @@ class DDPMActor(ActorOptim, Actor):
 
     x = self.prior_sample(obs.shape[0], prior_key)
     return reverse_chain(lambda x, n, k: self.reverse_step(obs, x, n, k),
-                         x, self.num_steps, key)
+                         x, self.config.num_steps, key)
 
   @staticmethod
   def _tile(obs, n: int):
@@ -254,7 +271,7 @@ class DDPMActor(ActorOptim, Actor):
 
   @property
   def explore_std(self):
-    lo, hi = self.explore_min, self.explore_max
+    lo, hi = self.config.explore_min, self.config.explore_max
     return lo + (hi - lo) * jax.nn.sigmoid(self.explore_raw[...])
 
   def explore(self, action, key):
@@ -272,14 +289,14 @@ class DDPMActor(ActorOptim, Actor):
   def after_step(self):
     super().after_step()
     self.explore_raw[...] = jnp.clip(self.explore_raw[...],
-                                     -self.explore_raw_limit, self.explore_raw_limit)
+                                     -self.config.explore_raw_limit, self.config.explore_raw_limit)
 
   def generate_action(self, obs, *, critic: Critic = None, key=None):
     """The played action plan: best-of-N, squashed, plus exploration noise.
     Also what the owning Policy's Bellman target bootstraps from."""
     key = self.rngs.noise() if key is None else key
     k_bon, k_explore = jax.random.split(key)
-    raw = self.best_of_n(obs, self.num_bon, critic=critic, key=k_bon)
+    raw = self.best_of_n(obs, self.config.num_bon, critic=critic, key=k_bon)
     return self._plan(self.explore(self.squash(raw), k_explore)), self.noise_entropy()
 
   def loss(self, obs, critic: Critic, alpha, *, key=None):
@@ -298,10 +315,10 @@ class DDPMActor(ActorOptim, Actor):
     REFACTOR.md's fusion measurement before assuming this is free."""
     key = self.rngs.noise() if key is None else key
     keys = jax.random.split(key, 5)
-    policy_x0 = self.best_of_n(obs, self.num_bon, critic=critic, key=keys[0])
+    policy_x0 = self.best_of_n(obs, self.config.num_bon, critic=critic, key=keys[0])
 
-    B, K = obs.shape[0], self.num_candidates
-    t   = jax.random.randint(keys[1], (B,), 1, self.num_steps + 1)
+    B, K = obs.shape[0], self.config.num_candidates
+    t   = jax.random.randint(keys[1], (B,), 1, self.config.num_steps + 1)
     x_t = jax.lax.stop_gradient(self.diffuse(policy_x0, t, keys[2]))
 
     noise      = jax.random.normal(keys[3], (K, B, self.plan_dim), x_t.dtype)
@@ -315,7 +332,7 @@ class DDPMActor(ActorOptim, Actor):
 
     q_scale = jax.lax.stop_gradient(qv.std(axis=0).mean()) + 1e-6
     weight  = jax.lax.stop_gradient(
-      jax.nn.softmax(qv / (self.softmax_temp * q_scale), axis=0)[..., None])  # (K, B, 1), sums to 1 over K
+      jax.nn.softmax(qv / (self.config.softmax_temp * q_scale), axis=0)[..., None])  # (K, B, 1), sums to 1 over K
 
     # eps space rather than score space: the two are the same objective, since
     # score = -eps/sqrt(nu) makes the score loss's `dsm_weight` factor exactly
@@ -356,9 +373,29 @@ class DDPMActor(ActorOptim, Actor):
 
   def create_optimizer(self) -> dict:
     return {**super().create_optimizer(),
-            "explore": adam(self.explore_lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}
+            "explore": adam(self.config.explore_lr, self.config.adam_b1, self.config.grad_clip, self.config.grad_clip_mode)}
 
   def param_labels(self, subpath) -> str:
     """`explore_raw` trains on its own optimizer key; every other parameter
     stays on the main actor optimizer."""
     return "explore" if subpath and str(subpath[0]) == "explore_raw" else "actor"
+
+
+@register_policy
+class SDAC(MaxEntRLPolicy):
+  """Binds DDPMActor into the shared max-entropy actor-critic template -- the
+  actor-policy integration for this algorithm."""
+
+  actor_cls = DDPMActor
+
+
+@register_model
+@dataclass(frozen=True)
+class SDACModelConfig(ModelConfig):
+  schema_name: ClassVar[str] = "SDAC"
+  policy_class: str = "SDAC"
+  params: MaxEntPolicyConfig = field(default_factory=lambda: MaxEntPolicyConfig(
+    entropy_scale=-0.9, entropy_in_target=False))
+  components: ComponentsConfig = field(default_factory=lambda: ComponentsConfig(
+    actor=DDPMActorConfig(), critic=C51CriticConfig(),
+    entropy=AutotuneRegulatorConfig()))

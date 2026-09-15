@@ -9,7 +9,6 @@ import optax
 from flax import nnx
 
 from barl_jax.components import TRAINABLE
-from barl_jax.hparam import Config
 from barl_jax.metrics import DEBUG, PRIMARY, DebugMetric, Metric, armed, collect, recording
 
 
@@ -247,41 +246,48 @@ def gated_losses(policy, fn, keys, *modules):
 # ---------------------------------------------------------------------------
 
 
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
 class OptimizerConfig:
-  lr            = Config(3.0e-4)
-  adam_b1       = Config(0.9)
-  grad_clip     = Config(1.0)
-  grad_clip_mode = Config("element")
+  lr: float = 3.0e-4
+  adam_b1: float = 0.9
+  grad_clip: float = 1.0
+  grad_clip_mode: str = "element"
 
 
-class CriticOptim(OptimizerConfig):
-  """The critic's optimizer (dime_am's `optim.critic`): b1 0.5, global-norm
-  clip -- the b1 the SAC-style critics train with."""
-
-  adam_b1         = Config(0.5)
-  grad_clip_mode  = Config("global_norm")
+@dataclass(frozen=True)
+class CriticOptimConfig(OptimizerConfig):
+  adam_b1: float = 0.5
+  grad_clip_mode: str = "global_norm"
 
 
-class ActorOptim(OptimizerConfig):
-  """The actors' optimizer (`optim.actor`): Adam with a per-element clip, which
-  is what actually bounds what one outlier sample can contribute under Adam.
+@dataclass(frozen=True)
+class ActorOptimConfig(OptimizerConfig):
+  pass
 
-  Mix in ahead of `Actor` (`class X(ActorOptim, Actor)`, as every actor does):
-  `Component.create_optimizer()` returns `{}` and would otherwise shadow this
-  one, since `Actor`'s own MRO chain precedes `ActorOptim` for any class that
-  lists `Actor` first."""
 
-  grad_clip_mode = Config("element")
+@dataclass(frozen=True)
+class DualOptimConfig(OptimizerConfig):
+  lr: float = 1.0e-3
+  grad_clip_mode: str = "global_norm"
+
+
+class CriticOptim:
+  config_type = CriticOptimConfig
+
+
+class ActorOptim:
+  config_type = ActorOptimConfig
 
   def create_optimizer(self) -> dict:
-    return {"actor": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}
+    c = self.config
+    return {"actor": adam(c.lr, c.adam_b1, c.grad_clip, c.grad_clip_mode)}
 
 
-class DualOptim(OptimizerConfig):
-  """The entropy dual's optimizer (`optim.dual`): a higher LR, unclipped."""
-
-  lr            = Config(1.0e-3)
-  grad_clip_mode = Config("global_norm")
+class DualOptim:
+  config_type = DualOptimConfig
 
 
 CLIP_MODES = ("global_norm", "element", "none")

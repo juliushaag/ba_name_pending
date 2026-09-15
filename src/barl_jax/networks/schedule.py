@@ -19,14 +19,24 @@ Two ways to read one, both off the same object:
 
 import math
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import jax.numpy as jnp
 from flax import nnx
 
 from barl_jax.components import Component
-from barl_jax.config.toolkit import ConfigMixin
-from barl_jax.hparam import Config
 from barl_jax.registration import register_component
+
+
+@dataclass(frozen=True)
+class ScheduleConfig:
+  class_name: str = "ExponentialSchedule"
+  start: float = 0.1
+  end: float | None = 0.001
+  steps: int = 10
+  warmup: int = 0
+  power: float = 2.0
+  s: float = 0.008
 
 
 class Schedule(Component, nnx.Module, ABC):
@@ -35,22 +45,14 @@ class Schedule(Component, nnx.Module, ABC):
   `end` (so a `steps` estimate that undershoots the real run is harmless)."""
 
   kind     = "schedule"
-  warmup = Config(0)
+  config_type = ScheduleConfig
 
-  def __init__(self, env_stats=None, config: ConfigMixin = None, **kw):
+  def __init__(self, env_stats=None, config=None, **kw):
     super().__init__(env_stats, config, **kw)
-
-    # start/end/steps are always spelled out by the slot that names this
-    # schedule -- there is no meaningful class default for a curve's domain.
-    start = config.get("start", float)
-    end   = config.get("end", float | None)
-    steps = config.get("steps", int)
-
-    assert steps >= 1 and 0 <= self.warmup < steps
-
-    self.start  = start
-    self.end    = start if end is None else end
-    self.steps  = steps
+    start, end, steps, warmup = config.start, config.end, config.steps, config.warmup
+    if steps < 1 or warmup < 0 or warmup >= steps:
+      raise ValueError(f"schedule requires steps >= 1 and 0 <= warmup < steps, got steps={steps}, warmup={warmup}")
+    self.start, self.end, self.steps, self.warmup = start, (start if end is None else end), steps, warmup
 
   @abstractmethod
   def value(self, t: float) -> float:
@@ -112,10 +114,11 @@ class SineSchedule(Schedule):
 @register_component
 class PolynomialSchedule(Schedule):
 
-  power = Config(2.0)
+  config_type = ScheduleConfig
 
-  def __init__(self, env_stats=None, config: ConfigMixin = None, **kw):
+  def __init__(self, env_stats=None, config=None, **kw):
     super().__init__(env_stats, config, **kw)
+    self.power = config.power
 
   def value(self, t: float) -> float:
     return self.lerp(t ** self.power)
@@ -127,9 +130,10 @@ class ExponentialSchedule(Schedule):
   difference, which is what a sigma ladder or a decay-to-1%-of-base wants.
   Both endpoints must be strictly positive."""
 
-  def __init__(self, env_stats=None, config: ConfigMixin = None, **kw):
+  def __init__(self, env_stats=None, config=None, **kw):
     super().__init__(env_stats, config, **kw)
-    assert self.start > 0.0 and self.end > 0.0
+    if self.start <= 0.0 or self.end <= 0.0:
+      raise ValueError("ExponentialSchedule requires positive start and end")
 
   def value(self, t: float) -> float:
     return self.start * (self.end / self.start) ** t
@@ -140,10 +144,11 @@ class CosineAlphaBarSchedule(Schedule):
   """Nichol & Dhariwal's cosine alpha-bar ladder, rescaled to run
   `start` -> `end`; `s` is their small offset keeping beta_0 away from 0."""
 
-  s = Config(0.008)
+  config_type = ScheduleConfig
 
-  def __init__(self, env_stats=None, config: ConfigMixin = None, **kw):
+  def __init__(self, env_stats=None, config=None, **kw):
     super().__init__(env_stats, config, **kw)
+    self.s = config.s
 
   def value(self, t: float) -> float:
     f  = lambda u: math.cos((u + self.s) / (1 + self.s) * math.pi / 2) ** 2

@@ -23,12 +23,11 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-import barl_jax.config.tree as model_config
 from barl_jax.checkpoints import load_policy, save_policy
 from barl_jax.collection import Collector
 from barl_jax.components import TRAINABLE
-from barl_jax.config.model import experiment_fingerprint
-from barl_jax.config.run import validate_run
+from barl_jax.config.model import ModelSpec, experiment_fingerprint
+from barl_jax.config.run import RunConfig, validate_run
 from barl_jax.env import Environment
 from barl_jax.evaluation import run_episodes
 from barl_jax.execution import ExecutionSpec, validate_execution_spec
@@ -74,13 +73,24 @@ class Run:
   Constructed by `setup()` so that `train()` and `validate()` share it rather
   than each rebuilding the world."""
 
-  def __init__(self, cfg, num_seeds):
+  def __init__(self, cfg: RunConfig, num_seeds: int):
+    from barl_jax.config.run import RunConfig as _RunConfig
+    if isinstance(cfg, dict):
+      # Compatibility for direct callers passing a saved mapping: strict
+      # nested shape only, no legacy flat envelopes.
+      cfg = _RunConfig.from_dict(cfg)
+    if not isinstance(cfg, _RunConfig):
+      raise TypeError(f"trainer.setup needs a RunConfig, got {type(cfg).__name__}")
+    # CLI `--seeds` wins over the stored value; keep the stored object as the
+    # source of every other run setting.
+    if num_seeds != cfg.num_seeds:
+      cfg = cfg.replace(num_seeds=num_seeds)
     self.resources = ExitStack()
     self.cfg = cfg
     self.num_seeds = num_seeds
-    self.model_name, self.env_name = cfg["model"], cfg["env"]
-    self.base_seed = cfg["seed"]
-    self.num_envs = cfg["num_envs"]
+    self.model_name, self.env_name = cfg.model, cfg.env
+    self.base_seed = cfg.seed
+    self.num_envs = cfg.num_envs
     self.progress = {}
     # Evaluation's own identity axis, independent of env_steps/grad_steps --
     # see evaluate()'s eval_seed. Not restored on resume, consistent with
@@ -98,8 +108,8 @@ class Run:
     return self.resources.__exit__(*exc)
 
 
-def setup(cfg: dict, num_seeds: int, *, validate_only: bool = False) -> Run:
-  run = Run(cfg, num_seeds)
+def setup(cfg: RunConfig | dict, num_seeds: int, *, validate_only: bool = False) -> Run:
+  run = Run(cfg if isinstance(cfg, RunConfig) else RunConfig.from_dict(cfg), num_seeds)
   try:
     return _setup(run, validate_only=validate_only)
   except BaseException:
@@ -115,27 +125,54 @@ def _setup(run, *, validate_only):
     raise ValueError(f"{run.model_name} on {run.env_name}: invalid run config, refusing to start:\n  "
                      + "\n  ".join(run_problems))
 
-  enable_compilation_cache(cfg["compile_cache_dir"])
+  enable_compilation_cache(cfg.compile_cache_dir)
 
-  mode = cfg.get("checkpoint_mode", "weights")
+  mode = cfg.checkpoint_mode
   resume_meta = None
   if mode == "resume":
-    if cfg["checkpoint"] is None:
+    if cfg.checkpoint is None:
       raise ValueError("checkpoint_mode: resume requires checkpoint")
-    resume_meta = read_training(cfg["checkpoint"])
+    resume_meta = read_training(cfg.checkpoint)
     validate_resume(cfg, num_seeds, resume_meta)
-    cfg = run.cfg = {**cfg, **{key: resume_meta["config"].get(key)
-                            for key in ("snapshot", "model_overrides")}}
-  if cfg["checkpoint"] and mode == "weights":
+    # Saved model takes precedence over current defaults; mutable run fields
+    # (paths, logging, cadences, eval strategy) may change -- see
+    # training_checkpoint.validate_resume's mutable set.
+    saved = resume_meta["config"]
+    from barl_jax.config.run import RunConfig as _RunConfig
+    saved_run = _RunConfig.from_dict(saved) if isinstance(saved, dict) else saved
+    cfg = run.cfg = saved_run.replace(
+      checkpoint=cfg.checkpoint, checkpoint_mode=cfg.checkpoint_mode,
+      run_dir=cfg.run_dir, sweep_tag=cfg.sweep_tag, logger=cfg.logger,
+      eval_every=cfg.eval_every, eval_runs=cfg.eval_runs,
+      eval_video_every=cfg.eval_video_every, log_every=cfg.log_every,
+      debug_every=cfg.debug_every, eval_mode=cfg.eval_mode,
+      eval_candidates=cfg.eval_candidates,
+      resume_every=cfg.resume_every, resume_keep=cfg.resume_keep,
+      compile_cache_dir=cfg.compile_cache_dir,
+      wandb_finish_timeout=cfg.wandb_finish_timeout,
+    )
+  if cfg.checkpoint and mode == "weights":
     from barl_jax.checkpoints import policy_spec
-    saved_spec, _ = policy_spec(cfg["checkpoint"])
-    cfg = run.cfg = {**cfg, "snapshot": saved_spec.data()["snapshot"],
-                     "model_overrides": saved_spec.data()["overrides"]}
-  run.config = model_config.ConfigTree(snapshot=cfg.get("snapshot"), overrides=cfg.get("model_overrides"))
-  problems = model_config.validate(run.model_name, run.config)
-  if problems:
-    raise ValueError(f"{run.model_name}: unusable model config, refusing to start:\n  "
-                     + "\n  ".join(problems))
+    saved_spec, _ = policy_spec(cfg.checkpoint)
+    # Saved model snapshot takes precedence over current defaults.
+    from barl_jax.config.run import RunConfig as _RunConfig
+    _model_dict = saved_spec.model()
+    # Rebuild the typed model from the saved canonical mapping.
+    from barl_jax.config.schemas import resolve_model as _resolve_model
+    _canonical, _, _model_cls = _resolve_model(saved_spec.name)
+    # Materialize via RunConfig machinery: start from current defaults for the
+    # saved model, then apply the saved canonical model as overrides.
+    _base = _RunConfig.defaults(saved_spec.name, cfg.env, saved_spec.profile)
+    # `model_overrides` input shape is nested; saved canonical `model` dict
+    # already is that shape minus the outer key -- reuse the override applier.
+    from barl_jax.config.run import _apply_model_overrides as _apply
+    _model_cfg = _apply(_base.model_config, {
+      "params": _model_dict.get("params", {}),
+      "components": {slot: comp for slot, comp in _model_dict.get("components", {}).items()},
+    })
+    from dataclasses import replace as _replace
+    cfg = run.cfg = _replace(cfg, model=cfg.model, model_config=_model_cfg)
+  run.spec = ModelSpec.resolve(run.model_name, cfg)
 
   run.environment = Environment.make(run.env_name)
   run.env = run.own(run.environment.get_env())       # single env: spaces and EnvStats
@@ -147,14 +184,15 @@ def _setup(run, *, validate_only):
   # A seed's buffer never receives more than total_env_steps transitions --
   # preallocating past that just reserves address space (and, as training
   # fills it in, real RAM) no run will ever use.
-  buffer_size = min(cfg["buffer_size"], cfg["total_env_steps"])
+  buffer_size = min(cfg.buffer_size, cfg.total_env_steps)
   run.collector = Collector(seed=run.base_seed)
   run.buffer = MultiSeedReplay(num_seeds, num_envs, buffer_size, seed=run.base_seed)
 
-  checkpoint = cfg["checkpoint"]
+  checkpoint = cfg.checkpoint
   if checkpoint is None:
     policies = [Policy.make(run.model_name, run.env, env_stats=run.env_stats,
-                            seed=run.base_seed + i, chunk_size=cfg["chunk_size"], config=run.config)
+                            seed=run.base_seed + i, chunk_size=cfg.chunk_size,
+                            spec=run.spec)
                 for i in range(num_seeds)]
   elif not os.path.exists(checkpoint):
     raise FileNotFoundError(f"checkpoint={checkpoint!r}: no such directory")
@@ -169,20 +207,19 @@ def _setup(run, *, validate_only):
       for component in policy.components.values():
         if hasattr(component, "target_steps"):
           component.target_steps[...] = jnp.zeros_like(component.target_steps[...])
-    if policies[0].chunk_size != cfg["chunk_size"]:
+    if policies[0].chunk_size != cfg.chunk_size:
       raise ValueError("Checkpoint chunk_size differs from the run")
 
-  expected_name, _ = run.config.resolve_model_name(run.model_name)
-  if policies[0].model_name != expected_name:
-    raise ValueError(f"Checkpoint model {policies[0].model_name!r} differs from {expected_name!r}")
+  if policies[0].model_name != run.spec.name:
+    raise ValueError(f"Checkpoint model {policies[0].model_name!r} differs from {run.spec.name!r}")
 
   if policies[0].on_policy:
     raise NotImplementedError(
       f"{run.model_name} is on-policy, and the GAE path is not ported -- barl_jax "
       f"currently implements the off-policy loop only.")
 
-  total_grad_steps = max(1, round(cfg["total_env_steps"] * cfg["utd_ratio"]))
-  schedule = Policy.lr_schedule(cfg["lr_warmup_steps"], total_grad_steps, cfg["lr_decay"])
+  total_grad_steps = max(1, round(cfg.total_env_steps * cfg.utd_ratio))
+  schedule = Policy.lr_schedule(cfg.lr_warmup_steps, total_grad_steps, cfg.lr_decay)
   optimizers = [nnx.Optimizer(p, p.build_optimizer(lr_schedule=schedule), wrt=TRAINABLE)
                 for p in policies]
 
@@ -195,8 +232,8 @@ def _setup(run, *, validate_only):
     restore_training(run, resume_meta)
   run.num_params = run.reference.num_params()
 
-  run.collection_spec = ExecutionSpec(mode=cfg["collection_mode"], num_candidates=cfg["collection_candidates"])
-  run.eval_spec = ExecutionSpec(mode=cfg["eval_mode"], num_candidates=cfg["eval_candidates"])
+  run.collection_spec = ExecutionSpec(mode=cfg.collection_mode, num_candidates=cfg.collection_candidates)
+  run.eval_spec = ExecutionSpec(mode=cfg.eval_mode, num_candidates=cfg.eval_candidates)
   spec_problems = [f"{label}: {p}" for label, spec in
                    (("collection", run.collection_spec), ("eval", run.eval_spec))
                    for p in validate_execution_spec(spec, policy=run.reference)]
@@ -238,11 +275,11 @@ def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
   # normally, just slow" after the fact otherwise means reading a stack trace.
   started = time.perf_counter()
   log.message(f"Eval start @ env_step {log.get_step('env_steps')} "
-              f"(every {cfg['eval_every']}), {run.num_seeds} seeds x {cfg['eval_runs']} episodes, "
+              f"(every {cfg.eval_every}), {run.num_seeds} seeds x {cfg.eval_runs} episodes, "
               f"eval_seed={eval_seed}")
 
   # One slot per seed; run_episodes reuses these slots for successive rounds.
-  per_run  = cfg["eval_runs"]
+  per_run  = cfg.eval_runs
   actor = StackedPolicy(run.graphdef, run.state, run.num_seeds, 1, run.reference,
                         execution_spec=run.eval_spec)
 
@@ -335,21 +372,31 @@ def run_config_snapshot(run: Run) -> dict:
   """Everything that determines this run, flattened for the logger's config
   panel (wandb's, or whatever a future local equivalent shows).
 
-  Assembled from the resolved config rather than from any YAML layer, so what the
-  panel shows *is* what ran: `model/*` carries every component kwarg including the
-  ones that used to sit at a Python default, and `run/*` every run key -- there is
-  no `cfg.get(key, default)` left anywhere for a value to hide behind. `snapshot`
-  is the same thing nested, kept so a finished run can be replayed exactly."""
+  Assembled from the resolved typed config rather than from any YAML layer,
+  so what the panel shows *is* what ran: `model/*` carries every component
+  value including hidden tier/style defaults, and `run/*` every run setting.
+  `snapshot` is the same model nested, kept so a finished run replays exactly
+  from its saved spec."""
   cfg = run.cfg
-  snapshot = run.reference._snapshot
-  resolved = snapshot["resolved"]
+  model_dict = run.spec.model()
+  # Flat model for logging: `params.*` + `components.<slot>.*` runtime shape.
+  # Rebuild flat from the spec's canonical model via a temporary RunConfig?
+  # Simpler: flatten the canonical dict directly for logging.
+  flat: dict = {"policy": model_dict.get("policy")}
+  for key, value in (model_dict.get("params") or {}).items():
+    flat[f"params.{key}"] = value
+  for slot, comp in (model_dict.get("components") or {}).items():
+    for key, value in comp.items():
+      flat[f"components.{slot}.{key}"] = value
 
   env_stats = {}
   for key, value in run.env_stats.static().items():
     env_stats[key] = value.tolist() if isinstance(value, np.ndarray) else value
 
-  config = {f"run/{k}": v for k, v in cfg.items() if k not in ("snapshot", "model_overrides")}
-  config.update({f"model/{k}": v for k, v in resolved.items()})
+  run_dict = cfg.to_dict()
+  config = {f"run/{k}": v for k, v in run_dict.items()
+            if k not in ("model_overrides", "env_metadata", "snapshot")}
+  config.update({f"model/{k}": v for k, v in flat.items()})
   config.update({f"model/derived.{k}": v for k, v in run.reference.derived_config().items()})
   config.update({f"env/{k}": v for k, v in env_stats.items()})
   config.update({
@@ -359,8 +406,8 @@ def run_config_snapshot(run: Run) -> dict:
     "env/act_space": str(run.env.action_space),
     "env/async_vector_env": run.environment.use_async_vector_env,
     "meta/git_sha": _git_sha(),
-    "meta/config_hash": experiment_fingerprint(resolved, cfg),
-    "snapshot": snapshot,
+    "meta/config_hash": experiment_fingerprint(flat, run_dict),
+    "snapshot": {"model": model_dict, "profile": run.spec.profile},
   })
   return config
 
@@ -437,29 +484,29 @@ def _train(run: Run):
 
   # `eval_video_every: null` means never, so the render env is not built either
   # -- one fewer mujoco model resident, and no GL context to create at all.
-  wants_video = cfg["eval_video_every"] is not None
+  wants_video = cfg.eval_video_every is not None
   eval_env = run.own(run.environment.get_vector_env(num_seeds))
 
   tags = [run.model_name, run.env_name, "online", "jax", "multiseed"]
-  if cfg["sweep_tag"]:
-    tags.append(cfg["sweep_tag"])
+  if cfg.sweep_tag:
+    tags.append(cfg.sweep_tag)
 
   # A sweep hands every run its own directory (barl_jax.launch.grid) and its
   # weights belong next to the config and log that produced them. A standalone
   # run has no such directory, and keeps the global checkpoints/ tree keyed by
   # the same <model>/<env>/<timestamp> the wandb run is named after.
-  ckpt_dir = os.path.abspath(os.path.join(cfg["run_dir"], "checkpoints") if cfg["run_dir"]
+  ckpt_dir = os.path.abspath(os.path.join(cfg.run_dir, "checkpoints") if cfg.run_dir
                              else os.path.join("checkpoints", name))
   os.makedirs(ckpt_dir, exist_ok=True)
   # The run-level directory the objective sidecar lives in: the run's own dir
   # under a sweep, else the standalone <model>/<env>/<timestamp>/ tree. This is
   # the only place a finished run's result is readable without wandb.
-  objective_dir = os.path.abspath(cfg["run_dir"]) if cfg["run_dir"] else os.path.join("checkpoints", name)
+  objective_dir = os.path.abspath(cfg.run_dir) if cfg.run_dir else os.path.join("checkpoints", name)
 
   log = make_logger(
-    cfg.get("logger", "wandb"), name, step_keys={"env_steps", "grad_steps"}, tags=tags,
+    cfg.logger, name, step_keys={"env_steps", "grad_steps"}, tags=tags,
     config=run_config_snapshot(run), group=name,
-    finish_timeout=cfg["wandb_finish_timeout"], run_dir=objective_dir,
+    finish_timeout=cfg.wandb_finish_timeout, run_dir=objective_dir,
     seeds=[run.base_seed + i for i in range(num_seeds)]
   )
 
@@ -497,31 +544,31 @@ def _train(run: Run):
 
   warmup_stats = warmup(run, eval_envs, log)
 
-  steps_per_iter = cfg["rollout_steps"] // run.num_envs
+  steps_per_iter = cfg.rollout_steps // run.num_envs
 
-  if cfg["random_steps"] > 0 and not run.progress:
+  if cfg.random_steps > 0 and not run.progress:
     # Prefill primitive steps are not counted into env_steps/grad_steps -- no
     # log.advance() around this call. Only skipped on resume (`not run.progress`),
     # never re-run against an already-filled buffer.
-    run.collector.random_fill(run.rollout_env, n_steps=cfg["random_steps"] // run.num_envs,
+    run.collector.random_fill(run.rollout_env, n_steps=cfg.random_steps // run.num_envs,
                            seed=run.base_seed, chunk_size=run.reference.chunk_size,
                            discount=run.reference.discount, sink=run.buffer)
-    log.message(f"Random-filled the buffer with {cfg['random_steps']} env steps before training")
+    log.message(f"Random-filled the buffer with {cfg.random_steps} env steps before training")
 
   if run.progress:
     log.advance({key: run.progress[key] for key in ("env_steps", "grad_steps")})
     log.message("Resumed optimizer, replay and counters; environment episodes restart")
   best = run.progress.get("best", [float("-inf")] * num_seeds)
-  eval_every, next_eval = cfg["eval_every"], cfg["eval_every"]
+  eval_every, next_eval = cfg.eval_every, cfg.eval_every
   # In evals, not env steps -- checked against run.eval_count (not restored on
   # resume, so this always restarts counting from the top, same as eval_count
   # itself) rather than a precomputed env-step threshold like next_eval's.
-  video_every = cfg["eval_video_every"] if wants_video else None
+  video_every = cfg.eval_video_every if wants_video else None
   next_eval = (log.get_step("env_steps") // eval_every + 1) * eval_every
   # Resume persistence is its own cadence -- independent of eval_every, since
   # the replay dump it carries is what makes a save expensive, not the eval.
   resume_dir = os.path.join(ckpt_dir, "resume")
-  resume_every = cfg["resume_every"]
+  resume_every = cfg.resume_every
   next_resume = (log.get_step("env_steps") // resume_every + 1) * resume_every
   it = run.progress.get("iteration", 0)
   chunk_seen = False
@@ -536,7 +583,7 @@ def _train(run: Run):
   # the dashboard. A fatal signal still bypasses it -- that is faulthandler's job.
   crash = None
   try:
-    while log.get_step("env_steps") < cfg["total_env_steps"]:
+    while log.get_step("env_steps") < cfg.total_env_steps:
       iter_start = time.perf_counter()
       actor = StackedPolicy(run.graphdef, run.state, num_seeds, run.num_envs, run.reference,
                             execution_spec=run.collection_spec)
@@ -545,7 +592,7 @@ def _train(run: Run):
                                          if run.collector.state is None else None,
                                          discount=actor.discount, sink=run.buffer)
       rollout_time = time.perf_counter() - iter_start
-      log.advance({"env_steps": cfg["rollout_steps"]})
+      log.advance({"env_steps": cfg.rollout_steps})
 
       log.log_per_seed([{f"rollout/{k}": v for k, v in seed.items()}
                         for seed in run.collector.per_seed(run.num_seeds, run.num_envs)],
@@ -554,14 +601,14 @@ def _train(run: Run):
       # Chunks can span collection calls: wait for replay data, then catch up
       # to the cumulative primitive-step budget (also preserves fractional UTD).
       grad_steps_this_iter = (
-        max(0, round(log.get_step("env_steps") * cfg["utd_ratio"])
+        max(0, round(log.get_step("env_steps") * cfg.utd_ratio)
             - log.get_step("grad_steps"))
         if run.buffer.min_transitions() > 0 else 0)
       narrate = (it == 0 or time.perf_counter() - last_narration > PROGRESS_INTERVAL_S)
       if narrate:
         log.message(f"Rollout done: {run.buffer.min_transitions()} transitions per seed, "
                     f"~{grad_steps_this_iter} grad steps this iter")
-      log.log({"buffer/utd_ratio": grad_steps_this_iter / cfg["rollout_steps"]})
+      log.log({"buffer/utd_ratio": grad_steps_this_iter / cfg.rollout_steps})
       log.log_per_seed([{"buffer/transitions": n} for n in run.buffer.transitions_per_seed()],
                        panel={"buffer/transitions": run.buffer.min_transitions()})
 
@@ -581,12 +628,12 @@ def _train(run: Run):
       # An iteration holds an armed step `grad_steps_this_iter / log_every` of
       # the time -- 13% at the 32-step iteration `rollout_steps: 16` gives.
       base = log.get_step("grad_steps")
-      armed_here = any((base + i) % cfg["log_every"] == 0
-                       or (base + i) % cfg["debug_every"] == 0
+      armed_here = any((base + i) % cfg.log_every == 0
+                       or (base + i) % cfg.debug_every == 0
                        for i in range(grad_steps_this_iter))
 
       if grad_steps_this_iter and not armed_here:
-        batches = run.buffer.sample_chunk(grad_steps_this_iter, cfg["batch_size"])
+        batches = run.buffer.sample_chunk(grad_steps_this_iter, cfg.batch_size)
         run.state = seeded_chunk(run.graphdef, run.state, batches,
                                  grad_steps_this_iter, jnp.asarray(base, jnp.int32))
         log.advance({"grad_steps": grad_steps_this_iter})
@@ -598,10 +645,10 @@ def _train(run: Run):
 
       for step in (range(grad_steps_this_iter) if armed_here else ()):
         gstep = log.get_step("grad_steps")
-        tiers = (tuple([PRIMARY] if gstep % cfg["log_every"] == 0 else [])
-                 + tuple([DEBUG] if gstep % cfg["debug_every"] == 0 else []))
+        tiers = (tuple([PRIMARY] if gstep % cfg.log_every == 0 else [])
+                 + tuple([DEBUG] if gstep % cfg.debug_every == 0 else []))
 
-        batch = run.buffer.sample(cfg["batch_size"])
+        batch = run.buffer.sample(cfg.batch_size)
         run.state, _, primary, debug = seeded_step(run.graphdef, run.state, batch, tiers,
                                                    jnp.asarray(gstep, jnp.int32))
 
@@ -653,7 +700,7 @@ def _train(run: Run):
                          seed=run.base_seed, num_seeds=run.num_seeds,
                          env_steps=int(log.get_step("env_steps")), best=best, status="running")
     
-      n_samples = max(1, grad_steps_this_iter * cfg["batch_size"] * num_seeds)
+      n_samples = max(1, grad_steps_this_iter * cfg.batch_size * num_seeds)
       iter_time = time.perf_counter() - iter_start
       elapsed   = max(1e-9, time.perf_counter() - run_started)
       stats = {"model/num_params": run.num_params,
@@ -675,7 +722,7 @@ def _train(run: Run):
                       "grad_steps": int(log.get_step("grad_steps")),
                       "iteration": it, "best": list(best)}
       if log.get_step("env_steps") >= next_resume:
-        save_training(run, resume_dir, run.progress, keep=cfg["resume_keep"])
+        save_training(run, resume_dir, run.progress, keep=cfg.resume_keep)
         next_resume = (log.get_step("env_steps") // resume_every + 1) * resume_every
   except BaseException as exc:
     crash = exc
@@ -691,7 +738,7 @@ def _train(run: Run):
     # Clean completion always gets a resume save, off-cadence or not: the run
     # is done, so this is the last chance and it costs nothing to take it.
     if crash is None:
-      save_training(run, resume_dir, run.progress, keep=cfg["resume_keep"])
+      save_training(run, resume_dir, run.progress, keep=cfg.resume_keep)
 
     if crash is not None:
       log.message(f"Run failed: {type(crash).__name__}: {crash}")
@@ -716,10 +763,10 @@ def _validate(run: Run):
   cfg = run.cfg
   actor = StackedPolicy(run.graphdef, run.state, run.num_seeds, run.num_envs, run.reference,
                         execution_spec=run.collection_spec)
-  run.collector.collect(actor, env=run.rollout_env, n_steps=cfg["batch_size"],
+  run.collector.collect(actor, env=run.rollout_env, n_steps=cfg.batch_size,
                      seed=run.base_seed, discount=actor.discount, sink=run.buffer)
 
-  batch = run.buffer.sample(cfg["batch_size"])
+  batch = run.buffer.sample(cfg.batch_size)
   run.state, losses, primary, debug = seeded_step(run.graphdef, run.state, batch,
                                                   (PRIMARY, DEBUG), jnp.asarray(0, jnp.int32))
   losses = jax.device_get(losses)

@@ -1,16 +1,38 @@
+from dataclasses import asdict, dataclass, field
+from typing import ClassVar
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-from barl_jax.actors.policy_dict import maxent_actor_policy
 from barl_jax.components import Actor, Buffer, Critic, PathwiseActorMixin
-from barl_jax.config.toolkit import ConfigMixin
-from barl_jax.hparam import Config, ConfigDict
+from barl_jax.config.schemas import ComponentsConfig, ModelConfig, register_model
+from barl_jax.critics.categorical import C51CriticConfig
 from barl_jax.networks import gaussian
-from barl_jax.networks.mlp import MLP
+from barl_jax.networks.mlp import MLP, MLPConfig
+from barl_jax.networks.regulator import AutotuneRegulatorConfig
 from barl_jax.optimization import ActorOptim
+from barl_jax.policies.rl import MaxEntPolicyConfig, MaxEntRLPolicy
+from barl_jax.policy import register_policy
 from barl_jax.registration import get_component, register_component
+
+
+@dataclass(frozen=True)
+class StochasticActorConfig:
+  class_name: str = "StochasticActor"
+  latent_dim: int = 256
+  layers: int = 2
+  mlp: MLPConfig = field(default_factory=lambda: MLPConfig(
+    activation="silu", norm="layer", norm_kwargs={"epsilon": 1e-5}, dtype="bfloat16"))
+  squash_cls: str = "TanhSquash"
+  log_std_min: float = -20.0
+  log_std_max: float = 2.0
+  log_prob_clip: float = 0.99
+  lr: float = 3.0e-4
+  adam_b1: float = 0.9
+  grad_clip: float = 1.0
+  grad_clip_mode: str = "element"
 
 
 @register_component
@@ -26,22 +48,14 @@ class StochasticActor(PathwiseActorMixin, ActorOptim, Actor):
   `log_std` is a state-independent parameter rather than a network head --
   barl's deliberate deviation from canonical SAC, kept as-is."""
 
-  POLICY = maxent_actor_policy()
-
   kind = "actor"
-  mlp = ConfigDict(activation='silu', norm='layer', norm_stem=False, norm_input=False,
-                   norm_after_act=True, dropout=0.0, final_activation=False, residual=False,
-                   norm_kwargs={'epsilon': 1e-05}, dtype='bfloat16')
-  squash_cls = Config("TanhSquash")
-  log_std_min  = Config(-20.0)
-  log_std_max  = Config(2.0)
-  log_prob_clip = Config(0.99)   # tanh atanh guard in log_prob
+  config_type = StochasticActorConfig
 
-  def __init__(self, env_stats, config: ConfigMixin, *, rngs: nnx.Rngs, **kwargs):
+  def __init__(self, env_stats, config: StochasticActorConfig, *, rngs: nnx.Rngs, **kwargs):
     super().__init__(env_stats, config, **kwargs)
 
     self.log_std = nnx.Param(jnp.zeros((self.plan_dim,), jnp.float32))
-    self.squash  = get_component(self.squash_cls)(env_stats, ConfigMixin())
+    self.squash  = get_component(config.squash_cls)(env_stats, None)
 
     low, high = env_stats.get("act_low"), env_stats.get("act_high")
     scale = 1.0 if low is None else (np.asarray(high) - np.asarray(low)) / 2
@@ -49,12 +63,11 @@ class StochasticActor(PathwiseActorMixin, ActorOptim, Actor):
                     self.chunk_size).reshape(-1)
     self.log_act_scale = Buffer(jnp.log(jnp.asarray(scale, jnp.float32)))
 
-    # latent_dim/layers are tier-ladder-owned (see tier ladders in hparam.py).
-    latent_dim, layers = config.get("latent_dim", int), config.get("layers", int)
+    latent_dim, layers = config.latent_dim, config.layers
 
     # MLP takes norm's own kwargs spread (**norm_kwargs), not a `norm_kwargs=`
     # parameter -- pop it out of the group and spread its contents instead.
-    mlp = self.mlp.todict()
+    mlp = asdict(config.mlp)
     norm_kwargs = mlp.pop("norm_kwargs") or {}
     self.net = MLP(self.obs_dim, self.plan_dim, latent_dim, layers, rngs=rngs, **mlp, **norm_kwargs)
     self.rngs = rngs
@@ -65,7 +78,7 @@ class StochasticActor(PathwiseActorMixin, ActorOptim, Actor):
   def dist(self, s):
     """(mean, std) of the pre-squash Normal, over the flat plan."""
     mean = self.net(s).astype(jnp.float32)
-    std  = jnp.exp(jnp.clip(self.log_std[...], self.log_std_min, self.log_std_max))
+    std  = jnp.exp(jnp.clip(self.log_std[...], self.config.log_std_min, self.config.log_std_max))
     return mean, std
 
   def log_prob(self, dist, action):
@@ -73,7 +86,8 @@ class StochasticActor(PathwiseActorMixin, ActorOptim, Actor):
     and applies the change-of-variables correction."""
     mean, std = dist
     flat = action.reshape(action.shape[0], -1)
-    x = self.squash.inverse(jnp.clip(flat, -self.log_prob_clip, self.log_prob_clip))
+    clip = self.config.log_prob_clip
+    x = self.squash.inverse(jnp.clip(flat, -clip, clip))
     lp = gaussian.log_prob(x, mean, std) - self.squash.log_abs_det_jacobian(x, flat)
     return lp.sum(axis=-1)
 
@@ -114,3 +128,25 @@ class StochasticActor(PathwiseActorMixin, ActorOptim, Actor):
   # loss: PathwiseActorMixin's reparameterized max-entropy objective,
   # -(Q + alpha*H) -- SAC's actor improves against the critic but must not
   # train it (frozen(critic) inside the mixin), same as every actor here.
+
+
+@register_policy
+class SAC(MaxEntRLPolicy):
+  """Binds StochasticActor into the shared max-entropy actor-critic template --
+  the actor-policy integration for this algorithm. `actor_cls` tightens
+  `build_component`'s gate from the generic `ActionSampler` ABC to this
+  concrete class, so a `components.actor.class` mismatch fails at construction
+  with a clear error instead of resolving to whatever the config named."""
+
+  actor_cls = StochasticActor
+
+
+@register_model
+@dataclass(frozen=True)
+class SACModelConfig(ModelConfig):
+  schema_name: ClassVar[str] = "SAC"
+  policy_class: str = "SAC"
+  params: MaxEntPolicyConfig = field(default_factory=MaxEntPolicyConfig)
+  components: ComponentsConfig = field(default_factory=lambda: ComponentsConfig(
+    actor=StochasticActorConfig(), critic=C51CriticConfig(),
+    entropy=AutotuneRegulatorConfig()))

@@ -7,9 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.env import EnvStats
-from barl_jax.hparam import Config, ConfigDict, ConfigValues
 from barl_jax.metrics import Recorder
 
 
@@ -63,43 +61,12 @@ def action_bounds_numpy(action_space) -> tuple:
 
 
 def frozen(module):
-  """A view of `module` that neither trains nor updates: its parameters carry
-  no gradient, and any batch-statistic normalization inside uses its running
-  averages instead of accumulating new ones. Inputs still carry gradient, which
-  is what an actor improving against a critic needs.
-
-  An nnx Module is a pytree, so the gradient half is just stop_gradient over its
-  leaves. (The split/stop_gradient/merge dance this replaces is not usable
-  inside a captured or nested transform at all.)
-
-  Freezing the statistics matters as much as freezing the weights. An actor loss
-  prices actions the critic was never trained on, so letting those move the
-  critic's normalization moments would shift the function under the very
-  regression that defines it -- CrossQ evaluates the critic in inference mode
-  in its actor update for the same reason. It also keeps the mutation out of a
-  nested transform, which nnx rejects outright ("Cannot mutate BatchStat from a
-  different trace level") -- AMDP takes its action-score gradient that way."""
   view = jax.lax.stop_gradient(module)
   view.eval()
   return view
 
 
 class _Static:
-  """Opaque holder for Python bookkeeping that must stay out of the state tree
-  *and* keep the GraphDef hashable.
-
-  Neither nnx-native option covers this, which is why the holder exists:
-
-  - a bare attribute trips nnx's "data in a static attribute" check as soon as
-    the value contains an array (EnvStats is a dict of numpy arrays);
-  - `nnx.data()` would make it state and thread it through every jit;
-  - `nnx.static()` accepts it but leaves the GraphDef unhashable, and the
-    GraphDef is a static argument of the jitted step -- `jax.jit` then raises
-    `unhashable type: 'dict'`.
-
-  Identity hashing is the right semantics here: these objects live for the whole
-  run, so the jit cache keys on them stably."""
-
   __slots__ = ("value",)
 
   def __init__(self, value):
@@ -109,104 +76,7 @@ class _Static:
     return f"_Static({self.value!r})"
 
 
-class ConfigOwner:
-  """Collects class-attribute `Config` declarations and resolves them to
-  instance attributes against a ConfigMixin of the YAML-override layer.
-
-  `_decls` is every declared `Config` in the MRO (own declarations win).
-  `resolve_config` reads each against `config`: the YAML value if present, the
-  declaration's default otherwise -- which is what moves the default out of
-  YAML and into the class that uses the value. Because the default lives in
-  the declaration, the resolved config a run logs can attribute every value to
-  a layer, and no value is ever silent.
-
-  Two nnx constraints shape the storage:
-  - a value resolved onto `self` before `Component.__init__` has run is fine
-    for a scalar, but a subclass building a nested module first passes
-    `env_stats` so `obs_dim`/`action_dim` exist too;
-  - an unhashable value (a dict `time_kwargs`/`ladder_kwargs` declared as a
-    plain `Config`) cannot live on the module as a plain attribute -- it
-    would make the GraphDef unhashable -- so it is held in a single
-    identity-hashable `_Static` and read back through `static(name)`. A
-    `ConfigDict`'s resolved `ConfigValues` needs no such wrapping: it is
-    itself identity-hashable regardless of what its own fields hold.
-
-  `nnx.Module` is not involved here: this mixin is pure Python and only reads
-  the class hierarchy at `__init_subclass__` time."""
-
-  _decls: dict[str, Config] = {}
-
-  def __init_subclass__(cls, **kw):
-    # Every class in the MRO contributes its own declarations, including plain
-    # geometry mixins (CriticOptim, CriticLossConfig, Polyak, ...) that are not
-    # themselves ConfigOwner -- a mixin *is* the config, and inheritance is how
-    # a class composes it. A later (more-derived) declaration wins over an
-    # earlier one of the same name.
-    super().__init_subclass__(**kw)
-    decls = {}
-    for base in reversed(cls.__mro__):
-      for name, value in base.__dict__.items():
-        if isinstance(value, Config):
-          decls[name] = value
-    cls._decls = decls
-
-  def resolve_config(self, config: ConfigMixin, names: tuple = None,
-                     env_stats: EnvStats = None) -> None:
-    """Resolve every (or `names`-subset of) declared Config. Idempotent: a
-    name already resolved (pre-super, by a subclass that needed a value to
-    build a nested module) is re-set to the same value. A style-tagged Config
-    (a `time_emb` selector) additionally materializes its named
-    style's whole surface as instance attributes, so the component reads
-    `self.activation`/`self.norm`/... exactly as if it had declared them. A
-    `ConfigDict` resolves each of its fields at its own flat name -- same
-    override surface as a standalone Config -- and reads back as one
-    namespace (`self.mlp.activation`) instead of one attribute per field."""
-    if env_stats is not None:
-      self._derive_env(env_stats)
-    decls = type(self)._decls if names is None else {n: type(self)._decls[n] for n in names}
-    owner = type(self).__name__
-    for name, decl in decls.items():
-      if isinstance(decl, ConfigDict):
-        fields = {field: config.resolve(field, field_decl, owner=owner)
-                 for field, field_decl in decl.fields.items()}
-        self._absorb(name, ConfigValues(**fields))
-        continue
-      value = config.resolve(name, decl, owner=owner)
-      if decl.style is not None:
-        # A style-selector Config: materialize the chosen style's whole
-        # surface so the component reads self.activation/self.norm/... as if
-        # it had declared them.
-        for surface_key, surface_value in decl.style[value].items():
-          # The resolver has already layered slot/profile/run overrides over the
-          # selected style. Consume that effective value rather than rebuilding
-          # the style default here, or the logged config and built module diverge.
-          self._absorb(surface_key, config.get(surface_key, type(surface_value)))
-      self._absorb(name, value)
-
-  def _absorb(self, name: str, value) -> None:
-    """Store a resolved value: unhashable (dict/list/set) values are kept out of
-    the GraphDef in a single identity-hashable `_Static`; the rest as plain
-    instance attributes."""
-    if isinstance(value, (dict, list, set)):
-      if not hasattr(self, "_static_config"):
-        self._static_config = _Static({})
-      self._static_config.value[name] = value
-    else:
-      setattr(self, name, value)
-
-  def static(self, name: str):
-    """A resolved value that could not live on the module (a dict, list or set
-    declaration) -- see `resolve_config`."""
-    return self._static_config.value[name]
-
-  def _derive_env(self, env_stats: EnvStats) -> None:
-    self.obs_dim    = env_stats.get("obs_dim")
-    self.action_dim = env_stats.get("act_dim")
-    self.chunk_size = int(env_stats.get("chunk_size") or 1)
-    self.plan_dim   = self.chunk_size * (self.action_dim or 0)
-
-
-class Component(ConfigOwner):
+class Component:
   """Mixin for anything Policy.build_component() constructs. Three jobs: consume
   the run's EnvStats and resolved config, which every component takes as its
   first two positional arguments; give the owning Policy a uniform lifecycle
@@ -221,20 +91,28 @@ class Component(ConfigOwner):
   `chunk_size`/`plan_dim`). Anything else a component needs from it
   (HLGaussCritic's return range) is read in __init__ and kept as a plain float.
 
-  `config` (a `barl_jax.config.toolkit.ConfigMixin`) is likewise not retained: a
-  subclass reads whatever it needs via `config.get("key", type)` once, in its
-  own __init__, and keeps the result as a plain attribute -- exactly the
-  pattern a keyword-only kwarg + `self.x = x` used to be, just sourced from
-  the resolved config instead of from a named parameter. Threading `config`
-  through every level's `super().__init__(env_stats, config, ...)` (the same
-  way `env_stats` already is) is what lets a subclass read config values
-  *before* calling super() -- e.g. to build a `q_function` -- with no ordering
-  constraint a stored `self.config` would have imposed."""
+  `config` (a materialized typed dataclass instance) *is* retained, as
+  `self.config` -- a subclass reads whatever it needs off it directly
+  (`self.config.log_std_min`), in `__init__` or any other method, rather than
+  re-declaring every field as its own flat attribute. It is kept behind
+  `_Static` (identity-hashed, see `_Static`'s own docstring) rather than a
+  bare attribute: a config's nested fields are ordinary mutable containers
+  (`MLPConfig.norm_kwargs`, `DDPMActorConfig.ladder_kwargs`, ...), and nnx
+  would otherwise need the whole frozen dataclass to hash by value to make it
+  a valid static leaf of the split GraphDef `jax.jit` keys its cache on.
+  `config` is also a plain settable property: `self.config = replace(self.config,
+  gamma=0.5)` is how a test perturbs one field without reconstructing the
+  whole component. `env_stats`/`config` are still threaded through every
+  level's `super().__init__(env_stats, config, ...)`, which is what lets a
+  subclass read the `config` *parameter* (not yet `self.config`) before
+  calling super() -- e.g. to build a `q_function`."""
 
-  def __init__(self, env_stats: EnvStats = None, config: ConfigMixin = None, **kwargs):
+  config_type = None
+
+  def __init__(self, env_stats: EnvStats = None, config=None, **kwargs):
     # Neither env_stats nor config is forwarded: nnx.Module's __init__ is
     # object's, taking no args. A component that needs nothing beyond what
-    # Component itself reads (e.g. TanhSquash) just never calls config.get().
+    # Component itself reads (e.g. TanhSquash) just never reads self.config.
     super().__init__()
     env_stats = env_stats if env_stats is not None else EnvStats()
     self.obs_dim    = env_stats.get("obs_dim")
@@ -247,12 +125,22 @@ class Component(ConfigOwner):
     # Both are overwritten by build_component with the real slot; the defaults
     # only keep a component constructed outside a Policy usable.
     self.slot       = type(self).__name__.lower()
-    # Every declared Config class attribute becomes an instance attribute: the
-    # YAML layer's value if present, the declaration's default otherwise. A
-    # subclass that needed values before this ran (to build a nested module
-    # first) calls resolve_config itself and this re-sets the same values.
-    if config is not None:
-      self.resolve_config(config, env_stats=env_stats)
+    self._config_s  = _Static(config)
+
+  @property
+  def config(self):
+    return self._config_s.value
+
+  @config.setter
+  def config(self, value):
+    self._config_s.value = value
+
+  def static(self, name: str):
+    """Read an explicitly stored derived (non-config) value from NNX static
+    state -- values computed from config (`time_kwargs` unpacked from
+    `config.time`) rather than a config field itself, which belongs on
+    `self.config` instead."""
+    return self._static_config.value[name]
 
   @property
   def metrics(self) -> Recorder:

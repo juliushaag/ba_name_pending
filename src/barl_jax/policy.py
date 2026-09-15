@@ -15,13 +15,10 @@ from barl_jax.components import (
   TRAINABLE,
   Buffer,
   Component,
-  ConfigOwner,
   _Static,
   sanitize_action,
 )
-from barl_jax.config.toolkit import ConfigMixin
 from barl_jax.env import EnvStats
-from barl_jax.hparam import Config
 from barl_jax.metrics import Recorder
 from barl_jax.optimization import OptimizerMixin
 
@@ -48,7 +45,7 @@ def _jitted_infer_exec(graphdef, spec, state, observation, key):
   return execution.act(infer_step, score_fn, observation, key, spec)
 
 
-class Policy(OptimizerMixin, ConfigOwner, nnx.Module, ABC):
+class Policy(OptimizerMixin, nnx.Module, ABC):
 
   _classes = dict()
 
@@ -57,15 +54,12 @@ class Policy(OptimizerMixin, ConfigOwner, nnx.Module, ABC):
   on_policy = False
 
   # The component slots this Policy builds, by attribute name -- the contract a
-  # actor's POLICY `components:` must match. An omitted slot already fails at
+  # model variant's `components:` must match. An omitted slot already fails at
   # build_component(); naming an *extra* one would resolve silently into the
-  # snapshot and the wandb config with nothing behind it, so lint_config.py and
-  # model_config.validate() check both directions against this.
+  # checkpoint metadata with nothing behind it, so validation checks both
+  # directions against this.
   SLOTS: tuple[str, ...] = ()
   SLOT_OBJECTIVES: dict[str, str] = {}
-
-  chunk_size = Config(1)
-  normalize_obs = Config(True)
 
   # ------------------------------------------------------------------
   # Registry
@@ -74,11 +68,12 @@ class Policy(OptimizerMixin, ConfigOwner, nnx.Module, ABC):
   @staticmethod
   def make(name: str, env: gym.Env, *args, **kwargs) -> "Policy":
     from barl_jax.config.model import ModelSpec
-    from barl_jax.config.tree import ConfigTree
     config = kwargs.pop("config", None)
     spec = kwargs.pop("spec", None)
+    profile = kwargs.pop("profile", None)
     if spec is None:
-      spec = ModelSpec.resolve(name, config if config is not None else ConfigTree(), kwargs.pop("profile", None))
+      # `config` is a RunConfig when present; otherwise resolve bare defaults.
+      spec = ModelSpec.resolve(name, config, profile)
     cls = Policy.class_for(spec.policy_class)
     return cls(env, *args, model_name=spec.name, profile=spec.profile, spec=spec, **kwargs)
 
@@ -102,8 +97,8 @@ class Policy(OptimizerMixin, ConfigOwner, nnx.Module, ABC):
     """Every model name a `model:` string can resolve to -- not the raw class
     registry, which is an implementation detail once one class can back several
     models."""
-    from barl_jax.config.tree import ConfigTree
-    return ConfigTree().available_models()
+    from barl_jax.config.schemas import MODEL_ALIASES, MODEL_SCHEMAS
+    return sorted([*MODEL_SCHEMAS, *MODEL_ALIASES])
 
   # ------------------------------------------------------------------
   # Construction
@@ -112,7 +107,6 @@ class Policy(OptimizerMixin, ConfigOwner, nnx.Module, ABC):
   def __init__(self, env: gym.Env, profile: str = None, env_stats: EnvStats = None,
                rngs: nnx.Rngs = None, seed: int = 0, model_name: str = None, spec=None, **kwargs):
     from barl_jax.config.model import ModelSpec
-    from barl_jax.config.tree import ConfigTree
 
     # The `model:` string this Policy was built from -- distinct from
     # `type(self).__name__` once one class backs several models (RLPolicy /
@@ -127,11 +121,8 @@ class Policy(OptimizerMixin, ConfigOwner, nnx.Module, ABC):
     self._raw_kwargs_s = _Static(dict(kwargs))
     # Captured so a checkpoint reconstructs under the same config it was built
     # from -- see checkpoints.py.
-    self._spec = spec if spec is not None else ModelSpec.resolve(self.model_name, ConfigTree(), profile)
-    self._overrides_s = _Static(self._spec.data()["overrides"])
-    snapshot = self._spec.data()["snapshot"]
-    snapshot["resolved"].update({f"params.{key}": value for key, value in kwargs.items()})
-    self._snapshot_s = _Static(snapshot)
+    self._spec = spec if spec is not None else ModelSpec.resolve(self.model_name, None, profile)
+    self._snapshot_s = _Static(self._spec.model())
 
     # Every module that needs randomness draws from this; nnx threads and
     # advances the key state across the jit boundary, so no call signature has
@@ -179,17 +170,14 @@ class Policy(OptimizerMixin, ConfigOwner, nnx.Module, ABC):
     # Gradient steps taken, for algorithms whose update cadence is `step % k`.
     self.train_steps = Buffer(jnp.zeros((), jnp.int32))
 
-    # The Policy's own declared params (Config) are resolved here against
-    # the resolved `params:` layer (actor defaults, profile and run
-    # overrides). Subclasses read them off `self` (self.policy_delay, ...) -- the
-    # same contract components get from Component.__init__.
-    params_config = ConfigMixin("", self.resolve_params(),
-                                config_path=f"{self.model_name}.params")
-    self.resolve_config(params_config)
+    # The Policy's own params come from the typed model spec, with explicit
+    # constructor kwargs (e.g. trainer's `chunk_size`) winning. Subclasses
+    # read them off `self` (self.policy_delay, ...) after calling
+    # `_absorb_params`.
+    self._absorb_params(self.resolve_params())
     self._env_stats = _Static(stats.derive(
       chunk_size=self.chunk_size,
       chunked_act_dim=self.chunk_size * self.action_dim))
-    params_config.assert_all_consumed(owner=f"{self.model_name}.params [{type(self).__name__}]")
 
   @property
   def env_stats(self) -> EnvStats:
@@ -210,17 +198,22 @@ class Policy(OptimizerMixin, ConfigOwner, nnx.Module, ABC):
     return self._raw_kwargs_s.value
 
   @property
-  def _overrides(self) -> dict:
-    return self._overrides_s.value
-
-  @property
   def _snapshot(self) -> dict:
     return self._snapshot_s.value
 
+  def _absorb_params(self, params: dict) -> None:
+    """Copy the typed `params` mapping onto plain attributes.
 
+    Only the two keys every Policy owns live here; algorithm-specific keys
+    (`policy_delay`, `entropy_scale`, ...) are absorbed by the subclass that
+    owns them, so a typo'd param fails at the subclass rather than silently
+    landing on the base.
+    """
+    self.chunk_size = int(params.get("chunk_size", 1))
+    self.normalize_obs = bool(params.get("normalize_obs", True))
 
   def resolve_component(self, slot: str) -> tuple[type, dict]:
-    """Resolves a named slot's class + kwargs from config/models.yaml.
+    """Resolves a named slot's class + canonical mapping from the spec.
 
     Policy constructor kwargs are deliberately not broadcast into every slot:
     slot overrides use the normal `components.<slot>.<key>` path, so a policy
@@ -228,12 +221,9 @@ class Policy(OptimizerMixin, ConfigOwner, nnx.Module, ABC):
     return self._spec.component(slot)
 
   def resolve_params(self) -> dict:
-    """Resolves this Policy's own top-level tunable kwargs (read directly off
-    `self` in train_step, not part of any actor/critic slot) from
-    config/models.yaml's `params:` block -- same precedence as
-    resolve_component(), minus the components.yaml layer."""
-    params = self._spec.data()["params"]
-    return {**params, **self._raw_kwargs}
+    """This Policy's own top-level params from the typed spec, with explicit
+    constructor kwargs winning."""
+    return {**self._spec.params(), **self._raw_kwargs}
 
   @classmethod
   def slot_objective(cls, slot, actor_cls=None):
@@ -248,18 +238,14 @@ class Policy(OptimizerMixin, ConfigOwner, nnx.Module, ABC):
     transformed input -- pass an `EnvStats.derive()` of the run's, never an
     unrelated one.
 
-    `explicit_kwargs` are for values that were never going to live in config/
-    because they're computed at run time and the component takes them as real
-    constructor arguments (a critic's `support`, an entropy dual's `target`) --
-    everything config *does* supply reaches the component through
-    `config.get()`, never through this. `config_overrides` is the rarer case
-    of a value that *is* a config-shaped tunable (so config/ may still declare
-    a baseline for it) but that this call site pins regardless -- NCLQL's
-    `sigmas` slot's `steps`, forced to `self.noise_levels` rather than
-    whatever LangevinActor.POLICY says, is the one real example."""
-    cls, kwargs = self.resolve_component(slot)
+    `explicit_kwargs` are for values computed at run time that never live in
+    config (an entropy dual's `target`) -- everything config supplies reaches
+    the component as a materialized typed instance, never through this.
+    `config_overrides` pins a config-shaped tunable regardless of the stored
+    value."""
+    cls, mapping = self.resolve_component(slot)
     if config_overrides:
-      kwargs.update(config_overrides)
+      mapping = {**mapping, **config_overrides}
     if not issubclass(cls, gate_cls):
       raise TypeError(f"{self.model_name}.{slot}: {cls.__name__} must implement {gate_cls.__name__}")
     objective = self.slot_objective(
@@ -267,10 +253,9 @@ class Policy(OptimizerMixin, ConfigOwner, nnx.Module, ABC):
     if objective is not None and getattr(cls, "learning_objective", None) != objective:
       raise TypeError(f"{self.model_name}.{slot}: {cls.__name__} does not support {objective!r}")
     stats = env_stats if env_stats is not None else self.env_stats
-    config = ConfigMixin("", kwargs, config_path=f"{self.model_name}.{slot}")
+    config = _materialize_component_config(cls, mapping, owner=f"{self.model_name}.{slot}")
     explicit_kwargs.setdefault("rngs", self.rngs)
     component = cls(stats, config, *args, **explicit_kwargs)
-    config.assert_all_consumed(owner=f"{self.model_name}.{slot} [{cls.__name__}]")
     component.slot = slot
     return component
 
@@ -500,6 +485,34 @@ class Policy(OptimizerMixin, ConfigOwner, nnx.Module, ABC):
     `(batch, chunk_size, act_dim)` and `extras` is a dict of named arrays to
     log/persist alongside the currently active chunk."""
     ...
+
+
+
+def _materialize_component_config(cls: type, mapping: dict, *, owner: str):
+  """Build the typed config a component declares via `config_type`.
+
+  The stored mapping is canonical (`class` selector + nested values). A `None`
+  config (e.g. a squash built with no knobs) passes through; a component
+  without `config_type` receives the raw mapping for backwards-compatible
+  plugin constructors.
+  """
+  if mapping is None:
+    return None
+  config_type = getattr(cls, "config_type", None)
+  if config_type is None:
+    return None if not mapping else dict(mapping)
+  values = dict(mapping)
+  # Public selector is `class`; dataclass field is `class_name`. The class is
+  # already known (`cls`), so neither needs passing to the constructor -- pop
+  # both to avoid requiring every impl schema to declare identity metadata it
+  # never reads (entropy/ categorical bases historically omitted it).
+  values.pop("class", None)
+  values.pop("class_name", None)
+  from barl_jax.config.serialization import construct
+  try:
+    return construct(config_type, values, path=owner)
+  except (KeyError, TypeError) as exc:
+    raise KeyError(f"{owner}: cannot materialize {config_type.__name__}: {exc}") from exc
 
 
 

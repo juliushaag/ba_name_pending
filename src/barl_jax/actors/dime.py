@@ -1,19 +1,52 @@
 import math
+from dataclasses import asdict, dataclass, field
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from barl_jax.actors.policy_dict import maxent_actor_policy
-from barl_jax.components import Actor, Buffer, Critic, PathwiseActorMixin
-from barl_jax.config.toolkit import ConfigMixin
-from barl_jax.hparam import Config, ConfigDict
+from barl_jax.components import Actor, Buffer, Critic, PathwiseActorMixin, _Static
+from barl_jax.config.schemas import ComponentsConfig, ModelConfig, register_model
+from barl_jax.critics.categorical import C51CriticConfig
 from barl_jax.networks import gaussian
 from barl_jax.networks.diffusion import TimeConditionedField, controlled_sde
-from barl_jax.networks.time_embedding import TIME_STYLES
+from barl_jax.networks.mlp import MLPConfig
+from barl_jax.networks.regulator import AutotuneRegulatorConfig
+from barl_jax.networks.time_embedding import TimeEmbeddingConfig
 from barl_jax.optimization import ActorOptim
+from barl_jax.policies.rl import MaxEntPolicyConfig, MaxEntRLPolicy
+from barl_jax.policy import register_policy
 from barl_jax.registration import get_component, register_component
 
+
+@dataclass(frozen=True)
+class DISActorConfig:
+  class_name: str = "DISActor"
+  latent_dim: int = 256
+  layers: int = 2
+  mlp: MLPConfig = field(default_factory=lambda: MLPConfig(activation="gelu", norm="none", dtype="float32"))
+  
+  time_emb: str = "ctrl"
+  time: TimeEmbeddingConfig = field(default_factory=lambda: TimeEmbeddingConfig(
+    kind="fourier", time_dim=16, num_freqs=16, hidden=32, concat_input=True))
+  
+  squash_cls: str = "TanhSquash"
+  adam_b1: float = 0.5
+  num_steps: int = 16
+  prior_std: float = 2.5
+  out_clip: float = 10000.0
+  dt_init: float = 0.1
+  dt_min: float = 0.001
+  dt_s: float = 0.008
+  dt_pow: float = 2.0
+  friction_init: float = 1.0
+  per_dim_friction: bool = True
+  learn_dt: bool = True
+  learn_friction: bool = True
+  lr: float = 3.0e-4
+  grad_clip: float = 1.0
+  grad_clip_mode: str = "element"
 
 def _inv_softplus(x: float) -> float:
   """dime_am's `inverse_softplus`, so a raw parameter initialized with this
@@ -49,63 +82,42 @@ class DISActor(PathwiseActorMixin, ActorOptim, Actor):
   supplies the log-det, and adding it inside the integration would count it
   twice."""
 
-  POLICY = maxent_actor_policy(entropy_scale=-4.0, policy_delay=3)
-
   kind = "actor"
-  # fp32: the reference is fp32, and the log-ratio accumulates. Both are Config
-  # selectors, not inheritance -- switch the net / time embedding with
-  # explicit MLP settings and `time_emb`.
-  mlp = ConfigDict(activation='gelu', norm='none', norm_stem=False, norm_input=False,
-                   norm_after_act=True, dropout=0.0, final_activation=False,
-                   residual=False, norm_kwargs={}, dtype='float32')
-  time_emb  = Config("pisgrad", style=TIME_STYLES)
-  squash_cls = Config("TanhSquash")
-  # dime_am trains the sampler's nets with the critic's b1, not the actor's
-  # usual 0.9 -- the one optimizer override this actor carries.
-  adam_b1      = Config(0.5)
-  num_steps    = Config(16)
-  prior_std    = Config(2.5)   # a std, not a variance -- the reference's sampler.init_std
-  out_clip     = Config(10000.0)   # PISGRADNet's `outer_clip`
-  dt_init      = Config(0.1)       # configs/base.yaml `dt`, shaped by the cosine schedule below
-  dt_min       = Config(0.001)     # configs/sampler/dt_schedule/cosine.yaml
-  dt_s         = Config(0.008)
-  dt_pow       = Config(2.0)
-  friction_init = Config(1.0)      # configs/sampler/dis.yaml `friction`
-  per_dim_friction = Config(True)
-  learn_dt     = Config(True)
-  learn_friction = Config(True)
+  config_type = DISActorConfig
 
-  def __init__(self, env_stats, config: ConfigMixin, *, rngs: nnx.Rngs, **kwargs):
-    self.resolve_config(config, env_stats=env_stats)
+  def __init__(self, env_stats, config: DISActorConfig, *, rngs: nnx.Rngs, **kwargs):
+    super().__init__(env_stats, config, **kwargs)
 
+    self._static_config = _Static({"time_kwargs": config.time.to_runtime_dict()["time_kwargs"]})
+    self.time_dim = config.time.to_runtime_dict()["time_dim"]
+    self.time_embed = config.time.to_runtime_dict()["time_embed"]
     # Both are stored through softplus, the reference's parameterization, so the
     # positivity a step size and a friction need is structural rather than a
     # clamp. `learn_*` picks Param vs Buffer -- the reference spells the same
     # choice as a stop_gradient on the read.
-    hold = (lambda v: nnx.Param(v)) if self.learn_dt else (lambda v: Buffer(v))
-    self.dt_raw = hold(jnp.full((1,), _inv_softplus(self.dt_init), jnp.float32))
-    hold = (lambda v: nnx.Param(v)) if self.learn_friction else (lambda v: Buffer(v))
-    friction_shape = (self.plan_dim,) if self.per_dim_friction else (1,)
-    self.friction_raw = hold(jnp.full(friction_shape, _inv_softplus(self.friction_init), jnp.float32))
+    hold = (lambda v: nnx.Param(v)) if self.config.learn_dt else (lambda v: Buffer(v))
+    self.dt_raw = hold(jnp.full((1,), _inv_softplus(self.config.dt_init), jnp.float32))
+    hold = (lambda v: nnx.Param(v)) if self.config.learn_friction else (lambda v: Buffer(v))
+    friction_shape = (self.plan_dim,) if self.config.per_dim_friction else (1,)
+    self.friction_raw = hold(jnp.full(friction_shape, _inv_softplus(self.config.friction_init), jnp.float32))
 
     # dime_am's `get_cosine_schedule`, tabulated once: `per_step_dt` is False
     # there, so the learned dt is a single scalar the schedule shapes.
-    i = jnp.arange(self.num_steps, dtype=jnp.float32)
-    t = (self.num_steps - i) / self.num_steps
-    offset = 1.0 + self.dt_s
-    self.dt_scale = Buffer((1.0 - self.dt_min) * jnp.cos(0.5 * jnp.pi * (offset - t) / offset) ** self.dt_pow + self.dt_min)
+    i = jnp.arange(self.config.num_steps, dtype=jnp.float32)
+    t = (self.config.num_steps - i) / self.config.num_steps
+    offset = 1.0 + self.config.dt_s
+    self.dt_scale = Buffer((1.0 - self.config.dt_min) * jnp.cos(0.5 * jnp.pi * (offset - t) / offset) ** self.config.dt_pow + self.config.dt_min)
 
-    # latent_dim/layers are tier-ladder-owned.
-    latent_dim, layers = config.get("latent_dim", int), config.get("layers", int)
+    latent_dim, layers = config.latent_dim, config.layers
 
     self.field = TimeConditionedField(
       self.obs_dim, self.plan_dim, latent_dim=latent_dim, layers=layers,
       time_dim=self.time_dim, time_embed=self.time_embed, time_kwargs=self.static("time_kwargs"),
-      rngs=rngs, **self.mlp.todict())
+      rngs=rngs, **asdict(config.mlp))
 
     self.field.zero_init_head()
 
-    self.squash = get_component(self.squash_cls)(env_stats, ConfigMixin())
+    self.squash = get_component(self.config.squash_cls)(env_stats, None)
     self.rngs = rngs
 
   # ---- the process ---------------------------------------------------------
@@ -118,12 +130,12 @@ class DISActor(PathwiseActorMixin, ActorOptim, Actor):
 
   def prior_score(self, x):
     """grad_x log N(x; 0, prior_std^2 I), the reference's uncontrolled drift."""
-    return -x / self.prior_std**2
+    return -x / self.config.prior_std**2
 
   def control_at(self, obs, x, i: int):
     t = jnp.full((x.shape[0], 1), float(i), jnp.float32)
     u = self.field(obs, x, t).astype(jnp.float32)
-    return jnp.clip(u, -self.out_clip, self.out_clip)
+    return jnp.clip(u, -self.config.out_clip, self.config.out_clip)
 
   def generate_action(self, obs, *, critic: Critic = None, key=None, squash=True):
     """`critic` is unused -- DIME's actor needs none to sample -- and accepted
@@ -131,7 +143,7 @@ class DISActor(PathwiseActorMixin, ActorOptim, Actor):
     key = self.rngs.noise() if key is None else key
     key, prior_key = jax.random.split(key)
 
-    x = self.prior_std * jax.random.normal(prior_key, (obs.shape[0], self.plan_dim), jnp.float32)
+    x = self.config.prior_std * jax.random.normal(prior_key, (obs.shape[0], self.plan_dim), jnp.float32)
 
     def euler_step(x, i, step_key):
       eta, scale = self.step_coef(i)
@@ -147,8 +159,8 @@ class DISActor(PathwiseActorMixin, ActorOptim, Actor):
       return x_new, self.chunk_sum(gaussian.log_prob(x, bwd_mean, scale)) \
                     - self.chunk_sum(gaussian.log_prob(x_new, fwd_mean, scale))
 
-    X, entropy =  controlled_sde(euler_step, x, self.num_steps, key,
-                          aux=-self.chunk_sum(gaussian.log_prob(x, 0.0, self.prior_std)))
+    X, entropy =  controlled_sde(euler_step, x, self.config.num_steps, key,
+                          aux=-self.chunk_sum(gaussian.log_prob(x, 0.0, self.config.prior_std)))
 
     if squash:
       entropy = entropy + self.chunk_sum(self.squash.log_abs_det_jacobian(X))
@@ -162,4 +174,24 @@ class DISActor(PathwiseActorMixin, ActorOptim, Actor):
   def derived(self) -> dict:
     return {"dt_0": float(jax.nn.softplus(self.dt_raw[...])[0] * self.dt_scale[...][0]),
             "dt_last": float(jax.nn.softplus(self.dt_raw[...])[0] * self.dt_scale[...][-1]),
-            "prior_var": self.prior_std**2}
+            "prior_var": self.config.prior_std**2}
+
+
+@register_policy
+class DIME(MaxEntRLPolicy):
+  """Binds DISActor into the shared max-entropy actor-critic template -- the
+  actor-policy integration for this algorithm."""
+
+  actor_cls = DISActor
+
+
+@register_model
+@dataclass(frozen=True)
+class DIMEModelConfig(ModelConfig):
+  schema_name: ClassVar[str] = "DIME"
+  policy_class: str = "DIME"
+  params: MaxEntPolicyConfig = field(default_factory=lambda: MaxEntPolicyConfig(
+    entropy_scale=-4.0, policy_delay=3))
+  components: ComponentsConfig = field(default_factory=lambda: ComponentsConfig(
+    actor=DISActorConfig(), critic=C51CriticConfig(),
+    entropy=AutotuneRegulatorConfig()))

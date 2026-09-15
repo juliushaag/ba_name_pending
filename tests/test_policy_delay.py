@@ -207,22 +207,24 @@ def _assert_state_equal(left, right, *, exact=False):
 
 
 def test_logging_does_not_change_training_state_with_stateful_actor():
-    from barl_jax.config.tree import ConfigTree
-    policy = Policy.make("SAC", FakeEnv(), env_stats=make_env_stats(), seed=0,
-                         config=ConfigTree(overrides={
-                             "params.policy_delay": 3,
-                             "components.actor.norm": "batchrenorm",
-                             "components.actor.norm_kwargs": {
-                                 "momentum": 0.99, "epsilon": 1e-5, "r_max": 3.0,
-                                 "d_max": 5.0, "warmup_steps": 0,
-                             },
-                             "components.actor.dropout": 0.2,
-                             # Compare gate semantics without bf16 kernel reassociation.
-                             "components.actor.dtype": "float32",
-                             "components.critic.dtype": "float32",
-                             "components.actor.latent_dim": 8,
-                             "components.critic.latent_dim": 8,
-                         }))
+    from barl_jax.config.model import ModelSpec
+    from barl_jax.config.run import RunConfig
+    run = RunConfig.from_dict({
+        "model": "SAC", "env": "HalfCheetah",
+        "model_overrides": {
+            "params": {"policy_delay": 3},
+            "components": {
+                "actor": {"latent_dim": 8, "mlp": {
+                    "norm": "batchrenorm", "dtype": "float32",
+                    "norm_kwargs": {"momentum": 0.99, "epsilon": 1e-5,
+                                   "r_max": 3.0, "d_max": 5.0, "warmup_steps": 0},
+                    "dropout": 0.2}},
+                "critic": {"latent_dim": 8, "mlp": {"dtype": "float32"}},
+            },
+        },
+    })
+    spec = ModelSpec.resolve("SAC", run)
+    policy = Policy.make("SAC", FakeEnv(), env_stats=make_env_stats(), seed=0, spec=spec)
     optimizer = nnx.Optimizer(policy, policy.build_optimizer(lr_schedule=None), wrt=TRAINABLE)
     graphdef, initial = nnx.split((policy, optimizer))
     unlogged = jax.tree.map(jnp.copy, initial)

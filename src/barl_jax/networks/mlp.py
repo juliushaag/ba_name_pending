@@ -1,19 +1,24 @@
+from dataclasses import dataclass, field
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
 
 from barl_jax.networks.norm import make_norm
 
-# Shared capacity ladders: fixed depth, increasing hidden width.
-MLP_TIERS = {
-  kind: {
-    name: {"latent_dim": width, "layers": 1 if kind == "critic" else 2,
-           **({"n_models": 2} if kind == "critic" else {})}
-    for name, width in (("low", 256), ("medium", 512), ("large", 1024), ("xlarge", 2048))
-  }
-  for kind in ("actor", "critic")
-}
 
+@dataclass(frozen=True)
+class MLPConfig:
+  activation: str = "silu"
+  norm: str = "layer"
+  norm_input: bool = False
+  norm_stem: bool = False
+  norm_after_act: bool = True
+  dropout: float = 0.0
+  final_activation: bool = False
+  residual: bool = False
+  norm_kwargs: dict = field(default_factory=dict)
+  dtype: str = "float32"
 
 _ACTIVATIONS = dict(
   silu=jax.nn.silu,
@@ -37,15 +42,6 @@ def Linear(in_features: int, out_features: int, *, rngs: nnx.Rngs,
                     kernel_init=nnx.initializers.lecun_normal(),
                     bias_init=nnx.initializers.zeros_init(),
                     dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
-
-
-# The full MLP surface, restated as named parameters by every component that
-# builds one (see e.g. StochasticActor). Named rather than passed through a
-# **kwargs catch-all on purpose: config_tree.validate() reports a kwarg no
-# __init__ in the MRO accepts, and a catch-all would swallow every typo in a
-# `components:` block silently. Keep this list and those signatures in step.
-MLP_KWARGS = ("activation", "norm", "norm_input", "norm_stem", "norm_after_act", "dropout",
-              "final_activation", "residual", "norm_kwargs", "dtype")
 
 
 class ResidualBlock(nnx.Module):

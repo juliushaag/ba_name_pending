@@ -15,9 +15,8 @@ from dataclasses import replace
 from pathlib import Path
 
 from barl_jax.config.model import ModelSpec
-from barl_jax.config.tree import ConfigTree
 
-POLICY_VERSION = 2
+POLICY_VERSION = 3
 
 
 @contextmanager
@@ -55,8 +54,7 @@ def save_policy(policy, path):
     "policy_type": f"{type(policy).__module__}:{type(policy).__qualname__}",
     "profile": policy._profile,
     "kwargs": policy._raw_kwargs,
-    "overrides": policy._overrides,
-    "snapshot": policy._snapshot,
+    "spec": policy._spec.data(),
   }
   with checkpoint_directory(path) as destination:
     with ocp.StandardCheckpointer() as ckpt:
@@ -65,15 +63,25 @@ def save_policy(policy, path):
 
 
 def policy_spec(path, name=None):
-  meta = json.loads((Path(path) / "meta.json").read_text())
+  import json as _json
+  meta = _json.loads((Path(path) / "meta.json").read_text())
   version = meta.get("format_version")
   if version != POLICY_VERSION:
     raise ValueError(f"Unsupported policy checkpoint version {version}")
   saved_name = meta["model"]
   if name is not None and name != saved_name:
     raise ValueError(f"Checkpoint contains {saved_name!r}, requested {name!r}")
-  config = ConfigTree(snapshot=meta.get("snapshot"), overrides=meta.get("overrides"))
-  spec = ModelSpec.resolve(saved_name, config, meta.get("profile"))
+  # Saved spec is authoritative; current defaults never replace saved values.
+  saved = meta.get("spec")
+  if not isinstance(saved, dict) or "model" not in saved:
+    raise ValueError(f"Checkpoint {path} has no versioned model spec")
+  spec = ModelSpec(
+    name=saved.get("name", saved_name),
+    profile=saved.get("profile"),
+    policy_class=saved["model"].get("policy", meta.get("policy_class", "")),
+    payload=json.dumps(saved, sort_keys=True, separators=(",", ":")),
+    schema_version=int(saved.get("schema_version", 1)),
+  )
   implementation = meta["policy_type"]
   return replace(spec, policy_class=implementation), meta
 

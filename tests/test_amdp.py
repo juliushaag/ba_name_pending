@@ -108,7 +108,7 @@ def test_loss_matches_manual_bridge_target(squash):
     score_r = np.repeat(score, rep, axis=0)
     X_r = np.repeat(X, rep, axis=0)
     N = X_r.shape[0]
-    tau = np.asarray(jax.random.uniform(tau_key, (N, 1), minval=actor.tau_min, maxval=actor.tau_max))
+    tau = np.asarray(jax.random.uniform(tau_key, (N, 1), minval=actor.config.tau_min, maxval=actor.config.tau_max))
     noise = np.asarray(jax.random.normal(noise_key, X_r.shape))
     sigma_sq = np.asarray(actor.sigma_sq_int_fn(jnp.asarray(tau)))
     ratio = sigma_sq / actor.terminal_var
@@ -135,16 +135,25 @@ def test_amdp_policy_updates_with_chunked_alphas(granularity):
     from test_policies import FakeEnv, batch
 
     from barl_jax.components import TRAINABLE
-    from barl_jax.config.tree import ConfigTree
+    from barl_jax.config.model import ModelSpec
+    from barl_jax.config.run import RunConfig
     from barl_jax.metrics import DEBUG, PRIMARY
     from barl_jax.optimization import train_step
     from barl_jax.policy import Policy
 
-    config = ConfigTree(overrides={
-        "params.chunk_size": 2, "params.alpha_granularity": granularity,
-        "components.actor.latent_dim": 8, "components.critic.latent_dim": 8,
+    run = RunConfig.from_dict({
+        "model": "AMDP", "env": "HalfCheetah", "chunk_size": 2,
+        "model_overrides": {
+            "params": {"chunk_size": 2, "alpha_granularity": granularity},
+            "components": {
+                "actor": {"latent_dim": 8},
+                "critic": {"latent_dim": 8},
+            },
+        },
     })
-    policy = Policy.make("AMDP", FakeEnv(), config=config, env_stats=make_env_stats(), seed=0)
+    spec = ModelSpec.resolve("AMDP", run)
+    policy = Policy.make("AMDP", FakeEnv(), spec=spec, env_stats=make_env_stats(),
+                         seed=0, chunk_size=2)
     policy.entropy.log_alpha[...] = jnp.log(
         jnp.array([0.4, 1.7]) if granularity == "per_action" else jnp.asarray(0.7))
     before_actor = jax.tree.leaves(nnx.state(policy.actor, nnx.Param))

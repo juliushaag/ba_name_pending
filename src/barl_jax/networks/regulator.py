@@ -1,4 +1,5 @@
 import math
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
@@ -6,9 +7,17 @@ import optax
 from flax import nnx
 
 from barl_jax.components import Component
-from barl_jax.hparam import Config
-from barl_jax.optimization import DualOptim, adam
+from barl_jax.optimization import DualOptim, DualOptimConfig, adam
 from barl_jax.registration import register_component
+
+
+@dataclass(frozen=True)
+class AutotuneRegulatorConfig(DualOptimConfig):
+  class_name: str = "AutotuneRegulator"
+  alpha_init: float = 1.0
+  tune: bool = True
+  min_alpha: float = 1.0e-7
+  max_alpha: float = 500.0
 
 
 @register_component
@@ -33,7 +42,7 @@ class AutotuneRegulator(DualOptim, Component, nnx.Module):
 
   The optimizer knobs come from the `DualOptim` mixin (a higher LR, unclipped)."""
 
-  alpha_init   = Config(1.0)
+  config_type = AutotuneRegulatorConfig
 
   # False pins alpha at `alpha_init` -- `components.<slot>.tune: false` in
   # config. `create_optimizer()` still declares this dual's key (train_step's
@@ -42,7 +51,6 @@ class AutotuneRegulator(DualOptim, Component, nnx.Module):
   # gradient computed and logged, it is just never applied -- alpha is a
   # config-set constant, not a silently-frozen-at-whatever-init-happened-to-be
   # one.
-  tune = Config(True)
 
   # A dual has no tier ladder -- `kind` exists so the resolver can tell a sized
   # component from a non-sized one.
@@ -53,8 +61,6 @@ class AutotuneRegulator(DualOptim, Component, nnx.Module):
   # alpha at a floor injects a constant entropy bonus into the Bellman target
   # that a near-zero-reward env cannot outvote. Declared as hparams, not dead
   # state, so a bound can be reinstated by an override without a code change.
-  min_alpha    = Config(1.0e-7)
-  max_alpha    = Config(500.0)
 
   def __init__(self, env_stats=None, config=None, *, target,
                rngs: nnx.Rngs = None, **kwargs):
@@ -67,7 +73,7 @@ class AutotuneRegulator(DualOptim, Component, nnx.Module):
     # jax.grad rejected it. A (chunk_size,) target gives log_alpha the same
     # shape -- one Lagrange multiplier per chunk position instead of one for
     # the whole plan.
-    self.log_alpha = nnx.Param(jnp.full(target.shape, math.log(self.alpha_init), jnp.float32))
+    self.log_alpha = nnx.Param(jnp.full(target.shape, math.log(config.alpha_init), jnp.float32))
 
     # A bare Python float for the scalar case (unchanged from before -- kept
     # out of the pytree entirely), a plain jnp array for the vector case.
@@ -98,6 +104,7 @@ class AutotuneRegulator(DualOptim, Component, nnx.Module):
   def create_optimizer(self) -> dict:
     # Keyed by slot, so a policy's two regulators stay distinct without a
     # `name` kwarg.
-    tx = (adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)
-          if self.tune else optax.set_to_zero())
+    c = self.config
+    tx = (adam(c.lr, c.adam_b1, c.grad_clip, c.grad_clip_mode)
+          if c.tune else optax.set_to_zero())
     return {f"{self.slot}_alpha": tx}

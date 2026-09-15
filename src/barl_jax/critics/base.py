@@ -1,25 +1,53 @@
 
+from dataclasses import dataclass
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
 
 from barl_jax.components import TARGET_SUFFIX, Buffer, Critic, frozen
-from barl_jax.config.toolkit import ConfigMixin
-from barl_jax.hparam import Config
 from barl_jax.networks.ensemble import Ensemble
-from barl_jax.networks.mlp import MLP
+from barl_jax.networks.mlp import MLP, MLPConfig
 from barl_jax.optimization import CriticOptim, adam
 
 
-class CriticLossConfig:
-  gamma             = Config(0.99)
-  pessimistic_target = Config(False)
-  polyak_tau        = Config(0.0)
-  target_delay      = Config(1)
+@dataclass(frozen=True)
+class CriticConfig:
+  gamma: float = 0.99
+  pessimistic_target: bool = False
+  polyak_tau: float = 0.0
+  target_delay: int = 1
+  lr: float = 3.0e-4
+  adam_b1: float = 0.5
+  grad_clip: float = 1.0
+  grad_clip_mode: str = "global_norm"
 
 
-class Polyak:
-  polyak_tau = Config(0.005)
+@dataclass(frozen=True)
+class PolyakConfig(CriticConfig):
+  polyak_tau: float = 0.005
+
+
+CriticLossConfig = CriticConfig
+
+
+def crossq_mlp() -> MLPConfig:
+  """CrossQ-style (Bhatt et al., ICLR 2024) preset: gelu + BatchRenorm with
+  both the input and stem normalized, so the shared [(s,a), (s',a')] forward
+  agrees on population statistics. The default `mlp` for every plain Q critic
+  (categorical and scalar-ensemble alike)."""
+  return MLPConfig(activation="gelu", norm="batchrenorm", norm_stem=True, norm_input=True,
+                   norm_after_act=True, norm_kwargs={"momentum": 0.99, "warmup_steps": 100000,
+                   "epsilon": 0.001, "r_max": 3.0, "d_max": 5.0}, dtype="bfloat16")
+
+
+def target_mlp() -> MLPConfig:
+  """`crossq_mlp`'s LayerNorm counterpart, for critics that keep a polyak
+  target net instead of BatchRenorm -- `QCriticBase.__init__` refuses the
+  combination of the two (both solve the [(s,a), (s',a')] population-mismatch
+  problem, so picking one makes the other redundant)."""
+  return MLPConfig(activation="gelu", norm="layer", norm_stem=True, norm_input=True,
+                   norm_after_act=True, norm_kwargs={"epsilon": 1e-5}, dtype="bfloat16")
 
 
 def n_step_discount(gamma, horizon, terminated, dtype):
@@ -39,18 +67,20 @@ def n_step_discount(gamma, horizon, terminated, dtype):
   return (1.0 - terminated) * jnp.power(jnp.asarray(gamma, dtype), horizon)
 
 
-class QCriticBase(CriticLossConfig, CriticOptim, Critic):
+class QCriticBase(CriticOptim, Critic):
   learning_objective = "td"
 
-  def __init__(self, env_stats, config: ConfigMixin, q_function, **kwargs):
+  config_type = CriticConfig
+
+  def __init__(self, env_stats, config, q_function, **kwargs):
     super().__init__(env_stats, config, **kwargs)
 
     self.q_function = q_function
 
-    if self.polyak_tau > 0.0:
-      if self.mlp.norm in ("batch", "batchrenorm"):
+    if config.polyak_tau > 0.0:
+      if getattr(self, "mlp_norm", "none") in ("batch", "batchrenorm"):
         raise ValueError(
-          f"{type(self).__name__}: polyak_tau={self.polyak_tau} with norm={self.mlp.norm!r}. A target net "
+          f"{type(self).__name__}: polyak_tau={config.polyak_tau} with norm={getattr(self, 'mlp_norm', 'none')!r}. A target net "
           f"and CrossQ-style running-statistic normalization are alternative answers to the "
           f"same problem -- the target's separate forward pass removes the shared "
           f"[(s,a), (s',a')] batch that makes BatchRenorm worth having. Pick one: either "
@@ -61,7 +91,7 @@ class QCriticBase(CriticLossConfig, CriticOptim, Critic):
 
   @property
   def has_target(self) -> bool:
-    return self.polyak_tau > 0.0
+    return self.config.polyak_tau > 0.0
 
   def target_modules(self) -> dict:
     return {"critic": self.q_function}
@@ -74,8 +104,9 @@ class QCriticBase(CriticLossConfig, CriticOptim, Critic):
     if not self.has_target:
       return
 
+    target_delay = self.config.target_delay
     self.target_steps[...] += 1
-    due = ((self.target_steps[...] % self.target_delay) == 0 if self.target_delay > 1
+    due = ((self.target_steps[...] % target_delay) == 0 if target_delay > 1
            else True)
 
     for name, live_module in self.target_modules().items():
@@ -83,9 +114,9 @@ class QCriticBase(CriticLossConfig, CriticOptim, Critic):
       live = nnx.state(live_module, nnx.Param)
       tgt  = nnx.state(target_module, nnx.Param)
 
-      blend = lambda t, l: t + self.polyak_tau * (l - t)
+      blend = lambda t, l: t + self.config.polyak_tau * (l - t)
       step  = (jax.tree.map(lambda t, l: jnp.where(due, blend(t, l), t), tgt, live)
-               if self.target_delay > 1 else jax.tree.map(blend, tgt, live))
+               if target_delay > 1 else jax.tree.map(blend, tgt, live))
       nnx.update(target_module, step)
 
       self.metrics.gap(f"{name}{TARGET_SUFFIX}", live, tgt)
@@ -122,10 +153,11 @@ class QCriticBase(CriticLossConfig, CriticOptim, Critic):
     return self.mean_expectation(self.raw(s, a))
 
   def create_optimizer(self) -> dict:
-    return {"critic": adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)}
+    c = self.config
+    return {"critic": adam(c.lr, c.adam_b1, c.grad_clip, c.grad_clip_mode)}
 
   def bootstrap_from_raw(self, next_raw):
-    reduce = self.reduce_value if self.pessimistic_target else self.mean_expectation
+    reduce = self.reduce_value if self.config.pessimistic_target else self.mean_expectation
     return jax.lax.stop_gradient(reduce(next_raw))
 
   def td_loss(self, obs, action, next_obs, next_action, chunk_return, terminated, horizon,
@@ -152,16 +184,13 @@ class QCriticBase(CriticLossConfig, CriticOptim, Critic):
     """td_target = chunk_return + bootstrap_discount * (bootstrap + entropy_bonus),
     bootstrap_discount = (1 - terminated) * gamma**horizon (n_step_discount)."""
     chunk_return = chunk_return.reshape(-1, 1)
-    discount = n_step_discount(self.gamma, horizon, terminated, chunk_return.dtype)
+    discount = n_step_discount(self.config.gamma, horizon, terminated, chunk_return.dtype)
     return chunk_return + discount * (bootstrap + entropy_bonus)
 
   def target_from_raw(self, raw):
     return jax.lax.stop_gradient(raw.mean(axis=0))
 
   def regression_loss(self, raw, target):
-    raise NotImplementedError
-
-  def record(self, raw, target) -> None:
     raise NotImplementedError
 
 

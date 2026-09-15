@@ -1,31 +1,44 @@
+from dataclasses import asdict, dataclass, field
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from barl_jax.config.toolkit import ConfigMixin
-from barl_jax.hparam import Config, ConfigDict
+from barl_jax.networks.mlp import MLPConfig
 from barl_jax.registration import register_component
 
-from .base import ConcatQ, Polyak, QCriticBase
+from .base import ConcatQ, CriticConfig, QCriticBase, crossq_mlp, target_mlp
+
+
+@dataclass(frozen=True)
+class EnsembleCriticConfig(CriticConfig):
+  class_name: str = "EnsembleCritic"
+  latent_dim: int = 2048
+  layers: int = 1
+  n_models: int = 2
+  mlp: MLPConfig = field(default_factory=crossq_mlp)
+  rho: float = 1.0
+  pessimistic_target: bool = True
+
+
+@dataclass(frozen=True)
+class TargetEnsembleCriticConfig(EnsembleCriticConfig):
+  class_name: str = "TargetEnsembleCritic"
+  polyak_tau: float = 0.005
+  mlp: MLPConfig = field(default_factory=target_mlp)
 
 
 @register_component
 class EnsembleCritic(QCriticBase):
   kind = "critic"
-  mlp = ConfigDict(
-    activation='relu', norm='batchrenorm', norm_stem=True, norm_input=True,
-    norm_after_act=True, dropout=0.0, final_activation=False, residual=False,
-    norm_kwargs={'momentum': 0.99, 'warmup_steps': 100000, 'epsilon': 0.001, 'r_max': 3.0, 'd_max': 5.0},
-    dtype='bfloat16')
-  rho                = Config(1.0)
-  pessimistic_target = Config(True)
+  config_type = EnsembleCriticConfig
 
-  def __init__(self, env_stats, config: ConfigMixin, *, rngs: nnx.Rngs, **kwargs):
-    self.resolve_config(config, env_stats=env_stats)
-    latent_dim, layers, n_models = (config.get(k, int) for k in ("latent_dim", "layers", "n_models"))
+  def __init__(self, env_stats, config, *, rngs: nnx.Rngs, **kwargs):
+    self.mlp_norm = config.mlp.norm
+    latent_dim, layers, n_models = config.latent_dim, config.layers, config.n_models
 
     q_function = ConcatQ(env_stats["obs_dim"] + env_stats["act_dim"], 1,
-                         latent_dim, layers, n_models=n_models, rngs=rngs, **self.mlp.todict())
+                         latent_dim, layers, n_models=n_models, rngs=rngs, **asdict(config.mlp))
 
     super().__init__(env_stats, config, q_function, **kwargs)
 
@@ -34,7 +47,7 @@ class EnsembleCritic(QCriticBase):
   def reduce_value(self, raw):
     raw = raw.astype(jnp.float32)
     std = jnp.sqrt(jnp.maximum(raw.var(axis=0), 1e-8))
-    return raw.mean(axis=0) - self.rho * std
+    return raw.mean(axis=0) - self.config.rho * std
 
   def regression_loss(self, raw, target):
     pred = raw.astype(jnp.float32)
@@ -50,8 +63,6 @@ class EnsembleCritic(QCriticBase):
 
 
 @register_component
-class TargetEnsembleCritic(Polyak, EnsembleCritic):
+class TargetEnsembleCritic(EnsembleCritic):
   kind = "critic"
-  mlp = ConfigDict(activation='relu', norm='layer', norm_stem=True, norm_input=True,
-                   norm_after_act=True, dropout=0.0, final_activation=False,
-                   residual=False, norm_kwargs={'epsilon': 1e-05}, dtype='bfloat16')
+  config_type = TargetEnsembleCriticConfig

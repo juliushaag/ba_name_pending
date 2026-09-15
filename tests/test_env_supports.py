@@ -16,11 +16,11 @@ import jax.numpy as jnp
 import pytest
 from conftest import build, make_env_stats
 
-import barl_jax.config.tree as model_config
+from barl_jax.critics.categorical import C51CriticConfig
 from barl_jax.env import Environment
 from barl_jax.environments.dm_control import DMControlEnvironment
 
-GAMMA = model_config.ConfigTree().component_kwargs("C51Critic")["gamma"]
+GAMMA = C51CriticConfig().gamma
 DM_HORIZON = 1000                      # every suite task; see DMControlEnvironment's docstring
 
 
@@ -87,7 +87,7 @@ def test_c51_resolves_a_realistic_dm_control_value_gap(q_gap):
     env_stats = make_env_stats(return_min=stats["return_min"], return_max=stats["return_max"])
     c = build("C51Critic", env_stats=env_stats)
 
-    n = c.num_atoms
+    n = c.config.num_atoms
     bin_width = (c.v_max - c.v_min) / (n - 1)
     boot = jnp.zeros((1, 1, n)).at[0, 0, n // 2].set(1.0)
     terminal = lambda q: c.bellman_target(jnp.array([q]), jnp.ones((1,)), jnp.ones((1,)), boot)

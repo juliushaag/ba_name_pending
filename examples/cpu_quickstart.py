@@ -59,10 +59,9 @@ class TinyPendulum(Environment):
     raise NotImplementedError("TinyPendulum has no offline dataset.")
 
 
-def base_config() -> dict:
-  from barl_jax.config.run import run_defaults
-  return {
-    **run_defaults(),
+def base_config():
+  from barl_jax.config.run import RunConfig
+  return RunConfig.from_dict({
     "model": "SAC", "env": "examples.cpu_quickstart:TinyPendulum",
     "seed": 0, "num_seeds": 1,
     "logger": "none",                # no W&B account or network needed
@@ -75,8 +74,9 @@ def base_config() -> dict:
     "run_dir": str(RUN_DIR), "compile_cache_dir": None,
     # A real net, just a small one -- this is a plumbing demonstration, not a
     # capacity claim. tests/conftest.py's TINY fixture shrinks the same way.
-    "model_overrides": {"components.actor.latent_dim": 8, "components.critic.latent_dim": 8},
-  }
+    "model_overrides": {"components": {
+      "actor": {"latent_dim": 8}, "critic": {"latent_dim": 8}}},
+  })
 
 
 def main():
@@ -122,7 +122,7 @@ def main():
   #    training_checkpoint.validate_resume's mutable-key set) -- unchanged
   #    here, so restoring lands exactly at the original run's final counters,
   #    which is what this checks against.
-  resumed_cfg = {**cfg, "checkpoint": str(resume_dir), "checkpoint_mode": "resume"}
+  resumed_cfg = cfg.replace(checkpoint=str(resume_dir), checkpoint_mode="resume")
   resumed = setup(resumed_cfg, num_seeds=1)
   assert resumed.progress == run.progress, (
     f"resumed progress {resumed.progress} does not match the original run's final "
