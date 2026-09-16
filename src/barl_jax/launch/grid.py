@@ -139,11 +139,13 @@ def build_combos(axes: dict, exclude: list[dict]) -> list[dict]:
   combos = [dict(zip(axes, values)) for values in itertools.product(*axes.values())]
   combos = [c for c in combos
             if not any(all(c.get(k) == v for k, v in ex.items()) for ex in exclude)]
-  # Algo-major regardless of which order the axes were declared in, so runs come
-  # out grouped the way `--algos SAC DIME AMDP` reads. Stable sort, so within one
-  # algo the product's own order survives.
-  order = {algo: i for i, algo in enumerate(axes["algo"])}
-  return sorted(combos, key=lambda c: order[c["algo"]])
+  # Env-major regardless of which order the axes were declared in, so runs come
+  # out grouped the way `--envs Ant Humanoid` reads: every algo on one env
+  # before moving to the next, so cross-algo comparisons are available early
+  # in the sweep instead of only once every env has been through the first
+  # algo. Stable sort, so within one env the product's own order survives.
+  order = {env: i for i, env in enumerate(axes["env"])}
+  return sorted(combos, key=lambda c: order[c["env"]])
 
 
 def name_combos(combos: list[dict], axes: dict, num_seeds: int) -> list[str]:
