@@ -64,8 +64,8 @@ class RunConfig:
   eval_every: int = 25_000
   eval_runs: int = 10
   eval_video_every: int | None = 4
-  log_every: int = 250
-  debug_every: int = 1000
+  log_every: int = 1000
+  debug_every: int = 10000
   wandb_finish_timeout: int = 300
   compile_cache_dir: str | None = "~/.cache/barl_jax/jax"
   resume_every: int | None = 50_000
