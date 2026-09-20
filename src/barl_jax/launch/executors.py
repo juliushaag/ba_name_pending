@@ -247,12 +247,16 @@ class SlurmExecutor(Executor):
 
         cmd.append(str(Path(__file__).with_name(script)))
 
-        print()
+        env = child_env(SWEEP_NAME=sweep_name, RESULT_DIR=str(sweep_dir))
+
+
+        print() 
         print("Submitting:")
         print(" ".join(cmd))
         print()
+        
+        submitted = subprocess.run(cmd, capture_output=True, text=True, env= env)
 
-        submitted = subprocess.run(cmd, capture_output=True, text=True)
         if submitted.returncode != 0:
             print(submitted.stdout, end="")
             print(submitted.stderr, file=sys.stderr, end="")

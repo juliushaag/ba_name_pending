@@ -34,7 +34,7 @@ class DDPMActorConfig:
   time: TimeEmbeddingConfig = field(default_factory=lambda: TimeEmbeddingConfig(
     kind="fourier", time_dim=16, num_freqs=16, hidden=32, concat_input=True))
   squash_cls: str = "TanhSquash"
-  num_steps: int = 20
+  num_steps: int = 16
   clip_denoised: bool = True
   prior_scale: float = 0.5
   ladder_cls: str = "LinearSchedule"

@@ -1,14 +1,13 @@
 #!/bin/bash
 
 #SBATCH --job-name=rl
-#SBATCH --partition=gpu_a100_il,gpu_h100_il,gpu_h100
-
+#SBATCH --partition=gpu_a100_il
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16                 # one core per few subprocess envs -- rollouts are
+#SBATCH --cpus-per-task=4                 # one core per few subprocess envs -- rollouts are
                                            # AsyncVectorEnv, num_seeds x num_envs processes deep
 #SBATCH --gres=gpu:1
-#SBATCH --mem=96gb                         # host RAM: the replay buffer is per seed, on the host
+#SBATCH --mem=32gb                         # host RAM: the replay buffer is per seed, on the host
 
 #SBATCH --output=logs/%x/%A_%a/term.out
 #SBATCH --error=logs/%x/%A_%a/term.err
@@ -16,7 +15,7 @@
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=ulqho@student.kit.edu
 
-#SBATCH --signal=B:USR1@300
+#SBATCH --signal=B:USR1@100
 
 #SBATCH --time=12:00:00
 
@@ -118,12 +117,6 @@ echo "Results:     $RESULT_DIR"
 echo "=================================================="
 uv run python -c "import jax; print('JAX devices:', jax.devices())"
 
-# +2: one for the header row, one because array indices start at 0.
-# ROW_KIND (always "train" here) is named and unused rather than left off the
-# read: bash `read` crams every field past the last *named* variable, comma
-# included, into that variable -- naming one fewer than the row has would
-# silently glue ",train" onto $CONFIG the moment the manifest gained that
-# column (executors.py's MANIFEST_FIELDS), not drop it.
 LINE=$(sed -n "$((SLURM_ARRAY_TASK_ID + 2))p" "$MANIFEST")
 IFS=',' read -r ROW_INDEX ROW_RUN_ID TAG CONFIG ROW_KIND <<< "${LINE%$'\r'}"
 
@@ -138,12 +131,12 @@ echo ""
 
 # --run-dir redirects this run's output to node-local scratch; the config itself
 # stays the shared one submit.py wrote, so the run is reproducible from it.
-# --signal=B:USR1@300 above sends USR1 to *this* shell 300s before the wall, and
+# --signal=B:USR1@100 above sends USR1 to *this* shell 100s before the wall, and
 # bash's default action for it is to terminate -- so without this trap the run
 # died silently and the EXIT trap saved whatever happened to be on disk. Forward
 # it to python, whose faulthandler dumps every thread's stack before it goes.
 on_usr1() {
-  echo "=== USR1 at $(date): walltime in <300s, forwarding to $TRAIN_PID ==="
+  echo "=== USR1 at $(date): walltime in <100s, forwarding to $TRAIN_PID ==="
   kill -USR1 "$TRAIN_PID" 2>/dev/null || true
 }
 trap on_usr1 USR1
@@ -157,7 +150,7 @@ TRAIN_PID=$!
 # not let the shell run on_usr1 until it finished. The cost is that a handled
 # signal makes `wait` return 128+n straight away while the child is still going,
 # so this waits again until the child is actually gone -- otherwise USR1 would
-# end the job 300s early instead of just dumping a stack.
+# end the job 100s early instead of just dumping a stack.
 set +e
 wait "$TRAIN_PID"; STATUS=$?
 while [ "$STATUS" -gt 128 ] && kill -0 "$TRAIN_PID" 2>/dev/null; do
