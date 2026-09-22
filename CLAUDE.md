@@ -2,10 +2,7 @@
 
 `barl_jax` is a JAX/Flax-NNX off-policy RL research framework. The current
 architecture, commands, extension interfaces and checkpoint semantics are in
-[README.md](README.md). The typed-config restructure plan
-([docs/plans/config-class-restructure.md](docs/plans/config-class-restructure.md))
-is now implemented: `RunConfig`/`ModelSpec` with dataclass schemas beside their
-implementations.
+[README.md](README.md). 
 
 Use `uv` for dependencies and `scripts/submit.py` to launch experiments. Run
 `uv run pytest tests/ -q` and `uv run ruff check .`
@@ -36,6 +33,7 @@ test with `c.config = dataclasses.replace(c.config, foo=...)`. `lr`/`adam_b1`/
 
 Comments should explain non-obvious invariants or numerical/shape constraints.
 Prefer clear identifiers and short comments over historical implementation essays.
+But reduce the overall commenting to a minimum !
 
 ## Algorithmic clarity
 

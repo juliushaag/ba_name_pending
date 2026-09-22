@@ -8,13 +8,19 @@ normalisation, the gate's cadence, the name of the actor's generator, and
 whether the dual is fed anything at all -- and none of those is an algorithm.
 
 `RLPolicy` states that shared step once; `MaxEntRLPolicy` adds the dual. Every
-algorithm reuses this template entirely: `SAC`, `AMDP`, `DIME` and `SDAC`
-(each beside its actor, in `barl_jax.actors.*`) are thin `MaxEntRLPolicy`
-subclasses that pin `actor_cls`, the actor-policy integration binding for that
-algorithm; `NCLQL` pins one on `RLPolicy` directly (no entropy dual). None of
-them override a single method here -- the algorithm difference is entirely in
-which actor/critic/params a model variant's `ModelConfig` selects, never in a
-second copy of this training step."""
+algorithm reuses this template: `SAC`, `AMDP`, `DIME` and `SDAC` (each beside
+its actor, in `barl_jax.actors.*`) are thin `MaxEntRLPolicy` subclasses that
+pin `actor_cls`, the actor-policy integration binding for that algorithm;
+`NCLQL` pins one on `RLPolicy` directly (no entropy dual). Every one of them
+except `SDAC` overrides no method here -- the algorithm difference is
+otherwise entirely in which actor/critic/params a model variant's
+`ModelConfig` selects, never in a second copy of this training step. `SDAC`
+is the one exception: its diffusion actor's bootstrap draw and actor loss
+share one expensive best-of-N reverse-diffusion chain rather than affording
+two independent ones (see `DDPMActor.train_loss`), which this template's
+two-call shape -- `generate_action` for the bootstrap, then a separately
+gated `loss` -- cannot express, so `SDAC` overrides `train_step` and
+`optimizer_cadence` beside its actor instead."""
 
 from dataclasses import dataclass
 

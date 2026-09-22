@@ -20,19 +20,6 @@
 
 #SBATCH --time=00:30:00
 
-# run_rl.slurm's sibling for evaluation: one array task per *batch* of
-# checkpoints (scripts/submit.py --from-sweep groups several {algo, env}
-# checkpoints per task on purpose -- eval is cheap enough that one task per
-# checkpoint would waste a node's worth of scheduling overhead on work that
-# finishes in seconds). Submit through that script, never sbatch directly --
-# see run_rl.slurm's own header for the sweep-directory contract, shared here.
-#
-# Unlike run_rl.slurm, this never renders (scripts/evaluate.py's run_episodes
-# call is always render=False), so there is no offscreen GL context to reserve
-# device memory for and no MUJOCO_EGL_DEVICE_ID pinning to do at this level --
-# evaluate.py's own top-of-file guard covers the case where some environment
-# still needs mujoco initialized without ever rendering.
-
 set -euo pipefail
 
 export PYTHONUNBUFFERED=1

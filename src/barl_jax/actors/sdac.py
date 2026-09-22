@@ -293,35 +293,38 @@ class DDPMActor(ActorOptim, Actor):
 
   def generate_action(self, obs, *, critic: Critic = None, key=None):
     """The played action plan: best-of-N, squashed, plus exploration noise.
-    Also what the owning Policy's Bellman target bootstraps from."""
+    Also what the owning Policy's Bellman target bootstraps from.
+
+    Standalone entry point for callers with no accompanying actor-loss batch
+    (`sample`/`inference_step`, a contract test over every actor). `SDAC.train_step`
+    does not call this -- it shares one best-of-N draw between the bootstrap and
+    the actor loss via `train_loss` below, see that method's docstring."""
     key = self.rngs.noise() if key is None else key
     k_bon, k_explore = jax.random.split(key)
     raw = self.best_of_n(obs, self.config.num_bon, critic=critic, key=k_bon)
     return self._plan(self.explore(self.squash(raw), k_explore)), self.noise_entropy()
 
-  def loss(self, obs, critic: Critic, alpha, *, key=None):
-    """The soft-DSM objective plus the exploration-noise objective, sharing one
-    best-of-N draw: `policy_x0` (this actor's own best-of-N at `obs`, not the
-    caller's) is diffused forward and regressed onto its noise, reweighted by
-    a softmax over K freshly-decoded candidates' critic value -- and the same
-    draw, squashed and noised, prices the `explore_raw` update on its own
-    optimizer key (see `create_optimizer`/`param_labels`).
+  def _played_action(self, raw, key):
+    """`best_of_n`'s raw x0 -> the played action plan, squashed and noised --
+    the part of `generate_action` downstream of the draw, factored out so
+    `train_loss` can reuse it against a chain it already ran."""
+    return self._plan(self.explore(self.squash(raw), key)), self.noise_entropy()
 
-    This is a second best-of-N draw, independent of `generate_action`'s -- the
-    two used to share one fused pass over `concat([tile(next_obs), tile(obs)])`
-    scored in a single critic call (SDAC.train_step, pre-refactor); splitting
-    them onto separate ABC methods costs the extra kernel launches of a second
-    chain and a second critic invocation for identical total FLOPs. See
-    REFACTOR.md's fusion measurement before assuming this is free."""
-    key = self.rngs.noise() if key is None else key
+  def _dsm_explore_loss(self, obs, policy_x0, critic: Critic, alpha, *, key):
+    """The soft-DSM objective plus the exploration-noise objective, given a
+    best-of-N draw `policy_x0` already made at `obs` -- shared by `loss`
+    (which makes its own single-purpose draw) and `train_loss` (which reuses
+    one made jointly with the Bellman bootstrap's). `policy_x0` is diffused
+    forward and regressed onto its noise, reweighted by a softmax over K
+    freshly-decoded candidates' critic value; the same draw, squashed and
+    noised, prices the `explore_raw` update on its own optimizer key (see
+    `create_optimizer`/`param_labels`)."""
     keys = jax.random.split(key, 5)
-    policy_x0 = self.best_of_n(obs, self.config.num_bon, critic=critic, key=keys[0])
-
     B, K = obs.shape[0], self.config.num_candidates
-    t   = jax.random.randint(keys[1], (B,), 1, self.config.num_steps + 1)
-    x_t = jax.lax.stop_gradient(self.diffuse(policy_x0, t, keys[2]))
+    t   = jax.random.randint(keys[0], (B,), 1, self.config.num_steps + 1)
+    x_t = jax.lax.stop_gradient(self.diffuse(policy_x0, t, keys[1]))
 
-    noise      = jax.random.normal(keys[3], (K, B, self.plan_dim), x_t.dtype)
+    noise      = jax.random.normal(keys[2], (K, B, self.plan_dim), x_t.dtype)
     a0_raw     = jax.lax.stop_gradient(self.x0_from_eps(x_t[None], noise, t))
     candidates = self.squash(a0_raw)                                          # (K, B, P)
 
@@ -353,7 +356,7 @@ class DDPMActor(ActorOptim, Actor):
     self.metrics.vec("eps_target", noise.reshape(-1, noise.shape[-1]))
 
     a_bon   = self.squash(policy_x0)
-    a_noisy = a_bon + self.explore_std * jax.random.normal(keys[4], a_bon.shape, a_bon.dtype)
+    a_noisy = a_bon + self.explore_std * jax.random.normal(keys[3], a_bon.shape, a_bon.dtype)
     # noise_entropy() is (chunk_size,); alpha is a scalar or (chunk_size,)
     # (per_action granularity) -- either broadcasts, and the sum restores the
     # single number this term needs, same as PathwiseActorMixin's entropy bonus.
@@ -371,6 +374,64 @@ class DDPMActor(ActorOptim, Actor):
     self.metrics.scalar("noise_entropy_value", jax.lax.stop_gradient(self.noise_entropy()))
     return {"actor": loss, "explore": explore_loss}
 
+  def loss(self, obs, critic: Critic, alpha, *, key=None):
+    """`Actor.loss`'s contract, satisfied with its own single best-of-N draw
+    at `obs` -- for standalone callers (a contract test over every actor)
+    with no accompanying `next_obs` to fuse against. `SDAC.train_step` never
+    calls this: it uses `train_loss` below, which shares one draw between
+    this objective and the Bellman bootstrap instead of affording two."""
+    keys = jax.random.split(self.rngs.noise() if key is None else key, 2)
+    policy_x0 = self.best_of_n(obs, self.config.num_bon, critic=critic, key=keys[0])
+    return self._dsm_explore_loss(obs, policy_x0, critic, alpha, key=keys[1])
+
+  def train_loss(self, obs, action, next_obs, chunk_return, terminated, horizon,
+                critic: Critic, alpha, entropy_bonus_fn, *, key=None):
+    """`SDAC.train_step`'s one call: the bootstrap action at `next_obs`, the
+    soft-DSM actor loss at `obs` (`_dsm_explore_loss`), and the critic's own
+    TD loss, all from a *single* best-of-N draw.
+
+    The reference implementation (Ma et al. 2025,
+    github.com/mahaitongdae/diffusion_policy_online_rl, relax/algorithm/sdac.py)
+    draws best-of-N once per step and reuses it both as the Bellman bootstrap
+    action and as the x0 its score-matching loss diffuses forward -- it never
+    runs a second independent reverse chain. This mirrors that: one best-of-N
+    call over `concat([obs, next_obs])` (batch doubles, chain length doesn't),
+    split back into `policy_x0` (actor loss) and `next_action` (bootstrap).
+    Doubling a chain's batch width is far cheaper than doubling its sequential
+    step count, which is what running two independent best-of-N draws (`loss`
+    and `generate_action`, called separately) costs.
+
+    `entropy_bonus_fn` is the owning Policy's `target_entropy_bonus(alpha,
+    entropy)` -- threaded through explicitly rather than hardcoded to 0.0 so
+    this stays correct if `entropy_in_target` is ever set True for SDAC.
+
+    Returns `({"actor", "explore", "critic"}, entropy)` -- the loss dict and
+    the bootstrap action's entropy (for `SDAC.train_step`'s `dual_loss` call),
+    separately rather than folded into the dict, since `entropy` is not a
+    loss term any optimizer key owns."""
+    key = self.rngs.noise() if key is None else key
+    keys = jax.random.split(key, 4)
+
+    B = obs.shape[0]
+    both = jnp.concatenate([obs, next_obs], axis=0)
+    raw_both = self.best_of_n(both, self.config.num_bon, critic=critic, key=keys[0])
+    policy_x0, next_raw = raw_both[:B], raw_both[B:]
+
+    next_action, entropy = jax.lax.stop_gradient(self._played_action(next_raw, keys[1]))
+    next_action = next_action.reshape(next_action.shape[0], -1)
+
+    critic_loss = critic.td_loss(
+      obs, action, next_obs, next_action, chunk_return, terminated, horizon,
+      entropy_bonus=entropy_bonus_fn(alpha, entropy), key=keys[2])
+
+    actor_losses = self._dsm_explore_loss(obs, policy_x0, critic, alpha, key=keys[3])
+
+    self.metrics.vec("action", next_action.reshape(
+      next_action.shape[0], self.chunk_size, self.action_dim), limit=1.0)
+    if entropy is not None:
+      self.metrics.dist("entropy", entropy)
+    return {**actor_losses, **critic_loss}, entropy
+
   def create_optimizer(self) -> dict:
     return {**super().create_optimizer(),
             "explore": adam(self.config.explore_lr, self.config.adam_b1, self.config.grad_clip, self.config.grad_clip_mode)}
@@ -384,9 +445,50 @@ class DDPMActor(ActorOptim, Actor):
 @register_policy
 class SDAC(MaxEntRLPolicy):
   """Binds DDPMActor into the shared max-entropy actor-critic template -- the
-  actor-policy integration for this algorithm."""
+  actor-policy integration for this algorithm.
+
+  Overrides `train_step`/`optimizer_cadence`, unlike every other
+  `MaxEntRLPolicy` subclass (SAC/AMDP/DIME/NCLQL all use the shared template
+  untouched): `DDPMActor.train_loss` shares one best-of-N draw between the
+  Bellman bootstrap and the actor's own DSM loss (see its docstring), which
+  the generic `generate_action` -> `gated_losses(loss)` two-call template
+  cannot express -- the bootstrap draw would still run on its own outside the
+  gate. Folding the critic's TD loss into `train_loss`'s return dict also
+  means `"critic"` must be pinned to cadence 1 here, not left to inherit
+  `policy_delay`, so the critic keeps updating every step exactly as it does
+  for every other algorithm on this template."""
 
   actor_cls = DDPMActor
+
+  def optimizer_cadence(self) -> dict:
+    # "critic" trains every step, same as SAC/AMDP/DIME/NCLQL -- explicit here
+    # because train_step (below) calls DDPMActor.train_loss directly rather
+    # than through gated_losses, so nothing else pins this.
+    return {**super().optimizer_cadence(), "critic": 1}
+
+  def train_step(self, batch):
+    obs          = self._obs(batch["obs"])
+    next_obs     = self._obs(batch["next_obs"])
+
+    action       = batch["act"]
+    chunk_return = batch["chunk_return"]
+    terminated   = batch["term"]
+    horizon      = batch["horizon"]
+
+    alpha = self.alpha()
+
+    # DDPMActor.train_loss shares one best-of-N draw between the Bellman
+    # bootstrap and the actor's own DSM loss (see its docstring) and folds in
+    # the critic's TD loss too -- it always runs in full, unconditionally,
+    # the same way the critic's own td_loss always did on the shared template
+    # this overrides. There is nothing left to gate: "actor"/"explore" are
+    # masked at the optimizer (build_optimizer, keyed by optimizer_cadence),
+    # not by skipping this call, and "critic" must never be skipped.
+    losses, entropy = self.actor.train_loss(
+      obs, action, next_obs, chunk_return, terminated, horizon,
+      self.critic, alpha, self.target_entropy_bonus, key=self.rngs.noise())
+    losses.update(self.dual_loss(entropy))
+    return losses
 
 
 @register_model

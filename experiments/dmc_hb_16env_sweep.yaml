@@ -29,11 +29,11 @@
 #   uv run python scripts/submit.py --grid experiments/dmc_hb_16env_sweep.yaml
 
 axes:
-  algo: [NCLQL, SAC, SDAC, DIME, AMDP]
+  algo: [SAC, AMDP, DIME, SDAC]
   env:
     - HumanoidRun
-    - HumanoidWalk
     - DogRun
+    - HumanoidWalk
     - DogTrot
     - H1HandCrawl
     - H1HandHurdle
