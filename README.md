@@ -189,9 +189,10 @@ existing "environment episodes restart" semantics.
 - `components.py` defines actors, critics, configuration declarations and NNX
   state utilities. Low-level components do not import the policy runtime.
 - `policies/` composes components and defines algorithm behavior. Critic losses
-  live in `critics/`: shared TD in `QCriticBase`, noise-conditioned TD in
-  `NoiseConditionedCritic`, and representation-specific targets/regression in
-  their critics. `SLOT_OBJECTIVES` validates compatibility before construction.
+  live in `critics/`: `QCritic` owns TD, the target net, ensemble reduction and
+  noise-conditioned TD; each value head (`DirectCritic`, `HLGaussCritic`,
+  `C51Critic`) supplies only its representation-specific target and regression.
+  `SLOT_OBJECTIVES` validates compatibility before construction.
 - `optimization.py` assembles parameter ownership, update cadence and schedules.
 - `collection.py` owns environment/chunk state and emits transitions into an
   injected sink. `rollout.py` owns replay storage and independent sampling RNGs;

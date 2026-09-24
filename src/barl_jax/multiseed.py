@@ -7,6 +7,7 @@ import numpy as np
 from flax import nnx
 
 import barl_jax.executors as executors
+from barl_jax.components import interned_static
 
 
 def stack(pairs):
@@ -68,7 +69,7 @@ class StackedPolicy:
   def inference_fn(self):
     is_direct = self._executor is None or self._executor.is_direct
     executor_config = None if is_direct else self._executor.config
-    return partial(_stacked_infer, _eval_graphdef(self._graphdef, self._state),
+    return partial(_stacked_infer, interned_static(_eval_graphdef(self._graphdef, self._state)),
                    self.num_seeds, self.num_envs, executor_config, self._state)
 
 
@@ -92,7 +93,7 @@ def _stacked_infer(graphdef, num_seeds, num_envs, executor_config, state, observ
   keys = jax.random.split(key, num_seeds)
 
   def one(state, obs, key):
-    policy, _ = nnx.merge(graphdef, state)
+    policy, _ = nnx.merge(graphdef.value, state)
     if executor_config is None:
       return policy.inference_step(obs, key=key)
     executor = executors.executor_from_config(executor_config)

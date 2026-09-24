@@ -584,7 +584,7 @@ def test_sac_median_of_n_matches_the_manual_reduction():
 
 def test_sac_topk_of_n_scores_are_finite_and_shape_is_right():
   """Not a whitebox reconstruction like the other SAC tests here: the critic
-  uses batch renormalization (`CategoricalCriticBase.mlp`, norm='batchrenorm'),
+  uses batch renormalization (`crossq_mlp`, norm='batchrenorm'),
   whose output depends on how many rows share one forward pass -- scoring the
   same candidates outside of `TopKExecutor.select`'s own N*batch fold does not
   reproduce the same numbers, only a policy-blind reducer (mean/median/

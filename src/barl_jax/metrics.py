@@ -200,7 +200,7 @@ class Recorder:
     in rather than derived from a coefficient here: `mean - rho*std` is only one
     of the reductions in this codebase, and a `min` over heads has no rho to
     multiply -- deriving it that way logged a constant 0 for every categorical
-    critic. See QCriticBase.pessimism_gap."""
+    critic. See QCritic.pessimism_gap."""
     if not _ACTIVE:
       return
     std = jnp.asarray(raw, dtype=jnp.float32).std(axis=0)

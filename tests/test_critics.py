@@ -1,8 +1,6 @@
-"""The `Critic` contract, over every registered critic.
-
-Everything here holds for all seven regardless of what the heads predict -- a
-scalar, categorical atoms, or a smoothed histogram -- which is the property that
-makes swapping a critic class a one-word edit in config/models.yaml.
+"""The `Critic` contract, over every registered critic and over the full
+composition grid (`conftest.VARIANTS`): value head x bootstrap x normalization
+x ensemble reduction x objective.
 
 Grouped a few assertions to a test on purpose: an eager `Ensemble` forward costs
 real time, so each test re-uses one `raw()` rather than paying for its own.
@@ -13,20 +11,23 @@ from dataclasses import replace
 import jax
 import jax.numpy as jnp
 import pytest
-from conftest import BATCH, CRITICS, build, built, critic_action, finite, target_expectation
+from conftest import (
+    BATCH,
+    CRITICS,
+    HEADS,
+    VARIANTS,
+    build,
+    build_variant,
+    finite,
+    make_env_stats,
+    target_expectation,
+)
 from flax import nnx
 
-from barl_jax.components import TRAINABLE, frozen
-from barl_jax.critics.nclql import NoiseConditionedCritic
+from barl_jax.components import TRAINABLE, frozen, is_target
+from barl_jax.config.serialization import merge
+from barl_jax.critics import presets
 from barl_jax.registration import get_component
-
-# `NoiseConditionedCritic.noise_td_loss` takes a sigma ladder and a key
-# in addition to the plain TD inputs, because TD at the clean level
-# plus smoothing of the noisier ones is one loss over two forwards. So the shared
-# contract below is the plain one, and the noise-conditioned critics get the same
-# assertions through their own entry point.
-PLAIN = [n for n in CRITICS if not issubclass(get_component(n), NoiseConditionedCritic)]
-NOISE_CONDITIONED = [n for n in CRITICS if issubclass(get_component(n), NoiseConditionedCritic)]
 
 REWARD = jnp.array([-2.0, -0.5, 0.5, 2.0])          # BATCH values, well inside every support
 
@@ -34,45 +35,109 @@ REWARD = jnp.array([-2.0, -0.5, 0.5, 2.0])          # BATCH values, well inside 
 # the projection clips and equivariance genuinely stops holding. That caps a
 # usable reward at v_max*(1 - gamma), which at the shipped gamma is 0.1.
 SMALL_REWARD = jnp.array([-0.06, -0.02, 0.02, 0.06])
+ONE = jnp.ones((BATCH,))
+SCALAR = [n for n in HEADS if not hasattr(get_component(n), "probs")]
+POLYAK = [v for v, (_, o) in VARIANTS.items() if o["target"]["kind"] == "polyak"]
 
 
-@pytest.mark.parametrize("name", CRITICS)
-def test_pricing_contract(name, obs, act):
-    """Shapes, finiteness, and `value()` being the pessimistic reading of the
-    same forward pass `expectation()` averages."""
-    c = built(name)
-    a = critic_action(c, act)
-    raw = c.raw(obs, a)
+def td_losses(c, obs, act):
+    return c.td_loss(obs, act, obs[::-1], act, REWARD, jnp.zeros((BATCH,)), ONE,
+                     key=jax.random.PRNGKey(0))
+
+
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_pricing_contract(variant, obs, act):
+    """Shapes, finiteness, and `value()` never above the expectation it reduces."""
+    c = build_variant(variant)
+    raw = c.raw(obs, act)
 
     assert raw.shape[:2] == (c.n_models, BATCH)
-    assert c.value(obs, a).shape == (BATCH, 1)
-    assert c.expectation(obs, a).shape == (BATCH, 1)
     assert finite(raw)
-    # Reduced off one `raw` rather than two calls: a BatchRenorm critic in train
-    # mode moves its own statistics per forward, so two calls are two functions.
-    assert jnp.all(c.reduce_value(raw) <= c.expectation_from_raw(raw).mean(axis=0) + 1e-4)
+    # Reduced off one `raw`: a BatchRenorm critic in train mode moves its own
+    # statistics per forward, so two calls are two functions.
+    exp = c.expectation_members(raw).mean(axis=0)
+    assert c.reduce_value(raw).shape == exp.shape == (BATCH, 1)
+    assert jnp.all(c.reduce_value(raw) <= exp + 1e-4)
+    assert jnp.array_equal(frozen(c).value(obs, act), frozen(c).value(obs, act))
 
 
-@pytest.mark.parametrize("name", CRITICS)
-def test_frozen_pricing_is_repeatable(name, obs, act):
-    """`frozen()` has to give a critic that prices the same action the same way
-    twice -- every actor loss here scores candidates it never trained on, and
-    a moving normalization would shift the function under its own regression."""
-    c = built(name)
-    a = critic_action(c, act)
-    assert jnp.array_equal(frozen(c).value(obs, a), frozen(c).value(obs, a))
+@pytest.mark.parametrize("variant", VARIANTS)
+def test_loss_trains_the_live_net_only(variant, obs, act):
+    """One `losses["critic"]` that moves the live heads and never the target
+    net, whichever bootstrap path produced it."""
+    c = build_variant(variant)
+
+    def loss_fn(critic):
+        losses = td_losses(critic, obs, act)
+        assert set(losses) == {"critic"}
+        return losses["critic"]
+
+    grads = nnx.grad(loss_fn, argnums=nnx.DiffState(0, nnx.Param))(build_variant(variant))
+    flat = [(path, jnp.asarray(g[...])) for path, g in nnx.to_flat_state(grads)]
+    live = [g for path, g in flat if not is_target(path, g)]
+    target = [g for path, g in flat if is_target(path, g)]
+    assert live and all(finite(g) for g in live)
+    assert any(jnp.any(g != 0) for g in live), "no head received gradient"
+    assert all(jnp.all(g == 0) for g in target), "the target net received gradient"
+    assert bool(target) == c.has_target
 
 
-ONE = jnp.ones((BATCH,))
+@pytest.mark.parametrize("variant", POLYAK)
+def test_polyak_target_tracks_the_live_net(variant):
+    """`after_step()` blends the target tau of the way toward the live net, as
+    it stands after any weight projection. Checked against a *perturbed* live
+    net -- the clone it starts as would make any blending law look correct."""
+    c = build_variant(variant)
+    assert jax.tree.all(jax.tree.map(jnp.array_equal, nnx.state(c.net, nnx.Param),
+                                     nnx.state(c.net_target, nnx.Param))), \
+        "target does not start as the (projected) live net"
+
+    nnx.update(c.net, jax.tree.map(lambda x: x + 1.0, nnx.state(c.net, nnx.Param)))
+    before = jax.tree.map(jnp.copy, nnx.state(c.net_target, nnx.Param))
+    c.after_step()
+    live = nnx.state(c.net, nnx.Param)
+
+    expected = jax.tree.map(lambda b, l: b + c.config.target.tau * (l - b), before, live)
+    for got, want in zip(jax.tree.leaves(nnx.state(c.net_target, nnx.Param)),
+                         jax.tree.leaves(expected)):
+        assert jnp.allclose(got, want, atol=1e-5)
 
 
-@pytest.mark.parametrize("name", CRITICS)
+def test_weight_norm_projects_every_step():
+    c = build("C51Critic", weight_norm=True)
+    nnx.update(c.net, jax.tree.map(lambda x: 3.0 * x + 0.1, nnx.state(c.net, nnx.Param)))
+    c.after_step()
+    members = c.net.ensemble.members
+    stem = jnp.concatenate([members.stem.kernel[...], members.stem.bias[...][:, None, :]], axis=-2)
+    assert jnp.allclose(jnp.linalg.norm(stem, axis=-2), 1.0, atol=1e-5)
+    assert jnp.allclose(jnp.linalg.norm(members.head.kernel[...], axis=-2), 1.0, atol=1e-5)
+
+
+@pytest.mark.parametrize("overrides", [
+    {"target": {"joint_forward": False}},                        # batchrenorm needs the joint batch
+    {"ensemble": {"value_reduce": "median"}},
+    {"target": {"kind": "ema"}},
+])
+def test_invalid_compositions_are_rejected(overrides):
+    with pytest.raises(ValueError):
+        build("C51Critic", **overrides)
+
+
+@pytest.mark.parametrize("name", HEADS)
+def test_learning_objective_follows_the_noise_axis(name):
+    cls = get_component(name)
+    assert cls.learning_objective_for(cls.config_type()) == "td"
+    noisy = replace(cls.config_type(), noise=replace(cls.config_type().noise, enabled=True))
+    assert cls.learning_objective_for(noisy) == "noise_td"
+    assert not build(name, noise={"enabled": True}).supports_bon
+
+
+@pytest.mark.parametrize("name", HEADS)
 def test_bellman_contract(name, obs, act):
-    """The target's expectation, in whatever representation the class returns it."""
+    """The target's expectation, in whatever representation the head returns it."""
     c = build(name)
-    a = critic_action(c, act)
-    raw = c.raw(obs, a)
-    boot = c.bootstrap_from_raw(raw)
+    raw = c.raw(obs, act)
+    boot = c.bootstrap(raw)
     live, done = jnp.zeros((BATCH,)), jnp.ones((BATCH,))
 
     # terminated=1 cuts the bootstrap -- catches an inverted flag or a discount
@@ -90,62 +155,51 @@ def test_bellman_contract(name, obs, act):
         c, c.bellman_target(jnp.zeros((BATCH,)), live, jnp.full((BATCH,), 2), boot))
     assert jnp.allclose(two_step, c.config.gamma * one_step, atol=0.05)
 
-    # `bellman_target` and `regression_loss` live in different classes; this is
-    # the coupling between them. `target_from_raw` is the same lift applied to
-    # one of the critic's own predictions (NC-LQL's smoothing loss).
-    for target in (c.bellman_target(REWARD, live, ONE, boot), c.target_from_raw(raw)):
+    # The Bellman target and the smoothing target are both what `regression_loss` fits.
+    for target in (c.bellman_target(REWARD, live, ONE, boot), c.soft_target(raw)):
         loss = c.regression_loss(raw, target)
         assert loss.shape == () and finite(loss)
 
 
-@pytest.mark.parametrize("name", [n for n in CRITICS if not issubclass(get_component(n), NoiseConditionedCritic)])
+def test_reward_scale_scales_the_return():
+    c = build("DirectCritic", reward_scale=2.0)
+    target = c.bellman_target(jnp.array([1.5]), jnp.array([1.0]), jnp.array([1]), jnp.array([[0.0]]))
+    assert jnp.allclose(target, 3.0)
+
+
+@pytest.mark.parametrize("name", SCALAR)
 def test_bellman_target_matches_hand_computed_chunk_return(name):
-    """The directive's own worked example: K=3, rewards=[1,2,3], gamma=0.5,
-    nonterminal next value=8 -> chunk_return=2.75, td_target=3.75. chunk_return
-    is an *input* here (the collector's own accumulation is checked separately,
-    in tests/test_replay_buffer.py); this is the objective layer's half."""
+    """K=3, rewards=[1,2,3], gamma=0.5, nonterminal next value=8 ->
+    chunk_return=2.75, td_target=3.75."""
     c = build(name)
-    if hasattr(c, "support"):
-        pytest.skip("categorical critics build the transformed support instead -- see "
-                    "test_categorical_projection_matches_scalar_discount in test_critic_stats.py")
     c.config = replace(c.config, gamma=0.5)
     target = c.bellman_target(jnp.array([2.75]), jnp.array([0.0]), jnp.array([3]),
                               jnp.array([[8.0]]))
     assert jnp.allclose(target, jnp.array([[3.75]]), atol=1e-5)
 
 
-@pytest.mark.parametrize("name", [n for n in CRITICS if not issubclass(get_component(n), NoiseConditionedCritic)])
+@pytest.mark.parametrize("name", SCALAR)
 def test_bellman_target_k1_matches_one_step(name):
-    """K=1 is an explicit value flowing through the ordinary path, not a
-    fallback for an omitted horizon."""
     c = build(name)
-    if hasattr(c, "support"):
-        pytest.skip("categorical: see test_categorical_projection_matches_scalar_discount")
     c.config = replace(c.config, gamma=0.5)
     target = c.bellman_target(jnp.array([1.0]), jnp.array([0.0]), jnp.array([1]), jnp.array([[8.0]]))
     assert jnp.allclose(target, jnp.array([[1.0 + 0.5 * 8.0]]), atol=1e-5)
 
 
-@pytest.mark.parametrize("name", [n for n in CRITICS if not issubclass(get_component(n), NoiseConditionedCritic)])
+@pytest.mark.parametrize("name", SCALAR)
 def test_bellman_target_terminated_drops_bootstrap(name):
-    """terminated=1 must zero the bootstrap contribution regardless of its
-    value -- bootstrap is deliberately large here to make a sign/mask bug
-    visible rather than accidentally passing at a small value."""
+    """Bootstrap deliberately large so a sign/mask bug is visible."""
     c = build(name)
-    if hasattr(c, "support"):
-        pytest.skip("categorical: see test_categorical_projection_matches_scalar_discount")
     c.config = replace(c.config, gamma=0.5)
     target = c.bellman_target(jnp.array([2.0]), jnp.array([1.0]), jnp.array([2]), jnp.array([[100.0]]))
     assert jnp.allclose(target, jnp.array([[2.0]]), atol=1e-5)
 
 
-@pytest.mark.parametrize("name", [n for n in CRITICS if not issubclass(get_component(n), NoiseConditionedCritic)])
+@pytest.mark.parametrize("name", SCALAR)
 def test_entropy_bonus_sign_and_discount(name):
     """entropy_bonus enters exactly like the bootstrap: added before the
-    n-step discount, so its contribution to the target is discount*entropy_bonus."""
+    n-step discount."""
     c = build(name)
-    if hasattr(c, "support"):
-        pytest.skip("categorical: see test_categorical_projection_matches_scalar_discount")
     c.config = replace(c.config, gamma=0.5)
     with_bonus = c.bellman_target(jnp.array([0.0]), jnp.array([0.0]), jnp.array([2]),
                                   jnp.array([[0.0]]), entropy_bonus=jnp.array([[1.0]]))
@@ -153,69 +207,27 @@ def test_entropy_bonus_sign_and_discount(name):
     assert jnp.allclose(with_bonus - without, 0.25, atol=1e-5)  # gamma**2 == 0.25
 
 
-@pytest.mark.parametrize("name", PLAIN)
-def test_loss_is_differentiable(name, obs, act):
-    """`loss` fills exactly `losses["critic"]`, and that scalar moves the heads."""
-    c = build(name)                       # fresh: loss updates BatchRenorm state
-    a = critic_action(c, act)
-
-    def loss_fn(critic):
-        losses = critic.td_loss(obs, a, obs[::-1], a, REWARD, jnp.zeros((BATCH,)), ONE)
-        assert set(losses) == {"critic"}
-        return losses["critic"]
-
-    grads = nnx.grad(loss_fn, argnums=nnx.DiffState(0, TRAINABLE))(c)
-    leaves = jax.tree.leaves(nnx.state(grads))
-    assert leaves and all(finite(g) for g in leaves)
-    assert any(jnp.any(g != 0) for g in leaves), "no head received gradient"
-
-
-@pytest.mark.parametrize("name", NOISE_CONDITIONED)
-def test_noise_conditioned_loss_is_differentiable(name, obs, act):
-    """The same contract as above through the noise-conditioned entry point: one
-    `losses["critic"]` covering both the TD and the smoothing term, and it moves
-    the heads."""
-    # The raw action, not `critic_action`: `augment()` is what widens it to the
-    # inner critic's input, and doing both would widen it twice.
-    c = build(name)
-    sigmas = jnp.array([0.5, 0.2, 0.05])
-
-    def loss_fn(critic):
-        losses = critic.noise_td_loss(obs, act, obs[::-1], act, REWARD, jnp.zeros((BATCH,)), ONE,
-                    sigmas, jax.random.PRNGKey(0))
-        assert set(losses) == {"critic"}
-        return losses["critic"]
-
-    grads = nnx.grad(loss_fn, argnums=nnx.DiffState(0, TRAINABLE))(c)
-    leaves = jax.tree.leaves(nnx.state(grads))
-    assert leaves and all(finite(g) for g in leaves)
-    assert any(jnp.any(g != 0) for g in leaves), "no head received gradient"
-
-
 @pytest.mark.parametrize("name", CRITICS)
-def test_polyak_target_tracks_the_live_net(name, obs, act):
-    """`after_step()` blends the target tau of the way toward the live net.
-    Checked against a *perturbed* live net -- the clone it starts as would make
-    any blending law look correct."""
+def test_registered_critics_train(name, obs, act):
     c = build(name)
-    if not c.has_target:
-        pytest.skip("no target network at this critic's polyak_tau")
+    assert c.value(obs, act).shape == (BATCH, 1)
+    grads = nnx.grad(lambda m: td_losses(m, obs, act)["critic"],
+                     argnums=nnx.DiffState(0, TRAINABLE))(c)
+    assert all(finite(g) for g in jax.tree.leaves(nnx.state(grads)))
 
-    nnx.update(c.q_function, jax.tree.map(lambda x: x + 1.0,
-                                          nnx.state(c.q_function, nnx.Param)))
-    live = nnx.state(c.q_function, nnx.Param)
-    before = jax.tree.map(jnp.copy, nnx.state(c.critic_target, nnx.Param))
 
-    c.after_step()
-
-    expected = jax.tree.map(lambda b, l: b + c.config.polyak_tau * (l - b), before, live)
-    for got, want in zip(jax.tree.leaves(nnx.state(c.critic_target, nnx.Param)),
-                         jax.tree.leaves(expected)):
-        assert jnp.allclose(got, want, atol=1e-5)
+@pytest.mark.parametrize("preset", ["target_ensemble", "xqc", "nclql"])
+@pytest.mark.parametrize("name", HEADS)
+def test_presets_compose_with_every_head(name, preset, obs, act):
+    cls = get_component(name)
+    config = merge(getattr(presets, preset)(cls.config_type()), {"latent_dim": 8})
+    c = cls(make_env_stats(), config, rngs=nnx.Rngs(0))
+    grads = nnx.grad(lambda m: td_losses(m, obs, act)["critic"],
+                     argnums=nnx.DiffState(0, TRAINABLE))(c)
+    assert all(finite(g) for g in jax.tree.leaves(nnx.state(grads)))
 
 
 def test_bfloat16_heads_still_price(obs, act):
-    """The shipped dtype for most of these, and the one SDAC runs. The contracts
-    above are checked in float32; this only asserts low precision stays finite."""
+    """Low precision stays finite; the laws above are dtype-agnostic."""
     c = build("C51Critic", mlp={"dtype": "bfloat16"})
-    assert finite(c.value(obs, critic_action(c, act)))
+    assert finite(c.value(obs, act))

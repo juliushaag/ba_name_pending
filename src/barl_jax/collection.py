@@ -193,9 +193,9 @@ class Collector:
 
       key, subkey = jax.random.split(key)
       action_np, step_extras = chunks.current(obs, subkey, to_device=to_device)
-      plan_np = chunks.plan().reshape(n_envs, -1).astype(np.float32)
       refilled = chunks.last_refilled()
       if refilled.any():
+        plan_np = chunks.plan().reshape(n_envs, -1).astype(np.float32)
         obs_flat = obs.reshape(n_envs, -1).astype(np.float32)
         pending["active"][refilled] = True
         pending["obs"][refilled] = obs_flat[refilled]
@@ -224,7 +224,7 @@ class Collector:
 
       env_action_np = action_np if act_scale_np is None else action_np * act_scale_np + act_bias_np
 
-      env_action_np = np.ascontiguousarray(env_action_np, dtype=np.float32).copy()
+      env_action_np = np.array(env_action_np, dtype=np.float32, order="C")
       env_action = env_action_np[0] if not is_vec else env_action_np
       next_obs, reward, term, trunc, _ = env.step(env_action)
 

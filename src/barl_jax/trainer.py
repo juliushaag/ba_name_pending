@@ -687,6 +687,9 @@ def _train(run: Run):
                       f"~{(grad_steps_this_iter - done) / rate / 60:.1f} min left this iter")
           last_report = now
 
+      # Dispatch is async: without this the training time lands in the next
+      # iteration's rollout_time.
+      jax.block_until_ready(run.state)
       epoch_time = time.perf_counter() - epoch_start
       if narrate:
         log.message(f"Trained {grad_steps_this_iter} grad steps in {epoch_time / 60:.1f} min "

@@ -103,7 +103,6 @@ class ActionChunkExecutor:
     action = np.where(live[:, None], action, 0.0)
     extras = {k: np.where(live.reshape(self.n_envs, *([1] * (v.ndim - 1))), v, 0)
               for k, v in self._extras.items()}
-    self._last_plan = self._chunks.copy()
     return action, extras
 
   def plan(self) -> np.ndarray:
@@ -111,8 +110,7 @@ class ActionChunkExecutor:
     Read after `current()` and before `advance()` it is the plan the returned
     primitive came from -- what the buffer stores so the critic prices whole
     plans rather than single steps."""
-    return np.array(self._last_plan if hasattr(self, "_last_plan") else self._chunks,
-                    copy=True)
+    return self._chunks.copy()
 
   def advance(self, done) -> None:
     done = np.asarray(done, dtype=bool)

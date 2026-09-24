@@ -36,6 +36,7 @@ from flax import nnx
 
 import barl_jax  # noqa: F401  -- import side effects populate the registry
 from barl_jax.components import Actor, Critic
+from barl_jax.critics import crossq_mlp, target_mlp
 from barl_jax.env import EnvStats
 from barl_jax.networks.schedule import Schedule
 from barl_jax.networks.squash import Squash
@@ -148,10 +149,50 @@ def built(name: str):
     return build(name)
 
 
-def critic_action(critic, act):
-    """`(a, level)` widened into the action an NC critic's inner net was built
-    over; the identity for every other critic."""
-    return critic.augment(act, 0) if hasattr(critic, "augment") else act
+# The critic composition grid: every value head crossed with every
+# bootstrap/normalization/reduction/objective choice `QCritic` accepts.
+HEADS = ("DirectCritic", "EnsembleCritic", "HLGaussCritic", "C51Critic")
+BOOTSTRAPS = {
+    "crossq": {"target": {"kind": "none", "joint_forward": True}},
+    "target": {"target": {"kind": "polyak", "joint_forward": False}},
+    "xqc": {"target": {"kind": "polyak", "joint_forward": True}, "weight_norm": True},
+}
+NORMS = {
+    "none": {"mlp": {"norm": "none", "norm_kwargs": {}}},
+    "layer": {"mlp": {"norm": "layer", "norm_kwargs": target_mlp().norm_kwargs}},
+    "batchrenorm": {"mlp": {"norm": "batchrenorm", "norm_kwargs": crossq_mlp().norm_kwargs}},
+}
+REDUCES = {r: {"ensemble": {"value_reduce": r, "target_reduce": r}} for r in ("mean", "min")}
+OBJECTIVES = {"td": {}, "noise": {"noise": {"enabled": True}}}
+
+
+def _deep_merge(*dicts) -> dict:
+    out: dict = {}
+    for d in dicts:
+        for k, v in d.items():
+            out[k] = _deep_merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
+def _variant_grid() -> dict[str, tuple[str, dict]]:
+    grid = {}
+    for head in HEADS:
+        for b, bv in BOOTSTRAPS.items():
+            for n, nv in NORMS.items():
+                if n == "batchrenorm" and not bv["target"]["joint_forward"]:
+                    continue      # rejected by QCritic.config_problems
+                for r, rv in REDUCES.items():
+                    for o, ov in OBJECTIVES.items():
+                        grid[f"{head}-{b}-{n}-{r}-{o}"] = (head, _deep_merge(bv, nv, rv, ov))
+    return grid
+
+
+VARIANTS = _variant_grid()
+
+
+def build_variant(variant_id: str, **extra):
+    head, overrides = VARIANTS[variant_id]
+    return build(head, **_deep_merge(overrides, extra))
 
 
 def target_expectation(critic, target):

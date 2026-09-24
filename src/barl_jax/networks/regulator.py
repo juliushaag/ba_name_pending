@@ -16,8 +16,6 @@ class AutotuneRegulatorConfig(DualOptimConfig):
   class_name: str = "AutotuneRegulator"
   alpha_init: float = 1.0
   tune: bool = True
-  min_alpha: float = 1.0e-7
-  max_alpha: float = 500.0
 
 
 @register_component
@@ -32,7 +30,7 @@ class AutotuneRegulator(DualOptim, Component, nnx.Module):
   `target` is always the owning Policy's own computed value, never a
   config/tunable -- so it stays a real keyword argument and is not a `Config`
   declaration. It is either a plain float (one alpha for the whole chunked plan -- SAC/AMDP/
-  DIME/SDAC's default, `target=self.chunk_size * self.action_dim *
+  DIME's default, `target=self.chunk_size * self.action_dim *
   self.entropy_scale`, entropy being joint over the whole plan) or a
   `(chunk_size,)` array (one alpha per chunk position -- `MaxEntRLPolicy`'s
   `alpha_granularity: per_action`, `target=self.action_dim * self.entropy_scale`
@@ -56,11 +54,8 @@ class AutotuneRegulator(DualOptim, Component, nnx.Module):
   # component from a non-sized one.
   kind = "dual"
 
-  # max_alpha/min_alpha are accepted because the config layers set them, but
-  # value() does not clamp -- dime_am's dual is unbounded too, and pinning
-  # alpha at a floor injects a constant entropy bonus into the Bellman target
-  # that a near-zero-reward env cannot outvote. Declared as hparams, not dead
-  # state, so a bound can be reinstated by an override without a code change.
+  # value() does not clamp: a floor on alpha injects a constant entropy bonus into
+  # the Bellman target that a near-zero-reward env cannot outvote.
 
   def __init__(self, env_stats=None, config=None, *, target,
                rngs: nnx.Rngs = None, **kwargs):

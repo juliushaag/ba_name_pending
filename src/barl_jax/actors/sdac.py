@@ -1,494 +1,154 @@
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from barl_jax.components import Actor, Buffer, Critic, _Static, frozen
+from barl_jax.components import Actor, Buffer, frozen
 from barl_jax.config.schemas import ComponentsConfig, ModelConfig, register_model
 from barl_jax.critics.categorical import C51CriticConfig
+from barl_jax.networks.base import NetworkConfig
 from barl_jax.networks.diffusion import TimeConditionedField, reverse_chain
 from barl_jax.networks.mlp import MLPConfig
-from barl_jax.networks.regulator import AutotuneRegulatorConfig
-from barl_jax.networks.schedule import Schedule
-from barl_jax.networks.time_embedding import TimeEmbeddingConfig
-from barl_jax.optimization import ActorOptim, adam
-from barl_jax.policies.rl import MaxEntPolicyConfig, MaxEntRLPolicy
+from barl_jax.networks.time_embedding import FourierTimeConfig, TimeEmbeddingConfig
+from barl_jax.optimization import ActorOptim
+from barl_jax.policies.rl import PolicyConfig, RLPolicy
 from barl_jax.policy import register_policy
-from barl_jax.registration import get_component, register_component
-
-# `ladder_kind` names which space DDPMActorConfig.ladder_cls's curve lives in
-# -- see _build_ladder below.
-LADDER_KINDS = ("beta", "alpha_bar")
+from barl_jax.registration import register_component
 
 
 @dataclass(frozen=True)
 class DDPMActorConfig:
   class_name: str = "DDPMActor"
-  latent_dim: int = 256
+  latent_dim: int = 512
   layers: int = 2
-  mlp: MLPConfig = field(default_factory=lambda: MLPConfig(activation="gelu", norm="none", dtype="bfloat16"))
+  mlp: NetworkConfig = field(default_factory=lambda: MLPConfig(activation="mish", norm="none", dtype="float32"))
   time_emb: str = "ctrl"
-  time: TimeEmbeddingConfig = field(default_factory=lambda: TimeEmbeddingConfig(
-    kind="fourier", time_dim=16, num_freqs=16, hidden=32, concat_input=True))
-  squash_cls: str = "TanhSquash"
-  num_steps: int = 16
-  clip_denoised: bool = True
-  prior_scale: float = 0.5
-  ladder_cls: str = "LinearSchedule"
-  ladder_kind: str = "beta"
-  ladder_start: float = 3.0e-5
-  ladder_end: float = 0.2997
-  ladder_kwargs: dict = field(default_factory=dict)
-  num_bon: int = 8
-  num_candidates: int = 12
-  softmax_temp: float = 0.25
-  explore_init: float = 0.1
-  explore_min: float = 1.0e-3
-  explore_max: float = 1.0
-  explore_raw_limit: float = 10.0
-  explore_lr: float = 1.0e-2
+  time: TimeEmbeddingConfig = field(default_factory=lambda: FourierTimeConfig(
+    time_dim=64, num_freqs=32, hidden=64, concat_input=False, learn_freqs=True))
+  num_steps: int = 20
+  t_min: float = 1.0e-3
+  t_max: float = 0.9946
+  cosine_s: float = 0.008
+  clip_sampler: bool = True
+  num_candidates: int = 500
+  temperature: float = 0.25
   lr: float = 3.0e-4
   adam_b1: float = 0.9
   grad_clip: float = 1.0
-  grad_clip_mode: str = "element"
-
-
-def _inv_sigmoid(y: float) -> float:
-  return math.log(y / (1.0 - y))
-
-
-def alpha_bar_from_betas(betas):
-  """A beta ladder as the alpha_bar it implies, with the clean end prepended.
-
-  The one thing a `Schedule` cannot state, because alpha_bar_n is a product over
-  the whole prefix rather than a function of n alone -- so the curve comes from a
-  schedule class and the accumulation happens here."""
-  return jnp.concatenate([jnp.ones((1,), jnp.float32),
-                          jnp.cumprod(1.0 - jnp.clip(betas, 0.0, 0.999))])
+  grad_clip_mode: str = "none"
 
 
 @register_component
 class DDPMActor(ActorOptim, Actor):
-  """Fixed-step DDPM actor over an alpha_bar ladder, with the standard ancestral
-  sampler -- SDAC's actor, and the only diffusion actor here.
+  """Continuous-time VP-cosine DDPM actor trained by reverse-sampling score
+  matching (SDAC, Ma et al. 2025), following flowrl's `SDACAgent`.
 
-  One class covers every variance-preserving discrete diffusion actor, because
-  they differ only in three things and none of them is the update rule: the
-  ladder (`ladder_cls`, see `_build_ladder`), the prior's scale, and whether the
-  reconstructed x0 is clipped back into the canonical action box each reverse
-  step. The posterior mean itself is shared -- see `reverse_step` for why the
-  clip is the only reason its two branches are written differently.
-
-  Every method that draws noise takes an explicit `key`: the reverse loop used to
-  be differentiated through, so the draws have to be ordinary values in the graph
-  rather than a side effect on the module."""
+  The clipped x0 is the action -- there is no squash -- so candidates, buffer
+  actions and samples all live in the same [-1, 1] box."""
 
   kind = "actor"
   config_type = DDPMActorConfig
 
   def __init__(self, env_stats, config: DDPMActorConfig, *, rngs: nnx.Rngs, **kwargs):
     super().__init__(env_stats, config, **kwargs)
-    time_values = config.time.to_runtime_dict()
-    self.time_dim, self.time_embed = time_values["time_dim"], time_values["time_embed"]
-    # Mutable mappings stay out of the GraphDef via _Static (a plain dict
-    # attribute would make it unhashable). `ladder_kwargs` only builds the
-    # ladder below.
-    self._static_config = _Static({"time_kwargs": time_values["time_kwargs"],
-                                   "ladder_kwargs": dict(config.ladder_kwargs)})
-    ladder_kwargs = self.static("ladder_kwargs")
-
-    latent_dim, layers = config.latent_dim, config.layers
-
     self.field = TimeConditionedField(
-      self.obs_dim, self.plan_dim, latent_dim=latent_dim, layers=layers,
-      time_dim=self.time_dim, time_embed=self.time_embed, time_kwargs=self.static("time_kwargs"),
-      rngs=rngs, **asdict(config.mlp))
-
-    self.tau_table = Buffer(jnp.arange(self.config.num_steps + 1, dtype=jnp.float32) / self.config.num_steps)
-    self.alpha_bar = Buffer(self._build_ladder(
-      self.config.ladder_cls, self.config.ladder_start, self.config.ladder_end, ladder_kwargs,
-      self.config.ladder_kind, self.config.num_steps))
-    self.squash = get_component(self.config.squash_cls)(env_stats, None)
+      self.obs_dim, self.plan_dim, latent_dim=config.latent_dim, layers=config.layers,
+      time=config.time, mlp=config.mlp, rngs=rngs)
+    self.t_grid = Buffer(jnp.linspace(config.t_min, config.t_max, config.num_steps + 1, dtype=jnp.float32))
     self.rngs = rngs
-
-    # The exploration std lives here, not on the owning Policy: it is trained
-    # by its own optimizer key (see create_optimizer/param_labels) but it is
-    # part of how this actor plays an action, not algorithm-level state.
-    lo, hi = self.config.explore_min, self.config.explore_max
-    self.explore_raw = nnx.Param(jnp.full(
-      (self.plan_dim,), _inv_sigmoid((self.config.explore_init - lo) / (hi - lo)), jnp.float32))
 
   def _plan(self, flat):
     return flat.reshape(flat.shape[0], self.chunk_size, self.action_dim)
 
-  @staticmethod
-  def _build_ladder(ladder_cls: str, start: float, end: float,
-                    ladder_kwargs: dict, kind: str, num_steps: int):
-    """The alpha_bar ladder over n = 0..num_steps, index 0 being the clean end.
-
-    The *shape* of the curve is an ordinary `Schedule` named by class, so it is a
-    one-word edit and a `model.components.actor.ladder_cls` sweep axis rather
-    than a branch in here. `kind` says which space that curve lives in, which is
-    the only thing a schedule cannot say about itself:
-
-    * `alpha_bar` -- the curve *is* alpha_bar, `num_steps + 1` points running
-      clean -> noisy. `CosineAlphaBarSchedule(start=0.999, end=0.001, s=0.008)`
-      is Ma et al.'s VP-cosine ladder exactly, including its deliberate refusal
-      to start at 1.
-    * `beta` -- the curve is a per-step beta, `num_steps` points, accumulated
-      into alpha_bar here. `LinearSchedule` over betas is the DDPM original."""
-    cls = get_component(ladder_cls)
-    assert issubclass(cls, Schedule), (
-      f"DDPMActor: ladder_cls names {cls.__name__}, which is not a Schedule.")
-
-    points = num_steps + 1 if kind == "alpha_bar" else num_steps
-    from barl_jax.networks.schedule import ScheduleConfig
-    values = dict(ladder_kwargs or {})
-    ladder_config = ScheduleConfig(class_name=ladder_cls, start=start, end=end,
-                                    steps=points, warmup=0, **values)
-    curve = cls(config=ladder_config).ladder()
-
-    if kind == "alpha_bar":
-      return curve
-    if kind == "beta":
-      return alpha_bar_from_betas(curve)
-    raise ValueError(f"ladder_kind must be alpha_bar or beta, got {kind!r}")
-
   # ---- the noise process ---------------------------------------------------
-  def marginal_coef(self, n):
-    """(gamma, nu): the mean coefficient and variance of q(x_n | x_0)."""
-    ab = self.alpha_bar[...][n][..., None]
-    return jnp.sqrt(ab), 1.0 - ab
+  def alpha_sigma(self, t):
+    """Cosine VP schedule: x_t = alpha(t) x0 + sigma(t) eps, alpha^2 + sigma^2 = 1."""
+    s = self.config.cosine_s
+    alpha = (jnp.cos(jnp.pi / 2 * (jnp.clip(t, 0.0, self.config.t_max) + s) / (1 + s))
+             / math.cos(math.pi / 2 * s / (1 + s)))
+    return alpha, jnp.sqrt(1.0 - alpha ** 2)
 
-  def prior_sample(self, batch: int, key):
-    noise = jax.random.normal(key, (batch, self.plan_dim), jnp.float32)
-    return self.config.prior_scale * noise if self.config.prior_scale != 1.0 else noise
+  def x0_from_eps(self, x_t, eps, t):
+    alpha, sigma = self.alpha_sigma(t)
+    return (x_t - sigma * eps) / alpha
 
-  def diffuse(self, x0, n, key):
-    g, nu = self.marginal_coef(n)
-    return g * x0 + jnp.sqrt(nu) * jax.random.normal(key, x0.shape, x0.dtype)
-
-  # ---- the network ---------------------------------------------------------
-  def _tau(self, n, batch: int):
-    tau = self.tau_table[...][n]
-    tau = jnp.broadcast_to(tau, (batch,)) if jnp.ndim(tau) == 0 else tau
-    return tau[:, None]
-
-  def predict_eps(self, obs, x, n):
-    return self.field(obs, x, self._tau(n, x.shape[0])).astype(jnp.float32)
-
-  # The DDPM literature states its losses in eps space where this codebase
-  # states them in score space; since this ladder's score is -eps/sqrt(nu), the
-  # two are one division apart rather than a second parameterization to keep in
-  # sync. `eps_from_score` is the inverse, and tests/test_actors.py pins the pair.
-  def predict_score(self, obs, x, n):
-    return -self.predict_eps(obs, x, n) / jnp.sqrt(self.marginal_coef(n)[1])
-
-  def eps_from_score(self, score, n):
-    return -score * jnp.sqrt(self.marginal_coef(n)[1])
-
-  def x0_from_eps(self, x_n, eps, n):
-    g, nu = self.marginal_coef(n)
-    return (x_n - jnp.sqrt(nu) * eps) / g
-
-  def eps_loss(self, obs, x0, n, key):
-    """The plain DDPM regression onto the noise that produced x_n -- the
-    unweighted baseline `actor_loss` below reweights. Draws its own eps rather
-    than calling `diffuse`, which discards the draw the target needs. Reduction
-    is sum-over-plan-dims then mean; the references mean over both, which is
-    this divided by `plan_dim`."""
-    eps = jax.random.normal(key, x0.shape, x0.dtype)
-    g, nu = self.marginal_coef(n)
-    x_n = g * x0 + jnp.sqrt(nu) * eps
-    return ((self.predict_eps(obs, x_n, n) - eps) ** 2).sum(axis=-1).mean()
+  def predict_eps(self, obs, x, t):
+    t = jnp.broadcast_to(t, (x.shape[0], 1))
+    return self.field(obs, x, t).astype(jnp.float32)
 
   # ---- the reverse chain ---------------------------------------------------
   def reverse_step(self, obs, x, n, key):
-    ab_t, ab_prev = self.alpha_bar[...][n], self.alpha_bar[...][n - 1]
-    a_t    = ab_t / ab_prev
-    beta_t = 1.0 - a_t
+    t_n, t_prev = self.t_grid[...][n], self.t_grid[...][n - 1]
+    ab_n, ab_prev = self.alpha_sigma(t_n)[0] ** 2, self.alpha_sigma(t_prev)[0] ** 2
+    a_n = ab_n / ab_prev
+    beta_n = 1.0 - a_n
 
-    if self.config.clip_denoised:
-      # x0 form, because the clip is a projection onto the action box that has
-      # no expression in terms of the score alone.
-      x0   = jnp.clip(self.x0_from_eps(x, self.predict_eps(obs, x, n), n), -1.0, 1.0)
-      mean = ((jnp.sqrt(ab_prev) * beta_t) * x0
-              + (jnp.sqrt(a_t) * (1.0 - ab_prev)) * x) / (1.0 - ab_t)
-    else:
-      # Algebraically the same posterior mean in eps form, in fewer ops. Kept
-      # verbatim rather than folded into the branch above: it is the expression
-      # SDAC's published numbers were produced with, and in float32 "equal" and
-      # "identical" are not the same claim.
-      mean = (x + beta_t * self.predict_score(obs, x, n)) / jnp.sqrt(a_t)
-
+    x0 = self.x0_from_eps(x, self.predict_eps(obs, x, t_n), t_n)
+    if self.config.clip_sampler:
+      x0 = jnp.clip(x0, -1.0, 1.0)
+    mean = (jnp.sqrt(ab_prev) * beta_n * x0 + jnp.sqrt(a_n) * (1.0 - ab_prev) * x) / (1.0 - ab_n)
     if n > 1:
-      # sigma_t^2 -- Eq. 8 omits the sqrt. `n` is a Python int here (the reverse
-      # loop is unrolled), so this branch is resolved at trace time.
-      var  = (1.0 - ab_prev) / (1.0 - ab_t) * beta_t
-      mean = mean + jnp.sqrt(var) * jax.random.normal(key, x.shape, x.dtype)
-
+      mean = mean + jnp.sqrt(beta_n) * jax.random.normal(key, x.shape, x.dtype)
     return mean
 
-  def sample_raw(self, obs, key=None):
-    """The reverse chain alone: a raw, unsquashed x0 draw. Renamed from
-    `sample` -- the ABC's `sample`/`generate_action` are the *played* action
-    (best-of-N, squashed, exploration noise), which this is only one
-    ingredient of."""
+  def generate_action(self, obs, *, critic=None, key=None):
     key = self.rngs.noise() if key is None else key
     key, prior_key = jax.random.split(key)
+    x = jax.random.normal(prior_key, (obs.shape[0], self.plan_dim), jnp.float32)
+    x = reverse_chain(lambda x, n, k: self.reverse_step(obs, x, n, k), x, self.config.num_steps, key)
+    return self._plan(jnp.clip(x, -1.0, 1.0)), None
 
-    x = self.prior_sample(obs.shape[0], prior_key)
-    return reverse_chain(lambda x, n, k: self.reverse_step(obs, x, n, k),
-                         x, self.config.num_steps, key)
-
-  @staticmethod
-  def _tile(obs, n: int):
-    return jnp.broadcast_to(obs[None], (n, *obs.shape)).reshape(n * obs.shape[0], -1)
-
-  def score(self, obs_rep, raw, critic: Critic):
-    return frozen(critic).value(obs_rep, self.squash(raw)).squeeze(-1)
-
-  @staticmethod
-  def pick_best_from(qv, raw, n: int):
-    B   = raw.shape[0] // n
-    idx = jnp.argmax(qv.reshape(n, B), axis=0)                                   # (B,)
-    return jnp.take_along_axis(raw.reshape(n, B, -1), idx[None, :, None], axis=0).squeeze(0)
-
-  def best_of_n(self, obs, n: int, *, critic: Critic = None, key=None):
-    """`n` fresh chain draws at `obs`, scored by `critic` and reduced to the
-    argmax -- the raw (pre-squash) x0. With no critic (or n<=1) this degenerates
-    to one draw and no scoring, which is what keeps a critic-free caller (a
-    contract test over every actor, say) able to call it at all."""
-    key = self.rngs.noise() if key is None else key
-    if critic is None or n <= 1:
-      return self.sample_raw(obs, key)
-    obs_rep = self._tile(obs, n)
-    raw = self.sample_raw(obs_rep, key)
-    return self.pick_best_from(self.score(obs_rep, raw, critic), raw, n)
-
-  @property
-  def explore_std(self):
-    lo, hi = self.config.explore_min, self.config.explore_max
-    return lo + (hi - lo) * jax.nn.sigmoid(self.explore_raw[...])
-
-  def explore(self, action, key):
-    noise = self.explore_std * jax.random.normal(key, action.shape, action.dtype)
-    return jnp.clip(action + noise, -1.0, 1.0)
-
-  def noise_entropy(self):
-    """H of the additive exploration noise per chunk position, `(chunk_size,)`
-    -- the entropy of a parameter, not of a per-sample draw, so unlike the
-    other actors' `(B, chunk_size)` this carries no batch axis. Summing within
-    each position's action_dim block rather than over the whole plan_dim is
-    the same total at chunk_size 1."""
-    return self.chunk_sum(0.5 * math.log(2 * math.pi * math.e) + jnp.log(self.explore_std))
-
-  def after_step(self):
-    super().after_step()
-    self.explore_raw[...] = jnp.clip(self.explore_raw[...],
-                                     -self.config.explore_raw_limit, self.config.explore_raw_limit)
-
-  def generate_action(self, obs, *, critic: Critic = None, key=None):
-    """The played action plan: best-of-N, squashed, plus exploration noise.
-    Also what the owning Policy's Bellman target bootstraps from.
-
-    Standalone entry point for callers with no accompanying actor-loss batch
-    (`sample`/`inference_step`, a contract test over every actor). `SDAC.train_step`
-    does not call this -- it shares one best-of-N draw between the bootstrap and
-    the actor loss via `train_loss` below, see that method's docstring."""
-    key = self.rngs.noise() if key is None else key
-    k_bon, k_explore = jax.random.split(key)
-    raw = self.best_of_n(obs, self.config.num_bon, critic=critic, key=k_bon)
-    return self._plan(self.explore(self.squash(raw), k_explore)), self.noise_entropy()
-
-  def _played_action(self, raw, key):
-    """`best_of_n`'s raw x0 -> the played action plan, squashed and noised --
-    the part of `generate_action` downstream of the draw, factored out so
-    `train_loss` can reuse it against a chain it already ran."""
-    return self._plan(self.explore(self.squash(raw), key)), self.noise_entropy()
-
-  def _dsm_explore_loss(self, obs, policy_x0, critic: Critic, alpha, *, key):
-    """The soft-DSM objective plus the exploration-noise objective, given a
-    best-of-N draw `policy_x0` already made at `obs` -- shared by `loss`
-    (which makes its own single-purpose draw) and `train_loss` (which reuses
-    one made jointly with the Bellman bootstrap's). `policy_x0` is diffused
-    forward and regressed onto its noise, reweighted by a softmax over K
-    freshly-decoded candidates' critic value; the same draw, squashed and
-    noised, prices the `explore_raw` update on its own optimizer key (see
-    `create_optimizer`/`param_labels`)."""
-    keys = jax.random.split(key, 5)
+  # ---- reverse-sampling score matching ---------------------------------------
+  def loss(self, obs, critic, alpha, *, key=None, action=None):
+    """Diffuse `action` (the replay action; a fresh sample when None) to a random
+    t, draw K eps whose x0 reconstructions stay in [-1, 1], and regress the eps
+    prediction onto them weighted by softmax(Q(x0_k) / (temperature * q_scale)) over K."""
+    keys = jax.random.split(self.rngs.noise() if key is None else key, 5)
+    if action is None:
+      action = jax.lax.stop_gradient(self.generate_action(obs, key=keys[4])[0])
     B, K = obs.shape[0], self.config.num_candidates
-    t   = jax.random.randint(keys[0], (B,), 1, self.config.num_steps + 1)
-    x_t = jax.lax.stop_gradient(self.diffuse(policy_x0, t, keys[1]))
+    a0 = action.reshape(B, -1)
 
-    noise      = jax.random.normal(keys[2], (K, B, self.plan_dim), x_t.dtype)
-    a0_raw     = jax.lax.stop_gradient(self.x0_from_eps(x_t[None], noise, t))
-    candidates = self.squash(a0_raw)                                          # (K, B, P)
+    t = jax.random.uniform(keys[0], (B, 1), minval=self.config.t_min, maxval=self.config.t_max)
+    alpha_t, sigma_t = self.alpha_sigma(t)
+    x_t = alpha_t * a0 + sigma_t * jax.random.normal(keys[1], a0.shape)
+
+    # x0 = (x_t - sigma eps) / alpha lies in [-1, 1] iff eps lies in [lo, hi].
+    lo, hi = (x_t - alpha_t) / sigma_t, (x_t + alpha_t) / sigma_t
+    eps = jax.random.truncated_normal(keys[2], lo, hi, (K, B, self.plan_dim))
+    # truncated_normal returns NaN when [lo, hi] is far in a tail.
+    eps = jnp.where(jnp.isnan(eps), jnp.clip(jax.random.normal(keys[3], eps.shape), lo, hi), eps)
+    candidates = self.x0_from_eps(x_t[None], eps, t)
 
     qv = frozen(critic).value(
       jnp.broadcast_to(obs[None], (K, B, obs.shape[-1])).reshape(K * B, -1),
-      candidates.reshape(K * B, -1),
-    ).reshape(K, B, -1).squeeze(-1)                                      # (K, B)
-
+      candidates.reshape(K * B, -1)).reshape(K, B)
+    # Scale-free: `temperature` is in units of the candidates' Q spread.
     q_scale = jax.lax.stop_gradient(qv.std(axis=0).mean()) + 1e-6
-    weight  = jax.lax.stop_gradient(
-      jax.nn.softmax(qv / (self.config.softmax_temp * q_scale), axis=0)[..., None])  # (K, B, 1), sums to 1 over K
+    weight = jax.lax.stop_gradient(jax.nn.softmax(qv / (self.config.temperature * q_scale), axis=0))
 
-    # eps space rather than score space: the two are the same objective, since
-    # score = -eps/sqrt(nu) makes the score loss's `dsm_weight` factor exactly
-    # the nu that cancels. Stated as the reference states it, one less conversion.
-    eps_pred = self.predict_eps(obs, x_t, t)                             # (B, P)
-    loss = (weight * (eps_pred[None] - noise) ** 2).sum(axis=-1).sum(axis=0).mean()
+    eps_pred = self.predict_eps(obs, x_t, t)
+    loss = (weight[..., None] * (eps_pred[None] - eps) ** 2).mean()
 
     self.metrics.scalar("q_scale", q_scale)
-    self.metrics.dist("weight_ess", 1.0 / (weight.squeeze(-1) ** 2).sum(axis=0))
-
-    norm = lambda x: jnp.linalg.norm(x, axis=-1).mean()
-    weighted = (weight * noise).sum(axis=0)
-    self.metrics.scalar("signal_ratio", norm(weighted) / (norm(noise) + 1e-8))
-    self.metrics.scalar("tilt_ratio",
-                        norm(weighted - noise.mean(axis=0)) / (norm(noise.std(axis=0)) + 1e-8))
-    self.metrics.scalar("cand_saturation", (jnp.abs(candidates) > 0.99).mean())
+    self.metrics.dist("weight_ess", 1.0 / (weight ** 2).sum(axis=0))
+    self.metrics.dist("weight_max", weight.max(axis=0))
     self.metrics.vec("eps_pred", eps_pred)
-    self.metrics.vec("eps_target", noise.reshape(-1, noise.shape[-1]))
-
-    a_bon   = self.squash(policy_x0)
-    a_noisy = a_bon + self.explore_std * jax.random.normal(keys[3], a_bon.shape, a_bon.dtype)
-    # noise_entropy() is (chunk_size,); alpha is a scalar or (chunk_size,)
-    # (per_action granularity) -- either broadcasts, and the sum restores the
-    # single number this term needs, same as PathwiseActorMixin's entropy bonus.
-    entropy_term = (jax.lax.stop_gradient(alpha) * self.noise_entropy()).sum()
-    explore_loss = -(frozen(critic).value(obs, a_noisy).mean() + entropy_term)
-    # Named "explore_noise_std", not "explore_std" -- a component's own
-    # `self.metrics` carries no prefix (unlike a Policy's), so the metric key
-    # is a bare attribute name and would collide with the `explore_std`
-    # property itself (`setattr` onto a property with no setter raises).
-    self.metrics.scalar("explore_noise_std", jax.lax.stop_gradient(self.explore_std.mean()))
-    # Same reason as explore_noise_std above: "noise_entropy" would overwrite
-    # the noise_entropy() method itself via setattr, which doesn't raise (a
-    # method is a plain attribute, unlike explore_std's property) but silently
-    # breaks any later call to it in the same trace.
-    self.metrics.scalar("noise_entropy_value", jax.lax.stop_gradient(self.noise_entropy()))
-    return {"actor": loss, "explore": explore_loss}
-
-  def loss(self, obs, critic: Critic, alpha, *, key=None):
-    """`Actor.loss`'s contract, satisfied with its own single best-of-N draw
-    at `obs` -- for standalone callers (a contract test over every actor)
-    with no accompanying `next_obs` to fuse against. `SDAC.train_step` never
-    calls this: it uses `train_loss` below, which shares one draw between
-    this objective and the Bellman bootstrap instead of affording two."""
-    keys = jax.random.split(self.rngs.noise() if key is None else key, 2)
-    policy_x0 = self.best_of_n(obs, self.config.num_bon, critic=critic, key=keys[0])
-    return self._dsm_explore_loss(obs, policy_x0, critic, alpha, key=keys[1])
-
-  def train_loss(self, obs, action, next_obs, chunk_return, terminated, horizon,
-                critic: Critic, alpha, entropy_bonus_fn, *, key=None):
-    """`SDAC.train_step`'s one call: the bootstrap action at `next_obs`, the
-    soft-DSM actor loss at `obs` (`_dsm_explore_loss`), and the critic's own
-    TD loss, all from a *single* best-of-N draw.
-
-    The reference implementation (Ma et al. 2025,
-    github.com/mahaitongdae/diffusion_policy_online_rl, relax/algorithm/sdac.py)
-    draws best-of-N once per step and reuses it both as the Bellman bootstrap
-    action and as the x0 its score-matching loss diffuses forward -- it never
-    runs a second independent reverse chain. This mirrors that: one best-of-N
-    call over `concat([obs, next_obs])` (batch doubles, chain length doesn't),
-    split back into `policy_x0` (actor loss) and `next_action` (bootstrap).
-    Doubling a chain's batch width is far cheaper than doubling its sequential
-    step count, which is what running two independent best-of-N draws (`loss`
-    and `generate_action`, called separately) costs.
-
-    `entropy_bonus_fn` is the owning Policy's `target_entropy_bonus(alpha,
-    entropy)` -- threaded through explicitly rather than hardcoded to 0.0 so
-    this stays correct if `entropy_in_target` is ever set True for SDAC.
-
-    Returns `({"actor", "explore", "critic"}, entropy)` -- the loss dict and
-    the bootstrap action's entropy (for `SDAC.train_step`'s `dual_loss` call),
-    separately rather than folded into the dict, since `entropy` is not a
-    loss term any optimizer key owns."""
-    key = self.rngs.noise() if key is None else key
-    keys = jax.random.split(key, 4)
-
-    B = obs.shape[0]
-    both = jnp.concatenate([obs, next_obs], axis=0)
-    raw_both = self.best_of_n(both, self.config.num_bon, critic=critic, key=keys[0])
-    policy_x0, next_raw = raw_both[:B], raw_both[B:]
-
-    next_action, entropy = jax.lax.stop_gradient(self._played_action(next_raw, keys[1]))
-    next_action = next_action.reshape(next_action.shape[0], -1)
-
-    critic_loss = critic.td_loss(
-      obs, action, next_obs, next_action, chunk_return, terminated, horizon,
-      entropy_bonus=entropy_bonus_fn(alpha, entropy), key=keys[2])
-
-    actor_losses = self._dsm_explore_loss(obs, policy_x0, critic, alpha, key=keys[3])
-
-    self.metrics.vec("action", next_action.reshape(
-      next_action.shape[0], self.chunk_size, self.action_dim), limit=1.0)
-    if entropy is not None:
-      self.metrics.dist("entropy", entropy)
-    return {**actor_losses, **critic_loss}, entropy
-
-  def create_optimizer(self) -> dict:
-    return {**super().create_optimizer(),
-            "explore": adam(self.config.explore_lr, self.config.adam_b1, self.config.grad_clip, self.config.grad_clip_mode)}
-
-  def param_labels(self, subpath) -> str:
-    """`explore_raw` trains on its own optimizer key; every other parameter
-    stays on the main actor optimizer."""
-    return "explore" if subpath and str(subpath[0]) == "explore_raw" else "actor"
+    return {"actor": loss}
 
 
 @register_policy
-class SDAC(MaxEntRLPolicy):
-  """Binds DDPMActor into the shared max-entropy actor-critic template -- the
-  actor-policy integration for this algorithm.
-
-  Overrides `train_step`/`optimizer_cadence`, unlike every other
-  `MaxEntRLPolicy` subclass (SAC/AMDP/DIME/NCLQL all use the shared template
-  untouched): `DDPMActor.train_loss` shares one best-of-N draw between the
-  Bellman bootstrap and the actor's own DSM loss (see its docstring), which
-  the generic `generate_action` -> `gated_losses(loss)` two-call template
-  cannot express -- the bootstrap draw would still run on its own outside the
-  gate. Folding the critic's TD loss into `train_loss`'s return dict also
-  means `"critic"` must be pinned to cadence 1 here, not left to inherit
-  `policy_delay`, so the critic keeps updating every step exactly as it does
-  for every other algorithm on this template."""
+class SDAC(RLPolicy):
+  """DDPMActor on the shared actor-critic template, with no entropy dual; its
+  actor loss is priced at the replay action rather than a fresh sample."""
 
   actor_cls = DDPMActor
 
-  def optimizer_cadence(self) -> dict:
-    # "critic" trains every step, same as SAC/AMDP/DIME/NCLQL -- explicit here
-    # because train_step (below) calls DDPMActor.train_loss directly rather
-    # than through gated_losses, so nothing else pins this.
-    return {**super().optimizer_cadence(), "critic": 1}
-
-  def train_step(self, batch):
-    obs          = self._obs(batch["obs"])
-    next_obs     = self._obs(batch["next_obs"])
-
-    action       = batch["act"]
-    chunk_return = batch["chunk_return"]
-    terminated   = batch["term"]
-    horizon      = batch["horizon"]
-
-    alpha = self.alpha()
-
-    # DDPMActor.train_loss shares one best-of-N draw between the Bellman
-    # bootstrap and the actor's own DSM loss (see its docstring) and folds in
-    # the critic's TD loss too -- it always runs in full, unconditionally,
-    # the same way the critic's own td_loss always did on the shared template
-    # this overrides. There is nothing left to gate: "actor"/"explore" are
-    # masked at the optimizer (build_optimizer, keyed by optimizer_cadence),
-    # not by skipping this call, and "critic" must never be skipped.
-    losses, entropy = self.actor.train_loss(
-      obs, action, next_obs, chunk_return, terminated, horizon,
-      self.critic, alpha, self.target_entropy_bonus, key=self.rngs.noise())
-    losses.update(self.dual_loss(entropy))
-    return losses
+  def actor_objective(self, actor, critic, obs, action, alpha, key):
+    return actor.loss(obs, critic, alpha, key=key, action=action)
 
 
 @register_model
@@ -496,8 +156,6 @@ class SDAC(MaxEntRLPolicy):
 class SDACModelConfig(ModelConfig):
   schema_name: ClassVar[str] = "SDAC"
   policy_class: str = "SDAC"
-  params: MaxEntPolicyConfig = field(default_factory=lambda: MaxEntPolicyConfig(
-    entropy_scale=-0.9, entropy_in_target=False))
+  params: PolicyConfig = field(default_factory=PolicyConfig)
   components: ComponentsConfig = field(default_factory=lambda: ComponentsConfig(
-    actor=DDPMActorConfig(), critic=C51CriticConfig(),
-    entropy=AutotuneRegulatorConfig()))
+    actor=DDPMActorConfig(), critic=C51CriticConfig(), entropy=None))

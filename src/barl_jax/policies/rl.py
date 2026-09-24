@@ -8,19 +8,13 @@ normalisation, the gate's cadence, the name of the actor's generator, and
 whether the dual is fed anything at all -- and none of those is an algorithm.
 
 `RLPolicy` states that shared step once; `MaxEntRLPolicy` adds the dual. Every
-algorithm reuses this template: `SAC`, `AMDP`, `DIME` and `SDAC` (each beside
-its actor, in `barl_jax.actors.*`) are thin `MaxEntRLPolicy` subclasses that
-pin `actor_cls`, the actor-policy integration binding for that algorithm;
-`NCLQL` pins one on `RLPolicy` directly (no entropy dual). Every one of them
-except `SDAC` overrides no method here -- the algorithm difference is
-otherwise entirely in which actor/critic/params a model variant's
-`ModelConfig` selects, never in a second copy of this training step. `SDAC`
-is the one exception: its diffusion actor's bootstrap draw and actor loss
-share one expensive best-of-N reverse-diffusion chain rather than affording
-two independent ones (see `DDPMActor.train_loss`), which this template's
-two-call shape -- `generate_action` for the bootstrap, then a separately
-gated `loss` -- cannot express, so `SDAC` overrides `train_step` and
-`optimizer_cadence` beside its actor instead."""
+algorithm reuses this template: `SAC`, `AMDP` and `DIME` (each beside its
+actor, in `barl_jax.actors.*`) are thin `MaxEntRLPolicy` subclasses that pin
+`actor_cls`, the actor-policy integration binding for that algorithm; `NCLQL`
+and `SDAC` pin one on `RLPolicy` directly (no entropy dual). The algorithm
+difference is entirely in which actor/critic/params a model variant's
+`ModelConfig` selects and, for SDAC, the `actor_objective` seam, never in a
+second copy of this training step."""
 
 from dataclasses import dataclass
 
@@ -29,7 +23,7 @@ import jax
 import jax.numpy as jnp
 
 from barl_jax.components import ActionSampler
-from barl_jax.critics import QCriticBase
+from barl_jax.critics import QCritic
 from barl_jax.networks.regulator import AutotuneRegulator
 from barl_jax.optimization import gated_losses
 from barl_jax.policy import Policy, register_policy
@@ -91,8 +85,7 @@ class RLPolicy(Policy):
     assert isinstance(env.action_space, gym.spaces.Box)
 
     chunked = self.env_stats.derive(act_dim=self.env_stats["chunked_act_dim"])
-    self.critic: QCriticBase = self.build_component("critic", QCriticBase,
-                                                    env_stats=chunked)
+    self.critic: QCritic = self.build_component("critic", QCritic, env_stats=chunked)
     self.actor: ActionSampler = self.build_component("actor", self.actor_cls)
     # No cadence/optimizer-key guard here: `self.optimizer_cadence()` is a
     # virtual call, and a MaxEntRLPolicy subclass hasn't built `self.entropy`
@@ -104,6 +97,9 @@ class RLPolicy(Policy):
 
   def optimizer_cadence(self) -> dict:
     return {key: self.policy_delay for key in self.actor.create_optimizer()}
+
+  def actor_objective(self, actor, critic, obs, action, alpha, key):
+    return actor.loss(obs, critic, alpha, key=key)
 
   # ---- the three seams MaxEntRLPolicy fills in -----------------------------
 
@@ -152,13 +148,12 @@ class RLPolicy(Policy):
       obs, action, next_obs, next_action, chunk_return, terminated, horizon,
       entropy_bonus=self.target_entropy_bonus(alpha, entropy), key=keys[-1]))
 
-    # An actor can own multiple optimizers (e.g. SDAC actor + exploration).
-    # Compute their shared loss whenever any partition is due; mask each
+    # An actor can own multiple optimizers. Compute their shared loss whenever any partition is due; mask each
     # optimizer independently according to optimizer_cadence().
     if actor_keys:
       losses.update(gated_losses(
         self,
-        lambda actor, critic: actor.loss(obs, critic, alpha, key=keys[1]),
+        lambda actor, critic: self.actor_objective(actor, critic, obs, action, alpha, keys[1]),
         actor_keys, self.actor, self.critic))
     losses.update(self.dual_loss(entropy))
 
@@ -177,12 +172,11 @@ class RLPolicy(Policy):
 
   @property
   def supports_bon(self):
-    return getattr(self.critic, "supports_bon", True)
+    return self.critic.supports_bon
 
   def score(self, observation, action_chunk):
-    """`critic.value()` at the online critic -- the same reduction (mean or
-    pessimistic, per `pessimistic_target`) `train_step`'s own Bellman target
-    uses, not a separately chosen expectation. Flattens the action plan the
+    """`critic.value()` at the online critic, reduced per
+    `ensemble.value_reduce`. Flattens the action plan the
     same way `train_step` flattens `next_action` before handing it to the
     critic."""
     obs = self._obs(observation)
@@ -192,19 +186,14 @@ class RLPolicy(Policy):
 
 @register_policy
 class MaxEntRLPolicy(RLPolicy):
-  """`RLPolicy` plus an automatic entropy dual -- SAC, AMDP, DIME and SDAC all
-  resolve here. `entropy_in_target` is the one real behavioural fork: SDAC's
-  Bellman target carries no entropy bonus (its `entropy` is a `(chunk_size,)`
-  property of the exploration parameter, not the per-sample quantity the
-  target wants), so it sets this false and the dual trains purely off the
-  actor's DSM loss.
+  """`RLPolicy` plus an automatic entropy dual -- SAC, AMDP and DIME all
+  resolve here. `entropy_in_target` toggles the Bellman target's entropy bonus.
 
   `alpha_granularity` is the other fork: `"per_chunk"` (default) trains one
   alpha for the whole chunked plan, exactly as before; `"per_action"` trains
   one alpha per chunk position, each held at its own per-action target entropy
   `action_dim * entropy_scale`. Every actor's `generate_action` already reports
-  entropy decomposed per chunk position (`(B, chunk_size)`, or `(chunk_size,)`
-  for SDAC's parameter entropy), so the only thing that changes between the two
+  entropy decomposed per chunk position (`(B, chunk_size)`), so the only thing that changes between the two
   is `target`'s shape -- `AutotuneRegulator` follows it -- and whether the dual
   sees that decomposition summed to one number or as-is."""
 

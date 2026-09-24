@@ -76,6 +76,20 @@ class _Static:
     return f"_Static({self.value!r})"
 
 
+_INTERNED: dict = {}
+
+
+def interned_static(value) -> _Static:
+  """One identity-hashed wrapper per distinct `value`. A GraphDef passed as a jit
+  static argument is re-hashed structurally on every call (~40% of an env step's
+  host time); the wrapper makes that an identity hash, and interning keeps equal
+  graphdefs on one jit cache entry."""
+  static = _INTERNED.get(value)
+  if static is None:
+    static = _INTERNED[value] = _Static(value)
+  return static
+
+
 class Component:
   """Mixin for anything Policy.build_component() constructs. Three jobs: consume
   the run's EnvStats and resolved config, which every component takes as its
@@ -108,6 +122,12 @@ class Component:
   calling super() -- e.g. to build a `q_function`."""
 
   config_type = None
+  learning_objective = None
+
+  @classmethod
+  def learning_objective_for(cls, config) -> str | None:
+    """The training objective this component serves under `config`."""
+    return cls.learning_objective
 
   def __init__(self, env_stats: EnvStats = None, config=None, **kwargs):
     # Neither env_stats nor config is forwarded: nnx.Module's __init__ is
@@ -197,12 +217,8 @@ class ActionSampler(Component, nnx.Module, ABC):
   def generate_action(self, obs, *, critic: "Critic" = None, key=None) -> tuple:
     """(action, entropy): a canonical [-1, 1] action, one row per obs row, and
     the differential entropy of whatever distribution produced it, decomposed
-    per chunk position -- shaped `(B, chunk_size)`, or `(chunk_size,)` for an
-    actor whose "entropy" is a property of a parameter rather than of the draw
-    (SDAC's `noise_entropy`). `chunk_size` 1 makes both the same shape (and
-    value) the old `(B, 1)`/scalar convention was, so every existing consumer
-    is unaffected; a caller wanting one number sums the chunk axis itself
-    (`target_entropy_bonus`/`PathwiseActorMixin.loss` do exactly that, weighted
+    per chunk position -- shaped `(B, chunk_size)`. A caller wanting one
+    number sums the chunk axis itself (`target_entropy_bonus` and the actor losses do exactly that, weighted
     by whatever shape `alpha` is). A sampler without an entropy estimate
     returns None for entropy."""
 
@@ -219,38 +235,11 @@ class Actor(ActionSampler):
   @abstractmethod
   def loss(self, obs, critic: "Critic", alpha, *, key=None):
     """This actor's own training objective at `obs`, priced against a frozen
-    `critic` -- a dict with one scalar per optimizer key it trains (just
-    `"actor"` for every actor but SDAC's, which also prices its exploration
-    noise on `"explore"`). Returns rather than mutating a `losses` dict -- see
+    `critic` -- a dict with one scalar per optimizer key it trains (usually just
+    `"actor"`). Returns rather than mutating a `losses` dict -- see
     the class docstring. Every key here must be one `create_optimizer()` also
     declares."""
 
-
-class PathwiseActorMixin:
-  """The pathwise max-entropy actor objective SAC's `StochasticActor` and
-  DIME's `DISActor` share once each supplies its own `generate_action`:
-  `-(Q + stop_gradient(alpha)*entropy)`, `Q` priced through a *frozen* critic
-  so the actor's gradient improves the action, never the critic. The two
-  samplers stay separate -- SAC's density-derived entropy and DIME's
-  path-density estimate are not interchangeable distributions -- only the
-  objective built on top of "an (action, entropy) pair and a critic" is
-  identical between them.
-
-  Mix in ahead of `Actor` in the MRO (`class X(PathwiseActorMixin, Actor,
-  ...)`) so this concrete `loss` satisfies `Actor.loss`'s abstract method.
-  Not for AMDP (score-regression) or SDAC (weighted-denoising/exploration),
-  whose objectives are not this one with a different sampler -- leave those
-  in their own actors."""
-
-  def loss(self, obs, critic: "Critic", alpha, *, key=None):
-    action, entropy = self.generate_action(obs, key=key)
-    q = frozen(critic).value(obs, action.reshape(action.shape[0], -1))
-    # entropy is (B, chunk_size); alpha is either a scalar (one alpha for the
-    # whole chunk) or (chunk_size,) (one per chunk position) -- either way
-    # `alpha * entropy` broadcasts, and summing the chunk axis restores the
-    # single (B, 1) bonus the old whole-plan entropy already was.
-    bonus = (jax.lax.stop_gradient(alpha) * entropy).sum(axis=-1, keepdims=True)
-    return {"actor": -(q + bonus).mean()}
 
 
 class Critic(Component, nnx.Module, ABC):

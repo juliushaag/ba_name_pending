@@ -290,11 +290,15 @@ class MultiSeedReplay(ReplayBuffer):
     return self.sample_chunk(1, batch_size, leading=False)
 
   def sample_chunk(self, k: int, batch_size: int, *, leading: bool = True) -> dict:
-    per_step = [[buffer.sample_numpy(batch_size) for buffer in self.seeds]
-                for _ in range(k)]
-    stack_seeds = lambda step, key: np.stack([seed[key] for seed in step])
-    out = {key: np.stack([stack_seeds(step, key) for step in per_step])
-           for key in per_step[0][0]}
+    # Gather straight into one preallocated (k, seeds, batch, ...) array per field;
+    # draws stay one per (step, seed) so the RNG stream is unchanged.
+    out = {}
+    for step in range(k):
+      for i, buffer in enumerate(self.seeds):
+        for key, value in buffer.sample_numpy(batch_size).items():
+          if key not in out:
+            out[key] = np.empty((k, self.num_seeds, *value.shape), value.dtype)
+          out[key][step, i] = value
     if not leading:
       out = {key: value[0] for key, value in out.items()}
     return jax.device_put(out)

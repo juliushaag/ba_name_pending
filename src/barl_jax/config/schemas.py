@@ -211,25 +211,28 @@ def component_to_dict(component: Any) -> dict[str, Any]:
 
 
 def component_to_runtime_dict(component: Any) -> dict[str, Any]:
-  """Flat legacy form used for `RunConfig.flat_model()`/wandb config logging --
+  """Flat legacy form used for wandb config logging --
   architecture-shape fields only (size, MLP surface, time coder, noise
   schedule). The complete value tree already travels alongside it as
   `model_overrides`; this is a projection for logging, not the source of
   truth (see `docs/plans/config-class-restructure.md`)."""
   out: dict[str, Any] = {"class": component.class_name}
-  for key in ("latent_dim", "layers", "n_models"):
+  for key in ("latent_dim", "layers"):
     value = getattr(component, key, None)
     if value is not None:
       out[key] = value
-  mlp = getattr(component, "mlp", None)
-  if mlp is not None:
-    out.update(asdict(mlp))
-  time = getattr(component, "time", None)
-  if time is not None:
-    out.update(time.to_runtime_dict())
-  schedule = getattr(component, "noise_schedule", None)
-  if schedule is not None:
-    out["noise_schedule"] = component_to_dict(schedule)
+  ensemble = getattr(component, "ensemble", None)
+  if ensemble is not None:
+    out["n_models"] = ensemble.n_models
+  for key in ("mlp", "time"):
+    part = getattr(component, key, None)
+    if part is not None:
+      values = asdict(part)
+      out[f"{key}_class"] = values.pop("class_name")
+      out.update(values)
+  noise = getattr(component, "noise", None)
+  if getattr(noise, "enabled", False):
+    out["noise_schedule"] = component_to_dict(noise.schedule)
   return deepcopy(out)
 
 

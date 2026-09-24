@@ -215,9 +215,6 @@ class RunConfig:
     out["model_overrides"] = self.model_config.to_dict()
     return deepcopy(out)
 
-  def flat_model(self) -> dict[str, Any]:
-    return model_to_runtime_dict(self.model_config)
-
   def validate(self) -> None:
     problems = _problems(self)
     if problems:
@@ -335,14 +332,13 @@ def _selected_time_style(name: str):
   `time_emb:` override shortcut. Lazily imported: only an override that
   actually names a `time_emb` style needs the (jax-touching) time-embedding
   module at all."""
-  from barl_jax.networks.time_embedding import TimeEmbeddingConfig
+  from barl_jax.networks.time_embedding import FourierTimeConfig, SinusoidalTimeConfig
   styles = {
-    "sin_16": TimeEmbeddingConfig(kind="sin", time_dim=8, num_freqs=16),
-    "sin_20": TimeEmbeddingConfig(kind="sin", time_dim=8, num_freqs=20),
-    "fourier": TimeEmbeddingConfig(kind="fourier", time_dim=16),
-    "ctrl": TimeEmbeddingConfig(kind="fourier", time_dim=16),
-    "pisgrad": TimeEmbeddingConfig(kind="fourier", time_dim=256, hidden=256,
-                                    num_freqs=256, concat_input=False, spacing="linear"),
+    "sin": SinusoidalTimeConfig(),
+    "fourier": FourierTimeConfig(),
+    "ctrl": FourierTimeConfig(),
+    "pisgrad": FourierTimeConfig(time_dim=256, hidden=256, num_freqs=256,
+                                 concat_input=False, spacing="linear"),
   }
   try:
     return styles[name]
@@ -528,8 +524,10 @@ def _model_problems(model: ModelConfig) -> list[str]:
         problems.append(str(exc)); continue
       _objective = _policy_cls.slot_objective(
         _slot, _actor_cls if "actor" in getattr(_policy_cls, "SLOTS", ()) else None)
-      if _objective is not None and getattr(_cls, "learning_objective", None) != _objective:
+      if _objective is not None and _cls.learning_objective_for(_comp) != _objective:
         problems.append(f"{model.policy_class}.{_slot}: {_cls.__name__} does not support {_objective!r}")
+      if hasattr(_cls, "config_problems"):
+        problems.extend(f"components.{_slot}: {p}" for p in _cls.config_problems(_comp))
   except Exception:
     pass
   for slot, component in (("actor", model.components.actor),
@@ -546,10 +544,12 @@ def _model_problems(model: ModelConfig) -> list[str]:
                      f"materialized value is {type(component).__name__}, expected {schema.__name__}")
     mlp = getattr(component, "mlp", None)
     if mlp is not None:
-      if mlp.activation not in {"silu", "relu", "gelu", "tanh", "relu6", "leakyrelu", "mish"}:
-        problems.append(f"components.{slot}.mlp.activation={mlp.activation!r}: unknown activation")
-      if mlp.dtype not in {"float32", "bfloat16", "float16"}:
-        problems.append(f"components.{slot}.mlp.dtype={mlp.dtype!r}: unknown dtype")
+      from barl_jax.networks.base import ACTIVATIONS, DTYPES
+      from barl_jax.networks.norm import NORMS
+      for field_name, allowed in (("activation", ACTIVATIONS), ("dtype", DTYPES), ("norm", NORMS)):
+        if getattr(mlp, field_name) not in allowed:
+          problems.append(f"components.{slot}.mlp.{field_name}={getattr(mlp, field_name)!r}: "
+                          f"unknown {field_name}; available: {sorted(allowed)}")
     time_name = getattr(component, "time_emb", None)
     if time_name is not None:
       try:
@@ -562,18 +562,13 @@ def _model_problems(model: ModelConfig) -> list[str]:
         return issubclass(get_component(name), _Schedule)
       except KeyError:
         return False
-    schedule = getattr(component, "noise_schedule", None)
-    if schedule is not None:
+    noise = getattr(component, "noise", None)
+    if getattr(noise, "enabled", False):
+      schedule = noise.schedule
       if not _is_schedule(schedule.class_name):
-        problems.append(f"components.{slot}.noise_schedule.class={schedule.class_name!r}: unknown schedule")
+        problems.append(f"components.{slot}.noise.schedule.class={schedule.class_name!r}: unknown schedule")
       if schedule.steps < 1 or schedule.warmup < 0 or schedule.warmup >= schedule.steps:
-        problems.append(f"components.{slot}.noise_schedule: steps must be >= 1 and warmup in [0, steps)")
-    if hasattr(component, "ladder_cls") and not _is_schedule(component.ladder_cls):
-      problems.append(f"components.{slot}.ladder_cls={component.ladder_cls!r}: unknown schedule")
-    if hasattr(component, "ladder_kind"):
-      from barl_jax.actors.sdac import LADDER_KINDS
-      if component.ladder_kind not in LADDER_KINDS:
-        problems.append(f"components.{slot}.ladder_kind={component.ladder_kind!r}: must be one of {LADDER_KINDS}")
+        problems.append(f"components.{slot}.noise.schedule: steps must be >= 1 and warmup in [0, steps)")
     if hasattr(component, "flow_steps") and component.flow_steps < 1:
       problems.append(f"components.{slot}.flow_steps={component.flow_steps!r}: must be >= 1")
     if hasattr(component, "num_bins") and component.num_bins < 2:

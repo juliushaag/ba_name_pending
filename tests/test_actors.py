@@ -49,41 +49,25 @@ def test_sample_is_differentiable_wrt_params(name, obs, key):
 
 @pytest.mark.parametrize("name", DIFFUSION)
 def test_x0_from_eps_inverts_the_marginal(name):
-    """`x0_from_eps` is the algebraic inverse of `q(x_n | x_0)` at a known noise.
-    SDAC's candidate mechanism is exactly this identity, so it is worth pinning:
-    reconstruct the x0 that each drawn eps implies from the same x_n."""
+    """SDAC's candidates are `x0_from_eps` of the forward marginal at a known eps."""
     a = built(name)
     x0 = jax.random.normal(jax.random.PRNGKey(3), (BATCH, a.plan_dim))
     eps = jax.random.normal(jax.random.PRNGKey(4), (BATCH, a.plan_dim))
-    n = jnp.ones((BATCH,), jnp.int32)
+    t = jnp.full((BATCH, 1), 0.3)
 
-    g, nu = a.marginal_coef(n)
-    x_n = g * x0 + jnp.sqrt(nu) * eps
-    assert jnp.allclose(a.x0_from_eps(x_n, eps, n), x0, atol=1e-3)
-
-
-@pytest.mark.parametrize("name", DIFFUSION)
-def test_eps_and_score_parameterizations_agree(name, obs):
-    """The codebase states its losses in score space and the DDPM literature in
-    eps space; `DDPMActor` calls them renamings and one division, its score
-    being -eps/sqrt(nu) over every ladder. This is that claim."""
-    a = built(name)
-    x = jax.random.normal(jax.random.PRNGKey(5), (BATCH, a.plan_dim))
-    n = jnp.ones((BATCH,), jnp.int32)
-
-    from_score = a.eps_from_score(a.predict_score(obs, x, n), n)
-    assert jnp.allclose(from_score, a.predict_eps(obs, x, n), atol=1e-3)
+    alpha, sigma = a.alpha_sigma(t)
+    assert jnp.allclose(alpha ** 2 + sigma ** 2, 1.0, atol=1e-5)
+    assert jnp.allclose(a.x0_from_eps(alpha * x0 + sigma * eps, eps, t), x0, atol=1e-3)
 
 
 @pytest.mark.parametrize("name", DIFFUSION)
-def test_diffuse_and_eps_loss_shapes(name, obs, key):
+def test_sampled_actions_can_reach_the_box_edges(name, obs, key):
+    """The clipped x0 is the played action, so the sampler's range is [-1, 1]."""
     a = built(name)
-    x0 = jnp.tanh(jax.random.normal(jax.random.PRNGKey(6), (BATCH, a.plan_dim)))
-    n = jnp.ones((BATCH,), jnp.int32)
-
-    assert a.diffuse(x0, n, key).shape == (BATCH, a.plan_dim)
-    loss = a.eps_loss(obs, x0, n, key)
-    assert loss.shape == () and finite(loss)
+    a.field.zero_init_head()
+    a.field.net.head.bias[...] = jnp.full_like(a.field.net.head.bias[...], -100.0)
+    action = a.sample(obs, key=key)
+    assert jnp.all(jnp.abs(action) > 0.99)
 
 
 def test_stochastic_actor_log_prob_and_mode(obs, key):

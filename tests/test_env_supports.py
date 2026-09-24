@@ -82,7 +82,7 @@ def test_c51_resolves_a_realistic_dm_control_value_gap(q_gap):
     2*gap/bin_width in L1 -- the fraction of the learning signal that survives
     quantization. HumanoidRun's discounted value is ~0.2 under a random policy,
     a gap this test's `q_gap=0.2` case stands in for -- deliberately checked
-    against whatever `bin_width` the current `num_atoms`/support actually
+    against whatever `bin_width` the current `num_bins`/support actually
     produces, not a hardcoded number: bin_width alone is a crude measure once
     the reward range isn't normalized, so this only asserts the quantization
     formula, never a specific config's tuned resolution."""
@@ -90,9 +90,9 @@ def test_c51_resolves_a_realistic_dm_control_value_gap(q_gap):
     env_stats = make_env_stats(return_min=stats["return_min"], return_max=stats["return_max"])
     c = build("C51Critic", env_stats=env_stats)
 
-    n = c.config.num_atoms
+    n = c.config.num_bins
     bin_width = (c.v_max - c.v_min) / (n - 1)
-    boot = jnp.zeros((1, 1, n)).at[0, 0, n // 2].set(1.0)
+    boot = jnp.zeros((1, n)).at[0, n // 2].set(1.0)
     terminal = lambda q: c.bellman_target(jnp.array([q]), jnp.ones((1,)), jnp.ones((1,)), boot)
 
     l1 = float(jnp.abs(terminal(0.0) - terminal(q_gap)).sum())

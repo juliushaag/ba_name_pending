@@ -13,8 +13,8 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from barl_jax.networks.mlp import MLP
-from barl_jax.networks.time_embedding import TimeEmbedding
+from barl_jax.networks.base import NetworkConfig
+from barl_jax.networks.time_embedding import TimeEmbeddingConfig
 
 
 class TimeConditionedField(nnx.Module):
@@ -25,18 +25,9 @@ class TimeConditionedField(nnx.Module):
   float32 casts at its own boundary."""
 
   def __init__(self, obs_dim: int, action_dim: int, *, latent_dim: int, layers: int,
-               time_dim: int, time_embed: str, time_kwargs: dict,
-               activation: str, norm: str,
-               norm_input: bool, norm_stem: bool, norm_after_act: bool,
-               dropout: float, final_activation: bool,
-               residual: bool, norm_kwargs: dict, dtype: str,
-               rngs: nnx.Rngs):
-    self.time_emb = TimeEmbedding(time_dim, kind=time_embed, rngs=rngs, **time_kwargs)
-    self.net = MLP(obs_dim + action_dim + time_dim, action_dim, latent_dim, layers,
-                   activation=activation, norm=norm, norm_input=norm_input,
-                   norm_stem=norm_stem, norm_after_act=norm_after_act,
-                   dropout=dropout, final_activation=final_activation,
-                   residual=residual, dtype=dtype, rngs=rngs, **(norm_kwargs or {}))
+               time: TimeEmbeddingConfig, mlp: NetworkConfig, rngs: nnx.Rngs):
+    self.time_emb = time.build(rngs=rngs)
+    self.net = mlp.build(obs_dim + action_dim + time.time_dim, action_dim, latent_dim, layers, rngs=rngs)
 
   def zero_init_head(self):
     """Start the chain uncontrolled -- the field is identically 0 at step 0, so

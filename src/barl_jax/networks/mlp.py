@@ -1,209 +1,98 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from barl_jax.networks.norm import make_norm
+from barl_jax.networks.base import (
+  Linear,
+  NetworkConfig,
+  act_norm,
+  make_dropout,
+  normalize_weights,  # noqa: F401  (re-exported: the projection is defined for any trunk)
+  register_network,
+)
 
 
+@register_network
 @dataclass(frozen=True)
-class MLPConfig:
-  activation: str = "silu"
-  norm: str = "layer"
+class MLPConfig(NetworkConfig):
+  class_name: str = "MLP"
   norm_input: bool = False
   norm_stem: bool = False
   norm_after_act: bool = True
-  dropout: float = 0.0
   final_activation: bool = False
   residual: bool = False
-  norm_kwargs: dict = field(default_factory=dict)
-  dtype: str = "float32"
 
-_ACTIVATIONS = dict(
-  silu=jax.nn.silu,
-  relu=jax.nn.relu,
-  gelu=jax.nn.gelu,
-  tanh=jax.nn.tanh,
-  relu6=jax.nn.relu6,
-  leakyrelu=jax.nn.leaky_relu,
-  mish=jax.nn.mish,
-)
-
-_DTYPES = dict(
-  float32=jnp.float32,
-  bfloat16=jnp.bfloat16,
-  float16=jnp.float16,
-)
-
-def Linear(in_features: int, out_features: int, *, rngs: nnx.Rngs,
-           dtype=jnp.float32) -> nnx.Linear:
-  return nnx.Linear(in_features, out_features,
-                    kernel_init=nnx.initializers.lecun_normal(),
-                    bias_init=nnx.initializers.zeros_init(),
-                    dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
+  def build(self, input_dim, output_dim, latent_dim, layers, *, rngs):
+    return MLP(input_dim, output_dim, latent_dim, layers, config=self, rngs=rngs)
 
 
-class ResidualBlock(nnx.Module):
-  """One hidden layer with residual connection, matching the main MLP's
-  norm_after_act ordering: Linear -> act -> Norm (default) or Linear -> Norm -> act."""
+class Block(nnx.Module):
+  """Linear -> dropout -> activation/norm, optionally wrapped in a skip."""
 
-  def __init__(self, latent_dim: int, act, norm: str, *, dropout: float,
-               norm_after_act: bool, rngs: nnx.Rngs, dtype=jnp.float32, **norm_kwargs):
-    self.norm          = make_norm(norm, latent_dim, rngs=rngs, dtype=dtype, **norm_kwargs)
-    self.act           = act
-    self.lin           = Linear(latent_dim, latent_dim, rngs=rngs, dtype=dtype)
-    self.dropout       = nnx.Dropout(dropout, rngs=rngs) if dropout > 0 else None
-    self.norm_after_act = norm_after_act
+  def __init__(self, latent_dim: int, act, norm, *, dropout: float, norm_after_act: bool,
+               residual: bool, rngs: nnx.Rngs, dtype=jnp.float32):
+    self.lin = Linear(latent_dim, latent_dim, rngs=rngs, dtype=dtype)
+    self.act, self.norm = act, norm
+    self.dropout = make_dropout(dropout, rngs)
+    self.norm_after_act, self.residual = norm_after_act, residual
 
   def __call__(self, x):
     h = self.lin(x)
-    if self.norm_after_act:
-      h = self.act(h)
-      if self.norm is not None:
-        h = self.norm(h)
-    else:
-      if self.norm is not None:
-        h = self.norm(h)
-      h = self.act(h)
     if self.dropout is not None:
       h = self.dropout(h)
-    return x + h
+    h = act_norm(h, self.act, self.norm, self.norm_after_act)
+    return x + h if self.residual else h
 
 
 class MLP(nnx.Module):
+  """Stem, `layers` x (Linear -> act/norm), head. With `residual` the blocks carry
+  skips, the stem is a bare embedding and the stream is normalized before the head.
 
-  def __init__(self, input_dim: int, output_dim: int, latent_dim: int, hidden_layers: int,
-               *, activation: str, norm: str,
-               norm_input: bool, norm_stem: bool,
-               norm_after_act: bool, dropout: float,
-               final_activation: bool, residual: bool,
-               dtype: str,
-               rngs: nnx.Rngs, **norm_kwargs):
-    """`norm` selects the normalization ("none" / "layer" / "batch" /
-    "batchrenorm"); leaving it unset gives LayerNorm.
+  `dropout` follows each hidden Linear, before its activation/norm (DroQ, Hiraoka
+  et al., 2022); it is off at eval via `nnx.Module.eval()`. `norm_input` and
+  `norm_stem` normalize the raw input and the stem output -- what CrossQ-style
+  nets need so the joint current+next forward shares statistics."""
 
-    `dtype` is the compute dtype only -- parameters stay float32 regardless.
+  def __init__(self, input_dim: int, output_dim: int, latent_dim: int, layers: int,
+               *, config: MLPConfig, rngs: nnx.Rngs):
+    act, dtype = config.resolve()
+    self.act, self.dtype = act, dtype
+    self.residual = config.residual
+    self.final_activation = config.final_activation
+    self.norm_after_act = config.norm_after_act
 
-    `dropout` is applied to each hidden layer's output, before its norm and
-    activation -- the ordering DroQ (Hiraoka et al., 2022) uses to get
-    ensemble-like uncertainty out of far fewer heads. It is off at eval, since
-    `nnx.Dropout`'s `deterministic` flag is one of the two things
-    `nnx.Module.eval()` flips.
-
-    `norm_input` normalizes the raw input, before the stem's Linear -- what
-    dime_am's critic does and what a CrossQ-style network wants, since it is
-    the input population the shared current+next forward has to agree on. It
-    and `norm_stem` are off by default because barl's MLP historically had
-    neither. Note the shapes still differ slightly even with both on: CrossQ's
-    net is `layers` Linear->Norm->Act blocks plus a head, where this MLP
-    additionally has a stem, so `layers=2` here is one Linear deeper."""
-
-    activation = activation.lower()
-
-    assert activation in _ACTIVATIONS, f"{activation} not in available activations {list(_ACTIVATIONS)}"
-    assert dtype in _DTYPES, f"{dtype} not in available dtypes {list(_DTYPES)}"
-
-    act   = _ACTIVATIONS[activation]
-    dtype = _DTYPES[dtype]
-
-    self.input_dim        = input_dim
-    self.output_dim       = output_dim
-    self.latent_dim       = latent_dim
-    self.hidden_layers    = hidden_layers
-    self.norm             = norm
-    self.dropout_rate     = dropout
-    self.final_activation = final_activation
-    self.residual         = residual
-    self.act              = act
-    self.dtype            = dtype
-    self.norm_after_act   = bool(norm_after_act)
-
-    normed = norm != "none"
-    mk = lambda dim: make_norm(norm, dim, rngs=rngs, dtype=dtype, **norm_kwargs)
-
-    # A residual stem is a bare linear embedding of the stream -- the activation
-    # the plain path puts here would be immediately followed by each block's own.
-    self.input_norm = mk(input_dim) if norm_input else None
+    mk = lambda dim: config.make_norm(dim, rngs=rngs)
+    self.input_norm = mk(input_dim) if config.norm_input else None
     self.stem = Linear(input_dim, latent_dim, rngs=rngs, dtype=dtype)
-    self.stem_norm = mk(latent_dim) if norm_stem else None
-
-    blocks, norms, drops = [], [], []
-    for _ in range(hidden_layers):
-      if residual:
-        # One Linear per block, same as the plain path, so `residual` swaps the
-        # wiring rather than the width -- the two differ only by the head norm.
-        blocks.append(ResidualBlock(latent_dim, act, norm, dropout,
-                                    norm_after_act=norm_after_act, rngs=rngs,
-                                    dtype=dtype, **norm_kwargs))
-      else:
-        blocks.append(Linear(latent_dim, latent_dim, rngs=rngs, dtype=dtype))
-        norms.append(mk(latent_dim))
-        drops.append(nnx.Dropout(dropout, rngs=rngs) if dropout > 0 else None)
-    self.blocks = nnx.List(blocks)
-    self.norms  = nnx.List(norms)
-    self.drops  = nnx.List(drops)
-
-    # Nothing has normalized the residual stream itself, only each branch's
-    # input, so without this the head sees a scale that grows with depth.
-    self.stream_norm = mk(latent_dim) if (residual and normed) else None
-
+    self.stem_norm = mk(latent_dim) if config.norm_stem else None
+    self.blocks = nnx.List([
+      Block(latent_dim, act, mk(latent_dim), dropout=config.dropout,
+            norm_after_act=config.norm_after_act, residual=config.residual,
+            rngs=rngs, dtype=dtype) for _ in range(layers)])
+    # A skip stream's scale grows with depth; the head needs it normalized.
+    self.stream_norm = mk(latent_dim) if config.residual else None
     self.head = Linear(latent_dim, output_dim, rngs=rngs, dtype=dtype)
-    self.head_norm = mk(output_dim) if (final_activation and normed) else None
+    self.head_norm = mk(output_dim) if config.final_activation else None
+
+  @property
+  def hidden_linears(self):
+    return [self.stem, *(block.lin for block in self.blocks)]
 
   def __call__(self, *x):
     h = x[0] if len(x) == 1 else jnp.concatenate(x, axis=-1)
-
-    # Cast once at the boundary: inputs (observations, actions, time embeddings)
-    # are float32 and every consumer of the output casts back.
     h = h.astype(self.dtype)
-
     if self.input_norm is not None:
       h = self.input_norm(h)
 
-    # `norm_after_act` is dime_am's order (Dense -> act -> Norm); the other is
-    # barl's original (Dense -> Norm -> act). For a BatchRenorm the two track
-    # different populations -- post-activation statistics are those of a
-    # one-sided, half-zero signal -- so this is not cosmetic.
-    h = self.stem(h)
-    if self.residual:
-      if self.stem_norm is not None:
-        h = self.stem_norm(h)
-    elif self.norm_after_act:
-      h = self.act(h)
-      if self.stem_norm is not None:
-        h = self.stem_norm(h)
-    else:
-      if self.stem_norm is not None:
-        h = self.stem_norm(h)
-      h = self.act(h)
-
-    for i, block in enumerate(self.blocks):
-      if self.residual:
-        h = block(h)
-        continue
+    h = act_norm(self.stem(h), None if self.residual else self.act,
+                 self.stem_norm, self.norm_after_act)
+    for block in self.blocks:
       h = block(h)
-      drop = self.drops[i]
-      if drop is not None:
-        h = drop(h)
-      norm = self.norms[i]
-      if self.norm_after_act:
-        h = self.act(h)
-        if norm is not None:
-          h = norm(h)
-      else:
-        if norm is not None:
-          h = norm(h)
-        h = self.act(h)
-
     if self.stream_norm is not None:
       h = self.stream_norm(h)
 
     h = self.head(h)
-
     if self.final_activation:
-      if self.head_norm is not None:
-        h = self.head_norm(h)
-      h = self.act(h)
-
+      h = act_norm(h, self.act, self.head_norm, True)
     return h

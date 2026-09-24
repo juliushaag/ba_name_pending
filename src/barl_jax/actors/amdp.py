@@ -1,18 +1,19 @@
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from barl_jax.components import Actor, Buffer, Critic, _Static, frozen
+from barl_jax.components import Actor, Buffer, Critic, frozen
 from barl_jax.config.schemas import ComponentsConfig, ModelConfig, register_model
 from barl_jax.critics.categorical import C51CriticConfig
+from barl_jax.networks.base import NetworkConfig
 from barl_jax.networks.diffusion import TimeConditionedField, controlled_sde
 from barl_jax.networks.mlp import MLPConfig
 from barl_jax.networks.regulator import AutotuneRegulatorConfig
-from barl_jax.networks.time_embedding import TimeEmbeddingConfig
+from barl_jax.networks.time_embedding import FourierTimeConfig, TimeEmbeddingConfig
 from barl_jax.optimization import ActorOptim
 from barl_jax.policies.rl import MaxEntPolicyConfig, MaxEntRLPolicy
 from barl_jax.policy import register_policy
@@ -24,10 +25,9 @@ class ScoreContinuousActorConfig:
   class_name: str = "ScoreContinuousActor"
   latent_dim: int = 256
   layers: int = 2
-  mlp: MLPConfig = field(default_factory=lambda: MLPConfig(activation="gelu", norm="none", dtype="float32"))
+  mlp: NetworkConfig = field(default_factory=lambda: MLPConfig(activation="gelu", norm="none", dtype="float32"))
   time_emb: str = "ctrl"
-  time: TimeEmbeddingConfig = field(default_factory=lambda: TimeEmbeddingConfig(
-    kind="fourier", time_dim=16, num_freqs=16, hidden=32, concat_input=True))
+  time: TimeEmbeddingConfig = field(default_factory=FourierTimeConfig)
   squash_cls: str = "ErfSquash"
   sigma_min: float = 0.01
   sigma_max: float = 2.0
@@ -62,9 +62,6 @@ class ScoreContinuousActor(ActorOptim, Actor):
   config_type = ScoreContinuousActorConfig
 
   def __init__(self, env_stats, config: ScoreContinuousActorConfig, *, rngs: nnx.Rngs, **kwargs):
-    time_values = config.time.to_runtime_dict()
-    self.time_dim, self.time_embed = time_values["time_dim"], time_values["time_embed"]
-    self._static_config = _Static({"time_kwargs": time_values["time_kwargs"]})
     super().__init__(env_stats, config, **kwargs)
 
     self._log_r    = math.log(self.config.sigma_max / self.config.sigma_min)
@@ -74,8 +71,7 @@ class ScoreContinuousActor(ActorOptim, Actor):
 
     self.field = TimeConditionedField(
       self.obs_dim, self.plan_dim, latent_dim=latent_dim, layers=layers,
-      time_dim=self.time_dim, time_embed=self.time_embed, time_kwargs=self.static("time_kwargs"),
-      rngs=rngs, **asdict(config.mlp))
+      time=config.time, mlp=config.mlp, rngs=rngs)
 
     self.field.zero_init_head()   # u ~ 0 at the beginning
 

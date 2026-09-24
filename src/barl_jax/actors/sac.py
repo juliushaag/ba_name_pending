@@ -1,4 +1,4 @@
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import ClassVar
 
 import jax
@@ -6,11 +6,12 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-from barl_jax.components import Actor, Buffer, Critic, PathwiseActorMixin
+from barl_jax.components import Actor, Buffer, Critic, frozen
 from barl_jax.config.schemas import ComponentsConfig, ModelConfig, register_model
 from barl_jax.critics.categorical import C51CriticConfig
 from barl_jax.networks import gaussian
-from barl_jax.networks.mlp import MLP, MLPConfig
+from barl_jax.networks.base import NetworkConfig
+from barl_jax.networks.mlp import MLPConfig
 from barl_jax.networks.regulator import AutotuneRegulatorConfig
 from barl_jax.optimization import ActorOptim
 from barl_jax.policies.rl import MaxEntPolicyConfig, MaxEntRLPolicy
@@ -23,7 +24,7 @@ class StochasticActorConfig:
   class_name: str = "StochasticActor"
   latent_dim: int = 256
   layers: int = 2
-  mlp: MLPConfig = field(default_factory=lambda: MLPConfig(
+  mlp: NetworkConfig = field(default_factory=lambda: MLPConfig(
     activation="silu", norm="layer", norm_kwargs={"epsilon": 1e-5}, dtype="bfloat16"))
   squash_cls: str = "TanhSquash"
   log_std_min: float = -20.0
@@ -36,7 +37,7 @@ class StochasticActorConfig:
 
 
 @register_component
-class StochasticActor(PathwiseActorMixin, ActorOptim, Actor):
+class StochasticActor(ActorOptim, Actor):
   """Diagonal-Normal MLP actor shared by SAC/PPO/IQL. `dist()` stays an
   unconstrained Normal; sample()/mode() squash it (the `squash_cls` Config
   selects which -- any no-arg Squash works generically here).
@@ -65,11 +66,7 @@ class StochasticActor(PathwiseActorMixin, ActorOptim, Actor):
 
     latent_dim, layers = config.latent_dim, config.layers
 
-    # MLP takes norm's own kwargs spread (**norm_kwargs), not a `norm_kwargs=`
-    # parameter -- pop it out of the group and spread its contents instead.
-    mlp = asdict(config.mlp)
-    norm_kwargs = mlp.pop("norm_kwargs") or {}
-    self.net = MLP(self.obs_dim, self.plan_dim, latent_dim, layers, rngs=rngs, **mlp, **norm_kwargs)
+    self.net = config.mlp.build(self.obs_dim, self.plan_dim, latent_dim, layers, rngs=rngs)
     self.rngs = rngs
 
   def _plan(self, flat):
@@ -125,10 +122,13 @@ class StochasticActor(PathwiseActorMixin, ActorOptim, Actor):
     mean, _ = self.dist(s)
     return self._plan(self.squash(mean))
 
-  # loss: PathwiseActorMixin's reparameterized max-entropy objective,
-  # -(Q + alpha*H) -- SAC's actor improves against the critic but must not
-  # train it (frozen(critic) inside the mixin), same as every actor here.
-
+  def loss(self, obs, critic: "Critic", alpha, *, key=None):
+    action, entropy = self.generate_action(obs, key=key)
+    q = frozen(critic).value(obs, action.reshape(action.shape[0], -1))
+    # entropy is (B, chunk_size); alpha is a scalar or (chunk_size,), so
+    # `alpha * entropy` broadcasts and the chunk sum gives one (B, 1) bonus.
+    bonus = (jax.lax.stop_gradient(alpha) * entropy).sum(axis=-1, keepdims=True)
+    return {"actor": -(q + bonus).mean()}
 
 @register_policy
 class SAC(MaxEntRLPolicy):

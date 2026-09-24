@@ -8,7 +8,8 @@ from flax import nnx
 
 from barl_jax.components import ActionSampler, frozen
 from barl_jax.config.schemas import ComponentsConfig, ModelConfig, register_model
-from barl_jax.critics.nclql import NCLQLC51CriticConfig
+from barl_jax.critics.categorical import C51CriticConfig
+from barl_jax.critics.presets import nclql
 from barl_jax.metrics import DEBUG
 from barl_jax.policies.rl import PolicyConfig, RLPolicy
 from barl_jax.policy import register_policy
@@ -19,7 +20,7 @@ from barl_jax.registration import register_component
 class LangevinActorConfig:
   class_name: str = "LangevinActor"
   steps_per_level: int = 2
-  step_size: float = 2.0e-3
+  step_lr: float = 2.0e-3
   temperature: float = 500.0
   normalize_score: bool = True
   clip_actions: bool = True
@@ -53,7 +54,7 @@ class LangevinActor(ActionSampler):
     critic = frozen(critic)
 
     def q_fn(critic, a):
-      return critic.expectation(obs, critic.augment(a, level)).sum()
+      return critic.expectation(obs, a, level=level).sum()
 
     return nnx.grad(q_fn, argnums=1)(critic, act)
 
@@ -61,7 +62,7 @@ class LangevinActor(ActionSampler):
     if critic is None:
       raise ValueError("LangevinActor requires a noise-conditioned critic")
     key = self.rngs.noise() if key is None else key
-    sigmas = critic.sigmas[...]
+    sigmas = critic.noise.sigmas[...]
     num_levels = int(sigmas.size)
     key, init_key = jax.random.split(key)
     a = self.config.init_scale * (2.0 * jax.random.uniform(
@@ -70,17 +71,13 @@ class LangevinActor(ActionSampler):
     score_norm = jnp.zeros(())
     keys = jax.random.split(key, num_levels * self.config.steps_per_level)
 
-    # Relative spacing only -- normalized to 1.0 at the coarsest level so `step_size`
-    # sets the actor's absolute step scale directly, independent of whatever
-    # absolute sigma units the critic's noise_schedule happens to use. Before this
-    # normalization, alpha_ratio[0] was (sigma_0/sigma_last)**2, which spans four
-    # orders of magnitude for the default ladder (0.1 -> 0.001) and drove the
-    # coarsest drift to ~250 against an action_limit of 1.0 -- a chain that spends
-    # its first levels slamming into the clip instead of annealing.
+    # Relative spacing normalized to 1 at the coarsest level, so `step_lr` is that
+    # level's absolute step independent of the ladder's sigma units. Unnormalized,
+    # the default ladder puts the coarsest drift at ~250 against action_limit 1.
     alpha_ratio = (sigmas / sigmas[-1]) ** 2
     alpha_ratio = alpha_ratio / alpha_ratio[0]
     for i in range(num_levels):
-      alpha = self.config.step_size * alpha_ratio[i]
+      alpha = self.config.step_lr * alpha_ratio[i]
       for t in range(self.config.steps_per_level):
         g = self.critic_score(critic, obs, a, i)
         score_norm = jnp.linalg.norm(g, axis=-1).mean()
@@ -92,10 +89,6 @@ class LangevinActor(ActionSampler):
         noise = jax.random.normal(keys[i * self.config.steps_per_level + t], a.shape, a.dtype)
         a = a + drift + jnp.sqrt(alpha) * noise
 
-        # `normalize_score` fixes |g| at 1, so the drift is 0.5*alpha*temperature
-        # outright while the noise is sqrt(alpha) -- whether either is comparable
-        # to `action_limit` is the difference between a chain that anneals and one
-        # that spends its first levels slamming into the clip.
         self.metrics.scalar(f"chain/drift_norm_l{i}",
                             jnp.linalg.norm(drift, axis=-1).mean(), tier=DEBUG)
         self.metrics.scalar(f"chain/noise_scale_l{i}", jnp.sqrt(alpha), tier=DEBUG)
@@ -127,5 +120,5 @@ class NCLQLModelConfig(ModelConfig):
   params: PolicyConfig = field(default_factory=PolicyConfig)
   components: ComponentsConfig = field(default_factory=lambda: ComponentsConfig(
     actor=LangevinActorConfig(),
-    critic=NCLQLC51CriticConfig(), entropy=None))
+    critic=nclql(C51CriticConfig()), entropy=None))
 

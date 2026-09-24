@@ -16,6 +16,7 @@ from barl_jax.components import (
   Buffer,
   Component,
   _Static,
+  interned_static,
   sanitize_action,
 )
 from barl_jax.env import EnvStats
@@ -29,7 +30,7 @@ def _jitted_infer(graphdef, state, observation, key):
   cache survives across calls: repeated `nnx.split` of the same policy yields an
   equal-and-equally-hashing GraphDef, so a rollout or an eval wave rebinding its
   weights hits the cache instead of recompiling."""
-  action, extras = nnx.merge(graphdef, state).inference_step(observation, key=key)
+  action, extras = nnx.merge(graphdef.value, state).inference_step(observation, key=key)
   return action, extras
 
 
@@ -43,7 +44,7 @@ def _jitted_infer_exec(graphdef, executor_config, state, observation, key):
   Only `executor_config` -- a frozen, all-primitive-field dataclass, hashable
   for free -- crosses the jit boundary as a static arg; the executor instance
   itself never needs to (see `executors.base.executor_from_config`)."""
-  policy = nnx.merge(graphdef, state)
+  policy = nnx.merge(graphdef.value, state)
   executor = executors.executor_from_config(executor_config)
   infer_step = lambda obs, key: policy.inference_step(obs, key=key)
   score_fn = policy.score if executor.needs_score else None
@@ -166,7 +167,6 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
       raise NotImplementedError(f"{action_space} type not supported ... yet")
 
     self.observation_shape = tuple(observation_space.shape)
-    self.observation_dim   = int(np.prod(observation_space.shape))
 
     self.obs_std  = Buffer(jnp.ones(observation_space.shape[-1]))
     self.obs_mean = Buffer(jnp.zeros(observation_space.shape[-1]))
@@ -253,12 +253,12 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
       mapping = {**mapping, **config_overrides}
     if not issubclass(cls, gate_cls):
       raise TypeError(f"{self.model_name}.{slot}: {cls.__name__} must implement {gate_cls.__name__}")
+    config = _materialize_component_config(cls, mapping, owner=f"{self.model_name}.{slot}")
     objective = self.slot_objective(
       slot, self.resolve_component("actor")[0] if "actor" in self.SLOTS else None)
-    if objective is not None and getattr(cls, "learning_objective", None) != objective:
+    if objective is not None and cls.learning_objective_for(config) != objective:
       raise TypeError(f"{self.model_name}.{slot}: {cls.__name__} does not support {objective!r}")
     stats = env_stats if env_stats is not None else self.env_stats
-    config = _materialize_component_config(cls, mapping, owner=f"{self.model_name}.{slot}")
     explicit_kwargs.setdefault("rngs", self.rngs)
     component = cls(stats, config, *args, **explicit_kwargs)
     component.slot = slot
@@ -354,8 +354,8 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
   # ------------------------------------------------------------------
 
   # Every continuous actor trains against a canonical per-dimension [-1, 1]
-  # output, independent of the env's real bounds; scale/unscale_action are
-  # the one-place affine remap, used only at env.step() call sites.
+  # output, independent of the env's real bounds; scale_action is the one-place
+  # affine remap, used only at env.step() call sites.
 
   def scale_action(self, raw_action):
     """Canonical [-1, 1]-per-dimension actor output -> this env's actual action bounds.
@@ -366,12 +366,6 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
     if self.action_discrete:
       return raw_action
     return sanitize_action(raw_action) * self.act_scale[...] + self.act_bias[...]
-
-  def unscale_action(self, action):
-    """Inverse of scale_action: real env-scale action -> canonical [-1, 1]."""
-    if self.action_discrete:
-      return action
-    return (action - self.act_bias[...]) / self.act_scale[...]
 
   def action_bounds_numpy(self) -> tuple:
     """Host-side (scale, bias), for the rollout/eval loops -- scaling on the
@@ -438,8 +432,8 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
     graphdef, state = nnx.split(clone)
 
     if executor is None or executor.is_direct:
-      return partial(_jitted_infer, graphdef, state)
-    return partial(_jitted_infer_exec, graphdef, executor.config, state)
+      return partial(_jitted_infer, interned_static(graphdef), state)
+    return partial(_jitted_infer_exec, interned_static(graphdef), executor.config, state)
 
   # ------------------------------------------------------------------
   # Best-of-N scoring (optional capability -- see barl_jax.executors)

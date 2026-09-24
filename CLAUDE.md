@@ -29,7 +29,7 @@ via `_Static`, see `components.py`) rather than copying each field onto its own
 flat attribute -- read `self.config.foo` from any method, and mutate it in a
 test with `c.config = dataclasses.replace(c.config, foo=...)`. `lr`/`adam_b1`/
 `grad_clip`/`grad_clip_mode` follow the same rule, including in the shared
-`ActorOptim`/`QCriticBase`/`AutotuneRegulator` optimizer-role mixins.
+`ActorOptim`/`QCritic`/`AutotuneRegulator` optimizer-role mixins.
 
 Comments should explain non-obvious invariants or numerical/shape constraints.
 Prefer clear identifiers and short comments over historical implementation essays.

@@ -200,7 +200,8 @@ def test_categorical_projection_conserves_mass_and_expectation():
     probs = jnp.full((2, 4, 11), 1 / 11)                # (n_models, B, atoms)
     reward, term, gamma = jnp.array([0.1, -0.1, 0.0, 0.2]), jnp.zeros((4,)), 0.5
 
-    proj = categorical_projection(probs, atoms, reward, term, gamma, 0.0, -1.0, 1.0)
+    discount = (1.0 - term[:, None]) * gamma
+    proj = categorical_projection(probs, atoms, reward, discount, -1.0, 1.0)
 
     assert proj.shape == probs.shape
     assert jnp.allclose(proj.sum(axis=-1), 1.0, atol=1e-5)
@@ -213,7 +214,7 @@ def test_categorical_projection_is_terminal_at_term_one():
     probs = jnp.full((1, 3, 11), 1 / 11)
     reward = jnp.array([0.2, 0.0, -0.4])
 
-    proj = categorical_projection(probs, atoms, reward, jnp.ones((3,)), 0.99, 0.0, -1.0, 1.0)
+    proj = categorical_projection(probs, atoms, reward, jnp.zeros((3, 1)), -1.0, 1.0)
     assert jnp.allclose((proj * atoms).sum(axis=-1), reward, atol=1e-5)
 
 
@@ -261,3 +262,60 @@ def test_adam_zeroes_nans_ahead_of_its_clip():
 def test_unknown_clip_mode_is_rejected():
     with pytest.raises(KeyError, match="grad_clip_mode"):
         adam(1e-3, 0.9, 1.0, "sometimes")
+
+
+@pytest.mark.parametrize("name", ["MLP", "SimBa"])
+def test_network_builds_and_weight_projection_normalizes_every_hidden_layer(name):
+  from barl_jax.networks.base import NETWORK_CONFIGS, normalize_weights
+  net = NETWORK_CONFIGS[name]().build(5, 3, 8, 2, rngs=nnx.Rngs(0))
+  assert net(jnp.ones((4, 5))).shape == (4, 3)
+  normalize_weights(net)
+  for lin in net.hidden_linears:
+    assert jnp.allclose(jnp.linalg.norm(lin.kernel[...], axis=-2), 1.0, atol=1e-2)
+
+
+def test_simba_block_is_a_pre_norm_residual_with_wide_hidden_layer():
+  from barl_jax.networks.base import NETWORK_CONFIGS
+  net = NETWORK_CONFIGS["SimBa"](expansion=4).build(5, 3, 8, 1, rngs=nnx.Rngs(0))
+  block = net.blocks[0]
+  assert block.up.kernel.shape == (8, 32) and block.down.kernel.shape == (32, 8)
+  block.down.kernel[...] = jnp.zeros_like(block.down.kernel[...])
+  x = jax.random.normal(jax.random.key(1), (3, 8))
+  assert jnp.array_equal(block(x), x)
+
+
+def test_network_class_name_selects_the_variant_in_config_overrides():
+  from barl_jax.actors.sac import StochasticActorConfig
+  from barl_jax.config.serialization import construct, merge, to_dict
+  from barl_jax.networks.simba import SimbaConfig
+  base = StochasticActorConfig()
+  swapped = merge(base, {"mlp": {"class_name": "SimBa", "expansion": 2}})
+  assert swapped.mlp == SimbaConfig(expansion=2)
+  assert merge(swapped, {"mlp": {"norm": "none"}}).mlp.norm == "none"
+  assert construct(StochasticActorConfig, to_dict(swapped)) == swapped
+  with pytest.raises(KeyError, match="class_name"):
+    merge(base, {"mlp": {"class_name": "Nope"}})
+  with pytest.raises(KeyError, match="unknown keys"):
+    merge(base, {"mlp": {"class_name": "SimBa", "norm_stem": True}})
+
+
+def test_time_embedding_class_name_selects_the_variant_and_shapes_the_output():
+  from barl_jax.actors.sdac import DDPMActorConfig
+  from barl_jax.config.serialization import merge
+  from barl_jax.networks.time_embedding import FourierTimeConfig, SinusoidalTimeConfig
+  base = DDPMActorConfig()
+  assert isinstance(base.time, FourierTimeConfig) and base.time.learn_freqs
+  swapped = merge(base, {"time": {"class_name": "Sinusoidal", "time_dim": 6}})
+  assert swapped.time == SinusoidalTimeConfig(time_dim=6)
+  for cfg in (swapped.time, base.time):
+    emb = cfg.build(rngs=nnx.Rngs(0))
+    assert emb(jnp.full((4, 1), 0.3)).shape == (4, cfg.time_dim)
+
+
+def test_unknown_network_field_values_are_reported_from_the_registries():
+  from barl_jax.config.run import RunConfig
+  with pytest.raises(Exception, match="unknown activation"):
+    RunConfig.from_dict({
+      "model": "SAC", "env": "HalfCheetah",
+      "model_overrides": {"components": {"actor": {"mlp": {"activation": "nope"}}}},
+    }).validate()

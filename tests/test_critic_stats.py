@@ -13,21 +13,14 @@ from dataclasses import replace
 
 import jax.numpy as jnp
 import pytest
-from conftest import BATCH, CRITICS, build, built, critic_action, finite, target_expectation
+from conftest import BATCH, CRITICS, HEADS, build, built, finite
 
-from barl_jax.critics import C51Critic, EnsembleCritic, HLGaussCritic, categorical_projection
-from barl_jax.critics.nclql import NoiseConditionedCritic
+from barl_jax.components import frozen
+from barl_jax.critics import categorical_projection, reduce_members
 from barl_jax.metrics import DEBUG, PRIMARY, DebugMetric, Metric, collect, recording
-from barl_jax.registration import get_component
-
-_sub = lambda base: [n for n in CRITICS if issubclass(get_component(n), base)]
-
-CATEGORICAL = _sub(C51Critic)          # bootstraps and transports a distribution
-HISTOGRAM = _sub(HLGaussCritic)        # bootstraps a scalar, discretizes at the end
-SCALAR = _sub(EnsembleCritic)
-NOISE_CONDITIONED = _sub(NoiseConditionedCritic)
 
 ONE = jnp.ones((1,))
+MULTI_MEMBER = [n for n in CRITICS if built(n).n_models > 1]
 
 
 def moments(support, d):
@@ -43,7 +36,7 @@ def two_point(c, half_width: int):
     support = c.support[...]
     n = support.shape[0]
     lo, hi = n // 2 - half_width, n // 2 + half_width
-    probs = jnp.zeros((1, 1, n)).at[0, 0, lo].set(0.5).at[0, 0, hi].set(0.5)
+    probs = jnp.zeros((1, n)).at[0, lo].set(0.5).at[0, hi].set(0.5)
     return probs, float(0.5 * (support[lo] + support[hi])), float(0.5 * (support[hi] - support[lo]))
 
 
@@ -56,7 +49,7 @@ def bin_width(c):
 # ----------------------------------------------------------------------
 
 @pytest.mark.parametrize("half_width", [8, 16, 32])
-@pytest.mark.parametrize("name", CATEGORICAL)
+@pytest.mark.parametrize("name", ["C51Critic"])
 def test_categorical_target_transports_the_spread(name, half_width):
     """C51 is genuinely distributional: the Bellman operator moves the whole
     next-state distribution, so the target's spread is the bootstrap's scaled by
@@ -73,7 +66,7 @@ def test_categorical_target_transports_the_spread(name, half_width):
 
 
 @pytest.mark.parametrize("boot_value", [0.0, 2.0, -4.0])
-@pytest.mark.parametrize("name", HISTOGRAM)
+@pytest.mark.parametrize("name", ["HLGaussCritic"])
 def test_histogram_target_discards_the_spread(name, boot_value):
     """HL-Gauss is *not* distributional -- it bootstraps a scalar and only
     discretizes at the end, so the width of its target is label smoothing and
@@ -90,7 +83,7 @@ def test_histogram_target_discards_the_spread(name, boot_value):
 
 
 @pytest.mark.parametrize("value", [0.0, 3.0, -5.0])
-@pytest.mark.parametrize("name", HISTOGRAM)
+@pytest.mark.parametrize("name", ["HLGaussCritic"])
 def test_histogram_of_a_scalar_is_a_discretized_gaussian(name, value):
     """`sigma` is a label-smoothing width, so the histogram a scalar lands in
     has that scalar as its mean and a variance of exactly sigma^2 plus the
@@ -112,28 +105,27 @@ def test_histogram_of_a_scalar_is_a_discretized_gaussian(name, value):
 RAW = jnp.array([[[1.0], [3.0], [-2.0]], [[2.0], [-1.0], [-2.0]]])      # (2 heads, 3, 1)
 
 
-def test_rho_one_at_two_heads_is_exactly_the_min():
-    """The claim in EnsembleCritic's docstring: at n_models=2 the population std
-    is |q1 - q2|/2, so mean - 1.0*std is TD3's min-over-heads rather than an
-    approximation of it. The 1e-3 is the sqrt(maximum(var, 1e-8)) floor, which
-    is why two heads that agree exactly come back 1e-4 low."""
-    c = build("EnsembleCritic", rho=1.0, n_models=2)
-    assert jnp.allclose(c.reduce_value(RAW), RAW.min(axis=0), atol=1e-3)
+def test_min_and_mean_reductions():
+    assert jnp.array_equal(reduce_members(RAW, RAW, "min"), RAW.min(axis=0))
+    assert jnp.array_equal(reduce_members(RAW, RAW, "mean"), RAW.mean(axis=0))
 
 
-def test_rho_zero_makes_the_price_the_expectation():
-    c = build("EnsembleCritic", rho=0.0, n_models=2)
-    assert jnp.allclose(c.reduce_value(RAW), c.expectation_from_raw(RAW).mean(axis=0))
+def test_min_selects_whole_members_not_elementwise_minima():
+    """A per-member payload follows the member with the lower expectation."""
+    payload = jnp.stack([jnp.zeros((3, 2)), jnp.ones((3, 2))])       # (2 members, 3, 2)
+    picked = reduce_members(payload, RAW, "min")
+    lower = (RAW[1] < RAW[0]).astype(jnp.float32)                      # (3, 1): member 1 lower
+    assert jnp.array_equal(picked, jnp.broadcast_to(lower, (3, 2)))
 
 
-@pytest.mark.parametrize("name", CRITICS)
+@pytest.mark.parametrize("name", MULTI_MEMBER)
 def test_ensemble_heads_are_independently_initialized(name, obs, act):
     """Ensemble's own docstring names this failure: drop `nnx.split_rngs` and
     every member draws the same init key, the heads collapse to identical, the
     spread goes to 0 and pessimism silently switches off for the whole run --
     nothing errors, the curve just looks plausible."""
     c = built(name)
-    spread = c.expectation_from_raw(c.raw(obs, critic_action(c, act))).astype(jnp.float32)
+    spread = c.expectation_members(c.raw(obs, act))
     assert float(spread.std(axis=0).mean()) > 1e-3
 
 
@@ -147,8 +139,8 @@ NO_TERM = jnp.zeros((1,))
 
 def _project(reward, probs=None, gamma=1.0):
     probs = jnp.zeros((1, 1, 11)).at[0, 0, 5].set(1.0) if probs is None else probs
-    return categorical_projection(probs, ATOMS, jnp.array([reward]), NO_TERM, ONE,
-                                  gamma, -1.0, 1.0)
+    return categorical_projection(probs, ATOMS, jnp.array([reward]), jnp.full((1, 1), gamma),
+                                  -1.0, 1.0)
 
 
 def test_categorical_projection_matches_scalar_discount():
@@ -160,8 +152,8 @@ def test_categorical_projection_matches_scalar_discount():
     path ever collapsing its distribution before projecting."""
     atoms = jnp.linspace(-10.0, 10.0, 21)     # spacing 1.0, so 8.0 is exactly an atom
     next_probs = jnp.zeros((1, 1, 21)).at[0, 0, 18].set(1.0)   # point mass at atom value 8.0
-    proj = categorical_projection(next_probs, atoms, jnp.array([2.75]), jnp.array([0.0]),
-                                  jnp.array([3]), 0.5, -10.0, 10.0)
+    proj = categorical_projection(next_probs, atoms, jnp.array([2.75]), jnp.full((1, 1), 0.5 ** 3),
+                                  -10.0, 10.0)
     mean, _ = moments(atoms, proj)
     assert float(mean[0, 0]) == pytest.approx(3.75, abs=1e-5)
 
@@ -188,59 +180,48 @@ def test_projection_splits_off_atom_mass_with_the_exact_two_point_variance():
 # Pessimism and saturation
 # ----------------------------------------------------------------------
 
-def _one_head(n, index):
-    return jnp.zeros((1, 1, n)).at[0, 0, index].set(1.0)
+def _logits(n, *indices):
+    """(members, 1, n) logits whose softmax is a point mass per member."""
+    onehot = jnp.stack([jnp.zeros((1, n)).at[0, i].set(1.0) for i in indices])
+    return jnp.where(onehot > 0, 0.0, -1e9)
 
 
-@pytest.mark.parametrize("name", CRITICS)
-def test_the_two_pessimism_axes_are_independent(name, obs, act):
-    """`rho` prices the heads' disagreement into `value()`; `pessimistic_target`
-    puts it in the Bellman target. They are separate because the references
-    disagree about them separately -- dime_am wants neither, NC-LQL's C51 critic
-    wants the first without the second -- and while they were one knob that
-    combination could not be expressed at all.
+@pytest.mark.parametrize("name", [n for n in HEADS if n != "DirectCritic"])
+def test_the_two_reduction_axes_are_independent(name, obs, act):
+    """`value_reduce` prices the members' disagreement into `value()`;
+    `target_reduce` puts it in the Bellman target. Neither reaches the other's
+    quantity, and each does reach its own."""
+    def priced(value_reduce, target_reduce):
+        c = build(name, ensemble={"value_reduce": value_reduce, "target_reduce": target_reduce})
+        raw = c.raw(obs, act)
+        exp = c.expectation_members(raw).mean(axis=0)
+        target = c.bellman_target(jnp.zeros((BATCH,)), jnp.zeros((BATCH,)), jnp.ones((BATCH,)),
+                                  c.bootstrap(raw))
+        return c, c.reduce_value(raw), exp, c.target_expectation(target)
 
-    Independence is the pair of cross-terms: neither knob reaches the other's
-    quantity. (`pessimistic_target` is *not* inert at rho=0 for a distributional
-    critic -- it selects a head's whole categorical rather than reducing with a
-    spread, so it never routes through `reduce_value`.)"""
-    def priced(**over):
-        c = build(name, **over)
-        raw = c.raw(obs, critic_action(c, act))
-        return (c, c.reduce_value(raw), c.mean_expectation(raw),
-                c.bellman_target(jnp.zeros((BATCH,)), jnp.zeros((BATCH,)), jnp.ones((BATCH,)),
-                                 c.bootstrap_from_raw(raw)))
+    c, price, exp, mean_target = priced("min", "mean")
+    _, price_min_target, _, min_target = priced("min", "min")
+    _, mean_price, _, mean_target_mean_price = priced("mean", "mean")
 
-    c, price, mean_exp, off = priced(rho=1.0, pessimistic_target=False)
-    _, price_on, _, on = priced(rho=1.0, pessimistic_target=True)
-    _, _, _, off_neutral = priced(rho=0.0, pessimistic_target=False)
-
-    lift = lambda t: target_expectation(c, t)
-    assert jnp.array_equal(price, price_on), "pessimistic_target moved the price"
-    assert jnp.array_equal(off, off_neutral), "rho moved a non-pessimistic target"
-
-    # ... and each knob does reach its own.
-    assert float(lift(on).mean()) < float(lift(off).mean()) - 1e-4
-    assert jnp.allclose(lift(off), c.config.gamma * mean_exp.squeeze(-1), atol=1e-3)
+    assert jnp.array_equal(price, price_min_target), "target_reduce moved the price"
+    assert jnp.array_equal(mean_target, mean_target_mean_price), "value_reduce moved the target"
+    assert float(price.mean()) < float(mean_price.mean()) - 1e-4
+    assert float(min_target.mean()) < float(mean_target.mean()) - 1e-4
+    assert jnp.allclose(mean_target, c.config.gamma * exp, atol=1e-3)
 
 
-def test_pessimistic_target_transports_the_lower_heads_distribution():
+def test_min_target_transports_the_lower_heads_distribution():
     """Not a pointwise min over probabilities -- that is not a distribution.
-    It picks the head with the lower E[Z] and moves *that* head's whole
-    categorical, which is what keeps the target well-posed."""
-    c = build("C51Critic", pessimistic_target=True, num_atoms=11, v_min=-1.0, v_max=1.0)
-    support = c.support[...]
-    boot = jnp.concatenate([_one_head(11, 8), _one_head(11, 2)], axis=0)   # E = +0.6, -0.6
-
-    target = c.bellman_target(jnp.zeros((1,)), NO_TERM, ONE, boot)
-    assert float(moments(support, target)[0][0]) == pytest.approx(c.config.gamma * -0.6, abs=1e-4)
+    It picks the member with the lower E[Z] and moves that member's whole
+    categorical."""
+    c = build("C51Critic", ensemble={"target_reduce": "min"}, num_bins=11, v_min=-1.0, v_max=1.0)
+    target = c.bellman_target(jnp.zeros((1,)), NO_TERM, ONE, c.bootstrap(_logits(11, 8, 2)))
+    assert float(moments(c.support[...], target)[0][0]) == pytest.approx(c.config.gamma * -0.6, abs=1e-4)
 
 
-def test_averaging_target_takes_both_heads():
-    c = build("C51Critic", pessimistic_target=False, num_atoms=11, v_min=-1.0, v_max=1.0)
-    boot = jnp.concatenate([_one_head(11, 8), _one_head(11, 2)], axis=0)
-
-    target = c.bellman_target(jnp.zeros((1,)), NO_TERM, ONE, boot)
+def test_mean_target_takes_both_heads():
+    c = build("C51Critic", ensemble={"target_reduce": "mean"}, num_bins=11, v_min=-1.0, v_max=1.0)
+    target = c.bellman_target(jnp.zeros((1,)), NO_TERM, ONE, c.bootstrap(_logits(11, 8, 2)))
     assert float(moments(c.support[...], target)[0][0]) == pytest.approx(0.0, abs=1e-4)
 
 
@@ -265,27 +246,26 @@ def test_projection_saturates_once_the_reward_leaves_the_contraction_interior():
 # Noise conditioning
 # ----------------------------------------------------------------------
 
-@pytest.mark.parametrize("name", NOISE_CONDITIONED)
-def test_augment_widens_the_action_by_the_level_embedding(name, act):
-    """The inner critic is built over `act_dim + time_dim`; `action_dim` stays
-    the env's, as it means everywhere else."""
-    c = built(name)
-    assert c.action_dim == act.shape[-1]
-    assert c.augment(act, 0).shape == (BATCH, act.shape[-1] + c.time_dim)
-    assert not jnp.array_equal(c.augment(act, 0), c.augment(act, 3)), "levels embed identically"
+@pytest.mark.parametrize("name", HEADS)
+def test_noise_level_conditions_the_prediction(name, obs, act):
+    """Through `frozen`, as the Langevin sampler prices: a train-mode batch
+    normalization would zero a level that is constant across the batch."""
+    c = frozen(build(name, noise={"enabled": True}))
+    assert not jnp.allclose(c.expectation(obs, act, level=0), c.expectation(obs, act, level=3)), \
+        "levels embed identically"
+    assert jnp.array_equal(c.expectation(obs, act), c.expectation(obs, act, level=c.noise.clean_level))
 
 
-@pytest.mark.parametrize("name", NOISE_CONDITIONED)
+@pytest.mark.parametrize("name", HEADS)
 def test_smoothing_coefficient_is_actually_wired_in(name, obs, act, key):
-    """`loss` folds TD at the clean level and smoothing of the
-    noisier ones into one `losses["critic"]`, since both fit the same heads."""
-    sigmas = jnp.array([0.5, 0.2, 0.05])
-    c = build(name)                     # one build, two coefficients -- it is a plain float
+    """TD at the clean level and smoothing of the noisier ones fold into one
+    `losses["critic"]`, since both fit the same heads."""
+    c = build(name, noise={"enabled": True})
 
     def loss_at(coef):
-        c.config = replace(c.config, smoothing_coef=coef)
-        losses = c.noise_td_loss(obs, act, obs[::-1], act, jnp.zeros((BATCH,)),
-                                 jnp.zeros((BATCH,)), jnp.ones((BATCH,)), sigmas, key)
+        c.config = replace(c.config, noise=replace(c.config.noise, smoothing_coef=coef))
+        losses = c.td_loss(obs, act, obs[::-1], act, jnp.zeros((BATCH,)),
+                           jnp.zeros((BATCH,)), jnp.ones((BATCH,)), key=key)
         assert set(losses) == {"critic"}
         return losses["critic"]
 
@@ -298,40 +278,33 @@ def test_smoothing_coefficient_is_actually_wired_in(name, obs, act, key):
 # What the metrics claim to measure
 # ----------------------------------------------------------------------
 
-def drain(name, obs, act) -> dict:
+def drain(name, obs, act, **overrides) -> dict:
     """One critic loss under `recording`, and the diagnostics it sowed."""
     from flax import nnx
 
-    c = build(name)
-    a = critic_action(c, act)
+    c = build(name, **overrides)
     with recording(PRIMARY, DEBUG):
-        c.td_loss(obs, a, obs[::-1], a, jnp.zeros((BATCH,)), jnp.zeros((BATCH,)), jnp.ones((BATCH,)))
+        c.td_loss(obs, act, obs[::-1], act, jnp.zeros((BATCH,)), jnp.zeros((BATCH,)), jnp.ones((BATCH,)))
         sown, sown_debug = nnx.pop(c, Metric, DebugMetric)
     return {**collect(sown), **collect(sown_debug)}
 
 
 def test_pessimism_gap_tracks_the_reduction_that_produced_it():
-    """It used to be reconstructed as `rho*std`, which is only one of the
-    reductions here -- a `min` over heads has no rho, so every categorical
-    critic logged a constant 0. Now it is `E[Z] - value()` itself: at rho=1 with
-    two heads that is exactly the population std, and at rho=0 there is no gap
-    at all, which is what a std-shaped stand-in could never report."""
-    assert jnp.allclose(build("EnsembleCritic", rho=1.0, n_models=2).pessimism_gap(RAW),
-                        RAW.astype(jnp.float32).std(axis=0), atol=1e-3)
-    assert jnp.allclose(build("EnsembleCritic", rho=0.0, n_models=2).pessimism_gap(RAW),
-                        0.0, atol=1e-6)
+    """`E[Z] - value()` itself: with two members, `min` sits exactly one
+    population std below the mean, and `mean` has no gap at all."""
+    reduced = lambda r: build("EnsembleCritic", ensemble={"value_reduce": r}).pessimism_gap(RAW)
+    assert jnp.allclose(reduced("min"), RAW.std(axis=0), atol=1e-6)
+    assert jnp.allclose(reduced("mean"), 0.0, atol=1e-6)
 
 
 @pytest.mark.parametrize("name", CRITICS)
 def test_every_critic_prices_no_higher_than_its_own_expectation(name, obs, act):
-    """A gap is a configured choice, not a property of the class: dime_am's own
-    reduction is the plain mean (`policy_q_reduce_fn = jnp.mean`), which is what
-    the shipped `rho: 0.0` on the C51/HL-Gauss critics reproduces. So the
-    invariant is one-sided, and strictness is keyed off `rho`."""
+    """A gap is a configured choice: one-sided always, strict only for `min`
+    over more than one member."""
     c = built(name)
-    gap = float(c.pessimism_gap(c.raw(obs, critic_action(c, act))).mean())
+    gap = float(c.pessimism_gap(c.raw(obs, act)).mean())
     assert gap >= -1e-4
-    assert (gap > 1e-3) == (c.config.rho > 0.0)
+    assert (gap > 1e-3) == (c.config.ensemble.value_reduce == "min" and c.n_models > 1)
 
 
 def test_metric_families_separate_the_two_spreads(obs, act):
@@ -339,15 +312,14 @@ def test_metric_families_separate_the_two_spreads(obs, act):
     `return_std` is the predicted return distribution's own (aleatoric). Only a
     critic that predicts a distribution has the second -- before this, nothing
     logged it and a C51 run was indistinguishable from a scalar-ensemble run."""
-    scalar = drain("EnsembleCritic", obs, act)
-    categorical = drain("C51Critic", obs, act)
+    scalar = drain("EnsembleCritic", obs, act, ensemble={"value_reduce": "min"})
+    categorical = drain("C51Critic", obs, act, ensemble={"value_reduce": "mean"})
 
     for m in (scalar, categorical):
         assert m["ensemble/disagreement"] > 1e-3
 
     # Disagreement is the heads' spread whatever the reduction does with it;
-    # the gap is what this critic's `rho` chooses to price in. EnsembleCritic
-    # ships rho: 1.0, C51Critic rho: 0.0 (dime_am's mean).
+    # the gap is what `value_reduce` chooses to price in.
     assert scalar["ensemble/pessimism_gap"] > 1e-3
     assert categorical["ensemble/pessimism_gap"] == pytest.approx(0.0, abs=1e-4)
 

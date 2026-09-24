@@ -1,19 +1,20 @@
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from barl_jax.components import Actor, Buffer, Critic, PathwiseActorMixin, _Static
+from barl_jax.components import Actor, Buffer, Critic, frozen
 from barl_jax.config.schemas import ComponentsConfig, ModelConfig, register_model
 from barl_jax.critics.categorical import C51CriticConfig
 from barl_jax.networks import gaussian
+from barl_jax.networks.base import NetworkConfig
 from barl_jax.networks.diffusion import TimeConditionedField, controlled_sde
 from barl_jax.networks.mlp import MLPConfig
 from barl_jax.networks.regulator import AutotuneRegulatorConfig
-from barl_jax.networks.time_embedding import TimeEmbeddingConfig
+from barl_jax.networks.time_embedding import FourierTimeConfig, TimeEmbeddingConfig
 from barl_jax.optimization import ActorOptim
 from barl_jax.policies.rl import MaxEntPolicyConfig, MaxEntRLPolicy
 from barl_jax.policy import register_policy
@@ -25,11 +26,10 @@ class DISActorConfig:
   class_name: str = "DISActor"
   latent_dim: int = 256
   layers: int = 2
-  mlp: MLPConfig = field(default_factory=lambda: MLPConfig(activation="gelu", norm="none", dtype="float32"))
+  mlp: NetworkConfig = field(default_factory=lambda: MLPConfig(activation="gelu", norm="none", dtype="float32"))
   
   time_emb: str = "ctrl"
-  time: TimeEmbeddingConfig = field(default_factory=lambda: TimeEmbeddingConfig(
-    kind="fourier", time_dim=16, num_freqs=16, hidden=32, concat_input=True))
+  time: TimeEmbeddingConfig = field(default_factory=FourierTimeConfig)
   
   squash_cls: str = "TanhSquash"
   adam_b1: float = 0.5
@@ -55,7 +55,7 @@ def _inv_softplus(x: float) -> float:
 
 
 @register_component
-class DISActor(PathwiseActorMixin, ActorOptim, Actor):
+class DISActor(ActorOptim, Actor):
   """The time-reversed diffusion sampler (DIS) DIME actually uses --
   `dime_am/diffusion/od/dis.py` plus `od_integrators.py`.
 
@@ -88,9 +88,6 @@ class DISActor(PathwiseActorMixin, ActorOptim, Actor):
   def __init__(self, env_stats, config: DISActorConfig, *, rngs: nnx.Rngs, **kwargs):
     super().__init__(env_stats, config, **kwargs)
 
-    self._static_config = _Static({"time_kwargs": config.time.to_runtime_dict()["time_kwargs"]})
-    self.time_dim = config.time.to_runtime_dict()["time_dim"]
-    self.time_embed = config.time.to_runtime_dict()["time_embed"]
     # Both are stored through softplus, the reference's parameterization, so the
     # positivity a step size and a friction need is structural rather than a
     # clamp. `learn_*` picks Param vs Buffer -- the reference spells the same
@@ -112,8 +109,7 @@ class DISActor(PathwiseActorMixin, ActorOptim, Actor):
 
     self.field = TimeConditionedField(
       self.obs_dim, self.plan_dim, latent_dim=latent_dim, layers=layers,
-      time_dim=self.time_dim, time_embed=self.time_embed, time_kwargs=self.static("time_kwargs"),
-      rngs=rngs, **asdict(config.mlp))
+      time=config.time, mlp=config.mlp, rngs=rngs)
 
     self.field.zero_init_head()
 
@@ -168,8 +164,11 @@ class DISActor(PathwiseActorMixin, ActorOptim, Actor):
 
     return X.reshape(obs.shape[0], self.chunk_size, self.action_dim), entropy
 
-  # loss: PathwiseActorMixin's -(Q + alpha*entropy), applied to DIME's
-  # path-KL entropy estimate exactly like SAC's closed-form one.
+  def loss(self, obs, critic: "Critic", alpha, *, key=None):
+    action, entropy = self.generate_action(obs, key=key)
+    q = frozen(critic).value(obs, action.reshape(action.shape[0], -1))
+    bonus = (jax.lax.stop_gradient(alpha) * entropy).sum(axis=-1, keepdims=True)
+    return {"actor": -(q + bonus).mean()}
 
   def derived(self) -> dict:
     return {"dt_0": float(jax.nn.softplus(self.dt_raw[...])[0] * self.dt_scale[...][0]),

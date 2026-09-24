@@ -57,10 +57,34 @@ def _dataclass_type(expected: Any) -> type | None:
   return None
 
 
+def variant_registry():
+  """(registry, register) for a polymorphic config family: subclasses of its base
+  register under their `class_name`, and the base exposes the dict as `variants`."""
+  registry: dict[str, type] = {}
+
+  def register(cls: type) -> type:
+    registry[cls.class_name] = cls
+    return cls
+
+  return registry, register
+
+
+def _variant(cls: type, name: str, path: str) -> type:
+  """The registered subclass of a polymorphic config (`cls.variants`) named `name`."""
+  try:
+    return cls.variants[name]
+  except KeyError:
+    raise KeyError(f"{path or cls.__name__}: unknown class_name {name!r}; "
+                   f"available: {sorted(cls.variants)}") from None
+
+
 def construct(cls: type, values: Mapping[str, Any], *, path: str = ""):
-  """Construct ``cls`` recursively, rejecting unknown keys and bad types."""
+  """Construct ``cls`` recursively, rejecting unknown keys and bad types. A config
+  with a `variants` registry is built as the variant its `class_name` names."""
   if not isinstance(values, Mapping):
     raise TypeError(f"{path or 'config'} must be a mapping, got {type(values).__name__}")
+  if hasattr(cls, "variants") and "class_name" in values:
+    cls = _variant(cls, values["class_name"], path)
   declared = {f.name for f in fields(cls) if f.init}
   unknown = sorted(set(values) - declared)
   if unknown:
@@ -89,6 +113,10 @@ def merge(instance, values: Mapping[str, Any], *, path: str = ""):
   """Strictly apply a nested mapping to an immutable dataclass."""
   if not isinstance(values, Mapping):
     raise TypeError(f"{path or 'config'} must be a mapping, got {type(values).__name__}")
+  if hasattr(instance, "variants") and values.get("class_name", instance.class_name) != instance.class_name:
+    # Switching variants starts from the new variant's defaults; the old one's
+    # fields do not carry over.
+    return construct(_variant(type(instance), values["class_name"], path), values, path=path)
   declared = {f.name for f in fields(instance) if f.init}
   unknown = sorted(set(values) - declared)
   if unknown:
