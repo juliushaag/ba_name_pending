@@ -21,7 +21,7 @@ from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 
-from .executors import detect_gpus, read_manifest
+from .backends import detect_gpus, read_manifest
 from .grid import command_for
 
 REPO_ROOT = Path.cwd()

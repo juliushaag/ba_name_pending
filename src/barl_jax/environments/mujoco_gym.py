@@ -1,16 +1,14 @@
 import gymnasium as gym
 
-from barl_jax.env import Environment
-from barl_jax.registration import register_environment
+from barl_jax.env import Environment, register_tasks
 
 
 class MuJoCoGymEnvironment(Environment):
-  """Wraps gymnasium's built-in MuJoCo `-v5` envs. Online-only --
-  get_dataset() always raises. Unlike HumanoidBench's Task, gymnasium's own
-  MujocoRenderer sets up its GL/EGL context lazily on the first real
-  render() call, so render_mode="rgb_array" would be free even for the N
-  parallel rollout envs that never render -- gated on `render` anyway, to
-  keep every Environment family to the same contract."""
+  """Wraps gymnasium's built-in MuJoCo `-v5` envs. Online-only. Unlike
+  HumanoidBench's Task, gymnasium's own MujocoRenderer sets up its GL/EGL context
+  lazily on the first real render() call, so render_mode="rgb_array" would be free
+  even for the N parallel rollout envs that never render -- gated on `render`
+  anyway, to keep every Environment family to the same contract."""
 
   use_async_vector_env = True
 
@@ -21,59 +19,18 @@ class MuJoCoGymEnvironment(Environment):
     return gym.make(self.mujoco_id(), render_mode="rgb_array" if render else None)
 
 
-@register_environment
-class HalfCheetah(MuJoCoGymEnvironment):
-  # 0.06 ms/env-step -- measured 16.1k env-steps/s sync vs 13.4k async.
-  use_async_vector_env = False
-  stats = {"return_min": -3200.0, "return_max": 3200.0}
-  def mujoco_id(self): return "HalfCheetah-v5"
+# name -> gymnasium id
+_TASKS = {name: f"{name}-v5" for name in (
+  "HalfCheetah", "Hopper", "Walker2d", "Ant", "Humanoid", "HumanoidStandup",
+  "InvertedPendulum", "InvertedDoublePendulum", "Reacher", "Swimmer", "Pusher")}
 
-@register_environment
-class Hopper(MuJoCoGymEnvironment):
-  stats = {"return_min": -900.0, "return_max": 900.0}
-  def mujoco_id(self): return "Hopper-v5"
+# Symmetric return bounds. Humanoid and Ant are dime_am's own values.
+_RETURN_BOUNDS = {
+  "HalfCheetah": 3200.0, "Hopper": 900.0, "Walker2d": 1400.0, "Ant": 1600.0,
+  "Humanoid": 1600.0, "HumanoidStandup": 80000.0, "InvertedPendulum": 200.0,
+  "InvertedDoublePendulum": 2000.0, "Reacher": 160.0, "Swimmer": 80.0, "Pusher": 380.0,
+}
 
-@register_environment
-class Walker2d(MuJoCoGymEnvironment):
-  stats = {"return_min": -1400.0, "return_max": 1400.0}
-  def mujoco_id(self): return "Walker2d-v5"
-
-@register_environment
-class Ant(MuJoCoGymEnvironment):
-  stats = {"return_min": -1600.0, "return_max": 1600.0}
-  def mujoco_id(self): return "Ant-v5"
-
-@register_environment
-class Humanoid(MuJoCoGymEnvironment):
-  stats = {"return_min": -1600.0, "return_max": 1600.0}
-  def mujoco_id(self): return "Humanoid-v5"
-
-@register_environment
-class HumanoidStandup(MuJoCoGymEnvironment):
-  stats = {"return_min": -80000.0, "return_max": 80000.0}
-  def mujoco_id(self): return "HumanoidStandup-v5"
-
-@register_environment
-class InvertedPendulum(MuJoCoGymEnvironment):
-  stats = {"return_min": -200.0, "return_max": 200.0}
-  def mujoco_id(self): return "InvertedPendulum-v5"
-
-@register_environment
-class InvertedDoublePendulum(MuJoCoGymEnvironment):
-  stats = {"return_min": -2000.0, "return_max": 2000.0}
-  def mujoco_id(self): return "InvertedDoublePendulum-v5"
-
-@register_environment
-class Reacher(MuJoCoGymEnvironment):
-  stats = {"return_min": -160.0, "return_max": 160.0}
-  def mujoco_id(self): return "Reacher-v5"
-
-@register_environment
-class Swimmer(MuJoCoGymEnvironment):
-  stats = {"return_min": -80.0, "return_max": 80.0}
-  def mujoco_id(self): return "Swimmer-v5"
-
-@register_environment
-class Pusher(MuJoCoGymEnvironment):
-  stats = {"return_min": -380.0, "return_max": 380.0}
-  def mujoco_id(self): return "Pusher-v5"
+register_tasks(MuJoCoGymEnvironment, "mujoco_id", _TASKS, into=globals(), bounds=_RETURN_BOUNDS,
+               # 0.06 ms/env-step: 16.1k env-steps/s sync vs 13.4k async.
+               extra={"HalfCheetah": {"use_async_vector_env": False}})

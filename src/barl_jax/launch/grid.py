@@ -19,11 +19,6 @@ from barl_jax.config.run import RunConfig
 RESERVED_AXES = ("algo", "env", "seed")
 
 
-def _config_dict(config) -> dict:
-  """Return the canonical detached mapping emitted by a typed config."""
-  return config.to_dict()
-
-
 def _config_validate(config, *, context: str = "run") -> None:
   """Validate one candidate before it is written or submitted."""
   try:
@@ -248,7 +243,7 @@ def materialize(combos: list[dict], tags: list[str], *, defaults: dict = None, s
     os.makedirs(run_dir, exist_ok=True)
     path = os.path.join(run_dir, "config.yaml")
     with open(path, "w") as f:
-      yaml.safe_dump(_config_dict(config), f, sort_keys=False)
+      yaml.safe_dump(config.to_dict(), f, sort_keys=False)
     # Validate the exact emitted mapping with the public loader. This catches
     # serializers that accidentally omit selector metadata or nested values.
     from_yaml(path)

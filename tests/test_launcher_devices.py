@@ -12,7 +12,7 @@ import pathlib
 
 import pytest
 
-from barl_jax.launch import executors, grid
+from barl_jax.launch import backends, grid
 
 LAUNCH = pathlib.Path(grid.__file__).parent
 
@@ -40,18 +40,18 @@ def test_check_config_leaves_no_device_var_behind(monkeypatch):
     """The launcher's own environment is what sbatch --export=ALL, tmux and
     LocalExecutor hand to every run of the sweep, so the config check must not
     be able to write to it -- whatever it needs set for itself."""
-    for var in executors.DEVICE_VARS:
+    for var in backends.DEVICE_VARS:
         monkeypatch.delenv(var, raising=False)
 
     assert grid.check_config(["SAC"], ["HalfCheetah"]) == []
-    assert not [var for var in executors.DEVICE_VARS if var in os.environ]
+    assert not [var for var in backends.DEVICE_VARS if var in os.environ]
 
 
-@pytest.mark.parametrize("var", executors.DEVICE_VARS)
+@pytest.mark.parametrize("var", backends.DEVICE_VARS)
 def test_child_env_drops_device_vars(var, monkeypatch):
     monkeypatch.setenv(var, "cpu")
-    assert var not in executors.child_env()
-    assert executors.child_env(CUDA_VISIBLE_DEVICES="0")["CUDA_VISIBLE_DEVICES"] == "0"
+    assert var not in backends.child_env()
+    assert backends.child_env(CUDA_VISIBLE_DEVICES="0")["CUDA_VISIBLE_DEVICES"] == "0"
 
 
 @pytest.mark.parametrize("script", ["run_rl.slurm", "run_eval.slurm", "tmux_pool.py"])
@@ -59,7 +59,7 @@ def test_started_runs_unset_device_vars(script):
     """Neither sbatch's `--export=ALL` nor a tmux server's environment is the
     launcher's to filter, so both paths unset the vars at their own end."""
     text = (LAUNCH / script).read_text()
-    assert f"unset {' '.join(executors.DEVICE_VARS)}" in text
+    assert f"unset {' '.join(backends.DEVICE_VARS)}" in text
 
 
 def test_run_refuses_to_start_without_an_accelerator(monkeypatch):
@@ -98,7 +98,7 @@ def test_command_for_eval_passes_through_an_explicit_output(monkeypatch):
 
 @pytest.mark.parametrize("kind, script", [("train", "run_rl.slurm"), ("eval", "run_eval.slurm")])
 def test_slurm_submit_picks_the_script_matching_run_kind(tmp_path, monkeypatch, kind, script):
-    monkeypatch.setattr(executors.shutil, "which", lambda name: "/usr/bin/sbatch" if name == "sbatch" else None)
+    monkeypatch.setattr(backends.shutil, "which", lambda name: "/usr/bin/sbatch" if name == "sbatch" else None)
     calls = []
 
     class FakeCompleted:
@@ -110,9 +110,9 @@ def test_slurm_submit_picks_the_script_matching_run_kind(tmp_path, monkeypatch, 
         calls.append(cmd)
         return FakeCompleted()
 
-    monkeypatch.setattr(executors.subprocess, "run", fake_run)
+    monkeypatch.setattr(backends.subprocess, "run", fake_run)
     run = grid.Run(index=0, tag="t", combo={}, dir="t", config="t/config.yaml", kind=kind)
-    executors.SlurmExecutor().submit([run], "sweep", tmp_path, max_parallel=1, debug=False)
+    backends.SlurmExecutor().submit([run], "sweep", tmp_path, max_parallel=1, debug=False)
 
     sbatch_cmd = calls[0]
     assert sbatch_cmd[-1].endswith(script)

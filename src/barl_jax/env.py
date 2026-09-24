@@ -5,9 +5,7 @@ from abc import ABC, abstractmethod
 import gymnasium as gym
 import numpy as np
 
-from barl_jax.registration import (
-  register_environment,  # noqa: F401  (re-exported for environment modules)
-)
+from barl_jax.registration import register_environment
 
 
 class EnvStats(dict):
@@ -146,3 +144,19 @@ class Environment(ABC):
             return max_steps
 
     return max_length
+
+
+def register_tasks(base: type, attr: str, tasks: dict, *, into: dict, bounds: dict = None,
+                   extra: dict = None) -> None:
+  """Register one `Environment` subclass of `base` per `name -> value` in `tasks`,
+  whose `attr()` method returns that value. `bounds[name]` overrides the family's
+  symmetric return range and `extra[name]` sets further class attributes. The
+  classes are also placed in `into` (the caller's `globals()`) so they stay
+  importable, which async vector-env workers rely on."""
+  bounds, extra = bounds or {}, extra or {}
+  for name, value in tasks.items():
+    attrs = {attr: lambda self, value=value: value, "__module__": base.__module__,
+             **extra.get(name, {})}
+    if name in bounds:
+      attrs["stats"] = {"return_min": -bounds[name], "return_max": bounds[name]}
+    into[name] = register_environment(type(name, (base,), attrs))

@@ -31,7 +31,7 @@ from pathlib import Path
 import yaml
 
 from barl_jax.launch import grid
-from barl_jax.launch.executors import EXECUTORS, SWEEP_NAME_FORMAT, SWEEPS_DIR, resolve
+from barl_jax.launch.backends import EXECUTORS, SWEEP_NAME_FORMAT, SWEEPS_DIR, resolve
 
 EVAL_MODES = ("DirectExecutor", "MeanExecutor", "MedianExecutor", "BestOfNExecutor",
               "TopKExecutor", "AxisShuffleExecutor", "PerturbExecutor")

@@ -23,8 +23,7 @@ Two things differ from the MuJoCo/DMC families and are load-bearing:
 
 import gymnasium as gym
 
-from barl_jax.env import Environment
-from barl_jax.registration import register_environment
+from barl_jax.env import Environment, register_tasks
 
 
 class ManiSkillEnvironment(Environment):
@@ -58,39 +57,23 @@ class ManiSkillEnvironment(Environment):
     return CPUGymWrapper(env)
 
 
+_TASKS = {
+  "PushCube": "PushCube-v1",
+  "PickCube": "PickCube-v1",
+  "StackCube": "StackCube-v1",
+  "PickSingleYCB": "PickSingleYCB-v1",
+  "PegInsertionSide": "PegInsertionSide-v1",
+}
 
-# ---- horizon 50 ------------------------------------------------------------
+# Everything else uses the family default (horizon 50). PegInsertionSide is twice the
+# discounted bound at its own horizon of 100.
+#
+# PickSingleYCB is the one task whose assets ship separately (the 85 MB YCB set):
+#
+#     uv run python -m mani_skill.utils.download_asset ycb -y
+#
+# Without it `get_env()` raises at construction; interactively ManiSkill prompts for
+# the download, which under a sweep surfaces as an EOFError.
+_RETURN_BOUNDS = {"PegInsertionSide": 126.79}
 
-@register_environment
-class PushCube(ManiSkillEnvironment):
-  def task_id(self): return "PushCube-v1"
-
-
-@register_environment
-class PickCube(ManiSkillEnvironment):
-  def task_id(self): return "PickCube-v1"
-
-
-@register_environment
-class StackCube(ManiSkillEnvironment):
-  def task_id(self): return "StackCube-v1"
-
-
-@register_environment
-class PickSingleYCB(ManiSkillEnvironment):
-  """The one task here whose assets ship separately -- the YCB object set (85 MB):
-
-      uv run python -m mani_skill.utils.download_asset ycb -y
-
-  Without it `get_env()` raises at construction; interactively ManiSkill prompts
-  for the download, which under a sweep surfaces as an EOFError."""
-  def task_id(self): return "PickSingleYCB-v1"
-
-
-# ---- horizon 100 -----------------------------------------------------------
-
-@register_environment
-class PegInsertionSide(ManiSkillEnvironment):
-  # Twice the discounted bound at its own horizon of 100.
-  stats = {"return_min": -126.79, "return_max": 126.79}
-  def task_id(self): return "PegInsertionSide-v1"
+register_tasks(ManiSkillEnvironment, "task_id", _TASKS, into=globals(), bounds=_RETURN_BOUNDS)

@@ -22,8 +22,7 @@ doesn't have from the sizing table -- once, up front -- costs nothing."""
 
 import gymnasium as gym
 
-from barl_jax.env import Environment
-from barl_jax.registration import register_environment
+from barl_jax.env import Environment, register_tasks
 
 
 # `humanoid_bench.wrappers` and `.envs.{reach,push,package}` each do
@@ -133,8 +132,7 @@ def _patch_stale_gymnasium_marker_size():
 
 
 class HumanoidBenchEnvironment(Environment):
-  """One HumanoidBench task id. Online-only, like MuJoCoGymEnvironment --
-  get_dataset() always raises."""
+  """One HumanoidBench task id. Online-only, like MuJoCoGymEnvironment."""
 
   use_async_vector_env = True
 
@@ -168,187 +166,62 @@ class HumanoidBenchEnvironment(Environment):
     return gym.make(self.task_id(), render_mode="rgb_array" if render else None)
 
 
+_TASKS = {
+  "H1HandWalk": "h1hand-walk-v0",
+  "H1HandStand": "h1hand-stand-v0",
+  "H1HandRun": "h1hand-run-v0",
+  "H1HandCrawl": "h1hand-crawl-v0",
+  "H1HandHurdle": "h1hand-hurdle-v0",
+  "H1HandMaze": "h1hand-maze-v0",
+  "H1HandSitSimple": "h1hand-sit_simple-v0",
+  "H1HandSitHard": "h1hand-sit_hard-v0",
+  "H1HandBalanceSimple": "h1hand-balance_simple-v0",
+  "H1HandBalanceHard": "h1hand-balance_hard-v0",
+  "H1HandStair": "h1hand-stair-v0",
+  "H1HandSlide": "h1hand-slide-v0",
+  "H1HandPole": "h1hand-pole-v0",
+  "H1HandHighbarSimple": "h1hand-highbar_simple-v0",
+  "H1HandHighbarHard": "h1hand-highbar_hard-v0",
+  "H1HandReach": "h1hand-reach-v0",
+  "H1HandPush": "h1hand-push-v0",
+  "H1HandCabinet": "h1hand-cabinet-v0",
+  "H1HandDoor": "h1hand-door-v0",
+  "H1HandTruck": "h1hand-truck-v0",
+  "H1HandCube": "h1hand-cube-v0",
+  "H1HandBookshelfSimple": "h1hand-bookshelf_simple-v0",
+  "H1HandBookshelfHard": "h1hand-bookshelf_hard-v0",
+  "H1HandBasketball": "h1hand-basketball-v0",
+  "H1HandWindow": "h1hand-window-v0",
+  "H1HandSpoon": "h1hand-spoon-v0",
+  "H1HandKitchen": "h1hand-kitchen-v0",
+  "H1HandPackage": "h1hand-package-v0",
+  "H1HandPowerlift": "h1hand-powerlift-v0",
+  "H1HandRoom": "h1hand-room-v0",
+  "H1HandInsertNormal": "h1hand-insert_normal-v0",
+  "H1HandInsertSmall": "h1hand-insert_small-v0",
+}
 
-# ---- locomotion ----
+# Tasks whose reward is not the family's <=1/step shaping term. Each bound is twice the
+# discounted value near the largest sustained or one-off reward, at gamma 0.99:
+#   Maze, Cabinet     4 checkpoint/subtask bonuses of 100*index (100..400) on top of a
+#                     <=1/step term: ~1080 near the last one.
+#   Bookshelf         5 shelving bonuses of 100*index (100..500): ~1560.
+#   Truck             10 pickup/place bonuses of 100, plus a <=4/step background (~400): ~1360.
+#   Reach             healthy(<=5) + close(<=5) + success(<=10) sustained: ~20/step, 20x the family.
+#   Push, Package,    a one-off +1000 that also terminates the episode, so nothing is
+#   Basketball        left to discount: ~1000.
+#   Kitchen           one point per subtask, four subtasks.
+_RETURN_BOUNDS = {
+  "H1HandMaze": 2200.0,
+  "H1HandReach": 4000.0,
+  "H1HandPush": 2000.0,
+  "H1HandCabinet": 2200.0,
+  "H1HandTruck": 2800.0,
+  "H1HandBookshelfSimple": 3000.0,
+  "H1HandBookshelfHard": 3000.0,
+  "H1HandBasketball": 2000.0,
+  "H1HandKitchen": 8.0,
+  "H1HandPackage": 2000.0,
+}
 
-@register_environment
-class H1HandWalk(HumanoidBenchEnvironment):
-  def task_id(self): return "h1hand-walk-v0"
-
-@register_environment
-class H1HandStand(HumanoidBenchEnvironment):
-  def task_id(self): return "h1hand-stand-v0"
-
-@register_environment
-class H1HandRun(HumanoidBenchEnvironment):
-  def task_id(self): return "h1hand-run-v0"
-
-@register_environment
-class H1HandCrawl(HumanoidBenchEnvironment):
-  def task_id(self): return "h1hand-crawl-v0"
-
-@register_environment
-class H1HandHurdle(HumanoidBenchEnvironment):
-  def task_id(self): return "h1hand-hurdle-v0"
-
-@register_environment
-class H1HandMaze(HumanoidBenchEnvironment):
-  # get_reward's <=1/step shaping term (discounted bound ~100, as in the
-  # family default) is joined by a sparse `stage_convert_reward` of
-  # 100*stage_index at each of 4 checkpoint crossings (100,200,300,400).
-  # Discounting 4 back-to-back bonuses at gamma=0.99 barely dents their
-  # 1000 undiscounted sum (still ~980) -- the value near the last crossing
-  # is ~1080, doubled for headroom.
-  stats = {"return_min": -2200.0, "return_max": 2200.0}
-  def task_id(self): return "h1hand-maze-v0"
-
-@register_environment
-class H1HandSitSimple(HumanoidBenchEnvironment):
-  def task_id(self): return "h1hand-sit_simple-v0"
-
-@register_environment
-class H1HandSitHard(HumanoidBenchEnvironment):
-  def task_id(self): return "h1hand-sit_hard-v0"
-
-@register_environment
-class H1HandBalanceSimple(HumanoidBenchEnvironment):
-  def task_id(self): return "h1hand-balance_simple-v0"
-
-@register_environment
-class H1HandBalanceHard(HumanoidBenchEnvironment):
-  def task_id(self): return "h1hand-balance_hard-v0"
-
-@register_environment
-class H1HandStair(HumanoidBenchEnvironment):
-  def task_id(self): return "h1hand-stair-v0"
-
-@register_environment
-class H1HandSlide(HumanoidBenchEnvironment):
-  def task_id(self): return "h1hand-slide-v0"
-
-@register_environment
-class H1HandPole(HumanoidBenchEnvironment):
-  def task_id(self): return "h1hand-pole-v0"
-
-@register_environment
-class H1HandHighbarSimple(HumanoidBenchEnvironment):
-  def task_id(self): return "h1hand-highbar_simple-v0"
-
-@register_environment
-class H1HandHighbarHard(HumanoidBenchEnvironment):
-  def task_id(self): return "h1hand-highbar_hard-v0"
-
-
-# ---- manipulation ----
-
-@register_environment
-class H1HandReach(HumanoidBenchEnvironment):
-  # get_reward = healthy_reward(<=5) - 1e-4*motion_penalty + reward_close(<=5)
-  # + reward_success(<=10): once the hand holds position all three positive
-  # terms are sustained every step, ~20/step rather than the family's ~1 --
-  # 20x the shared bound, doubled for headroom.
-  stats = {"return_min": -4000.0, "return_max": 4000.0}
-  def task_id(self): return "h1hand-reach-v0"
-
-@register_environment
-class H1HandPush(HumanoidBenchEnvironment):
-  # get_reward's dense term is a small distance penalty, but reaching the
-  # goal (box within 5cm) adds a one-off +1000 and terminates the episode --
-  # the value approaching that transition is ~1000, doubled for headroom.
-  stats = {"return_min": -2000.0, "return_max": 2000.0}
-  def task_id(self): return "h1hand-push-v0"
-
-@register_environment
-class H1HandCabinet(HumanoidBenchEnvironment):
-  # 4 subtasks each pay a one-off 100*subtask_index completion bonus on top
-  # of a <=1/step stabilization/subtask term (discounted bound ~100). Same
-  # near-back-to-back discounting as Maze's 4 checkpoints: 100+200+300+400
-  # discounts to ~980 at gamma=0.99, so the value near the last completion
-  # is ~1080, doubled for headroom.
-  stats = {"return_min": -2200.0, "return_max": 2200.0}
-  def task_id(self): return "h1hand-cabinet-v0"
-
-@register_environment
-class H1HandDoor(HumanoidBenchEnvironment):
-  def task_id(self): return "h1hand-door-v0"
-
-@register_environment
-class H1HandTruck(HumanoidBenchEnvironment):
-  # 5 packages each pay a pickup (+100) and a place (+100) bonus -- 10
-  # events, discounting to ~960 of their 1000 undiscounted sum at gamma=0.99
-  # if reached back-to-back -- plus a <=4/step (not <=1, unlike most tasks:
-  # `upright * (1 + 3 proximity terms)`) background whose discounted bound
-  # is ~400. Together ~1360, doubled for headroom.
-  stats = {"return_min": -2800.0, "return_max": 2800.0}
-  def task_id(self): return "h1hand-truck-v0"
-
-@register_environment
-class H1HandCube(HumanoidBenchEnvironment):
-  def task_id(self): return "h1hand-cube-v0"
-
-@register_environment
-class H1HandBookshelfSimple(HumanoidBenchEnvironment):
-  # get_reward's <=1/step shaping term (discounted bound ~100) is joined by
-  # a one-off 100*task_index bonus per shelved object, for 5 objects
-  # (100+200+300+400+500=1500 undiscounted). Discounting 5 back-to-back
-  # placements at gamma=0.99 only brings that to ~1460 -- the value near the
-  # last placement is ~1560, doubled for headroom.
-  stats = {"return_min": -3000.0, "return_max": 3000.0}
-  def task_id(self): return "h1hand-bookshelf_simple-v0"
-
-@register_environment
-class H1HandBookshelfHard(HumanoidBenchEnvironment):
-  stats = {"return_min": -3000.0, "return_max": 3000.0}
-  def task_id(self): return "h1hand-bookshelf_hard-v0"
-
-@register_environment
-class H1HandBasketball(HumanoidBenchEnvironment):
-  # get_terminated ends the episode the instant the ball is within 5cm of
-  # the hoop, the same step get_reward's +1000 fires -- like Push/Package,
-  # the value approaching that transition is ~1000 undiscounted (gamma
-  # applies only to rewards *after* this step, and there are none), doubled
-  # for headroom.
-  stats = {"return_min": -2000.0, "return_max": 2000.0}
-  def task_id(self): return "h1hand-basketball-v0"
-
-@register_environment
-class H1HandWindow(HumanoidBenchEnvironment):
-  def task_id(self): return "h1hand-window-v0"
-
-@register_environment
-class H1HandSpoon(HumanoidBenchEnvironment):
-  def task_id(self): return "h1hand-spoon-v0"
-
-@register_environment
-class H1HandKitchen(HumanoidBenchEnvironment):
-  # get_reward is `len(completions)` -- at most one point per subtask, ever,
-  # since completed subtasks are removed from tasks_to_complete. success_bar
-  # (4) is the whole task's subtask count; doubled for headroom.
-  stats = {"return_min": -8.0, "return_max": 8.0}
-  def task_id(self): return "h1hand-kitchen-v0"
-
-@register_environment
-class H1HandPackage(HumanoidBenchEnvironment):
-  # get_reward's dense term is a distance penalty, but reaching the
-  # destination (within 10cm) adds a one-off +1000 and get_terminated ends
-  # the episode the same step -- like Push, the value approaching that
-  # transition is ~1000 undiscounted (no future rewards left to discount),
-  # doubled for headroom.
-  stats = {"return_min": -2000.0, "return_max": 2000.0}
-  def task_id(self): return "h1hand-package-v0"
-
-@register_environment
-class H1HandPowerlift(HumanoidBenchEnvironment):
-  def task_id(self): return "h1hand-powerlift-v0"
-
-@register_environment
-class H1HandRoom(HumanoidBenchEnvironment):
-  def task_id(self): return "h1hand-room-v0"
-
-@register_environment
-class H1HandInsertNormal(HumanoidBenchEnvironment):
-  def task_id(self): return "h1hand-insert_normal-v0"
-
-@register_environment
-class H1HandInsertSmall(HumanoidBenchEnvironment):
-  def task_id(self): return "h1hand-insert_small-v0"
+register_tasks(HumanoidBenchEnvironment, "task_id", _TASKS, into=globals(), bounds=_RETURN_BOUNDS)

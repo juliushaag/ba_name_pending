@@ -3,8 +3,7 @@ import os
 
 import gymnasium as gym
 
-from barl_jax.env import Environment
-from barl_jax.registration import register_environment
+from barl_jax.env import Environment, register_tasks
 
 
 @contextlib.contextmanager
@@ -41,6 +40,7 @@ class DMControlEnvironment(Environment):
   # reward in [0, 1] over a 1000-step horizon, so the discounted value is
   # bounded by (1-gamma^T)/(1-gamma) and the support is twice that, symmetric.
   stats = {"return_min": -200.0, "return_max": 200.0}
+
   def domain_task(self) -> tuple[str, str]:
     raise NotImplementedError
 
@@ -54,104 +54,31 @@ class DMControlEnvironment(Environment):
     return gym.wrappers.FlattenObservation(env)
 
 
-# Doggo
+# name -> (domain, task)
+_TASKS = {
+  "DogRun": ("dog", "run"),
+  "DogStand": ("dog", "stand"),
+  "DogWalk": ("dog", "walk"),
+  "DogTrot": ("dog", "trot"),
+  "HumanoidWalk": ("humanoid", "walk"),
+  "HumanoidRun": ("humanoid", "run"),
+  "HumanoidStand": ("humanoid", "stand"),
+  "CartpoleSwingup": ("cartpole", "swingup"),
+  "CartpoleBalance": ("cartpole", "balance"),
+  "CheetahRun": ("cheetah", "run"),
+  "WalkerWalk": ("walker", "walk"),
+  "WalkerRun": ("walker", "run"),
+  "HopperHop": ("hopper", "hop"),
+  "HopperStand": ("hopper", "stand"),
+  "QuadrupedWalk": ("quadruped", "walk"),
+  "QuadrupedRun": ("quadruped", "run"),
+  "FingerSpin": ("finger", "spin"),
+  "FishSwim": ("fish", "swim"),
+  "AcrobotSwingup": ("acrobot", "swingup"),
+  "PendulumSwingup": ("pendulum", "swingup"),
+  "BallInCupCatch": ("ball_in_cup", "catch"),
+  "ReacherEasy": ("reacher", "easy"),
+  "ReacherHard": ("reacher", "hard"),
+}
 
-@register_environment
-class DogRun(DMControlEnvironment):
-  def domain_task(self): return ("dog", "run")
-
-
-@register_environment
-class DogStand(DMControlEnvironment):
-  def domain_task(self): return ("dog", "stand")
-
-@register_environment
-class DogWalk(DMControlEnvironment):
-  def domain_task(self): return ("dog", "walk")
-
-
-@register_environment
-class DogTrot(DMControlEnvironment):
-  def domain_task(self): return ("dog", "trot")
-
-
-# Humanoid
-
-
-@register_environment
-class HumanoidWalk(DMControlEnvironment):
-  def domain_task(self): return ("humanoid", "walk")
-
-@register_environment
-class HumanoidRun(DMControlEnvironment):
-  def domain_task(self): return ("humanoid", "run")
-
-@register_environment
-class HumanoidStand(DMControlEnvironment):
-  def domain_task(self): return ("humanoid", "stand")
-
-
-
-@register_environment
-class CartpoleSwingup(DMControlEnvironment):
-  def domain_task(self): return ("cartpole", "swingup")
-
-@register_environment
-class CartpoleBalance(DMControlEnvironment):
-  def domain_task(self): return ("cartpole", "balance")
-
-@register_environment
-class CheetahRun(DMControlEnvironment):
-  def domain_task(self): return ("cheetah", "run")
-
-@register_environment
-class WalkerWalk(DMControlEnvironment):
-  def domain_task(self): return ("walker", "walk")
-
-@register_environment
-class WalkerRun(DMControlEnvironment):
-  def domain_task(self): return ("walker", "run")
-
-@register_environment
-class HopperHop(DMControlEnvironment):
-  def domain_task(self): return ("hopper", "hop")
-
-@register_environment
-class HopperStand(DMControlEnvironment):
-  def domain_task(self): return ("hopper", "stand")
-
-@register_environment
-class QuadrupedWalk(DMControlEnvironment):
-  def domain_task(self): return ("quadruped", "walk")
-
-@register_environment
-class QuadrupedRun(DMControlEnvironment):
-  def domain_task(self): return ("quadruped", "run")
-
-@register_environment
-class FingerSpin(DMControlEnvironment):
-  def domain_task(self): return ("finger", "spin")
-
-@register_environment
-class FishSwim(DMControlEnvironment):
-  def domain_task(self): return ("fish", "swim")
-
-@register_environment
-class AcrobotSwingup(DMControlEnvironment):
-  def domain_task(self): return ("acrobot", "swingup")
-
-@register_environment
-class PendulumSwingup(DMControlEnvironment):
-  def domain_task(self): return ("pendulum", "swingup")
-
-@register_environment
-class BallInCupCatch(DMControlEnvironment):
-  def domain_task(self): return ("ball_in_cup", "catch")
-
-@register_environment
-class ReacherEasy(DMControlEnvironment):
-  def domain_task(self): return ("reacher", "easy")
-
-@register_environment
-class ReacherHard(DMControlEnvironment):
-  def domain_task(self): return ("reacher", "hard")
+register_tasks(DMControlEnvironment, "domain_task", _TASKS, into=globals())
