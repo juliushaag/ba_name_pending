@@ -49,7 +49,7 @@ def test_gym_humanoid_and_ant_match_the_reference():
     """dime_am's README gives these two explicitly -- "the same values for both
     gym environments" -- so they are not ours to derive."""
     for name in ("Humanoid", "Ant"):
-        stats = declared(Environment._classes[name])
+        stats = declared(Environment.class_for(name))
         assert (stats["return_min"], stats["return_max"]) == (-1600.0, 1600.0), name
 
 
@@ -58,7 +58,7 @@ def test_every_support_is_symmetric(name):
     """The reference's convention throughout, and what keeps a near-uniform
     head's E[Z] -- and the pull of `entropy_coef` -- at 0 rather than off in the
     middle of a one-sided range."""
-    stats = declared(Environment._classes[name])
+    stats = declared(Environment.class_for(name))
     assert stats["return_min"] == pytest.approx(-stats["return_max"])
 
 
@@ -66,7 +66,7 @@ def test_every_support_is_symmetric(name):
 def test_every_environment_declares_a_usable_support(name):
     """A distributional critic defaults its support from these, so an absent or
     inverted range is a run that dies at construction."""
-    stats = declared(Environment._classes[name])
+    stats = declared(Environment.class_for(name))
     lo, hi = stats.get("return_min"), stats.get("return_max")
 
     assert lo is not None and hi is not None, f"{name} declares no return range"
@@ -86,7 +86,7 @@ def test_c51_resolves_a_realistic_dm_control_value_gap(q_gap):
     produces, not a hardcoded number: bin_width alone is a crude measure once
     the reward range isn't normalized, so this only asserts the quantization
     formula, never a specific config's tuned resolution."""
-    stats = declared(Environment._classes["HumanoidRun"])
+    stats = declared(Environment.class_for("HumanoidRun"))
     env_stats = make_env_stats(return_min=stats["return_min"], return_max=stats["return_max"])
     c = build("C51Critic", env_stats=env_stats)
 

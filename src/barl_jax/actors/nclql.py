@@ -1,6 +1,5 @@
 """Annealed Langevin action sampling from a noise-conditioned critic."""
 from dataclasses import dataclass, field
-from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -12,8 +11,7 @@ from barl_jax.critics.categorical import C51CriticConfig
 from barl_jax.critics.presets import nclql
 from barl_jax.metrics import DEBUG
 from barl_jax.policies.rl import PolicyConfig, RLPolicy
-from barl_jax.policy import register_policy
-from barl_jax.registration import register_component
+from barl_jax.registration import register_component, register_policy
 
 
 @dataclass(frozen=True)
@@ -115,7 +113,6 @@ class NCLQL(RLPolicy):
 @register_model
 @dataclass(frozen=True)
 class NCLQLModelConfig(ModelConfig):
-  schema_name: ClassVar[str] = "NCLQL"
   policy_class: str = "NCLQL"
   params: PolicyConfig = field(default_factory=PolicyConfig)
   components: ComponentsConfig = field(default_factory=lambda: ComponentsConfig(

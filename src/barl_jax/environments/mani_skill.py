@@ -23,7 +23,8 @@ Two things differ from the MuJoCo/DMC families and are load-bearing:
 
 import gymnasium as gym
 
-from barl_jax.env import Environment, register_environment
+from barl_jax.env import Environment
+from barl_jax.registration import register_environment
 
 
 class ManiSkillEnvironment(Environment):

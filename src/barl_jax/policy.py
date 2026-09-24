@@ -54,8 +54,6 @@ def _jitted_infer_exec(graphdef, executor_config, state, observation, key):
 
 class Policy(OptimizerMixin, nnx.Module, ABC):
 
-  _classes = dict()
-
   # The component slots this Policy builds, by attribute name -- the contract a
   # model variant's `components:` must match. An omitted slot already fails at
   # build_component(); naming an *extra* one would resolve silently into the
@@ -81,18 +79,8 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
 
   @staticmethod
   def class_for(name):
-    from barl_jax.registration import available_names, import_type, load_builtins, resolve_named
-    load_builtins("policies")
-    if ":" in name:
-      cls = import_type(name)
-    else:
-      cls = resolve_named("policies", name, Policy._classes, Policy)
-      if cls is None:
-        raise KeyError(f"{name!r} is not a registered Policy or plugin "
-                       f"({', '.join(available_names('policies', Policy._classes))})")
-    if not issubclass(cls, Policy):
-      raise TypeError(f"{name!r} must implement Policy")
-    return cls
+    from barl_jax.registration import POLICIES
+    return POLICIES.get(name)
 
   @staticmethod
   def available() -> list[str]:
@@ -111,7 +99,7 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
     # The `model:` string this Policy was built from -- plain str, so it is static
     # in nnx: it lands in the GraphDef (SAC and AMDP get distinct jit cache
     # entries) and never enters the state tree `multiseed.stack()` compares.
-    self.model_name = model_name or model.schema_name
+    self.model_name = model_name or model.policy_class
     # Behind _Static for hashability: the config holds dicts, and the GraphDef it
     # ends up in is a static jit argument.
     self._config_s = _Static(model)
@@ -459,12 +447,3 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
     `(batch, chunk_size, act_dim)` and `extras` is a dict of named arrays to
     log/persist alongside the currently active chunk."""
     ...
-
-
-
-def register_policy(cls: type):
-  name = cls.__name__
-  if name in Policy._classes:
-    raise ValueError(f"Policy {name} already registered")
-  Policy._classes[name] = cls
-  return cls

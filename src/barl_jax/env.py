@@ -5,6 +5,10 @@ from abc import ABC, abstractmethod
 import gymnasium as gym
 import numpy as np
 
+from barl_jax.registration import (
+  register_environment,  # noqa: F401  (re-exported for environment modules)
+)
+
 
 class EnvStats(dict):
 
@@ -36,8 +40,6 @@ class EnvStats(dict):
 
 
 class Environment(ABC):
-
-  _classes = dict()
 
   # SyncVectorEnv runs N sub-envs sequentially in one process, so mujoco's
   # GIL-releasing C step never actually overlaps -- override to True for
@@ -101,25 +103,13 @@ class Environment(ABC):
 
   @staticmethod
   def class_for(name: str):
-    from barl_jax.registration import available_names, import_type, load_builtins, resolve_named
-    load_builtins("environments")
-    if ":" in name:
-      cls = import_type(name)
-    else:
-      cls = resolve_named("environments", name, Environment._classes, Environment)
-      if cls is None:
-        raise KeyError(f"{name!r} is not a registered Environment or plugin "
-                       f"({', '.join(available_names('environments', Environment._classes))})")
-    if not issubclass(cls, Environment):
-      raise TypeError(f"{name!r} must implement Environment")
-    return cls
+    from barl_jax.registration import ENVIRONMENTS
+    return ENVIRONMENTS.get(name)
 
   @staticmethod
   def available() -> list[str]:
-    from barl_jax.registration import available_names, load_builtins
-    load_builtins("environments")
-    return available_names("environments", Environment._classes)
-
+    from barl_jax.registration import ENVIRONMENTS
+    return ENVIRONMENTS.available()
 
   def get_env_stats(self, env: gym.Env) -> EnvStats:
     """The env-derived facts every component is built with -- the spaces, plus
@@ -156,13 +146,3 @@ class Environment(ABC):
             return max_steps
 
     return max_length
-
-def register_environment(cls : type):
-
-  name = cls.__name__
-  if name in Environment._classes:
-    raise ValueError(f"Environment {name} already registered")
-
-  Environment._classes[name] = cls
-
-  return cls

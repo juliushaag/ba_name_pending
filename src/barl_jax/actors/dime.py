@@ -1,6 +1,5 @@
 import math
 from dataclasses import dataclass, field
-from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -17,8 +16,7 @@ from barl_jax.networks.regulator import AutotuneRegulatorConfig
 from barl_jax.networks.time_embedding import FourierTimeConfig, TimeEmbeddingConfig
 from barl_jax.optimization import ActorOptim
 from barl_jax.policies.rl import MaxEntPolicyConfig, MaxEntRLPolicy
-from barl_jax.policy import register_policy
-from barl_jax.registration import get_component, register_component
+from barl_jax.registration import get_component, register_component, register_policy
 
 
 @dataclass(frozen=True)
@@ -185,7 +183,6 @@ class DIME(MaxEntRLPolicy):
 @register_model
 @dataclass(frozen=True)
 class DIMEModelConfig(ModelConfig):
-  schema_name: ClassVar[str] = "DIME"
   policy_class: str = "DIME"
   params: MaxEntPolicyConfig = field(default_factory=lambda: MaxEntPolicyConfig(
     entropy_scale=-4.0, policy_delay=3))

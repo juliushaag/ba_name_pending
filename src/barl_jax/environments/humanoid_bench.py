@@ -22,7 +22,8 @@ doesn't have from the sizing table -- once, up front -- costs nothing."""
 
 import gymnasium as gym
 
-from barl_jax.env import Environment, register_environment
+from barl_jax.env import Environment
+from barl_jax.registration import register_environment
 
 
 # `humanoid_bench.wrappers` and `.envs.{reach,push,package}` each do

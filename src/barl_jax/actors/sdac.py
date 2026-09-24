@@ -1,6 +1,5 @@
 import math
 from dataclasses import dataclass, field
-from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -15,8 +14,7 @@ from barl_jax.networks.mlp import MLPConfig
 from barl_jax.networks.time_embedding import FourierTimeConfig, TimeEmbeddingConfig
 from barl_jax.optimization import ActorOptim
 from barl_jax.policies.rl import PolicyConfig, RLPolicy
-from barl_jax.policy import register_policy
-from barl_jax.registration import register_component
+from barl_jax.registration import register_component, register_policy
 
 
 @dataclass(frozen=True)
@@ -153,7 +151,6 @@ class SDAC(RLPolicy):
 @register_model
 @dataclass(frozen=True)
 class SDACModelConfig(ModelConfig):
-  schema_name: ClassVar[str] = "SDAC"
   policy_class: str = "SDAC"
   params: PolicyConfig = field(default_factory=PolicyConfig)
   components: ComponentsConfig = field(default_factory=lambda: ComponentsConfig(

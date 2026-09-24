@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import asdict, dataclass, fields, replace
-from typing import TYPE_CHECKING, Any, ClassVar, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 from barl_jax.config.serialization import construct
 from barl_jax.config.serialization import merge as merge_dataclass
@@ -86,8 +86,6 @@ class ModelConfig:
   params: "PolicyConfig"
   components: ComponentsConfig
 
-  schema_name: ClassVar[str] = "ModelConfig"
-
   def to_dict(self) -> dict[str, Any]:
     return {
       "policy": self.policy_class,
@@ -142,7 +140,7 @@ class ModelConfig:
       for slot, override in entries.items():
         current = getattr(result.components, slot)
         if current is None:
-          raise KeyError(f"model_overrides.components.{slot}: slot is not present in {self.schema_name}")
+          raise KeyError(f"model_overrides.components.{slot}: slot is not present in {self.policy_class}")
         values[slot] = _override_component(current, override, path=f"model_overrides.components.{slot}")
       result = replace(result, components=replace(result.components, **values))
     return result
@@ -165,14 +163,11 @@ MODEL_SCHEMAS: dict[str, type[ModelConfig]] = {}
 
 
 def register_model(schema: type[ModelConfig]) -> type[ModelConfig]:
-  """Register `schema` under its own `schema_name`, as a decorator beside the
+  """Register `schema` under the policy class it names, as a decorator beside the
   class it registers."""
   if not isinstance(schema, type) or not issubclass(schema, ModelConfig):
     raise TypeError("model schema must derive from ModelConfig")
-  name = schema.schema_name
-  if not name or name == ModelConfig.schema_name:
-    raise ValueError(f"{schema.__name__} must set a distinct schema_name before registering")
-  MODEL_SCHEMAS[name] = schema
+  MODEL_SCHEMAS[schema().policy_class] = schema
   return schema
 
 

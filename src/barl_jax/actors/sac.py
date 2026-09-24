@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -15,8 +14,7 @@ from barl_jax.networks.mlp import MLPConfig
 from barl_jax.networks.regulator import AutotuneRegulatorConfig
 from barl_jax.optimization import ActorOptim
 from barl_jax.policies.rl import MaxEntPolicyConfig, MaxEntRLPolicy
-from barl_jax.policy import register_policy
-from barl_jax.registration import get_component, register_component
+from barl_jax.registration import get_component, register_component, register_policy
 
 
 @dataclass(frozen=True)
@@ -144,7 +142,6 @@ class SAC(MaxEntRLPolicy):
 @register_model
 @dataclass(frozen=True)
 class SACModelConfig(ModelConfig):
-  schema_name: ClassVar[str] = "SAC"
   policy_class: str = "SAC"
   params: MaxEntPolicyConfig = field(default_factory=MaxEntPolicyConfig)
   components: ComponentsConfig = field(default_factory=lambda: ComponentsConfig(

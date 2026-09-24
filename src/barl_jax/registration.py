@@ -1,8 +1,8 @@
 """Explicit, idempotent discovery of built-in, plugin, and external
 implementations. Three ways to name an implementation, in the order every
-`class_for`/`get_component` tries them:
+`Registry.get` tries them:
 
-1. A built-in name (`load_builtins` below) -- always tried first, so an
+1. A built-in name (`Registry.load`) -- always tried first, so an
    installed plugin can never silently shadow one.
 2. A plugin name -- an entry point installed under `barl_jax.<group>`
    (`barl_jax.policies`, `barl_jax.environments`, `barl_jax.components`),
@@ -20,26 +20,6 @@ from threading import RLock
 _LOCK = RLock()
 _LOADED = set()
 _PLUGINS: dict[str, dict] = {}
-
-
-def load_builtins(group):
-  modules = {
-    "components": ("critics", "actors", "networks.squash", "networks.regulator", "networks.schedule"),
-    # Per-algorithm Policy classes (AMDP, DIME, NCLQL, SAC, SDAC) and their
-    # ModelConfig schemas live beside their actor -- importing "actors" is
-    # what makes both `Policy._classes` and `config.schemas.MODEL_SCHEMAS`
-    # complete.
-    "policies": ("policies", "actors"),
-    "environments": tuple(f"environments.{name}" for name in
-                          ("mujoco_gym", "dm_control", "mani_skill", "humanoid_bench")),
-    "executors": ("executors",),
-  }
-  with _LOCK:
-    if group in _LOADED:
-      return
-    for module in modules[group]:
-      import_module(f"barl_jax.{module}")
-    _LOADED.add(group)
 
 
 def _discover_plugins(group: str) -> dict:
@@ -112,78 +92,67 @@ def import_type(path):
   return value
 
 
-# ---------------------------------------------------------------------------
-# Component registry -- concrete Actor/Critic/Squash/Schedule/Regulator
-# classes, so config/models.yaml can name one (`class: HLGaussCritic`)
-# instead of a Python import path. Same shape as Policy._classes/
-# Environment._classes (policy.py, env.py), kept here rather than under
-# `networks/` since it is not itself a network and is looked up the same
-# way policies and environments are, through this module's own
-# load_builtins/resolve_named/available_names.
-# ---------------------------------------------------------------------------
+class Registry:
+  """One named family of implementations (components, executors, policies,
+  environments): built-ins registered by import side effect, installed plugins,
+  and `module:Class` paths, resolved in that order."""
 
-_COMPONENT_REGISTRY: dict[str, type] = {}
+  def __init__(self, group: str, kind: str, base: str, modules: tuple[str, ...]):
+    self.group, self.kind, self._base, self._modules = group, kind, base, modules
+    self.classes: dict[str, type] = {}
+    self._loaded = False
 
+  def register(self, cls: type) -> type:
+    if cls.__name__ in self.classes:
+      raise ValueError(f"{self.kind.capitalize()} {cls.__name__} already registered")
+    self.classes[cls.__name__] = cls
+    return cls
 
-def register_component(cls: type) -> type:
-  name = cls.__name__
-  if name in _COMPONENT_REGISTRY:
-    raise ValueError(f"Component {name} already registered")
-  _COMPONENT_REGISTRY[name] = cls
-  return cls
+  def load(self) -> None:
+    with _LOCK:
+      if self._loaded:
+        return
+      for module in self._modules:
+        import_module(f"barl_jax.{module}")
+      self._loaded = True
 
+  def get(self, name: str) -> type:
+    self.load()
+    base = import_type(self._base)
+    cls = import_type(name) if ":" in name else resolve_named(self.group, name, self.classes, base)
+    if cls is None:
+      raise KeyError(f"{name!r} is not a registered {self.kind} or plugin "
+                     f"({', '.join(self.available())})")
+    if not issubclass(cls, base):
+      raise TypeError(f"{name!r} must implement {base.__name__}")
+    return cls
 
-def get_component(name: str) -> type:
-  load_builtins("components")
-  if ":" in name:
-    return import_type(name)
-  from barl_jax.components import Component
-  cls = resolve_named("components", name, _COMPONENT_REGISTRY, Component)
-  if cls is None:
-    raise KeyError(f"{name} not in registered components: "
-                   f"{available_names('components', _COMPONENT_REGISTRY)}")
-  return cls
-
-
-def available_components() -> list[str]:
-  load_builtins("components")
-  return available_names("components", _COMPONENT_REGISTRY)
-
-
-# ---------------------------------------------------------------------------
-# Executor registry -- concrete ActionExecutor classes (barl_jax.executors),
-# resolved by name the same way components are, through this module's own
-# load_builtins/resolve_named/available_names. Kept separate from
-# _COMPONENT_REGISTRY rather than folded into it: resolve_named's
-# issubclass(cls, base) gate only actually runs on the plugin-entry-point
-# path, so reusing "components" would silently let a third-party plugin
-# executor skip the ActionExecutor check every built-in executor is exempt
-# from anyway -- a dedicated group enforces it for plugins here too.
-# ---------------------------------------------------------------------------
-
-_EXECUTOR_REGISTRY: dict[str, type] = {}
+  def available(self) -> list[str]:
+    self.load()
+    return available_names(self.group, self.classes)
 
 
-def register_executor(cls: type) -> type:
-  name = cls.__name__
-  if name in _EXECUTOR_REGISTRY:
-    raise ValueError(f"Executor {name} already registered")
-  _EXECUTOR_REGISTRY[name] = cls
-  return cls
+COMPONENTS = Registry("components", "component", "barl_jax.components:Component",
+                      ("critics", "actors", "networks.squash", "networks.regulator",
+                       "networks.schedule"))
+EXECUTORS = Registry("executors", "executor", "barl_jax.executors.base:ActionExecutor",
+                     ("executors",))
+# Per-algorithm Policy classes (AMDP, DIME, NCLQL, SAC, SDAC) and their ModelConfig
+# schemas live beside their actor, so importing "actors" completes both registries.
+POLICIES = Registry("policies", "policy", "barl_jax.policy:Policy", ("policies", "actors"))
+ENVIRONMENTS = Registry("environments", "environment", "barl_jax.env:Environment",
+                        tuple(f"environments.{name}" for name in
+                              ("mujoco_gym", "dm_control", "mani_skill", "humanoid_bench")))
+
+register_component = COMPONENTS.register
+register_executor = EXECUTORS.register
+register_policy = POLICIES.register
+register_environment = ENVIRONMENTS.register
+get_component = COMPONENTS.get
+get_executor = EXECUTORS.get
+available_components = COMPONENTS.available
+available_executors = EXECUTORS.available
 
 
-def get_executor(name: str) -> type:
-  load_builtins("executors")
-  if ":" in name:
-    return import_type(name)
-  from barl_jax.executors.base import ActionExecutor
-  cls = resolve_named("executors", name, _EXECUTOR_REGISTRY, ActionExecutor)
-  if cls is None:
-    raise KeyError(f"{name} not in registered executors: "
-                   f"{available_names('executors', _EXECUTOR_REGISTRY)}")
-  return cls
-
-
-def available_executors() -> list[str]:
-  load_builtins("executors")
-  return available_names("executors", _EXECUTOR_REGISTRY)
+def load_builtins(group: str) -> None:
+  {r.group: r for r in (COMPONENTS, EXECUTORS, POLICIES, ENVIRONMENTS)}[group].load()

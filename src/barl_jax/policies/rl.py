@@ -26,7 +26,8 @@ from barl_jax.components import ActionSampler
 from barl_jax.critics import QCritic
 from barl_jax.networks.regulator import AutotuneRegulator
 from barl_jax.optimization import gated_losses
-from barl_jax.policy import Policy, register_policy
+from barl_jax.policy import Policy
+from barl_jax.registration import register_policy
 
 ALPHA_GRANULARITIES = ("per_chunk", "per_action")
 

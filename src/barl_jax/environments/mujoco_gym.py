@@ -1,6 +1,7 @@
 import gymnasium as gym
 
-from barl_jax.env import Environment, register_environment
+from barl_jax.env import Environment
+from barl_jax.registration import register_environment
 
 
 class MuJoCoGymEnvironment(Environment):
