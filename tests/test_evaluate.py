@@ -21,8 +21,6 @@ checkpoints, environment_name, evaluate = module.checkpoints, module.environment
 class ShortPendulum(Environment):
   stats = {"return_min": -100.0, "return_max": 0.0}
 
-  def get_dataset(self):
-    raise NotImplementedError
 
   def get_env(self, *, render: bool = False):
     return gym.make("Pendulum-v1", max_episode_steps=3)

@@ -155,13 +155,6 @@ class Component:
   def config(self, value):
     self._config_s.value = value
 
-  def static(self, name: str):
-    """Read an explicitly stored derived (non-config) value from NNX static
-    state -- values computed from config (`time_kwargs` unpacked from
-    `config.time`) rather than a config field itself, which belongs on
-    `self.config` instead."""
-    return self._static_config.value[name]
-
   @property
   def metrics(self) -> Recorder:
     """Diagnostics sink. A facade bound to this module, rebuilt per access and

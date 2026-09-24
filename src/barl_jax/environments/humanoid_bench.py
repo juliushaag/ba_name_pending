@@ -166,8 +166,6 @@ class HumanoidBenchEnvironment(Environment):
     # entirely for them -- one less GL context to fail on a flaky headless node.
     return gym.make(self.task_id(), render_mode="rgb_array" if render else None)
 
-  def get_dataset(self):
-    raise NotImplementedError(f"{type(self).__name__} has no offline dataset -- HumanoidBench is online-only.")
 
 
 # ---- locomotion ----

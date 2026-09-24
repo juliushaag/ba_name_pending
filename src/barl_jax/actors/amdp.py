@@ -26,7 +26,6 @@ class ScoreContinuousActorConfig:
   latent_dim: int = 256
   layers: int = 2
   mlp: NetworkConfig = field(default_factory=lambda: MLPConfig(activation="gelu", norm="none", dtype="float32"))
-  time_emb: str = "ctrl"
   time: TimeEmbeddingConfig = field(default_factory=FourierTimeConfig)
   squash_cls: str = "ErfSquash"
   sigma_min: float = 0.01
@@ -55,7 +54,7 @@ def clip_score(score, max_norm: float, percentile: float):
 class ScoreContinuousActor(ActorOptim, Actor):
   """AMDP's controlled-SDE actor. The net uses GELU in float32 (the chain accumulates
   a log-weight) and the ctrl time coder by default. MLP settings are grouped under
-  `mlp`; time_emb selects the time coder.
+  `mlp`.
   Only the SDE and score-clipping knobs are this class's own."""
 
   kind = "actor"

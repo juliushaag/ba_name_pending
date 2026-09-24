@@ -52,8 +52,6 @@ class DMControlEnvironment(Environment):
     env = DmControlCompatibilityV0(dm_env, render_mode="rgb_array" if render else None)
     return gym.wrappers.FlattenObservation(env)
 
-  def get_dataset(self):
-    raise NotImplementedError(f"{type(self).__name__} has no offline dataset -- DeepMind Control Suite is online-only.")
 
 # Doggo
 

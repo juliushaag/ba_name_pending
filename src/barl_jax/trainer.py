@@ -212,11 +212,6 @@ def _setup(run, *, validate_only):
   if policies[0].model_name != run.spec.name:
     raise ValueError(f"Checkpoint model {policies[0].model_name!r} differs from {run.spec.name!r}")
 
-  if policies[0].on_policy:
-    raise NotImplementedError(
-      f"{run.model_name} is on-policy, and the GAE path is not ported -- barl_jax "
-      f"currently implements the off-policy loop only.")
-
   total_grad_steps = max(1, round(cfg.total_env_steps * cfg.utd_ratio))
   schedule = Policy.lr_schedule(cfg.lr_warmup_steps, total_grad_steps, cfg.lr_decay)
   optimizers = [nnx.Optimizer(p, p.build_optimizer(lr_schedule=schedule), wrt=TRAINABLE)
@@ -395,7 +390,7 @@ def run_config_snapshot(run: Run) -> dict:
       flat[f"components.{slot}.{key}"] = value
 
   env_stats = {}
-  for key, value in run.env_stats.static().items():
+  for key, value in run.env_stats.items():
     env_stats[key] = value.tolist() if isinstance(value, np.ndarray) else value
 
   run_dict = cfg.to_dict()

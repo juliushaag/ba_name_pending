@@ -102,13 +102,6 @@ class ReplayBuffer():
 
     self._write = int((self._write + n) % self.max_transitions)
     self._size  = int(min(self._size + n, self.max_transitions))
-    self._on_write(idx)
-
-  def _on_write(self, idx: "np.ndarray") -> None:
-    """Hook for a subclass that keeps per-slot bookkeeping alongside the
-    fields (PrioritizedReplayBuffer's priority and write-generation arrays)
-    -- called with the ring indices just written, after they are committed.
-    A plain ReplayBuffer has nothing to do here."""
 
   def sample(self, batch_size : int) -> dict:
     """Draws `batch_size` i.i.d. random transition indices across the whole
@@ -150,100 +143,6 @@ class ReplayBuffer():
         self._fields[name][:len(values)] = values
     self._size, self._write = snapshot["size"], snapshot["write"]
     self.rng.bit_generator.state = snapshot["rng"]
-
-
-class PrioritizedReplayBuffer(ReplayBuffer):
-  """Proportional prioritized sampling (Schaul, Quan, Antonoglou & Silver
-  2016, "Prioritized Experience Replay") over the same ring-buffer storage
-  `ReplayBuffer` uses -- priorities and a per-slot write generation live in
-  parallel arrays, not among `_fields`, so they never appear in a sampled
-  transition batch.
-
-  A `sample_id` is `generation[index] * max_transitions + index`: stable
-  across the row's lifetime (it does not change while the row is not
-  overwritten) and distinguishable from any later row a wrapping write puts
-  at the same ring index, since that write bumps `generation[index]`.
-  `update_priorities` uses this to silently drop a priority update whose row
-  has since been overwritten -- a stale update from a training step that ran
-  concurrently with (or long after) the sample it was scored from, rather
-  than corrupting a different, newer transition's priority."""
-
-  def __init__(self, max_transitions: int, seed=None, *, eps: float = 1e-6):
-    super().__init__(max_transitions, seed=seed)
-    self._eps = eps
-    self._priorities = np.zeros(self.max_transitions, dtype=np.float64)
-    self._generation = np.zeros(self.max_transitions, dtype=np.int64)
-    # New rows must be sampled at least once to ever be scored -- seeding at
-    # the running max priority (1.0 until anything is scored) is the
-    # standard PER convention, not an arbitrary default.
-    self._max_priority = 1.0
-
-  def _on_write(self, idx: "np.ndarray") -> None:
-    self._generation[idx] += 1
-    self._priorities[idx] = self._max_priority
-
-  def _sample_ids(self, idx: "np.ndarray") -> "np.ndarray":
-    return self._generation[idx].astype(np.int64) * self.max_transitions + idx.astype(np.int64)
-
-  def sample_prioritized(self, batch_size: int, *, alpha: float = 0.6, beta: float = 0.4) -> dict:
-    """`alpha` shapes the sampling distribution toward high-priority rows
-    (0 = uniform, matching plain `sample()`'s distribution exactly at
-    alpha=0); `beta` shapes how strongly importance weights correct for
-    that bias (1 = full correction). Returns the sampled fields plus
-    `sample_ids` (feed back to `update_priorities` after scoring) and
-    `weights` (normalized so the batch's largest weight is 1, the standard
-    PER convention -- multiply a per-sample loss by this before reducing,
-    never learn at the unweighted scale)."""
-    if self._size == 0:
-      raise ValueError("sample_prioritized() from an empty buffer")
-    live = self._priorities[:self._size] + self._eps
-    probs = live ** alpha
-    total = probs.sum()
-    probs = probs / total if total > 0 else np.full(self._size, 1.0 / self._size)
-
-    idx = self.rng.choice(self._size, size=batch_size, replace=True, p=probs)
-    weights = (self._size * probs[idx]) ** (-beta)
-    weights = weights / weights.max()
-
-    batch = {name: value[idx] for name, value in self._fields.items()}
-    batch["sample_ids"] = self._sample_ids(idx)
-    batch["weights"] = weights.astype(np.float32)
-    return batch
-
-  def snapshot(self) -> dict:
-    """`ReplayBuffer.snapshot()` plus the priority/generation arrays and the
-    running max priority -- restoring only the ring contents would silently
-    reset every row to the seed priority and break `sample_ids` continuity.
-    Truncated to `_size` for the same reason the ring fields are: everything
-    past it has never been written."""
-    base = super().snapshot()
-    base["priorities"] = self._priorities[:self._size].copy()
-    base["generation"] = self._generation[:self._size].copy()
-    base["max_priority"] = self._max_priority
-    return base
-
-  def restore(self, snapshot: dict) -> None:
-    super().restore(snapshot)
-    priorities, generation = snapshot["priorities"], snapshot["generation"]
-    self._priorities[:len(priorities)] = priorities
-    self._generation[:len(generation)] = generation
-    self._max_priority = snapshot["max_priority"]
-
-  def update_priorities(self, sample_ids, td_errors) -> int:
-    """Sets each row's priority to `|td_error| + eps`. Returns how many of
-    `sample_ids` were actually applied -- fewer than `len(sample_ids)` is
-    normal, not an error, whenever a row was overwritten between sampling
-    it and scoring it."""
-    sample_ids = np.asarray(sample_ids)
-    td_errors = np.asarray(td_errors)
-    idx = (sample_ids % self.max_transitions).astype(np.int64)
-    current = self._sample_ids(idx)
-    valid = current == sample_ids
-    priorities = np.abs(td_errors[valid]) + self._eps
-    self._priorities[idx[valid]] = priorities
-    if priorities.size:
-      self._max_priority = max(self._max_priority, float(priorities.max()))
-    return int(valid.sum())
 
 
 class MultiSeedReplay(ReplayBuffer):

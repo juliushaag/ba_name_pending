@@ -19,8 +19,6 @@ class MuJoCoGymEnvironment(Environment):
   def get_env(self, *, render: bool = False) -> gym.Env:
     return gym.make(self.mujoco_id(), render_mode="rgb_array" if render else None)
 
-  def get_dataset(self):
-    raise NotImplementedError(f"{type(self).__name__} has no offline dataset -- MuJoCo Gym is online-only.")
 
 @register_environment
 class HalfCheetah(MuJoCoGymEnvironment):

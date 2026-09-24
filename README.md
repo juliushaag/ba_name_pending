@@ -195,19 +195,7 @@ existing "environment episodes restart" semantics.
   `SLOT_OBJECTIVES` validates compatibility before construction.
 - `optimization.py` assembles parameter ownership, update cadence and schedules.
 - `collection.py` owns environment/chunk state and emits transitions into an
-  injected sink. `rollout.py` owns replay storage and independent sampling RNGs;
-  `PrioritizedReplayBuffer` (proportional PER, Schaul et al. 2016) is a drop-in
-  alternative to `ReplayBuffer` -- `MultiSeedReplay(..., buffer_cls=PrioritizedReplayBuffer)`
-  -- with `sample_prioritized(batch_size, alpha=, beta=)` returning `sample_ids`
-  and normalized importance `weights` alongside the batch, and
-  `update_priorities(sample_ids, td_errors)` feeding scores back (silently
-  dropping an update for a row already overwritten since it was sampled,
-  rather than corrupting a different transition's priority). Not wired into
-  `trainer.py`'s own training loop: applying `weights` to a critic's loss
-  before its reduction is algorithm/critic-representation-specific (scalar
-  vs. categorical vs. ensemble each reduce differently), and doing that
-  correctly for all of them is future work, not implied by the sampler
-  existing. Use it directly in your own training loop today.
+  injected sink. `rollout.py` owns replay storage and independent sampling RNGs.
 - `evaluation.py` evaluates action providers; `multiseed.py` stacks independent
   policies and optimizers. `trainer.py` coordinates their lifecycle.
 - `checkpoints.py` restores policy architectures from saved metadata;
@@ -286,14 +274,7 @@ snapshots take precedence over current defaults.
 
 Environment episodes restart on resume. Partial action chunks are discarded;
 completed replay transitions remain intact. This is training-state continuation,
-not bit-identical simulator trajectory continuation, for every environment --
-`barl_jax.exact_resume.ExactResumeMixin` is an opt-in mechanism for an
-environment family whose full state (simulator internals, wrapper counters,
-RNGs) is demonstrably captured (verified with a real save/interrupt/restore/
-continue test, `tests/test_exact_resume.py`'s Pendulum-v1 adapter is the one
-example today), but it is not wired into `trainer.py`'s resume flow itself --
-episodes still restart on every resume regardless, including for an
-environment with an exact-resume adapter declared. A failed iteration retains
+not bit-identical simulator trajectory continuation. A failed iteration retains
 the last completed resume generation; `final` policy weights may be newer.
 Full replay checkpoints can be large, so account for their storage and I/O cost --
 `save_training` refuses to start a new generation when free disk looks

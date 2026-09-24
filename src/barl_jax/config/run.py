@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 from copy import deepcopy
 from dataclasses import dataclass, field, fields, replace
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, get_type_hints
 
 if TYPE_CHECKING:
@@ -249,15 +248,10 @@ RUN_CONFIGS = {("validate" if f.name == "validate_config" else f.name): f.defaul
                                  "collection_executor", "eval_executor"}}
 RUN_CONFIGS["collection_executor"] = {"class": "DirectExecutor"}
 RUN_CONFIGS["eval_executor"] = {"class": "DirectExecutor"}
-INJECTED_KEYS = frozenset({"model", "env", "profile", "model_overrides", "snapshot"})
 
 
 def run_defaults() -> dict[str, Any]:
   return deepcopy(RUN_CONFIGS)
-
-
-def run_keys(root=None) -> set[str]:
-  return set(RUN_CONFIGS)
 
 
 def validate_run(cfg: RunConfig | Mapping[str, Any], *, num_seeds: int | None = None) -> list[str]:
@@ -270,13 +264,6 @@ def validate_run(cfg: RunConfig | Mapping[str, Any], *, num_seeds: int | None = 
     if not isinstance(num_seeds, int) or isinstance(num_seeds, bool) or num_seeds < 1:
       problems.append(f"num_seeds={num_seeds!r}: must be an int >= 1")
   return problems
-
-
-def load_config(path: str | Path, root=None) -> list[dict[str, Any]]:
-  """Compatibility boundary returning one runtime mapping for one YAML run."""
-  from barl_jax.config import from_yaml
-  run = from_yaml(path)
-  return [run.to_runtime_dict()]
 
 
 def _profile_model(name: str, value: ModelConfig, profile: str) -> ModelConfig:
@@ -327,25 +314,6 @@ def _resolve_executor_config(raw: Mapping[str, Any], *, path: str) -> ExecutorCo
     raise KeyError(f"{path}: cannot materialize {config_type.__name__}: {exc}") from exc
 
 
-def _selected_time_style(name: str):
-  """A named time-coder preset as a complete `TimeEmbeddingConfig` -- the
-  `time_emb:` override shortcut. Lazily imported: only an override that
-  actually names a `time_emb` style needs the (jax-touching) time-embedding
-  module at all."""
-  from barl_jax.networks.time_embedding import FourierTimeConfig, SinusoidalTimeConfig
-  styles = {
-    "sin": SinusoidalTimeConfig(),
-    "fourier": FourierTimeConfig(),
-    "ctrl": FourierTimeConfig(),
-    "pisgrad": FourierTimeConfig(time_dim=256, hidden=256, num_freqs=256,
-                                 concat_input=False, spacing="linear"),
-  }
-  try:
-    return styles[name]
-  except KeyError as exc:
-    raise KeyError(f"unknown time_emb {name!r}; available styles: {list(styles)}") from exc
-
-
 def _apply_component_override(base: Any, override: Mapping[str, Any], *, path: str) -> Any:
   if not isinstance(override, Mapping):
     raise TypeError(f"{path} must be a mapping")
@@ -355,10 +323,6 @@ def _apply_component_override(base: Any, override: Mapping[str, Any], *, path: s
   # typed default a fresh Policy.build_component() would materialize.
   if selected_name != base.class_name:
     base = get_component(selected_name).config_type()
-  if "time_emb" in raw:
-    raw_time = _selected_time_style(raw["time_emb"])
-    if hasattr(base, "time"):
-      base = replace(base, time=raw_time)
   # Selector keys are now represented by the selected dataclass.  Apply the
   # ordinary nested override after selector surfaces have been expanded.
   raw.pop("class_name", None)
@@ -550,12 +514,6 @@ def _model_problems(model: ModelConfig) -> list[str]:
         if getattr(mlp, field_name) not in allowed:
           problems.append(f"components.{slot}.mlp.{field_name}={getattr(mlp, field_name)!r}: "
                           f"unknown {field_name}; available: {sorted(allowed)}")
-    time_name = getattr(component, "time_emb", None)
-    if time_name is not None:
-      try:
-        _selected_time_style(time_name)
-      except KeyError as exc:
-        problems.append(str(exc))
     from barl_jax.networks.schedule import Schedule as _Schedule
     def _is_schedule(name: str) -> bool:
       try:
@@ -579,5 +537,4 @@ def _model_problems(model: ModelConfig) -> list[str]:
   return problems
 
 
-__all__ = ["RunConfig", "RUN_CONFIGS", "INJECTED_KEYS", "run_defaults", "run_keys",
-           "validate_run", "load_config"]
+__all__ = ["RunConfig", "RUN_CONFIGS", "run_defaults", "validate_run"]

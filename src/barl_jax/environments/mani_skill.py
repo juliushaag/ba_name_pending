@@ -56,10 +56,6 @@ class ManiSkillEnvironment(Environment):
                    num_envs=1)
     return CPUGymWrapper(env)
 
-  def get_dataset(self):
-    raise NotImplementedError(
-      f"{type(self).__name__} has no offline dataset -- ManiSkill is wired here as an "
-      f"online-only benchmark, like MuJoCoGymEnvironment and DMControlEnvironment.")
 
 
 # ---- horizon 50 ------------------------------------------------------------

@@ -25,7 +25,6 @@ class DDPMActorConfig:
   latent_dim: int = 512
   layers: int = 2
   mlp: NetworkConfig = field(default_factory=lambda: MLPConfig(activation="mish", norm="none", dtype="float32"))
-  time_emb: str = "ctrl"
   time: TimeEmbeddingConfig = field(default_factory=lambda: FourierTimeConfig(
     time_dim=64, num_freqs=32, hidden=64, concat_input=False, learn_freqs=True))
   num_steps: int = 20

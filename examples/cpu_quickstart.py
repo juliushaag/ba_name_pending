@@ -55,8 +55,6 @@ class TinyPendulum(Environment):
   def get_env(self, *, render: bool = False) -> gym.Env:
     return gym.make("Pendulum-v1")
 
-  def get_dataset(self):
-    raise NotImplementedError("TinyPendulum has no offline dataset.")
 
 
 def base_config():

@@ -90,10 +90,6 @@ def _fingerprint(payload: dict) -> str:
   return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:12]
 
 
-def model_fingerprint(resolved: dict) -> str:
-  return _fingerprint(resolved)
-
-
 def experiment_fingerprint(resolved: dict, run_cfg: dict) -> str:
   payload = {**{f"model.{k}": v for k, v in resolved.items()},
              **{f"run.{k}": v for k, v in run_cfg.items()
@@ -101,4 +97,4 @@ def experiment_fingerprint(resolved: dict, run_cfg: dict) -> str:
   return _fingerprint(payload)
 
 
-__all__ = ["ModelSpec", "model_fingerprint", "experiment_fingerprint"]
+__all__ = ["ModelSpec", "experiment_fingerprint"]

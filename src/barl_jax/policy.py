@@ -55,10 +55,6 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
 
   _classes = dict()
 
-  # True for strictly on-policy algorithms (e.g. PPO) -- the training script
-  # clears the replay buffer after each rollout's training pass when set.
-  on_policy = False
-
   # The component slots this Policy builds, by attribute name -- the contract a
   # model variant's `components:` must match. An omitted slot already fails at
   # build_component(); naming an *extra* one would resolve silently into the
@@ -128,7 +124,6 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
     # Captured so a checkpoint reconstructs under the same config it was built
     # from -- see checkpoints.py.
     self._spec = spec if spec is not None else ModelSpec.resolve(self.model_name, None, profile)
-    self._snapshot_s = _Static(self._spec.model())
 
     # Every module that needs randomness draws from this; nnx threads and
     # advances the key state across the jit boundary, so no call signature has
@@ -201,10 +196,6 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
   @property
   def _raw_kwargs(self) -> dict:
     return self._raw_kwargs_s.value
-
-  @property
-  def _snapshot(self) -> dict:
-    return self._snapshot_s.value
 
   def _absorb_params(self, params: dict) -> None:
     """Copy the typed `params` mapping onto plain attributes.

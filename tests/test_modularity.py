@@ -51,8 +51,6 @@ class ToyFamily(Environment):
     self.created.append(env)
     return env
 
-  def get_dataset(self):
-    raise NotImplementedError
 
 
 def tiny_run(**overrides) -> RunConfig:

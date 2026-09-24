@@ -27,8 +27,6 @@ class DISActorConfig:
   latent_dim: int = 256
   layers: int = 2
   mlp: NetworkConfig = field(default_factory=lambda: MLPConfig(activation="gelu", norm="none", dtype="float32"))
-  
-  time_emb: str = "ctrl"
   time: TimeEmbeddingConfig = field(default_factory=FourierTimeConfig)
   
   squash_cls: str = "TanhSquash"

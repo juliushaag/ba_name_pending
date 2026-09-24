@@ -44,14 +44,3 @@ def write_json_atomic(path, payload: dict) -> None:
     except OSError:
       pass
     raise
-
-
-def read_json(path) -> dict | None:
-  """`None` for missing or malformed files -- callers must handle "no result
-  yet" and "corrupt result" without mistaking either for a real one."""
-  path = Path(path)
-  try:
-    with open(path) as f:
-      return json.load(f)
-  except (OSError, json.JSONDecodeError):
-    return None
