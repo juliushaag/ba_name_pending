@@ -4,7 +4,7 @@ import pytest
 
 from barl_jax.collection import Collector, RandomPolicy
 from barl_jax.multiseed import StackedPolicy, stack, unstack
-from barl_jax.rollout import MultiSeedReplay, ReplayBuffer
+from barl_jax.replay import MultiSeedReplay, ReplayBuffer
 
 
 def _stacked_fixture(num_seeds: int):

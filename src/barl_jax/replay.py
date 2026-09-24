@@ -145,18 +145,17 @@ class ReplayBuffer():
     self.rng.bit_generator.state = snapshot["rng"]
 
 
-class MultiSeedReplay(ReplayBuffer):
+class MultiSeedReplay:
   """One ReplayBuffer per seed behind a single rollout loop.
 
   `num_seeds: 1` is not a separate path; it is the size-1 instance of the same
   routing and sampling behavior the trainer uses at larger seed counts."""
 
-  def __init__(self, num_seeds: int, num_envs: int, max_transitions: int, seed=None,
-              *, buffer_cls: type = ReplayBuffer):
-    super().__init__(max_transitions, seed=seed)
+  def __init__(self, num_seeds: int, num_envs: int, max_transitions: int, seed=None):
     self.num_seeds = num_seeds
     self.num_envs  = num_envs
-    self.seeds = [buffer_cls(max_transitions, seed=child)
+    self.max_transitions = int(max_transitions)
+    self.seeds = [ReplayBuffer(max_transitions, seed=child)
                   for child in np.random.SeedSequence(seed).spawn(num_seeds)]
 
   def add(self, **row) -> None:

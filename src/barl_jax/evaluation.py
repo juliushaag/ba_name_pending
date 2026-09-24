@@ -1,11 +1,10 @@
 """Episode evaluation independent of policy construction and training."""
 import gymnasium as gym
 import jax
-import jax.numpy as jnp
 import numpy as np
 
-from barl_jax.action_chunking import ActionChunkExecutor
-from barl_jax.components import action_bounds_numpy, sanitize_action
+from barl_jax.action_chunking import ActionChunkExecutor, step_env
+from barl_jax.components import action_bounds_numpy
 from barl_jax.seeding import derive_seed
 
 
@@ -85,20 +84,10 @@ def run_episodes(actor, env: gym.Env, n: int, render: bool, *, seed: int = 0,
 
     while live.any():
       key, subkey = jax.random.split(key)
-      action_np, _ = chunks.current(obs, subkey, to_device=lambda x: jnp.asarray(x, dtype=jnp.float32),
-                                    live=live, full_batch=hasattr(actor, "num_seeds"))
-      # Same failsafe the rollout applies (rollout.py). Without it a NaN action
-      # reaches mj_step, which only warns and poisons qpos -- the eval returns
-      # quietly wrong numbers and the next render() aborts the process inside
-      # mjr_render with no python traceback (sweep 2026-08-27_13-23-15).
+      action_np, _ = chunks.current(obs, subkey, live=live, full_batch=hasattr(actor, "num_seeds"))
       nonfinite = ~np.isfinite(action_np)
-      action_np = sanitize_action(action_np, xp=np)
-      env_action = action_np if act_scale_np is None else action_np * act_scale_np + act_bias_np
-      env_action = np.ascontiguousarray(env_action, dtype=np.float32).copy()
-      obs, reward, term, trunc, info = env.step(env_action if is_vec else env_action[0])
-
-      if not is_vec:
-        obs, reward, term, trunc = obs[None, ...], np.array([reward]), np.array([term]), np.array([trunc])
+      obs, reward, term, trunc, info = step_env(env, action_np, act_scale_np, act_bias_np,
+                                                is_vec=is_vec)
 
       frames = (env.call("render") if is_vec else [env.render()]) if render else None
 

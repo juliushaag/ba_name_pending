@@ -1,13 +1,25 @@
 import math
+from typing import Callable, Protocol
 
 import gymnasium as gym
 import jax
-import jax.numpy as jnp
 import numpy as np
 
-from barl_jax.action_chunking import ActionChunkExecutor
-from barl_jax.components import action_bounds_numpy, sanitize_action
-from barl_jax.contracts import ActionProvider, TransitionSink
+from barl_jax.action_chunking import ActionChunkExecutor, normalize_action_chunk, step_env
+from barl_jax.components import action_bounds_numpy
+
+
+class ActionProvider(Protocol):
+  action_dim: int
+  chunk_size: int
+
+  def inference_fn(self) -> Callable:
+    ...
+
+
+class TransitionSink(Protocol):
+  def add(self, **transition) -> None:
+    ...
 
 
 class RandomPolicy:
@@ -42,7 +54,6 @@ class RandomPolicy:
       # canonical [-1, 1] per dimension -- same convention every real actor outputs.
       plan = self._rng.uniform(-1.0, 1.0,
                                (batch, self.chunk_size, *self.action_space.shape)).astype(np.float32)
-    from barl_jax.action_chunking import normalize_action_chunk
     return normalize_action_chunk(
       plan, chunk_size=self.chunk_size, act_dim=self.action_dim, xp=np), {}
 
@@ -89,6 +100,68 @@ def summarize_rollout(acc: dict, slots: slice = slice(None)) -> dict:
   return out
 
 
+class PendingChunks:
+  """Per slot, the chunk being executed: its start observation, plan, discounted
+  return so far, and horizon -- held until the chunk finishes and is emitted to
+  replay as one transition."""
+
+  ARRAYS = ("active", "obs", "act", "chunk_return", "next_obs", "term", "horizon")
+
+  def __init__(self, n_envs: int, obs_dim: int, plan_dim: int):
+    self.active = np.zeros(n_envs, dtype=bool)
+    self.obs = np.zeros((n_envs, obs_dim), dtype=np.float32)
+    self.act = np.zeros((n_envs, plan_dim), dtype=np.float32)
+    self.chunk_return = np.zeros(n_envs, dtype=np.float32)
+    self.next_obs = np.zeros((n_envs, obs_dim), dtype=np.float32)
+    self.term = np.zeros(n_envs, dtype=np.float32)
+    self.horizon = np.zeros(n_envs, dtype=np.int32)
+    self.extras: dict = {}
+
+  def copy(self) -> "PendingChunks":
+    other = object.__new__(PendingChunks)
+    for name in self.ARRAYS:
+      setattr(other, name, np.array(getattr(self, name), copy=True))
+    other.extras = {k: np.array(v, copy=True) for k, v in self.extras.items()}
+    return other
+
+  def start(self, slots, obs, plan, step_extras: dict) -> None:
+    """Begin a new chunk on the boolean `slots` that just refilled their plan."""
+    self.active[slots] = True
+    self.obs[slots] = obs[slots]
+    self.act[slots] = plan[slots]
+    self.chunk_return[slots] = 0.0
+    self.term[slots] = 0.0
+    self.horizon[slots] = 0
+    for name in set(self.extras) - set(step_extras):
+      self.extras[name][slots] = 0
+    for name, value in step_extras.items():
+      value = np.asarray(value)
+      if name not in self.extras:
+        self.extras[name] = np.zeros((len(self.active), *value.shape[1:]), dtype=value.dtype)
+      self.extras[name][slots] = value[slots]
+
+  def observe(self, reward, next_obs, term, discount: float) -> None:
+    """Fold one env step into every slot's running chunk."""
+    self.chunk_return += (discount ** self.horizon) * reward
+    self.next_obs = next_obs
+    self.term = np.maximum(self.term, term)
+    self.horizon += self.active.astype(np.int32)
+
+  def emit(self, finished, sink: TransitionSink) -> None:
+    """Hand the `finished` slots' chunks to `sink` and clear them."""
+    emit = np.flatnonzero(finished)
+    if not len(emit):
+      return
+    sink.add(
+      slot_ids=emit, obs=self.obs[emit], next_obs=self.next_obs[emit], act=self.act[emit],
+      chunk_return=self.chunk_return[emit], term=self.term[emit], horizon=self.horizon[emit],
+      **{name: value[emit] for name, value in self.extras.items()})
+    self.active[emit] = False
+    self.chunk_return[emit] = 0.0
+    self.term[emit] = 0.0
+    self.horizon[emit] = 0
+
+
 class Collector:
   """Owns environment/chunk state and emits transitions into an injected sink."""
 
@@ -100,10 +173,9 @@ class Collector:
   def random_fill(self, env : gym.Env | gym.vector.VectorEnv, n_steps : int, seed : int = None,
                   chunk_size: int = 1, discount: float = 1.0, *, sink: TransitionSink):
     """Seeds the buffer with `n_steps` of uniformly-random actions before
-    training starts -- broader, less-correlated coverage than an untrained
-    (but already-biased) policy's own actions would give. Just rollout()
-    under a RandomPolicy stand-in, so every truncation rule there applies
-    unchanged."""
+    training starts: broader, less-correlated coverage than an untrained policy's
+    own actions. Just `collect()` under a `RandomPolicy`, so every truncation
+    rule there applies unchanged."""
     action_space = env.single_action_space if isinstance(env, gym.vector.VectorEnv) else env.action_space
     return self.collect(RandomPolicy(action_space, seed=seed, chunk_size=chunk_size),
                         env, n_steps=n_steps, seed=seed, discount=discount, sink=sink)
@@ -122,8 +194,7 @@ class Collector:
     explicit `seed`) resets. Resetting per call would cap the visited horizon at
     `n_steps`, so a run with many envs would only ever train on the first
     `rollout_steps // num_envs` steps of an episode while eval runs the full
-    `max_episode_steps` -- num_envs would trade against horizon coverage."""
-
+    `max_episode_steps`."""
     is_vec = isinstance(env, gym.vector.VectorEnv)
     n_envs = env.num_envs if is_vec else 1
 
@@ -132,15 +203,9 @@ class Collector:
       obs, _ = env.reset(seed=seed)
       if not is_vec:
         obs = obs[None, ...]
-      chunk_state = None
-      pending = None
+      chunk_state, pending = None, None
     else:
-      obs = state["obs"]
-      chunk_state = state.get("chunk_state")
-      pending = state.get("pending")
-
-    def to_device(o):
-      return jnp.asarray(o, jnp.float32)
+      obs, chunk_state, pending = state["obs"], state.get("chunk_state"), state.get("pending")
 
     act = policy.inference_fn()
     key = jax.random.PRNGKey(int(self.rng.integers(0, 2 ** 31 - 1)))
@@ -153,7 +218,8 @@ class Collector:
     action_space = env.single_action_space if is_vec else env.action_space
     act_scale_np, act_bias_np = action_bounds_numpy(action_space)
 
-   
+    pending = (PendingChunks(n_envs, obs.reshape(n_envs, -1).shape[1], chunk_size * policy.action_dim)
+               if pending is None else pending.copy())
     zeros = lambda: np.zeros(n_envs, dtype=np.float64)
     acc = dict(rew_sum=zeros(), rew_sq_sum=zeros(), n_rew=zeros(),
                obs_sum=zeros(), obs_sq_sum=zeros(), n_obs=zeros(),
@@ -161,55 +227,18 @@ class Collector:
                act_min=np.full(n_envs, np.inf), act_max=np.full(n_envs, -np.inf),
                act_nonfinite=zeros(), act_clipped=zeros())
 
-    if pending is None:
-      pending = dict(
-        active=np.zeros(n_envs, dtype=bool),
-        obs=np.zeros((n_envs, obs.reshape(n_envs, -1).shape[1]), dtype=np.float32),
-        act=np.zeros((n_envs, chunk_size * policy.action_dim), dtype=np.float32),
-        chunk_return=np.zeros(n_envs, dtype=np.float32),
-        next_obs=np.zeros((n_envs, obs.reshape(n_envs, -1).shape[1]), dtype=np.float32),
-        term=np.zeros(n_envs, dtype=np.float32),
-        horizon=np.zeros(n_envs, dtype=np.int32),
-        extras={},
-      )
-    else:
-      pending = dict(
-        active=np.array(pending["active"], copy=True),
-        obs=np.array(pending["obs"], copy=True),
-        act=np.array(pending["act"], copy=True),
-        chunk_return=np.array(pending["chunk_return"], copy=True),
-        next_obs=np.array(pending["next_obs"], copy=True),
-        term=np.array(pending["term"], copy=True),
-        horizon=np.array(pending["horizon"], copy=True),
-        extras={k: np.array(v, copy=True) for k, v in pending.get("extras", {}).items()},
-      )
-
     for _ in range(n_steps):
-
       obs64 = obs.astype(np.float64).reshape(n_envs, -1)
       acc["obs_sum"]    += obs64.sum(axis=1)
       acc["obs_sq_sum"] += (obs64 ** 2).sum(axis=1)
       acc["n_obs"]      += obs64.shape[1]
 
       key, subkey = jax.random.split(key)
-      action_np, step_extras = chunks.current(obs, subkey, to_device=to_device)
+      action_np, step_extras = chunks.current(obs, subkey)
       refilled = chunks.last_refilled()
       if refilled.any():
-        plan_np = chunks.plan().reshape(n_envs, -1).astype(np.float32)
-        obs_flat = obs.reshape(n_envs, -1).astype(np.float32)
-        pending["active"][refilled] = True
-        pending["obs"][refilled] = obs_flat[refilled]
-        pending["act"][refilled] = plan_np[refilled]
-        pending["chunk_return"][refilled] = 0.0
-        pending["term"][refilled] = 0.0
-        pending["horizon"][refilled] = 0
-        for name in set(pending["extras"]) - set(step_extras):
-          pending["extras"][name][refilled] = 0
-        for name, value in step_extras.items():
-          value = np.asarray(value)
-          if name not in pending["extras"]:
-            pending["extras"][name] = np.zeros((n_envs, *value.shape[1:]), dtype=value.dtype)
-          pending["extras"][name][refilled] = value[refilled]
+        pending.start(refilled, obs.reshape(n_envs, -1).astype(np.float32),
+                      chunks.plan().reshape(n_envs, -1).astype(np.float32), step_extras)
 
       act64 = action_np.astype(np.float64).reshape(n_envs, -1)
       acc["act_sum"]    += act64.sum(axis=1)
@@ -217,76 +246,31 @@ class Collector:
       acc["act_min"]     = np.minimum(acc["act_min"], act64.min(axis=1))
       acc["act_max"]     = np.maximum(acc["act_max"], act64.max(axis=1))
       acc["n_act"]      += act64.shape[1]
-
       acc["act_nonfinite"] += (~np.isfinite(act64)).sum(axis=1)
       acc["act_clipped"]   += (np.abs(act64) > 1.0).sum(axis=1)
-      action_np = sanitize_action(action_np, xp=np)
 
-      env_action_np = action_np if act_scale_np is None else action_np * act_scale_np + act_bias_np
-
-      env_action_np = np.array(env_action_np, dtype=np.float32, order="C")
-      env_action = env_action_np[0] if not is_vec else env_action_np
-      next_obs, reward, term, trunc, _ = env.step(env_action)
-
-      if not is_vec:
-        next_obs, reward, term, trunc = next_obs[None, ...], np.array([reward]), np.array([term]), np.array([trunc])
-
+      next_obs, reward, term, trunc, _ = step_env(env, action_np, act_scale_np, act_bias_np,
+                                                  is_vec=is_vec)
       rew64 = reward.astype(np.float64).reshape(n_envs)
       acc["rew_sum"]    += rew64
       acc["rew_sq_sum"] += rew64 ** 2
       acc["n_rew"]      += 1
 
-      done = term | trunc
-      pending["chunk_return"] += (discount ** pending["horizon"]) * reward.astype(np.float32).reshape(n_envs)
-      pending["next_obs"] = next_obs.reshape(n_envs, -1).astype(np.float32)
-      pending["term"] = np.maximum(pending["term"], term.astype(np.float32).reshape(n_envs))
-      pending["horizon"] += pending["active"].astype(np.int32)
-      finished = chunks.advance(done)
-
-      emit = np.flatnonzero(finished)
-      if len(emit):
-        sink.add(
-          slot_ids=emit,
-          obs=pending["obs"][emit],
-          next_obs=pending["next_obs"][emit],
-          act=pending["act"][emit],
-          chunk_return=pending["chunk_return"][emit],
-          term=pending["term"][emit],
-          horizon=pending["horizon"][emit],
-          **{name: value[emit] for name, value in pending["extras"].items()},
-        )
-        pending["active"][emit] = False
-        pending["chunk_return"][emit] = 0.0
-        pending["term"][emit] = 0.0
-        pending["horizon"][emit] = 0
-
-      finished_idx = np.flatnonzero(done).tolist()
+      done = np.asarray(term | trunc, dtype=bool)
+      pending.observe(reward.astype(np.float32).reshape(n_envs),
+                      next_obs.reshape(n_envs, -1).astype(np.float32),
+                      term.astype(np.float32).reshape(n_envs), discount)
+      pending.emit(chunks.advance(done), sink)
 
       obs = next_obs
-
-      if finished_idx:
+      if done.any():
         if is_vec:
-          mask = np.zeros(n_envs, dtype=bool)
-          mask[finished_idx] = True
-          obs, _ = env.reset(options={"reset_mask": mask})
+          obs, _ = env.reset(options={"reset_mask": done})
         else:
           obs[0], _ = env.reset()
 
-    self.state = dict(
-      env=env, obs=obs, chunk_state=chunks.snapshot(),
-      pending=dict(
-        active=np.array(pending["active"], copy=True),
-        obs=np.array(pending["obs"], copy=True),
-        act=np.array(pending["act"], copy=True),
-        chunk_return=np.array(pending["chunk_return"], copy=True),
-        next_obs=np.array(pending["next_obs"], copy=True),
-        term=np.array(pending["term"], copy=True),
-        horizon=np.array(pending["horizon"], copy=True),
-        extras={k: np.array(v, copy=True) for k, v in pending["extras"].items()},
-      ))
+    self.state = dict(env=env, obs=obs, chunk_state=chunks.snapshot(), pending=pending.copy())
 
-    # The per-slot sums stay off the return value -- a caller owning a subset of
-    # the slots reads them through last_rollout_per_seed() instead.
     acc["chunk_refills"] = chunks.slot_refills().astype(np.float64)
     acc["chunk_wasted"] = chunks.slot_wasted().astype(np.float64)
     acc["chunk_size"] = np.full(n_envs, float(policy.chunk_size), np.float64)

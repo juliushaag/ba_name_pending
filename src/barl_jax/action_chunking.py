@@ -1,4 +1,7 @@
+import jax.numpy as jnp
 import numpy as np
+
+from barl_jax.components import sanitize_action
 
 
 def normalize_action_chunk(action, *, chunk_size: int, act_dim: int, xp=np):
@@ -68,14 +71,14 @@ class ActionChunkExecutor:
       wasted=int(self.wasted),
     )
 
-  def current(self, obs, key, *, to_device, live=None, full_batch=False) -> tuple[np.ndarray, dict]:
+  def current(self, obs, key, *, live=None, full_batch=False) -> tuple[np.ndarray, dict]:
     live = np.ones(self.n_envs, bool) if live is None else np.asarray(live, dtype=bool)
     slots = np.flatnonzero(live & ~self._active)
     self._last_refilled = np.zeros(self.n_envs, bool)
     if len(slots):
       # Vmapped seed policies require every seed slot, even after some
       # episodes finish. Only install plans for slots that need a refill.
-      chunk, extras = self._infer(to_device(obs if full_batch else obs[slots]), key)
+      chunk, extras = self._infer(jnp.asarray(obs if full_batch else obs[slots], jnp.float32), key)
       if full_batch:
         chunk = np.asarray(chunk)[slots]
         extras = {name: np.asarray(value)[slots] for name, value in extras.items()}
@@ -134,3 +137,18 @@ class ActionChunkExecutor:
 
   def slot_wasted(self) -> np.ndarray:
     return np.array(self._slot_wasted, copy=True)
+
+
+def step_env(env, action, act_scale, act_bias, *, is_vec: bool):
+  """Step `env` with a canonical `(n_envs, act_dim)` action: sanitize it (a NaN
+  reaching `env.step` poisons the physics state), scale it to the env's bounds
+  and step. A single env comes back with a leading env axis, like a vector env.
+  Returns `(next_obs, reward, terminated, truncated, info)`."""
+  action = sanitize_action(action, xp=np)
+  if act_scale is not None:
+    action = action * act_scale + act_bias
+  action = np.array(action, dtype=np.float32, order="C")
+  obs, reward, term, trunc, info = env.step(action if is_vec else action[0])
+  if not is_vec:
+    obs, reward, term, trunc = obs[None, ...], np.array([reward]), np.array([term]), np.array([trunc])
+  return obs, reward, term, trunc, info

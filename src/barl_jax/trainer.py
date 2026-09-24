@@ -37,8 +37,8 @@ from barl_jax.metrics import DEBUG, PRIMARY, to_host
 from barl_jax.multiseed import SeedActor, StackedPolicy, split_metrics, stack, unstack
 from barl_jax.optimization import seeded_chunk, seeded_step
 from barl_jax.policy import Policy
+from barl_jax.replay import MultiSeedReplay
 from barl_jax.result import presentable, write_json_atomic
-from barl_jax.rollout import MultiSeedReplay
 from barl_jax.seeding import derive_seed
 from barl_jax.training_checkpoint import (
   MUTABLE_ON_RESUME,

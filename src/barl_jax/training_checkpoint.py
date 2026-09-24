@@ -76,7 +76,7 @@ def _prune_generations(root: Path, *, keep: int, published: int) -> None:
     shutil.rmtree(_generation_dir(root, gen), ignore_errors=True)
 
 
-# A buffer's `snapshot()` (rollout.py) mixes ring-sized arrays (the fields
+# A buffer's `snapshot()` (replay.py) mixes ring-sized arrays (the fields
 # themselves, and a PrioritizedReplayBuffer's priority/generation arrays) with
 # small JSON-safe scalars (size, write, rng state, max priority). This module
 # owns splitting that apart for storage -- arrays into the .npz, scalars into

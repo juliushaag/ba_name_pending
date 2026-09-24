@@ -195,7 +195,7 @@ existing "environment episodes restart" semantics.
   `SLOT_OBJECTIVES` validates compatibility before construction.
 - `optimization.py` assembles parameter ownership, update cadence and schedules.
 - `collection.py` owns environment/chunk state and emits transitions into an
-  injected sink. `rollout.py` owns replay storage and independent sampling RNGs.
+  injected sink. `replay.py` owns replay storage and independent sampling RNGs.
 - `evaluation.py` evaluates action providers; `multiseed.py` stacks independent
   policies and optimizers. `trainer.py` coordinates their lifecycle.
 - `checkpoints.py` restores policy architectures from saved metadata;

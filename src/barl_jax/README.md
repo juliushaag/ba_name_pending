@@ -7,7 +7,7 @@ Core APIs:
 - `barl_jax.config.run.RunConfig` and `barl_jax.config.model.ModelSpec`
 - `barl_jax.policy.Policy`
 - `barl_jax.components.ActionSampler`, `Actor`, and `Critic`
-- `barl_jax.collection.Collector` and `barl_jax.rollout.MultiSeedReplay`
+- `barl_jax.collection.Collector` and `barl_jax.replay.MultiSeedReplay`
 - `barl_jax.checkpoints.save_policy` / `load_policy`
 - `barl_jax.trainer.setup` / `train` / `validate`
 
