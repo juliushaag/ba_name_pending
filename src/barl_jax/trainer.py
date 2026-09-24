@@ -431,7 +431,7 @@ def _train(run: Run):
   now  = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
   name = f"{run.model_name.lower()}/{run.env_name.lower()}/{now}_x{num_seeds}"
 
-  # A sweep hands every run its own directory (barl_jax.launch.grid); a standalone
+  # A sweep hands every run its own directory (launch.grid); a standalone
   # run keeps the global checkpoints/ tree keyed like its wandb run.
   ckpt_dir = os.path.abspath(os.path.join(cfg.run_dir, "checkpoints") if cfg.run_dir
                              else os.path.join("checkpoints", name))

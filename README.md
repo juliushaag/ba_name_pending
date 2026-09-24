@@ -47,8 +47,8 @@ uv run python scripts/evaluate.py sweeps/<submission> --mode default mean --json
 ```
 
 CI runs Ruff, the CPU test suite, an installed-wheel import check, and the CPU
-example against the standalone library. Slurm/tmux executor support lives in
-`barl_jax.launch`; it is an implementation detail of `submit.py`, which shells
+example against the standalone library. Slurm/tmux executor support lives in the top-level
+`launch/` package (not part of the installed library); it is an implementation detail of `submit.py`, which shells
 out to train.py/evaluate.py exactly as a human running one of them directly
 would.
 

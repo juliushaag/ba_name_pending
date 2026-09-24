@@ -284,7 +284,7 @@ class SlurmExecutor(Executor):
 
 
 class TmuxExecutor(Executor):
-    """One detached session per sweep: barl_jax.launch.tmux_pool in window 0 owning
+    """One detached session per sweep: launch.tmux_pool in window 0 owning
     the queue, and one window per run that it opens as a slot frees up. Detached
     and returning immediately is the point -- `sbatch` does not block either."""
 
@@ -307,7 +307,7 @@ class TmuxExecutor(Executor):
         write_manifest(sweep_dir, run_id, runs)
 
         session = f"barl-{sweep_name}"
-        manager = [sys.executable, "-m", "barl_jax.launch.tmux_pool",
+        manager = [sys.executable, "-m", "launch.tmux_pool",
                    "--session", session,
                    "--sweep-dir", str(sweep_dir),
                    "--max-parallel", str(max_parallel)]

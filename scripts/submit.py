@@ -30,8 +30,10 @@ from pathlib import Path
 
 import yaml
 
-from barl_jax.launch import grid
-from barl_jax.launch.backends import EXECUTORS, SWEEP_NAME_FORMAT, SWEEPS_DIR, resolve
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from launch import grid  # noqa: E402
+from launch.backends import EXECUTORS, SWEEP_NAME_FORMAT, SWEEPS_DIR, resolve  # noqa: E402
 
 EVAL_MODES = ("DirectExecutor", "MeanExecutor", "MedianExecutor", "BestOfNExecutor",
               "TopKExecutor", "AxisShuffleExecutor", "PerturbExecutor")

@@ -33,9 +33,6 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.setuptools.package-data]
-barl_jax = ["launch/*.slurm"]
-
 [tool.uv.sources]
 # humanoid_bench's own setup.py uses find_packages(), which silently drops
 # every subpackage missing an __init__.py (dmc_deps, envs, mjx/envs) from a
@@ -80,6 +77,7 @@ testpaths = ["tests"]
 # -n 4 is the sweet spot measured on this box: XLA's own compilation is already
 # multi-threaded, so more workers just duplicate imports. Use `-n 0` to debug.
 addopts = "-n 4"
+pythonpath = ["."]
 
 [tool.ruff]
 # Only first-party code: the submodule and installed/generated trees are not

@@ -42,10 +42,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
         with: {python-version: "3.11"}
-      - run: uv build src/barl_jax --wheel --out-dir /tmp/barl-dist
+      - run: uv build --wheel --out-dir /tmp/barl-dist
       - run: uv venv /tmp/barl-wheel
       - run: uv pip install --python /tmp/barl-wheel/bin/python /tmp/barl-dist/*.whl
-      - run: cd /tmp && /tmp/barl-wheel/bin/python -c "from barl_jax.policy import Policy; from barl_jax.launch import grid; assert Policy.available(); assert grid.default_num_seeds() > 0"
+      - run: cd /tmp && /tmp/barl-wheel/bin/python -c "from barl_jax.policy import Policy; assert Policy.available()"
 
   cpu-example:
     runs-on: ubuntu-latest

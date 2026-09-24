@@ -12,7 +12,7 @@ import pathlib
 
 import pytest
 
-from barl_jax.launch import backends, grid
+from launch import backends, grid
 
 LAUNCH = pathlib.Path(grid.__file__).parent
 
