@@ -39,8 +39,7 @@ class LangevinActor(ActionSampler):
   critic_objective = "noise_td"
 
   def __init__(self, env_stats, config: LangevinActorConfig, *, rngs, **kwargs):
-    super().__init__(env_stats, config, **kwargs)
-    self.rngs = rngs
+    super().__init__(env_stats, config, rngs=rngs, **kwargs)
 
   def critic_score(self, critic, obs, act, level):
     """grad_a E[Z(s, a, level)], averaged over heads -- `expectation()` and not
@@ -59,7 +58,7 @@ class LangevinActor(ActionSampler):
   def generate_action(self, obs, *, critic=None, key=None):
     if critic is None:
       raise ValueError("LangevinActor requires a noise-conditioned critic")
-    key = self.rngs.noise() if key is None else key
+    key = self.next_key(key)
     sigmas = critic.noise.sigmas[...]
     num_levels = int(sigmas.size)
     key, init_key = jax.random.split(key)

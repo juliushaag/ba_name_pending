@@ -6,7 +6,6 @@ losses price through `frozen(critic).value`); TD samples the same interval and
 trains the field on the linear flow-matching target to the Bellman target.
 """
 
-import math
 from dataclasses import dataclass, field
 
 import jax
@@ -20,21 +19,15 @@ from barl_jax.networks.time_embedding import FourierTimeConfig, TimeEmbeddingCon
 from barl_jax.registration import register_component
 
 from .base import EnsembleConfig, TargetConfig, value_range
+from .categorical import to_histogram
 from .direct import DirectCritic, DirectCriticConfig
 
 
 def _histogram(value, v_min, v_max, num_bins, sigma):
   """HL-Gauss encoding of the interpolant, keeping its changing magnitude from
-  becoming an unbounded MLP input."""
-  value = jnp.clip(value.reshape(-1, 1), v_min, v_max)
+  becoming an unbounded MLP input. `sigma` is in bin widths."""
   edges = jnp.linspace(v_min, v_max, num_bins, dtype=jnp.float32)
-  width = (v_max - v_min) / (num_bins - 1)
-  std = jnp.maximum(sigma * width, 1e-6)
-  cdf = 0.5 * (1.0 + jax.scipy.special.erf(
-    (edges[None, :] - value) / (math.sqrt(2.0) * std)))
-  mass = jnp.maximum(cdf[:, 1:] - cdf[:, :-1], 0.0)
-  # Out-of-range interpolants leave tiny mass; a positive denominator keeps gradients finite.
-  return mass / jnp.maximum(mass.sum(axis=-1, keepdims=True), 1e-8)
+  return to_histogram(value, edges, max(sigma * (v_max - v_min) / (num_bins - 1), 1e-6))
 
 
 class FloqVectorField(nnx.Module):

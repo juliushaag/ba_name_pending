@@ -5,20 +5,20 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-from barl_jax.components import Actor, Buffer, Critic, frozen
+from barl_jax.components import Actor, Buffer, Critic
 from barl_jax.config.schemas import ComponentsConfig, ModelConfig, register_model
 from barl_jax.critics.categorical import C51CriticConfig
 from barl_jax.networks import gaussian
 from barl_jax.networks.base import NetworkConfig
 from barl_jax.networks.mlp import MLPConfig
 from barl_jax.networks.regulator import AutotuneRegulatorConfig
-from barl_jax.optimization import ActorOptim
+from barl_jax.optimization import ActorOptim, ActorOptimConfig
 from barl_jax.policies.rl import MaxEntPolicyConfig, MaxEntRLPolicy
 from barl_jax.registration import get_component, register_component, register_policy
 
 
 @dataclass(frozen=True)
-class StochasticActorConfig:
+class StochasticActorConfig(ActorOptimConfig):
   class_name: str = "StochasticActor"
   latent_dim: int = 256
   layers: int = 2
@@ -28,10 +28,6 @@ class StochasticActorConfig:
   log_std_min: float = -20.0
   log_std_max: float = 2.0
   log_prob_clip: float = 0.99
-  lr: float = 3.0e-4
-  adam_b1: float = 0.9
-  grad_clip: float = 1.0
-  grad_clip_mode: str = "element"
 
 
 @register_component
@@ -51,7 +47,7 @@ class StochasticActor(ActorOptim, Actor):
   config_type = StochasticActorConfig
 
   def __init__(self, env_stats, config: StochasticActorConfig, *, rngs: nnx.Rngs, **kwargs):
-    super().__init__(env_stats, config, **kwargs)
+    super().__init__(env_stats, config, rngs=rngs, **kwargs)
 
     self.log_std = nnx.Param(jnp.zeros((self.plan_dim,), jnp.float32))
     self.squash  = get_component(config.squash_cls)(env_stats, None)
@@ -65,10 +61,6 @@ class StochasticActor(ActorOptim, Actor):
     latent_dim, layers = config.latent_dim, config.layers
 
     self.net = config.mlp.build(self.obs_dim, self.plan_dim, latent_dim, layers, rngs=rngs)
-    self.rngs = rngs
-
-  def _plan(self, flat):
-    return flat.reshape(flat.shape[0], self.chunk_size, self.action_dim)
 
   def dist(self, s):
     """(mean, std) of the pre-squash Normal, over the flat plan."""
@@ -89,7 +81,7 @@ class StochasticActor(ActorOptim, Actor):
   def rsample(self, s, key=None):
     """Reparameterized (action, pre-squash x, dist) -- differentiable through s."""
     mean, std = self.dist(s)
-    key = self.rngs.noise() if key is None else key
+    key = self.next_key(key)
     x = mean + std * jax.random.normal(key, mean.shape, mean.dtype)
     return self.squash(x), x, (mean, std)
 
@@ -109,24 +101,17 @@ class StochasticActor(ActorOptim, Actor):
     # the same shape (and at chunk_size 1 the same value) as the old (B, 1)
     # joint entropy, so a scalar alpha reads the chunk-summed total unchanged.
     entropy = -self.chunk_sum(log_prob)
-    return self._plan(action_flat), entropy
+    return self.to_plan(action_flat), entropy
 
   def sample(self, s, *, critic: Critic = None, key=None):
     action_flat, _, _ = self.rsample(s, key)
-    return self._plan(action_flat)
+    return self.to_plan(action_flat)
 
   def mode(self, s):
     """Deterministic (mean) action -- IQL trains via AWR but deploys this."""
     mean, _ = self.dist(s)
-    return self._plan(self.squash(mean))
+    return self.to_plan(self.squash(mean))
 
-  def loss(self, obs, critic: "Critic", alpha, *, key=None):
-    action, entropy = self.generate_action(obs, key=key)
-    q = frozen(critic).value(obs, action.reshape(action.shape[0], -1))
-    # entropy is (B, chunk_size); alpha is a scalar or (chunk_size,), so
-    # `alpha * entropy` broadcasts and the chunk sum gives one (B, 1) bonus.
-    bonus = (jax.lax.stop_gradient(alpha) * entropy).sum(axis=-1, keepdims=True)
-    return {"actor": -(q + bonus).mean()}
 
 @register_policy
 class SAC(MaxEntRLPolicy):

@@ -162,6 +162,10 @@ class Component:
     the module tree, so it never names itself."""
     return Recorder(self)
 
+  def to_plan(self, flat):
+    """A flat `(B, plan_dim)` array as `(B, chunk_size, action_dim)`."""
+    return flat.reshape(flat.shape[0], self.chunk_size, self.action_dim)
+
   def chunk_sum(self, x):
     """An elementwise per-dimension quantity at plan resolution, `(..., plan_dim)`,
     reduced within each chunk position's `action_dim` block: `(..., plan_dim) ->
@@ -213,6 +217,14 @@ class ActionSampler(Component, nnx.Module, ABC):
 
   critic_objective = "td"
 
+  def __init__(self, env_stats=None, config=None, *, rngs: nnx.Rngs = None, **kwargs):
+    super().__init__(env_stats, config, **kwargs)
+    self.rngs = rngs
+
+  def next_key(self, key=None):
+    """`key`, or a fresh draw from this sampler's own RNG stream."""
+    return self.rngs.noise() if key is None else key
+
   @abstractmethod
   def generate_action(self, obs, *, critic: "Critic" = None, key=None) -> tuple:
     """(action, entropy): a canonical [-1, 1] action, one row per obs row, and
@@ -232,13 +244,18 @@ class ActionSampler(Component, nnx.Module, ABC):
 class Actor(ActionSampler):
   """A sampler with an off-policy actor objective."""
 
-  @abstractmethod
   def loss(self, obs, critic: "Critic", alpha, *, key=None):
     """This actor's own training objective at `obs`, priced against a frozen
-    `critic` -- a dict with one scalar per optimizer key it trains (usually just
-    `"actor"`). Returns rather than mutating a `losses` dict -- see
-    the class docstring. Every key here must be one `create_optimizer()` also
-    declares."""
+    `critic` -- a dict with one scalar per optimizer key it trains. Every key
+    must be one `create_optimizer()` also declares.
+
+    The default is maximum-entropy Q ascent through the reparameterized sample:
+    `alpha` is a scalar or `(chunk_size,)` and broadcasts against the per-position
+    `(B, chunk_size)` entropy, whose chunk sum is the `(B, 1)` bonus."""
+    action, entropy = self.generate_action(obs, key=key)
+    q = frozen(critic).value(obs, action.reshape(action.shape[0], -1))
+    bonus = (jax.lax.stop_gradient(alpha) * entropy).sum(axis=-1, keepdims=True)
+    return {"actor": -(q + bonus).mean()}
 
 
 

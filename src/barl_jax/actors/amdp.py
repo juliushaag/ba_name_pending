@@ -13,13 +13,13 @@ from barl_jax.networks.diffusion import TimeConditionedField, controlled_sde
 from barl_jax.networks.mlp import MLPConfig
 from barl_jax.networks.regulator import AutotuneRegulatorConfig
 from barl_jax.networks.time_embedding import FourierTimeConfig, TimeEmbeddingConfig
-from barl_jax.optimization import ActorOptim
+from barl_jax.optimization import ActorOptim, ActorOptimConfig
 from barl_jax.policies.rl import MaxEntPolicyConfig, MaxEntRLPolicy
 from barl_jax.registration import get_component, register_component, register_policy
 
 
 @dataclass(frozen=True)
-class ScoreContinuousActorConfig:
+class ScoreContinuousActorConfig(ActorOptimConfig):
   class_name: str = "ScoreContinuousActor"
   latent_dim: int = 256
   layers: int = 2
@@ -35,10 +35,6 @@ class ScoreContinuousActorConfig:
   q_score_max_norm: float = 5.0
   q_score_max_percentile: float = 95.0
   batch_rep: int = 1
-  lr: float = 3.0e-4
-  adam_b1: float = 0.9
-  grad_clip: float = 1.0
-  grad_clip_mode: str = "element"
 
 
 def clip_score(score, max_norm: float, percentile: float):
@@ -59,7 +55,7 @@ class ScoreContinuousActor(ActorOptim, Actor):
   config_type = ScoreContinuousActorConfig
 
   def __init__(self, env_stats, config: ScoreContinuousActorConfig, *, rngs: nnx.Rngs, **kwargs):
-    super().__init__(env_stats, config, **kwargs)
+    super().__init__(env_stats, config, rngs=rngs, **kwargs)
 
     self._log_r    = math.log(self.config.sigma_max / self.config.sigma_min)
     self._int_base = float(self._raw_int(jnp.asarray(self.config.tau_min, jnp.float32)))
@@ -76,7 +72,6 @@ class ScoreContinuousActor(ActorOptim, Actor):
     sig_sq = self.sigma_sq_int_fn(taus)                        # exact, rebased to tau_min
     self.taus     = Buffer(taus)
     self.step_var = Buffer(jnp.maximum(sig_sq[1:] - sig_sq[:-1], 0.0))
-    self.rngs     = rngs
 
     self._terminal_var = float(self.step_var[...].sum())
 
@@ -141,7 +136,7 @@ class ScoreContinuousActor(ActorOptim, Actor):
     """`critic` is unused -- AMDP's actor needs none to sample -- and accepted
     only to satisfy the shared `Actor.generate_action` contract."""
     B = obs.shape[0]
-    key = self.rngs.noise() if key is None else key
+    key = self.next_key(key)
 
     X = jnp.zeros((B, self.plan_dim), jnp.float32)
     X, log_w = controlled_sde(lambda x, i, k: self.euler_step(obs, x, i, k),
@@ -159,7 +154,7 @@ class ScoreContinuousActor(ActorOptim, Actor):
   def loss(self, obs, critic: Critic, alpha, *, key=None):
     """Adjoint matching (Adjoint Matching, arXiv:2409.08861, Sec. 5.2)"""
 
-    key = self.rngs.noise() if key is None else key
+    key = self.next_key(key)
     rollout_key, tau_key, noise_key = jax.random.split(key, 3)
     alpha = jax.lax.stop_gradient(jnp.asarray(alpha))
 

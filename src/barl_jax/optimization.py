@@ -1,6 +1,7 @@
 """Optimizer ownership, partitioning, gradient steps, and schedules."""
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from functools import partial
 
 import jax
@@ -239,14 +240,8 @@ def gated_losses(policy, fn, keys, *modules):
 
 
 # ---------------------------------------------------------------------------
-# Optimizer role configurations -- the four optimizer knobs as class
-# attributes, grouped by role so every component that optimizes inherits
-# exactly the one that fits it (critic uses the critic's b1 and clip, actor
-# the actor's, dual the dual's). These are ordinary config defaults.
+# Optimizer configuration: the four Adam knobs, with per-role defaults.
 # ---------------------------------------------------------------------------
-
-
-from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -260,6 +255,10 @@ class OptimizerConfig:
     if self.grad_clip_mode in CLIP_MODES:
       return []
     return [f"grad_clip_mode={self.grad_clip_mode!r}: unknown clip mode"]
+
+  def build(self):
+    """This component's optax transform: NaN guard, its own clip, then Adam."""
+    return adam(self.lr, self.adam_b1, self.grad_clip, self.grad_clip_mode)
 
 
 @dataclass(frozen=True)
@@ -279,20 +278,11 @@ class DualOptimConfig(OptimizerConfig):
   grad_clip_mode: str = "global_norm"
 
 
-class CriticOptim:
-  config_type = CriticOptimConfig
-
-
 class ActorOptim:
-  config_type = ActorOptimConfig
+  """Mixin for an actor trained by one Adam optimizer under the key "actor"."""
 
   def create_optimizer(self) -> dict:
-    c = self.config
-    return {"actor": adam(c.lr, c.adam_b1, c.grad_clip, c.grad_clip_mode)}
-
-
-class DualOptim:
-  config_type = DualOptimConfig
+    return {"actor": self.config.build()}
 
 
 CLIP_MODES = ("global_norm", "element", "none")

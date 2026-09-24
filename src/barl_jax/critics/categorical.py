@@ -65,7 +65,7 @@ def to_histogram(value, edges, sigma):
   clipped range."""
   value = jnp.clip(value.reshape(-1, 1), edges[0], edges[-1])
   cdf = 0.5 * (1.0 + jax.scipy.special.erf((edges - value) / (sigma * math.sqrt(2.0))))
-  mass = cdf[:, 1:] - cdf[:, :-1]
+  mass = jnp.maximum(cdf[:, 1:] - cdf[:, :-1], 0.0)
   return mass / jnp.maximum(mass.sum(axis=-1, keepdims=True), 1e-8)
 
 

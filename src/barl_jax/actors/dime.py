@@ -5,7 +5,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from barl_jax.components import Actor, Buffer, Critic, frozen
+from barl_jax.components import Actor, Buffer, Critic
 from barl_jax.config.schemas import ComponentsConfig, ModelConfig, register_model
 from barl_jax.critics.categorical import C51CriticConfig
 from barl_jax.networks import gaussian
@@ -14,13 +14,13 @@ from barl_jax.networks.diffusion import TimeConditionedField, controlled_sde
 from barl_jax.networks.mlp import MLPConfig
 from barl_jax.networks.regulator import AutotuneRegulatorConfig
 from barl_jax.networks.time_embedding import FourierTimeConfig, TimeEmbeddingConfig
-from barl_jax.optimization import ActorOptim
+from barl_jax.optimization import ActorOptim, ActorOptimConfig
 from barl_jax.policies.rl import MaxEntPolicyConfig, MaxEntRLPolicy
 from barl_jax.registration import get_component, register_component, register_policy
 
 
 @dataclass(frozen=True)
-class DISActorConfig:
+class DISActorConfig(ActorOptimConfig):
   class_name: str = "DISActor"
   latent_dim: int = 256
   layers: int = 2
@@ -40,9 +40,6 @@ class DISActorConfig:
   per_dim_friction: bool = True
   learn_dt: bool = True
   learn_friction: bool = True
-  lr: float = 3.0e-4
-  grad_clip: float = 1.0
-  grad_clip_mode: str = "element"
 
 def _inv_softplus(x: float) -> float:
   """dime_am's `inverse_softplus`, so a raw parameter initialized with this
@@ -82,7 +79,7 @@ class DISActor(ActorOptim, Actor):
   config_type = DISActorConfig
 
   def __init__(self, env_stats, config: DISActorConfig, *, rngs: nnx.Rngs, **kwargs):
-    super().__init__(env_stats, config, **kwargs)
+    super().__init__(env_stats, config, rngs=rngs, **kwargs)
 
     # Both are stored through softplus, the reference's parameterization, so the
     # positivity a step size and a friction need is structural rather than a
@@ -110,7 +107,6 @@ class DISActor(ActorOptim, Actor):
     self.field.zero_init_head()
 
     self.squash = get_component(self.config.squash_cls)(env_stats, None)
-    self.rngs = rngs
 
   # ---- the process ---------------------------------------------------------
 
@@ -132,7 +128,7 @@ class DISActor(ActorOptim, Actor):
   def generate_action(self, obs, *, critic: Critic = None, key=None, squash=True):
     """`critic` is unused -- DIME's actor needs none to sample -- and accepted
     only to satisfy the shared `Actor.generate_action` contract."""
-    key = self.rngs.noise() if key is None else key
+    key = self.next_key(key)
     key, prior_key = jax.random.split(key)
 
     x = self.config.prior_std * jax.random.normal(prior_key, (obs.shape[0], self.plan_dim), jnp.float32)
@@ -159,12 +155,6 @@ class DISActor(ActorOptim, Actor):
       X = self.squash(X)
 
     return X.reshape(obs.shape[0], self.chunk_size, self.action_dim), entropy
-
-  def loss(self, obs, critic: "Critic", alpha, *, key=None):
-    action, entropy = self.generate_action(obs, key=key)
-    q = frozen(critic).value(obs, action.reshape(action.shape[0], -1))
-    bonus = (jax.lax.stop_gradient(alpha) * entropy).sum(axis=-1, keepdims=True)
-    return {"actor": -(q + bonus).mean()}
 
   def derived(self) -> dict:
     return {"dt_0": float(jax.nn.softplus(self.dt_raw[...])[0] * self.dt_scale[...][0]),

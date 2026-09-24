@@ -11,6 +11,7 @@ and works for every head:
   weight_norm           XQC's unit-norm weight projection after every step
 """
 
+from abc import abstractmethod
 from dataclasses import dataclass, field
 
 import jax
@@ -24,7 +25,7 @@ from barl_jax.networks.ensemble import Ensemble
 from barl_jax.networks.mlp import MLPConfig
 from barl_jax.networks.schedule import ScheduleConfig
 from barl_jax.networks.time_embedding import FourierTimeConfig, TimeEmbeddingConfig
-from barl_jax.optimization import CriticOptim, CriticOptimConfig, adam
+from barl_jax.optimization import CriticOptimConfig
 
 REDUCTIONS = ("mean", "min")
 TARGET_KINDS = ("none", "polyak")
@@ -155,7 +156,7 @@ class QNetwork(nnx.Module):
     return self.ensemble(jnp.concatenate(x, axis=-1))
 
 
-class QCritic(CriticOptim, Critic):
+class QCritic(Critic):
   """Shared TD machinery. A head implements `out_dim`, `expectation_members`,
   `bootstrap_members`, `td_target`, `regression_loss`, `soft_target` and
   `target_expectation`; raw outputs are always (n_models, B, out_dim)."""
@@ -211,8 +212,7 @@ class QCritic(CriticOptim, Critic):
     return self.noise is None
 
   def create_optimizer(self) -> dict:
-    c = self.config
-    return {"critic": adam(c.lr, c.adam_b1, c.grad_clip, c.grad_clip_mode)}
+    return {"critic": self.config.build()}
 
   # ---- pricing -----------------------------------------------------------
 
@@ -330,26 +330,30 @@ class QCritic(CriticOptim, Critic):
   # ---- head interface ----------------------------------------------------
 
   @classmethod
+  @abstractmethod
   def out_dim(cls, config) -> int:
-    raise NotImplementedError
+    ...
 
+  @abstractmethod
   def expectation_members(self, raw):
     """(N, B, 1) float32 expected value per member."""
-    raise NotImplementedError
 
+  @abstractmethod
   def bootstrap_members(self, next_raw):
     """(N, B, K) per-member quantity `td_target` consumes."""
-    raise NotImplementedError
 
+  @abstractmethod
   def td_target(self, chunk_return, discount, bootstrap, entropy_bonus):
-    raise NotImplementedError
+    ...
 
+  @abstractmethod
   def regression_loss(self, raw, target):
-    raise NotImplementedError
+    ...
 
+  @abstractmethod
   def soft_target(self, raw):
     """Ensemble-mean prediction, in the representation `regression_loss` fits."""
-    raise NotImplementedError
 
+  @abstractmethod
   def target_expectation(self, target):
-    raise NotImplementedError
+    ...

@@ -7,7 +7,7 @@ import optax
 from flax import nnx
 
 from barl_jax.components import Component
-from barl_jax.optimization import DualOptim, DualOptimConfig, adam
+from barl_jax.optimization import DualOptimConfig
 from barl_jax.registration import register_component
 
 
@@ -19,7 +19,7 @@ class AutotuneRegulatorConfig(DualOptimConfig):
 
 
 @register_component
-class AutotuneRegulator(DualOptim, Component, nnx.Module):
+class AutotuneRegulator(Component, nnx.Module):
   """A Lagrange multiplier tuned to hold some measured quantity at `target`
   (SAC's entropy temperature, and the same machinery for any other dual). The
   loss is `log_alpha * (value - target)`, whose gradient wrt log_alpha is
@@ -38,7 +38,7 @@ class AutotuneRegulator(DualOptim, Component, nnx.Module):
   no granularity switch of its own -- the owning Policy decides by what shape
   of `target` it passes in, and `value()`/`loss()` broadcast either way.
 
-  The optimizer knobs come from the `DualOptim` mixin (a higher LR, unclipped)."""
+  The optimizer knobs come from `DualOptimConfig` (a higher LR)."""
 
   config_type = AutotuneRegulatorConfig
 
@@ -99,7 +99,5 @@ class AutotuneRegulator(DualOptim, Component, nnx.Module):
   def create_optimizer(self) -> dict:
     # Keyed by slot, so a policy's two regulators stay distinct without a
     # `name` kwarg.
-    c = self.config
-    tx = (adam(c.lr, c.adam_b1, c.grad_clip, c.grad_clip_mode)
-          if c.tune else optax.set_to_zero())
+    tx = self.config.build() if self.config.tune else optax.set_to_zero()
     return {f"{self.slot}_alpha": tx}

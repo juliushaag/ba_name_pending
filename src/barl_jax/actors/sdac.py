@@ -12,13 +12,13 @@ from barl_jax.networks.base import NetworkConfig
 from barl_jax.networks.diffusion import TimeConditionedField, reverse_chain
 from barl_jax.networks.mlp import MLPConfig
 from barl_jax.networks.time_embedding import FourierTimeConfig, TimeEmbeddingConfig
-from barl_jax.optimization import ActorOptim
+from barl_jax.optimization import ActorOptim, ActorOptimConfig
 from barl_jax.policies.rl import PolicyConfig, RLPolicy
 from barl_jax.registration import register_component, register_policy
 
 
 @dataclass(frozen=True)
-class DDPMActorConfig:
+class DDPMActorConfig(ActorOptimConfig):
   class_name: str = "DDPMActor"
   latent_dim: int = 512
   layers: int = 2
@@ -32,9 +32,6 @@ class DDPMActorConfig:
   clip_sampler: bool = True
   num_candidates: int = 500
   temperature: float = 0.25
-  lr: float = 3.0e-4
-  adam_b1: float = 0.9
-  grad_clip: float = 1.0
   grad_clip_mode: str = "none"
 
 
@@ -50,15 +47,11 @@ class DDPMActor(ActorOptim, Actor):
   config_type = DDPMActorConfig
 
   def __init__(self, env_stats, config: DDPMActorConfig, *, rngs: nnx.Rngs, **kwargs):
-    super().__init__(env_stats, config, **kwargs)
+    super().__init__(env_stats, config, rngs=rngs, **kwargs)
     self.field = TimeConditionedField(
       self.obs_dim, self.plan_dim, latent_dim=config.latent_dim, layers=config.layers,
       time=config.time, mlp=config.mlp, rngs=rngs)
     self.t_grid = Buffer(jnp.linspace(config.t_min, config.t_max, config.num_steps + 1, dtype=jnp.float32))
-    self.rngs = rngs
-
-  def _plan(self, flat):
-    return flat.reshape(flat.shape[0], self.chunk_size, self.action_dim)
 
   # ---- the noise process ---------------------------------------------------
   def alpha_sigma(self, t):
@@ -92,18 +85,18 @@ class DDPMActor(ActorOptim, Actor):
     return mean
 
   def generate_action(self, obs, *, critic=None, key=None):
-    key = self.rngs.noise() if key is None else key
+    key = self.next_key(key)
     key, prior_key = jax.random.split(key)
     x = jax.random.normal(prior_key, (obs.shape[0], self.plan_dim), jnp.float32)
     x = reverse_chain(lambda x, n, k: self.reverse_step(obs, x, n, k), x, self.config.num_steps, key)
-    return self._plan(jnp.clip(x, -1.0, 1.0)), None
+    return self.to_plan(jnp.clip(x, -1.0, 1.0)), None
 
   # ---- reverse-sampling score matching ---------------------------------------
   def loss(self, obs, critic, alpha, *, key=None, action=None):
     """Diffuse `action` (the replay action; a fresh sample when None) to a random
     t, draw K eps whose x0 reconstructions stay in [-1, 1], and regress the eps
     prediction onto them weighted by softmax(Q(x0_k) / (temperature * q_scale)) over K."""
-    keys = jax.random.split(self.rngs.noise() if key is None else key, 5)
+    keys = jax.random.split(self.next_key(key), 5)
     if action is None:
       action = jax.lax.stop_gradient(self.generate_action(obs, key=keys[4])[0])
     B, K = obs.shape[0], self.config.num_candidates

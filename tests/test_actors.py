@@ -79,5 +79,5 @@ def test_stochastic_actor_log_prob_and_mode(obs, key):
     assert jnp.all(jnp.abs(action) <= 1.0)
     assert jnp.all(jnp.abs(a.mode(obs)) <= 1.0)
 
-    lp = a.log_prob(dist, a._plan(action))
+    lp = a.log_prob(dist, a.to_plan(action))
     assert lp.shape == (BATCH,) and finite(lp)
