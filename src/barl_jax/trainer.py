@@ -205,9 +205,7 @@ def _build_policies(run, resume_meta) -> list[Policy]:
   return policies
 
 
-# ----------------------------------------------------------------------
 # Evaluation
-# ----------------------------------------------------------------------
 
 
 def _checkpoint_dir(run: Run, root: str, seed: int) -> str:
@@ -314,9 +312,7 @@ def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
                 "time/eval_video_s": video_s}
 
 
-# ----------------------------------------------------------------------
 # Training
-# ----------------------------------------------------------------------
 
 
 def run_config_snapshot(run: Run) -> dict:

@@ -58,9 +58,7 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
   SLOTS: tuple[str, ...] = ()
   SLOT_OBJECTIVES: dict[str, str] = {}
 
-  # ------------------------------------------------------------------
   # Registry
-  # ------------------------------------------------------------------
 
   @staticmethod
   def make(name: str, env: gym.Env, model: ModelConfig = None, *, policy_class: str = None,
@@ -86,9 +84,7 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
     load_builtins("policies")
     return sorted(MODEL_SCHEMAS)
 
-  # ------------------------------------------------------------------
   # Construction
-  # ------------------------------------------------------------------
 
   def __init__(self, env: gym.Env, model: ModelConfig, env_stats: EnvStats = None,
                rngs: nnx.Rngs = None, seed: int = 0, model_name: str = None):
@@ -231,9 +227,7 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
             for slot, component in self.components.items()
             for key, value in component.derived().items()}
 
-  # ------------------------------------------------------------------
   # Metrics
-  # ------------------------------------------------------------------
 
   def algo_name(self) -> str:
     """This algorithm's logging namespace -- `SAC` -> `sac`, `AMDP` -> `amdp`.
@@ -248,9 +242,7 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
     self.batch_metrics.dist("reward", batch["chunk_return"])
     self.batch_metrics.dist("action", batch["act"])
 
-  # ------------------------------------------------------------------
   # Component lifecycle
-  # ------------------------------------------------------------------
 
   @property
   def components(self) -> dict[str, "Component"]:
@@ -277,13 +269,7 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
     for component in self.components.values():
       component.after_step()
 
-  # ------------------------------------------------------------------
-  # Checkpointing
-  # ------------------------------------------------------------------
-
-  # ------------------------------------------------------------------
   # Observation normalisation
-  # ------------------------------------------------------------------
 
   def update_observation_stats(self, obs):
     if not self.normalize_obs:
@@ -308,9 +294,7 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
   def discount(self):
     return 1.0
 
-  # ------------------------------------------------------------------
   # Action scaling
-  # ------------------------------------------------------------------
 
   # Every continuous actor trains against a canonical per-dimension [-1, 1]
   # output, independent of the env's real bounds; scale_action is the one-place
@@ -338,19 +322,14 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
     """Canonical runtime action shape, always `(batch, chunk_size, act_dim)`."""
     return normalize_action_chunk(action, chunk_size=self.chunk_size, act_dim=self.action_dim, xp=jnp)
 
-  # ------------------------------------------------------------------
   # Misc
-  # ------------------------------------------------------------------
 
   def num_params(self) -> int:
     # TRAINABLE, not nnx.Param: a Polyak target is a full second copy of the
-    # critic and counting it would inflate this by ~40%. It is the analogue of
-    # torch's `if p.requires_grad`, which excluded the frozen EMA copy.
+    # critic and counting it would inflate this by ~40%.
     return sum(int(np.prod(x.shape)) for x in jax.tree.leaves(nnx.state(self, TRAINABLE)))
 
-  # ------------------------------------------------------------------
   # Jitted inference
-  # ------------------------------------------------------------------
 
   # inference_step runs once per env step in both rollout and eval, so this is
   # the hot path. Called directly it dispatches op-by-op in eager JAX (~17x the
@@ -394,9 +373,7 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
       return partial(_jitted_infer, interned_static(graphdef), state)
     return partial(_jitted_infer_exec, interned_static(graphdef), executor.config, state)
 
-  # ------------------------------------------------------------------
   # Best-of-N scoring (optional capability -- see barl_jax.executors)
-  # ------------------------------------------------------------------
 
   #: Whether `score()` is a real critic-backed scorer. False by default;
   #: `RLPolicy` (SAC/AMDP/DIME/SDAC) sets this True. Checked eagerly by
@@ -426,9 +403,7 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
 
     return 1000 * elapsed / n
 
-  # ------------------------------------------------------------------
   # Abstract interface
-  # ------------------------------------------------------------------
 
   @abstractmethod
   def train_step(self, batch: dict) -> dict:

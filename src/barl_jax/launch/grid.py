@@ -77,9 +77,7 @@ def check_config(algos: list[str], envs: list[str]) -> list[str]:
   return problems
 
 
-# ---------------------------------------------------------------------------
 # axes
-# ---------------------------------------------------------------------------
 
 def build_axes(*, grid: str = None, algos: list = None, envs: list = None,
                sets: list = None) -> tuple[dict, list[dict]]:
@@ -163,9 +161,7 @@ def name_combos(combos: list[dict], axes: dict, num_seeds: int) -> list[str]:
   return tags
 
 
-# ---------------------------------------------------------------------------
 # materialization
-# ---------------------------------------------------------------------------
 
 def command_for(kind: str, config_path: str, *, output_path: str = None,
                 run_dir: str = None) -> list[str]:

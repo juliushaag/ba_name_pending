@@ -1,42 +1,28 @@
 """Diagnostics, as sown nnx intermediates.
 
-`train_step` returns *only* losses; everything else is sown onto the module that
-computed it and collected by `nnx.capture` at the jit boundary. Two things fall
-out of using nnx's own mechanism rather than a side-channel object:
+`train_step` returns *only* losses; everything else is set as an attribute on the
+module that computed it and collected with `nnx.pop` at the jit boundary.
 
 - **Keys come from the module hierarchy.** A critic writing
   `self.metrics.dist("critic", pred)` lands at `critic/q/*` because the critic *is*
-  at `policy.critic` -- nothing is passed a namespace and nothing names itself.
-- **Nothing can leak a tracer.** The old sink held traced values on a plain
-  Python object; if it outlived the transform that produced them, JAX raised
-  `UnexpectedTracerError`. `nnx.pop` hands them back as a State the trainer
-  returns from the traced step, which is how values are supposed to leave a
-  transform.
+  at `policy.critic`; nothing names itself.
+- **Nothing leaks a tracer.** `nnx.pop` hands the values back as a State the trainer
+  returns from the traced step, which is how values leave a transform.
 
-Collection is `nnx.pop`, not the `nnx.capture` that `Module.sow` now advertises.
-`capture` instruments the module while the function runs -- it injects a
-`__captures__` entry whose keys mix ints and strings -- and every nnx operation
-that flattens module state then dies sorting them. That rules out any nnx
-transform inside the traced region, which NC-LQL needs (`nnx.grad` through an
-ensemble critic whose forward is an `nnx.vmap`) and which AMDP needs to freeze
-a critic. `pop` reads the values out afterwards and instruments nothing, so the
-transforms compose.
+Collection is `nnx.pop`, not `nnx.capture`: `capture` instruments the module while
+the function runs, and every nnx operation that flattens module state then dies
+sorting the injected `__captures__` keys. That rules out any nnx transform inside
+the traced region, which NC-LQL needs (`nnx.grad` through an ensemble critic) and
+AMDP needs to freeze a critic. Recording is a plain attribute assignment rather
+than `Module.sow()`: a metric never wants sow's `reduce_fn`, and sow warns outside
+`nnx.capture()`.
 
-Recording is a plain attribute assignment rather than `Module.sow()` for the
-same reason: sow's only extra service is combining repeats via `reduce_fn`,
-which a metric never wants (the current value wins), and it warns when used
-outside `nnx.capture()` -- a warning that cannot reliably be filtered, since
-jax installs an `always` filter for DeprecationWarning ahead of ours.
+Tiers are a *trace-time* decision: `recording()` is entered by the trainer around
+the traced step, so an unarmed family is compiled away rather than skipped, and
+there are at most three compiled variants (none / primary / primary+debug).
 
-Tiers are a *trace-time* decision: `recording()` is entered by the trainer
-around the traced step, so an unarmed family is compiled away entirely rather
-than merely skipped, and there are at most three compiled variants of the step
-(none / primary / primary+debug).
-
-Values stay 0-dim device arrays throughout; crossing to the host is the
-trainer's job -- one `jax.device_get` on the whole captured State per logged
-step, never a `float()` per key (that serializes JAX's async dispatch the same
-way `.item()` did in torch)."""
+Values stay 0-dim device arrays; crossing to the host is the trainer's job -- one
+`jax.device_get` per logged step, never a `float()` per key."""
 
 import types
 from contextlib import contextmanager
@@ -132,9 +118,7 @@ class Recorder:
     self._owner  = owner
     self._prefix = prefix
 
-  # ------------------------------------------------------------------
   # Recording
-  # ------------------------------------------------------------------
 
   def _put(self, name: str, value, tier: str = PRIMARY):
     if tier not in _ACTIVE:
@@ -158,9 +142,7 @@ class Recorder:
   def scalar(self, name: str, value, tier: str = PRIMARY):
     self._put(name, value, tier)
 
-  # ------------------------------------------------------------------
   # Families -- one primary key per quantity, the expansion on the debug tier
-  # ------------------------------------------------------------------
 
   def dist(self, name: str, x):
     """Any per-sample scalar quantity: q values, advantages, rewards, entropies."""
@@ -172,8 +154,7 @@ class Recorder:
     self._put(f"{name}/min", x.min())
     self._put(f"{name}/max", x.max())
 
-    # `or`, not the torch version's `and`: a value cannot be both above
-    # max-1e-3 and below min+1e-3, so that key logged a constant 0.
+    # `or`: a value cannot be both above max-1e-3 and below min+1e-3.
     lo, hi = x.min() + 1e-3, x.max() - 1e-3
     self._put(f"{name}/edge_sat",
               jnp.logical_or(x > hi, x < lo).astype(jnp.float32).mean())

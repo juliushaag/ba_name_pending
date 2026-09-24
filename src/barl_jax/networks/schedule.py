@@ -4,7 +4,7 @@ single abstract `value(t)` over normalized progress t in [0, 1].
 
 Being components means a schedule is a slot like any other -- `class:` picks the
 curve, so switching a noise ladder from geometric to cosine spacing is a
-one-word edit in config/models.yaml and a sweepable `model.components.<slot>.class`
+one-word config edit and a sweepable `model.components.<slot>.class`
 axis:
 
     sigmas: {class: ExponentialSchedule, start: 0.1, end: 1.0e-3, steps: 10}

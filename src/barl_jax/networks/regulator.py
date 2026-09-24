@@ -62,10 +62,9 @@ class AutotuneRegulator(Component, nnx.Module):
     super().__init__(env_stats, config, **kwargs)
 
     target = jnp.asarray(target, jnp.float32)
-    # 0-dim, not shape (1,), for a scalar target: the torch original carried a
-    # singleton dimension that made every product with alpha non-scalar, so a
-    # loss which did not happen to end in .mean() came out shaped (1,) and
-    # jax.grad rejected it. A (chunk_size,) target gives log_alpha the same
+    # 0-dim, not shape (1,), for a scalar target: a singleton dimension makes
+    # every product with alpha non-scalar, and jax.grad rejects a non-scalar
+    # loss. A (chunk_size,) target gives log_alpha the same
     # shape -- one Lagrange multiplier per chunk position instead of one for
     # the whole plan.
     self.log_alpha = nnx.Param(jnp.full(target.shape, math.log(config.alpha_init), jnp.float32))

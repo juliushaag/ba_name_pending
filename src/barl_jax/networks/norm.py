@@ -112,8 +112,7 @@ def BatchNorm(num_features: int, *, momentum: float, epsilon: float,
 
 def LayerNorm(num_features: int, *, epsilon: float, dtype=jnp.float32,
               rngs: nnx.Rngs, **_) -> nnx.LayerNorm:
-  # torch's LayerNorm eps is 1e-5, flax's 1e-6; config/presets/net.yaml states
-  # which, rather than either library's default deciding silently.
+  # `epsilon` is always the config's, never a library default (1e-5 vs 1e-6).
   return nnx.LayerNorm(num_features, epsilon=epsilon,
                        dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
 

@@ -10,14 +10,14 @@ for verification. Tests use the CPU; the training CLI requires an accelerator
 unless `BARL_ALLOW_CPU=1` is explicitly set.
 
 Keep package and config imports lightweight. Load simulator dependencies inside
-environment factories. Pass a `ModelSpec`/`RunConfig` explicitly in new runtime
+environment factories. Pass a `ModelConfig`/`RunConfig` explicitly in new runtime
 code and keep configuration instance-local. Components
 import contracts from `components.py`, not from the policy implementation.
 
 Algorithm defaults live in typed frozen dataclasses beside their
 implementations (`*Config` with `config_type`, e.g. `StochasticActorConfig`)
 -- the single source of truth for that component; `config/schemas.py` stays
-generic scaffolding (run/environment metadata, the model/components
+generic scaffolding (the model/components
 composition shape, the registries) and never redeclares them. MLP settings
 are grouped under one nested `mlp` dataclass, read back as
 `self.config.mlp.activation`. There is no capacity-tier selector; a
@@ -43,7 +43,7 @@ operations should have one implementation and explicit, readable composition.
 ## Active implementation handoff
 
 The typed-config restructure is complete (`RunConfig.from_dict`/`defaults`,
-`ModelSpec`, `config.serialization`). Keep algorithm changes explicit,
+`ModelConfig`, `config.serialization`). Keep algorithm changes explicit,
 especially normalization, gradient isolation, action chunking, evaluation RNG
 ownership, and checkpoint continuation semantics.
 

@@ -6,9 +6,7 @@ class Ensemble(nnx.Module):
   single vmapped call. Returns the un-reduced `(n, ...)` stack; how it is
   reduced belongs to whoever owns it (see QCritic.reduce_value).
 
-  The torch version hand-rolled this out of stack_module_state +
-  functional_call + a meta-device template; here it is what nnx.vmap does
-  natively. `nnx.split_rngs(splits=n)` is the load-bearing part: without it
+  `nnx.split_rngs(splits=n)` is the load-bearing part: without it
   every member draws the same init key and the ensemble collapses to `n`
   identical heads. Nothing errors -- the spread is simply 0, which silently
   turns a `min` reduction into a plain mean and disables pessimism for the

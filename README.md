@@ -112,7 +112,7 @@ completed evaluation is `null` there, not a non-finite float, with
 Algorithm defaults live in typed dataclasses beside their implementations
 (`StochasticActorConfig`, `C51CriticConfig`, ... with `config_type`, the
 single source of truth for that component -- `config/schemas.py` stays
-generic run/environment scaffolding and never redeclares them); policy YAML
+generic model/components scaffolding and never redeclares them); policy YAML
 files are no longer required. MLP settings are grouped under one nested `mlp`
 dataclass on actors and critics, read back as
 `self.config.mlp.activation`/`self.config.mlp.norm`/... There is no capacity-tier
@@ -220,7 +220,6 @@ time, not a silent precedence rule.
 For independent in-process experiments, pass configuration explicitly:
 
 ```python
-from barl_jax.config.model import ModelSpec
 from barl_jax.config.run import RunConfig
 from barl_jax.policy import Policy
 
@@ -228,13 +227,13 @@ run = RunConfig.from_dict({
   "model": "SAC", "env": "HalfCheetah",
   "model_overrides": {"params": {"policy_delay": 2}},
 })
-spec = ModelSpec.resolve("SAC", run)
-policy = Policy.make("SAC", env, env_stats=env_stats, spec=spec)
+policy = Policy.make("SAC", env, run.model_config, env_stats=env_stats)
 ```
 
-`ModelSpec` freezes resolved parameters, component choices and provenance.
-Policies retain their own resolved specification; later config changes cannot affect
-their components. Import contracts, checkpoint functions and inference utilities from
+`RunConfig.model_config` is the complete typed model (policy params and component
+configs). Policies retain it as `policy.config`; it is frozen, so later config
+changes cannot affect their components. `chunk_size` is a policy param
+(`model.params.chunk_size`), not a run key. Import contracts, checkpoint functions and inference utilities from
 their owning modules. Older checkpoint formats are rejected explicitly.
 
 Observation normalization now updates running moments from each training batch,
@@ -283,5 +282,3 @@ insufficient to hold it alongside the previous one.
 Use `with setup(config, num_seeds) as run:` when managing a run directly. The
 public `train` and `validate` functions close owned resources on success or
 failure, including failures during initialization and warmup.
-
-See [the prioritized QOL backlog](docs/QOL.md) for follow-up improvements.

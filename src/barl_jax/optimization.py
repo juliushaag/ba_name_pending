@@ -17,7 +17,7 @@ class OptimizerMixin:
   # Parameters a Policy owns directly rather than through a slot, mapped to
   # the optimizer key that trains them: `{"log_std": "explore"}`. Without an
   # entry a stray parameter is a hard error rather than a silently untrained
-  # one (torch's add_param_group had the same job, minus the check).
+  # one.
   policy_params: dict[str, str] = {}
 
   def optimizer_slots(self) -> dict[str, str]:
@@ -106,12 +106,9 @@ class OptimizerMixin:
   def build_optimizer(self, *, lr_schedule):
     """One optax.multi_transform over the whole param tree. multi_transform
     applies each transform to its own partition, so each component's own clip
-    and Adam see only that component's gradients -- exactly what the torch
-    loop's clip_grad_norm_(params_of_key_k, ...) did, in one backward pass
-    instead of one per key.
+    and Adam see only that component's gradients, in one backward pass.
 
-    The clip itself lives in the component (optimization.adam, spent from
-    config/presets/optim.yaml), not here: `global_norm` and `element` are
+    The clip itself lives in the component (`OptimizerConfig.build`), not here: `global_norm` and `element` are
     different operations rather than two strengths of one, and which of them a
     net wants is a property of that net's gradients."""
     cadence = self.optimizer_cadence()
@@ -239,9 +236,7 @@ def gated_losses(policy, fn, keys, *modules):
   return nnx.cond(due, evaluate, lambda *_: {k: jnp.zeros(()) for k in keys}, *modules)
 
 
-# ---------------------------------------------------------------------------
 # Optimizer configuration: the four Adam knobs, with per-role defaults.
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)

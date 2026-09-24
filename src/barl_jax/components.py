@@ -91,35 +91,22 @@ def interned_static(value) -> _Static:
 
 
 class Component:
-  """Mixin for anything Policy.build_component() constructs. Three jobs: consume
-  the run's EnvStats and resolved config, which every component takes as its
-  first two positional arguments; give the owning Policy a uniform lifecycle
-  to fan out to -- it registers each slot it builds and forwards both hooks
-  below, so no Policy has to hand-roll a critic's Polyak update from its own
-  train_step; and hold a `metrics` sink already namespaced to this component's
-  slot, so writing `self.metrics.dist("critic", pred)` lands at `critic/q/*`
-  without the component ever naming itself.
+  """Mixin for anything `Policy.build_component()` constructs.
 
-  Unlike the torch original, the EnvStats itself is *not* retained -- only the
-  scalars every component wants (`obs_dim`/`action_dim`, plus the chunk plan's
-  `chunk_size`/`plan_dim`). Anything else a component needs from it
-  (HLGaussCritic's return range) is read in __init__ and kept as a plain float.
+  Takes the run's `EnvStats` and its typed config as the first two positional
+  arguments and keeps only what every component wants from the former
+  (`obs_dim`, `action_dim`, and the chunk plan's `chunk_size`/`plan_dim`).
 
-  `config` (a materialized typed dataclass instance) *is* retained, as
-  `self.config` -- a subclass reads whatever it needs off it directly
-  (`self.config.log_std_min`), in `__init__` or any other method, rather than
-  re-declaring every field as its own flat attribute. It is kept behind
-  `_Static` (identity-hashed, see `_Static`'s own docstring) rather than a
-  bare attribute: a config's nested fields are ordinary mutable containers
-  (`MLPConfig.norm_kwargs`, `DDPMActorConfig.ladder_kwargs`, ...), and nnx
-  would otherwise need the whole frozen dataclass to hash by value to make it
-  a valid static leaf of the split GraphDef `jax.jit` keys its cache on.
-  `config` is also a plain settable property: `self.config = replace(self.config,
-  gamma=0.5)` is how a test perturbs one field without reconstructing the
-  whole component. `env_stats`/`config` are still threaded through every
-  level's `super().__init__(env_stats, config, ...)`, which is what lets a
-  subclass read the `config` *parameter* (not yet `self.config`) before
-  calling super() -- e.g. to build a `q_function`."""
+  The whole config is kept as `self.config` -- read `self.config.foo` from any
+  method rather than copying fields onto flat attributes. It sits behind
+  `_Static` (identity-hashed) because config fields are mutable containers
+  (`MLPConfig.norm_kwargs`), and nnx needs a hashable static leaf for the split
+  GraphDef `jax.jit` keys its cache on. `config` is settable, so a test can
+  perturb one field with `c.config = replace(c.config, gamma=0.5)`.
+
+  The owning Policy fans `before_step`/`after_step` out to every slot, and each
+  component has a `metrics` sink namespaced to its slot: `self.metrics.dist("critic",
+  pred)` lands at `critic/q/*` without the component naming itself."""
 
   config_type = None
   learning_objective = None
