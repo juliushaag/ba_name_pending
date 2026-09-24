@@ -135,14 +135,13 @@ def test_amdp_policy_updates_with_chunked_alphas(granularity):
     from test_policies import FakeEnv, batch
 
     from barl_jax.components import TRAINABLE
-    from barl_jax.config.model import ModelSpec
     from barl_jax.config.run import RunConfig
     from barl_jax.metrics import DEBUG, PRIMARY
     from barl_jax.optimization import train_step
     from barl_jax.policy import Policy
 
     run = RunConfig.from_dict({
-        "model": "AMDP", "env": "HalfCheetah", "chunk_size": 2,
+        "model": "AMDP", "env": "HalfCheetah",
         "model_overrides": {
             "params": {"chunk_size": 2, "alpha_granularity": granularity},
             "components": {
@@ -151,9 +150,7 @@ def test_amdp_policy_updates_with_chunked_alphas(granularity):
             },
         },
     })
-    spec = ModelSpec.resolve("AMDP", run)
-    policy = Policy.make("AMDP", FakeEnv(), spec=spec, env_stats=make_env_stats(),
-                         seed=0, chunk_size=2)
+    policy = Policy.make("AMDP", FakeEnv(), run.model_config, env_stats=make_env_stats(), seed=0)
     policy.entropy.log_alpha[...] = jnp.log(
         jnp.array([0.4, 1.7]) if granularity == "per_action" else jnp.asarray(0.7))
     before_actor = jax.tree.leaves(nnx.state(policy.actor, nnx.Param))

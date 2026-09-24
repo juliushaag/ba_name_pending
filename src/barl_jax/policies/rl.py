@@ -62,9 +62,6 @@ class RLPolicy(Policy):
       return cls.SLOT_OBJECTIVES.get(slot, actor_cls.critic_objective)
     return super().slot_objective(slot, actor_cls)
 
-  # Grad steps between actor/dual updates (critic steps every step).
-  policy_delay: int = 1
-
   # The actor-policy integration binding: a per-algorithm subclass (`SAC`,
   # `AMDP`, `DIME`, `SDAC`, `NCLQL`, each beside its actor implementation) sets
   # this to its concrete actor class, tightening build_component's gate from
@@ -73,15 +70,8 @@ class RLPolicy(Policy):
   # silently accepting whatever the config named.
   actor_cls: type = ActionSampler
 
-  def __init__(self, env: gym.Env, **kwargs):
-    super().__init__(env, **kwargs)
-    # Params arrive merged from the spec; explicit constructor kwargs win.
-    # `policy_delay` is the only RLPolicy-owned param beyond the base's
-    # `chunk_size`/`normalize_obs`.
-    params = self.resolve_params()
-    self.policy_delay = int(params.get("policy_delay", 1))
-    self.normalize_obs = bool(params.get("normalize_obs", self.normalize_obs))
-
+  def __init__(self, env: gym.Env, *args, **kwargs):
+    super().__init__(env, *args, **kwargs)
     assert isinstance(env.action_space, gym.spaces.Box)
 
     chunked = self.env_stats.derive(act_dim=self.env_stats["chunked_act_dim"])
@@ -92,8 +82,14 @@ class RLPolicy(Policy):
     # yet at this point in `super().__init__()` -- the check belongs at the
     # end of whichever `__init__` runs last (MaxEntRLPolicy's, today).
 
-  def _obs(self, x):
-    return self.normalize_observations(x) if self.normalize_obs else x
+  @property
+  def policy_delay(self) -> int:
+    """Grad steps between actor/dual updates (the critic steps every step)."""
+    return self.params.policy_delay
+
+  @classmethod
+  def config_problems(cls, params) -> list[str]:
+    return [] if params.policy_delay >= 1 else [f"policy_delay={params.policy_delay!r}: must be >= 1"]
 
   def optimizer_cadence(self) -> dict:
     return {key: self.policy_delay for key in self.actor.create_optimizer()}
@@ -119,8 +115,8 @@ class RLPolicy(Policy):
     return self.critic.config.gamma
 
   def train_step(self, batch):
-    obs          = self._obs(batch["obs"])
-    next_obs     = self._obs(batch["next_obs"])
+    obs          = self.normalize_observations(batch["obs"])
+    next_obs     = self.normalize_observations(batch["next_obs"])
     
     action       = batch["act"]
     chunk_return = batch["chunk_return"]
@@ -165,7 +161,7 @@ class RLPolicy(Policy):
     return losses
 
   def inference_step(self, observation, step_info=None, key=None):
-    obs = self._obs(observation)
+    obs = self.normalize_observations(observation)
     return self.action_chunk(self.actor.sample(obs, critic=self.critic, key=key)), {}
 
   # ---- Best-of-N scoring (barl_jax.executors) --------------------------
@@ -179,7 +175,7 @@ class RLPolicy(Policy):
     `ensemble.value_reduce`. Flattens the action plan the
     same way `train_step` flattens `next_action` before handing it to the
     critic."""
-    obs = self._obs(observation)
+    obs = self.normalize_observations(observation)
     flat_action = action_chunk.reshape(action_chunk.shape[0], -1)
     return self.critic.value(obs, flat_action)
 
@@ -199,32 +195,26 @@ class MaxEntRLPolicy(RLPolicy):
 
   SLOTS = ("critic", "actor", "entropy")
   SLOT_OBJECTIVES = {"critic": "td"}
-  # Docstring above: "'per_chunk' (default) ... exactly as before" -- every
-  # checkpoint saved before this knob existed trained with one scalar alpha
-  # for the whole plan, which is what 'per_chunk' reproduces.
-  entropy_scale: float = -1.0
-  entropy_in_target: bool = True
-  alpha_granularity: str = "per_chunk"
 
-  def __init__(self, env: gym.Env, **kwargs):
-    super().__init__(env, **kwargs)
-    params = self.resolve_params()
-    self.entropy_scale = float(params.get("entropy_scale", -1.0))
-    self.entropy_in_target = bool(params.get("entropy_in_target", True))
-    self.alpha_granularity = str(params.get("alpha_granularity", "per_chunk"))
-
-    assert self.alpha_granularity in ("per_chunk", "per_action"), (
-      f"{self.model_name}: alpha_granularity must be 'per_chunk' or "
-      f"'per_action', got {self.alpha_granularity!r}")
-
-    target = (jnp.full((self.chunk_size,), self.action_dim * self.entropy_scale, jnp.float32)
-              if self.alpha_granularity == "per_action"
-              else self.chunk_size * self.action_dim * self.entropy_scale)
+  def __init__(self, env: gym.Env, *args, **kwargs):
+    super().__init__(env, *args, **kwargs)
+    params = self.params
+    target = (jnp.full((self.chunk_size,), self.action_dim * params.entropy_scale, jnp.float32)
+              if params.alpha_granularity == "per_action"
+              else self.chunk_size * self.action_dim * params.entropy_scale)
     self.entropy: AutotuneRegulator = self.build_component(
       "entropy", AutotuneRegulator, target=target)
     assert set(self.optimizer_cadence()) <= set(self.create_optimizer()), (
       f"{self.model_name}: optimizer_cadence names a key create_optimizer() "
       f"doesn't -- build_optimizer's cadence.get(key, 1) would drop it silently.")
+
+  @classmethod
+  def config_problems(cls, params) -> list[str]:
+    problems = super().config_problems(params)
+    if params.alpha_granularity not in ALPHA_GRANULARITIES:
+      problems.append(f"alpha_granularity={params.alpha_granularity!r}: "
+                      f"must be one of {ALPHA_GRANULARITIES}")
+    return problems
 
   def optimizer_cadence(self) -> dict:
     return {**super().optimizer_cadence(),
@@ -237,7 +227,7 @@ class MaxEntRLPolicy(RLPolicy):
     """`entropy` is `(B, chunk_size)`; summing the chunk axis after weighting by
     `alpha` (scalar or `(chunk_size,)`) restores the single `(B, 1)` bonus the
     Bellman target wants, whichever granularity produced it."""
-    if not self.entropy_in_target:
+    if not self.params.entropy_in_target:
       return 0.0
     return jax.lax.stop_gradient((alpha * entropy).sum(axis=-1, keepdims=True))
 
@@ -245,5 +235,5 @@ class MaxEntRLPolicy(RLPolicy):
     # per_chunk's target is one number for the whole plan, so the dual must see
     # entropy summed the same way; per_action's target is per position, so the
     # per-position decomposition goes in as-is.
-    value = entropy if self.alpha_granularity == "per_action" else entropy.sum(axis=-1, keepdims=True)
+    value = entropy if self.params.alpha_granularity == "per_action" else entropy.sum(axis=-1, keepdims=True)
     return self.entropy.loss(value)

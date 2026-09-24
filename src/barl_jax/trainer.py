@@ -12,6 +12,8 @@ an enclosing jit the step is dispatched op-by-op and costs ~4x more at N=1 and
 """
 
 import datetime
+import hashlib
+import json
 import math
 import os
 import subprocess
@@ -23,11 +25,11 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-from barl_jax.checkpoints import load_policy, save_policy
+from barl_jax.checkpoints import load_policy, save_policy, saved_model
 from barl_jax.collection import Collector
 from barl_jax.components import TRAINABLE
-from barl_jax.config.model import ModelSpec, experiment_fingerprint
 from barl_jax.config.run import RunConfig, validate_run
+from barl_jax.config.serialization import flatten
 from barl_jax.env import Environment
 from barl_jax.evaluation import run_episodes
 from barl_jax.executors import executor_from_config
@@ -74,13 +76,6 @@ class Run:
   than each rebuilding the world."""
 
   def __init__(self, cfg: RunConfig, num_seeds: int):
-    from barl_jax.config.run import RunConfig as _RunConfig
-    if isinstance(cfg, dict):
-      # Compatibility for direct callers passing a saved mapping: strict
-      # nested shape only, no legacy flat envelopes.
-      cfg = _RunConfig.from_dict(cfg)
-    if not isinstance(cfg, _RunConfig):
-      raise TypeError(f"trainer.setup needs a RunConfig, got {type(cfg).__name__}")
     # CLI `--seeds` wins over the stored value; keep the stored object as the
     # source of every other run setting.
     if num_seeds != cfg.num_seeds:
@@ -108,8 +103,8 @@ class Run:
     return self.resources.__exit__(*exc)
 
 
-def setup(cfg: RunConfig | dict, num_seeds: int, *, validate_only: bool = False) -> Run:
-  run = Run(cfg if isinstance(cfg, RunConfig) else RunConfig.from_dict(cfg), num_seeds)
+def setup(cfg: RunConfig, num_seeds: int, *, validate_only: bool = False) -> Run:
+  run = Run(cfg, num_seeds)
   try:
     return _setup(run, validate_only=validate_only)
   except BaseException:
@@ -137,10 +132,7 @@ def _setup(run, *, validate_only):
     # Saved model takes precedence over current defaults; mutable run fields
     # (paths, logging, cadences, eval strategy) may change -- see
     # training_checkpoint.validate_resume's mutable set.
-    saved = resume_meta["config"]
-    from barl_jax.config.run import RunConfig as _RunConfig
-    saved_run = _RunConfig.from_dict(saved) if isinstance(saved, dict) else saved
-    cfg = run.cfg = saved_run.replace(
+    cfg = run.cfg = RunConfig.from_dict(resume_meta["config"]).replace(
       checkpoint=cfg.checkpoint, checkpoint_mode=cfg.checkpoint_mode,
       run_dir=cfg.run_dir, sweep_tag=cfg.sweep_tag, logger=cfg.logger,
       eval_every=cfg.eval_every, eval_runs=cfg.eval_runs,
@@ -151,27 +143,8 @@ def _setup(run, *, validate_only):
       wandb_finish_timeout=cfg.wandb_finish_timeout,
     )
   if cfg.checkpoint and mode == "weights":
-    from barl_jax.checkpoints import policy_spec
-    saved_spec, _ = policy_spec(cfg.checkpoint)
-    # Saved model snapshot takes precedence over current defaults.
-    from barl_jax.config.run import RunConfig as _RunConfig
-    _model_dict = saved_spec.model()
-    # Rebuild the typed model from the saved canonical mapping.
-    from barl_jax.config.schemas import resolve_model as _resolve_model
-    _canonical, _, _model_cls = _resolve_model(saved_spec.name)
-    # Materialize via RunConfig machinery: start from current defaults for the
-    # saved model, then apply the saved canonical model as overrides.
-    _base = _RunConfig.defaults(saved_spec.name, cfg.env, saved_spec.profile)
-    # `model_overrides` input shape is nested; saved canonical `model` dict
-    # already is that shape minus the outer key -- reuse the override applier.
-    from barl_jax.config.run import _apply_model_overrides as _apply
-    _model_cfg = _apply(_base.model_config, {
-      "params": _model_dict.get("params", {}),
-      "components": {slot: comp for slot, comp in _model_dict.get("components", {}).items()},
-    })
-    from dataclasses import replace as _replace
-    cfg = run.cfg = _replace(cfg, model=cfg.model, model_config=_model_cfg)
-  run.spec = ModelSpec.resolve(run.model_name, cfg)
+    # The saved model takes precedence over current defaults.
+    cfg = run.cfg = cfg.replace(model_config=saved_model(cfg.checkpoint)[0])
 
   run.environment = Environment.make(run.env_name)
   run.env = run.own(run.environment.get_env())       # single env: spaces and EnvStats
@@ -189,9 +162,8 @@ def _setup(run, *, validate_only):
 
   checkpoint = cfg.checkpoint
   if checkpoint is None:
-    policies = [Policy.make(run.model_name, run.env, env_stats=run.env_stats,
-                            seed=run.base_seed + i, chunk_size=cfg.chunk_size,
-                            spec=run.spec)
+    policies = [Policy.make(run.model_name, run.env, cfg.model_config,
+                            env_stats=run.env_stats, seed=run.base_seed + i)
                 for i in range(num_seeds)]
   elif not os.path.exists(checkpoint):
     raise FileNotFoundError(f"checkpoint={checkpoint!r}: no such directory")
@@ -206,11 +178,9 @@ def _setup(run, *, validate_only):
       for component in policy.components.values():
         if hasattr(component, "target_steps"):
           component.target_steps[...] = jnp.zeros_like(component.target_steps[...])
-    if policies[0].chunk_size != cfg.chunk_size:
-      raise ValueError("Checkpoint chunk_size differs from the run")
 
-  if policies[0].model_name != run.spec.name:
-    raise ValueError(f"Checkpoint model {policies[0].model_name!r} differs from {run.spec.name!r}")
+  if policies[0].model_name != run.model_name:
+    raise ValueError(f"Checkpoint model {policies[0].model_name!r} differs from {run.model_name!r}")
 
   total_grad_steps = max(1, round(cfg.total_env_steps * cfg.utd_ratio))
   schedule = Policy.lr_schedule(cfg.lr_warmup_steps, total_grad_steps, cfg.lr_decay)
@@ -378,16 +348,8 @@ def run_config_snapshot(run: Run) -> dict:
   `snapshot` is the same model nested, kept so a finished run replays exactly
   from its saved spec."""
   cfg = run.cfg
-  model_dict = run.spec.model()
-  # Flat model for logging: `params.*` + `components.<slot>.*` runtime shape.
-  # Rebuild flat from the spec's canonical model via a temporary RunConfig?
-  # Simpler: flatten the canonical dict directly for logging.
-  flat: dict = {"policy": model_dict.get("policy")}
-  for key, value in (model_dict.get("params") or {}).items():
-    flat[f"params.{key}"] = value
-  for slot, comp in (model_dict.get("components") or {}).items():
-    for key, value in comp.items():
-      flat[f"components.{slot}.{key}"] = value
+  model_dict = cfg.model_config.to_dict()
+  flat = flatten(model_dict)
 
   env_stats = {}
   for key, value in run.env_stats.items():
@@ -395,7 +357,7 @@ def run_config_snapshot(run: Run) -> dict:
 
   run_dict = cfg.to_dict()
   config = {f"run/{k}": v for k, v in run_dict.items()
-            if k not in ("model_overrides", "env_metadata", "snapshot")}
+            if k not in ("model_overrides", "snapshot")}
   config.update({f"model/{k}": v for k, v in flat.items()})
   config.update({f"model/derived.{k}": v for k, v in run.reference.derived_config().items()})
   config.update({f"env/{k}": v for k, v in env_stats.items()})
@@ -407,9 +369,20 @@ def run_config_snapshot(run: Run) -> dict:
     "env/async_vector_env": run.environment.use_async_vector_env,
     "meta/git_sha": _git_sha(),
     "meta/config_hash": experiment_fingerprint(flat, run_dict),
-    "snapshot": {"model": model_dict, "profile": run.spec.profile},
+    "snapshot": {"model": model_dict},
   })
   return config
+
+
+_EXPERIMENT_IDENTITY_KEYS = frozenset({"seed", "num_seeds", "run_dir", "sweep_tag",
+                                       "snapshot", "checkpoint"})
+
+
+def experiment_fingerprint(model_flat: dict, run_cfg: dict) -> str:
+  """A short hash of everything that defines the experiment apart from its identity."""
+  payload = {**{f"model.{k}": v for k, v in model_flat.items()},
+             **{f"run.{k}": v for k, v in run_cfg.items() if k not in _EXPERIMENT_IDENTITY_KEYS}}
+  return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:12]
 
 
 def _git_sha() -> str:

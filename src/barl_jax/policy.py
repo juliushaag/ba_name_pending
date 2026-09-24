@@ -19,6 +19,7 @@ from barl_jax.components import (
   interned_static,
   sanitize_action,
 )
+from barl_jax.config.schemas import ModelConfig
 from barl_jax.env import EnvStats
 from barl_jax.metrics import Recorder
 from barl_jax.optimization import OptimizerMixin
@@ -68,16 +69,15 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
   # ------------------------------------------------------------------
 
   @staticmethod
-  def make(name: str, env: gym.Env, *args, **kwargs) -> "Policy":
-    from barl_jax.config.model import ModelSpec
-    config = kwargs.pop("config", None)
-    spec = kwargs.pop("spec", None)
-    profile = kwargs.pop("profile", None)
-    if spec is None:
-      # `config` is a RunConfig when present; otherwise resolve bare defaults.
-      spec = ModelSpec.resolve(name, config, profile)
-    cls = Policy.class_for(spec.policy_class)
-    return cls(env, *args, model_name=spec.name, profile=spec.profile, spec=spec, **kwargs)
+  def make(name: str, env: gym.Env, model: ModelConfig = None, *, policy_class: str = None,
+           **kwargs) -> "Policy":
+    """Build the policy for model `name`. `model` is its complete typed config
+    (defaults when omitted); `policy_class` overrides the class the config names."""
+    from barl_jax.config.schemas import model_schema
+    if model is None:
+      model = model_schema(name)()
+    cls = Policy.class_for(policy_class or model.policy_class)
+    return cls(env, model, model_name=name, **kwargs)
 
   @staticmethod
   def class_for(name):
@@ -96,34 +96,26 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
 
   @staticmethod
   def available() -> list[str]:
-    """Every model name a `model:` string can resolve to -- not the raw class
-    registry, which is an implementation detail once one class can back several
-    models."""
-    from barl_jax.config.schemas import MODEL_ALIASES, MODEL_SCHEMAS
-    return sorted([*MODEL_SCHEMAS, *MODEL_ALIASES])
+    """Every model name a `model:` string can resolve to."""
+    from barl_jax.config.schemas import MODEL_SCHEMAS
+    from barl_jax.registration import load_builtins
+    load_builtins("policies")
+    return sorted(MODEL_SCHEMAS)
 
   # ------------------------------------------------------------------
   # Construction
   # ------------------------------------------------------------------
 
-  def __init__(self, env: gym.Env, profile: str = None, env_stats: EnvStats = None,
-               rngs: nnx.Rngs = None, seed: int = 0, model_name: str = None, spec=None, **kwargs):
-    from barl_jax.config.model import ModelSpec
-
-    # The `model:` string this Policy was built from -- distinct from
-    # `type(self).__name__` once one class backs several models (RLPolicy /
-    # MaxEntRLPolicy). Plain str, so it is static in nnx: it lands in the
-    # GraphDef (SAC and AMDP get distinct jit cache entries) and never enters
-    # the state tree `multiseed.stack()` compares. Defaults to the class name
-    # so a policy built directly (a test, a notebook) still resolves.
-    self.model_name = model_name or type(self).__name__
-    self._profile  = profile
-    # Held behind _Static for hashability (see _Static): these are dicts/lists,
-    # and the GraphDef they end up in is a static jit argument.
-    self._raw_kwargs_s = _Static(dict(kwargs))
-    # Captured so a checkpoint reconstructs under the same config it was built
-    # from -- see checkpoints.py.
-    self._spec = spec if spec is not None else ModelSpec.resolve(self.model_name, None, profile)
+  def __init__(self, env: gym.Env, model: ModelConfig, env_stats: EnvStats = None,
+               rngs: nnx.Rngs = None, seed: int = 0, model_name: str = None):
+    # The `model:` string this Policy was built from -- plain str, so it is static
+    # in nnx: it lands in the GraphDef (SAC and AMDP get distinct jit cache
+    # entries) and never enters the state tree `multiseed.stack()` compares.
+    self.model_name = model_name or model.schema_name
+    # Behind _Static for hashability: the config holds dicts, and the GraphDef it
+    # ends up in is a static jit argument.
+    self._config_s = _Static(model)
+    self._optimizer_slots_cache = _Static({"value": None})
 
     # Every module that needs randomness draws from this; nnx threads and
     # advances the key state across the jit boundary, so no call signature has
@@ -131,16 +123,6 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
     self.rngs = rngs if rngs is not None else nnx.Rngs(seed)
 
     stats = env_stats if env_stats is not None else EnvStats.from_env(env)
-    self._env_stats = _Static(stats)
-
-    # Build order of the slots build_component() constructs -- names only. The
-    # components themselves are *not* stored here: they already live in the
-    # module tree under their own attributes (self.critic, self.actor, ...),
-    # and a second hard reference would survive nnx.merge() unchanged, so the
-    # lifecycle hooks would mutate the pre-trace objects instead of the merged
-    # ones (TraceContextError). `components` re-derives the mapping from live
-    # attributes every time.
-    self._optimizer_slots_cache = _Static({"value": None})
 
     action_space      = env.action_space
     observation_space = env.observation_space
@@ -170,11 +152,6 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
     # Gradient steps taken, for algorithms whose update cadence is `step % k`.
     self.train_steps = Buffer(jnp.zeros((), jnp.int32))
 
-    # The Policy's own params come from the typed model spec, with explicit
-    # constructor kwargs (e.g. trainer's `chunk_size`) winning. Subclasses
-    # read them off `self` (self.policy_delay, ...) after calling
-    # `_absorb_params`.
-    self._absorb_params(self.resolve_params())
     self._env_stats = _Static(stats.derive(
       chunk_size=self.chunk_size,
       chunked_act_dim=self.chunk_size * self.action_dim))
@@ -194,64 +171,71 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
     return Recorder(self, "batch")
 
   @property
-  def _raw_kwargs(self) -> dict:
-    return self._raw_kwargs_s.value
+  def config(self) -> ModelConfig:
+    return self._config_s.value
 
-  def _absorb_params(self, params: dict) -> None:
-    """Copy the typed `params` mapping onto plain attributes.
+  @config.setter
+  def config(self, value: ModelConfig) -> None:
+    self._config_s.value = value
 
-    Only the two keys every Policy owns live here; algorithm-specific keys
-    (`policy_delay`, `entropy_scale`, ...) are absorbed by the subclass that
-    owns them, so a typo'd param fails at the subclass rather than silently
-    landing on the base.
-    """
-    self.chunk_size = int(params.get("chunk_size", 1))
-    self.normalize_obs = bool(params.get("normalize_obs", True))
+  @property
+  def params(self):
+    return self.config.params
 
-  def resolve_component(self, slot: str) -> tuple[type, dict]:
-    """Resolves a named slot's class + canonical mapping from the spec.
+  @property
+  def chunk_size(self) -> int:
+    return self.params.chunk_size
 
-    Policy constructor kwargs are deliberately not broadcast into every slot:
-    slot overrides use the normal `components.<slot>.<key>` path, so a policy
-    parameter cannot accidentally retune every component with the same name."""
-    return self._spec.component(slot)
+  @property
+  def normalize_obs(self) -> bool:
+    return self.params.normalize_obs
 
-  def resolve_params(self) -> dict:
-    """This Policy's own top-level params from the typed spec, with explicit
-    constructor kwargs winning."""
-    return {**self._spec.params(), **self._raw_kwargs}
+  @classmethod
+  def config_problems(cls, params) -> list[str]:
+    """Problems in this policy's own params."""
+    return []
 
   @classmethod
   def slot_objective(cls, slot, actor_cls=None):
     return cls.SLOT_OBJECTIVES.get(slot)
 
+  @classmethod
+  def slot_problem(cls, model: ModelConfig, slot: str) -> str | None:
+    """Why `model`'s `slot` cannot serve this policy's objective for it, if so."""
+    from barl_jax.registration import get_component
+    component = getattr(model.components, slot, None)
+    if component is None:
+      return None
+    component_cls = get_component(component.class_name)
+    actor_cls = (get_component(model.components.actor.class_name)
+                 if "actor" in cls.SLOTS else None)
+    objective = cls.slot_objective(slot, actor_cls)
+    if objective is not None and component_cls.learning_objective_for(component) != objective:
+      return f"{model.policy_class}.{slot}: {component_cls.__name__} does not support {objective!r}"
+    return None
+
   def build_component(self, slot: str, gate_cls: type, *args,
-                      env_stats: EnvStats = None, config_overrides: dict = None,
-                      **explicit_kwargs):
-    """Resolves + constructs a named slot (actor/critic/squash/...), gated to
-    `gate_cls`: the resolved class must be `gate_cls` or a subclass. `env_stats`
-    overrides the run's own for a slot another component wraps and feeds a
-    transformed input -- pass an `EnvStats.derive()` of the run's, never an
-    unrelated one.
+                      env_stats: EnvStats = None, **explicit_kwargs):
+    """Constructs a named slot (actor/critic/squash/...) from its typed config,
+    gated to `gate_cls`: the resolved class must be `gate_cls` or a subclass.
+    `env_stats` overrides the run's own for a slot another component wraps and
+    feeds a transformed input -- pass an `EnvStats.derive()` of the run's.
 
     `explicit_kwargs` are for values computed at run time that never live in
-    config (an entropy dual's `target`) -- everything config supplies reaches
-    the component as a materialized typed instance, never through this.
-    `config_overrides` pins a config-shaped tunable regardless of the stored
-    value."""
-    cls, mapping = self.resolve_component(slot)
-    if config_overrides:
-      mapping = {**mapping, **config_overrides}
+    config (an entropy dual's `target`)."""
+    from barl_jax.registration import get_component
+    config = getattr(self.config.components, slot, None)
+    if config is None:
+      raise KeyError(f"model {self.model_name!r} has no component slot {slot!r}")
+    cls = get_component(config.class_name)
     if not issubclass(cls, gate_cls):
       raise TypeError(f"{self.model_name}.{slot}: {cls.__name__} must implement {gate_cls.__name__}")
-    config = _materialize_component_config(cls, mapping, owner=f"{self.model_name}.{slot}")
-    objective = self.slot_objective(
-      slot, self.resolve_component("actor")[0] if "actor" in self.SLOTS else None)
-    if objective is not None and cls.learning_objective_for(config) != objective:
-      raise TypeError(f"{self.model_name}.{slot}: {cls.__name__} does not support {objective!r}")
-    stats = env_stats if env_stats is not None else self.env_stats
+    problem = self.slot_problem(self.config, slot)
+    if problem:
+      raise TypeError(problem)
     explicit_kwargs.setdefault("rngs", self.rngs)
-    component = cls(stats, config, *args, **explicit_kwargs)
+    component = cls(env_stats if env_stats is not None else self.env_stats, config, *args,
+                    **explicit_kwargs)
     component.slot = slot
     return component
 
@@ -475,34 +459,6 @@ class Policy(OptimizerMixin, nnx.Module, ABC):
     `(batch, chunk_size, act_dim)` and `extras` is a dict of named arrays to
     log/persist alongside the currently active chunk."""
     ...
-
-
-
-def _materialize_component_config(cls: type, mapping: dict, *, owner: str):
-  """Build the typed config a component declares via `config_type`.
-
-  The stored mapping is canonical (`class` selector + nested values). A `None`
-  config (e.g. a squash built with no knobs) passes through; a component
-  without `config_type` receives the raw mapping for backwards-compatible
-  plugin constructors.
-  """
-  if mapping is None:
-    return None
-  config_type = getattr(cls, "config_type", None)
-  if config_type is None:
-    return None if not mapping else dict(mapping)
-  values = dict(mapping)
-  # Public selector is `class`; dataclass field is `class_name`. The class is
-  # already known (`cls`), so neither needs passing to the constructor -- pop
-  # both to avoid requiring every impl schema to declare identity metadata it
-  # never reads (entropy/ categorical bases historically omitted it).
-  values.pop("class", None)
-  values.pop("class_name", None)
-  from barl_jax.config.serialization import construct
-  try:
-    return construct(config_type, values, path=owner)
-  except (KeyError, TypeError) as exc:
-    raise KeyError(f"{owner}: cannot materialize {config_type.__name__}: {exc}") from exc
 
 
 

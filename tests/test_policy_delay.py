@@ -207,7 +207,6 @@ def _assert_state_equal(left, right, *, exact=False):
 
 
 def test_logging_does_not_change_training_state_with_stateful_actor():
-    from barl_jax.config.model import ModelSpec
     from barl_jax.config.run import RunConfig
     run = RunConfig.from_dict({
         "model": "SAC", "env": "HalfCheetah",
@@ -223,8 +222,7 @@ def test_logging_does_not_change_training_state_with_stateful_actor():
             },
         },
     })
-    spec = ModelSpec.resolve("SAC", run)
-    policy = Policy.make("SAC", FakeEnv(), env_stats=make_env_stats(), seed=0, spec=spec)
+    policy = Policy.make("SAC", FakeEnv(), run.model_config, env_stats=make_env_stats(), seed=0)
     optimizer = nnx.Optimizer(policy, policy.build_optimizer(lr_schedule=None), wrt=TRAINABLE)
     graphdef, initial = nnx.split((policy, optimizer))
     unlogged = jax.tree.map(jnp.copy, initial)

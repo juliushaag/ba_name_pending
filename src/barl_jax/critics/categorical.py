@@ -17,6 +17,12 @@ class CategoricalCriticConfig(QCriticConfig):
   v_max: float | None = None
   entropy_coef: float = 0.0
 
+  def problems(self) -> list[str]:
+    problems = super().problems()
+    if self.num_bins < 2:
+      problems.append(f"num_bins={self.num_bins!r}: must be >= 2")
+    return problems
+
 
 @dataclass(frozen=True)
 class C51CriticConfig(CategoricalCriticConfig):

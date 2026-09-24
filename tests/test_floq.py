@@ -14,7 +14,6 @@ from conftest import BATCH, OBS_DIM, build, make_env_stats
 from flax import nnx
 
 from barl_jax.components import TRAINABLE
-from barl_jax.config.model import ModelSpec
 from barl_jax.config.run import RunConfig
 from barl_jax.metrics import DEBUG, PRIMARY
 from barl_jax.optimization import train_step
@@ -87,7 +86,6 @@ def test_floq_flow_matching_loss_updates_velocity_parameters_and_is_key_reproduc
 def test_sac_and_amdp_accept_floq_critic_and_take_a_training_step(model):
   run = RunConfig.from_dict({
     "model": model, "env": "HalfCheetah",
-    "chunk_size": 2,
     "model_overrides": {
       "params": {"chunk_size": 2},
       "components": {
@@ -97,9 +95,8 @@ def test_sac_and_amdp_accept_floq_critic_and_take_a_training_step(model):
       },
     },
   })
-  spec = ModelSpec.resolve(model, run)
-  policy = Policy.make(model, _BoxEnv(), spec=spec,
-                       env_stats=make_env_stats(), seed=0, chunk_size=2)
+  policy = Policy.make(model, _BoxEnv(), run.model_config,
+                       env_stats=make_env_stats(), seed=0)
   assert type(policy.critic).__name__ == "FloqCritic"
 
   derived = policy.derived_config()

@@ -178,6 +178,13 @@ class Component:
     alpha = jnp.asarray(alpha)
     return alpha if alpha.ndim == 0 else jnp.repeat(alpha, self.action_dim)
 
+  @classmethod
+  def config_problems(cls, config) -> list[str]:
+    """Why `config` cannot build this component: its own and its nested configs'
+    `problems()`."""
+    from barl_jax.config.serialization import config_problems
+    return config_problems(config)
+
   def before_step(self):
     """Called once per gradient step, before the Policy's train_step."""
     ...

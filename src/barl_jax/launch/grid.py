@@ -16,7 +16,7 @@ import yaml
 from barl_jax.config import from_yaml
 from barl_jax.config.run import RunConfig
 
-RESERVED_AXES = ("algo", "env", "profile", "seed")
+RESERVED_AXES = ("algo", "env", "seed")
 
 
 def _config_dict(config) -> dict:
@@ -27,7 +27,7 @@ def _config_dict(config) -> dict:
 def _config_validate(config, *, context: str = "run") -> None:
   """Validate one candidate before it is written or submitted."""
   try:
-    config.validate()
+    config.check()
   except Exception as exc:
     raise ValueError(f"{context}: invalid configuration: {exc}") from exc
 
@@ -48,8 +48,6 @@ def _materialize_candidate(combo: dict, *, defaults: dict | None = None):
   """Build and validate one expanded point from Python values."""
   model, env = combo["algo"], combo["env"]
   payload = {"model": model, "env": env}
-  if combo.get("profile") is not None:
-    payload["profile"] = combo["profile"]
   payload.update({key.partition(".")[2]: value for key, value in combo.items()
                  if key.startswith("run.")})
   if "seed" in combo:
@@ -61,7 +59,6 @@ def _materialize_candidate(combo: dict, *, defaults: dict | None = None):
       _nested_set(model_overrides, key.removeprefix("model."), value)
   if model_overrides:
     payload["model_overrides"] = model_overrides
-  RunConfig.defaults(model=model, env=env, profile=payload.get("profile"))
   config = RunConfig.from_dict(payload)
   _config_validate(config, context=f"{model} on {env}")
   return config
@@ -79,7 +76,7 @@ def check_config(algos: list[str], envs: list[str]) -> list[str]:
     for env in envs:
       try:
         config = RunConfig.defaults(model=algo, env=env)
-        config.validate()
+        config.check()
       except Exception as exc:
         problems.append(f"{algo} on {env}: {type(exc).__name__}: {exc}")
   return problems
@@ -121,7 +118,7 @@ def build_axes(*, grid: str = None, algos: list = None, envs: list = None,
     if name not in RESERVED_AXES and not name.startswith(("model.", "run.")):
       raise SystemExit(f"axis {name!r} must be one of {RESERVED_AXES}, or be prefixed "
                        "'model.' (a model override) or 'run.' (a run-config key)")
-    if name in ("run.model", "run.env", "run.profile", "run.seed"):
+    if name in ("run.model", "run.env", "run.seed"):
       bare = name.partition(".")[2]
       raise SystemExit(f"axis {name!r} would fight the {bare!r} selector; use the "
                        f"{bare.replace('model', 'algo')} axis instead")

@@ -318,4 +318,4 @@ def test_unknown_network_field_values_are_reported_from_the_registries():
     RunConfig.from_dict({
       "model": "SAC", "env": "HalfCheetah",
       "model_overrides": {"components": {"actor": {"mlp": {"activation": "nope"}}}},
-    }).validate()
+    }).check()

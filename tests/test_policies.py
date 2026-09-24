@@ -108,17 +108,11 @@ def test_per_action_alpha_gives_one_alpha_per_chunk_position(name, chunk_size):
   already decomposed at that resolution (`Component.chunk_sum`), so this has
   to hold for every one of them, at chunk_size 1 (where it must degenerate to
   the same shape `per_chunk` uses) and above."""
-  from barl_jax.config.model import ModelSpec
   run = RunConfig.from_dict({
     "model": name, "env": "HalfCheetah",
-    "chunk_size": chunk_size,
-    "model_overrides": {"params": {"alpha_granularity": "per_action"}},
+    "model_overrides": {"params": {"alpha_granularity": "per_action", "chunk_size": chunk_size}},
   })
-  # Trainer passes run chunk_size as an explicit constructor kwarg, winning
-  # over the model default -- mirror that here.
-  spec = ModelSpec.resolve(name, run)
-  policy = Policy.make(name, FakeEnv(), spec=spec, env_stats=make_env_stats(),
-                       seed=0, chunk_size=chunk_size)
+  policy = Policy.make(name, FakeEnv(), run.model_config, env_stats=make_env_stats(), seed=0)
   assert policy.chunk_size == chunk_size
   assert policy.alpha().shape == (chunk_size,)
 
@@ -166,11 +160,7 @@ def test_critics_declare_supported_objectives():
 
 def test_resolved_style_surface_is_the_surface_that_gets_built():
   policy = make("SDAC")
-  from barl_jax.config.model import ModelSpec
-  spec = ModelSpec.resolve("SDAC", None)
-  _, mapping = spec.component("actor")
-  # Canonical mapping uses `class`; the MLP activation lives nested.
-  activation = mapping["mlp"]["activation"] if "mlp" in mapping else mapping["activation"]
+  activation = policy.config.components.actor.mlp.activation
   assert policy.actor.field.net.act is getattr(jax.nn, activation.lower())
 
 

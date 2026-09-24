@@ -12,7 +12,6 @@ from typing import Any
 import yaml
 
 from barl_jax.config.run import RunConfig
-from barl_jax.config.schemas import *  # noqa: F401,F403 - public typed schemas
 
 
 def from_yaml(path: str | Path) -> RunConfig:

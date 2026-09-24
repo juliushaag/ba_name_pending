@@ -256,6 +256,11 @@ class OptimizerConfig:
   grad_clip: float = 1.0
   grad_clip_mode: str = "element"
 
+  def problems(self) -> list[str]:
+    if self.grad_clip_mode in CLIP_MODES:
+      return []
+    return [f"grad_clip_mode={self.grad_clip_mode!r}: unknown clip mode"]
+
 
 @dataclass(frozen=True)
 class CriticOptimConfig(OptimizerConfig):

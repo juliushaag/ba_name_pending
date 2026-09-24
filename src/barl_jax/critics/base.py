@@ -74,6 +74,17 @@ class NoiseConditioningConfig:
   time: TimeEmbeddingConfig = field(default_factory=FourierTimeConfig)
   smoothing_coef: float = 1.0
 
+  def problems(self) -> list[str]:
+    if not self.enabled:
+      return []
+    from barl_jax.networks.schedule import Schedule
+    from barl_jax.registration import get_component
+    try:
+      is_schedule = issubclass(get_component(self.schedule.class_name), Schedule)
+    except KeyError:
+      is_schedule = False
+    return [] if is_schedule else [f"schedule.class={self.schedule.class_name!r}: unknown schedule"]
+
 
 @dataclass(frozen=True)
 class QCriticConfig(CriticOptimConfig):
@@ -168,7 +179,7 @@ class QCritic(CriticOptim, Critic):
 
   @classmethod
   def config_problems(cls, config) -> list[str]:
-    problems = []
+    problems = super().config_problems(config)
     if config.target.kind not in TARGET_KINDS:
       problems.append(f"target.kind={config.target.kind!r} not in {TARGET_KINDS}")
     for name in ("value_reduce", "target_reduce"):

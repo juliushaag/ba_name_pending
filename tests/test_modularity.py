@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import subprocess
 import sys
@@ -11,7 +12,6 @@ from flax import nnx
 
 from barl_jax import optimization, trainer
 from barl_jax.checkpoints import load_policy, save_policy
-from barl_jax.config.model import ModelSpec
 from barl_jax.config.run import RunConfig
 from barl_jax.env import Environment
 from barl_jax.policy import Policy
@@ -67,8 +67,7 @@ def tiny_run(**overrides) -> RunConfig:
 
 def make_policy(run=None):
   run = run or tiny_run()
-  spec = ModelSpec.resolve("SAC", run)
-  return Policy.make("SAC", ToyEnv(), spec=spec,
+  return Policy.make("SAC", ToyEnv(), run.model_config,
                      env_stats=ToyFamily().get_env_stats(ToyEnv()))
 
 
@@ -119,15 +118,11 @@ def test_typed_defaults_are_owned_by_dataclasses():
   assert replace(StochasticActorConfig(), squash_cls="ErfSquash").squash_cls == "ErfSquash"
 
 
-def test_model_spec_is_isolated_from_config_mutation():
+def test_policy_params_come_from_the_model_config():
   run = tiny_run(model_overrides={"params": {"policy_delay": 2}, "components": {
     "actor": {"latent_dim": 8}, "critic": {"latent_dim": 8}}})
-  spec = ModelSpec.resolve("SAC", run)
-  p = Policy.make("SAC", ToyEnv(), spec=spec, env_stats=ToyFamily().get_env_stats(ToyEnv()))
-  assert p.policy_delay == 2
-  data = spec.data()
-  data["model"]["params"]["policy_delay"] = 20
-  assert p.resolve_params()["policy_delay"] == 2
+  p = make_policy(run)
+  assert p.policy_delay == 2 == run.model_config.params.policy_delay
 
 
 def test_incompatible_objective_is_rejected_before_building():
@@ -149,7 +144,7 @@ def test_running_normalization_handles_unequal_batches_and_constant_channels():
   np.testing.assert_allclose(p.obs_mean[...], all_obs.mean(0))
   np.testing.assert_allclose(p.obs_std[...], all_obs.std(0), rtol=1e-6)
   assert np.isfinite(p.normalize_observations(second)).all()
-  p.normalize_obs = False
+  p.config = dataclasses.replace(p.config, params=dataclasses.replace(p.params, normalize_obs=False))
   p.update_observation_stats(second)
   assert float(p.obs_count[...]) == 3
   np.testing.assert_array_equal(p.normalize_observations(second), second)
@@ -424,7 +419,8 @@ def test_chunked_training_counts_primitive_steps(tmp_path, monkeypatch, utd_rati
   monkeypatch.setattr(Environment, "make", lambda name: family)
   monkeypatch.setattr(logging, "make_logger", lambda kind, *a, **kw: MemoryLogger(*a, **kw))
   monkeypatch.setattr(trainer, "warmup", lambda *args: {})
-  cfg = run_config(tmp_path).replace(total_env_steps=8, num_envs=2, rollout_steps=2, chunk_size=4, utd_ratio=utd_ratio)
+  cfg = run_config(tmp_path).replace(total_env_steps=8, num_envs=2, rollout_steps=2, utd_ratio=utd_ratio)
+  cfg = cfg.replace(model_config=cfg.model_config.overridden({"params": {"chunk_size": 4}}))
   run = trainer.setup(cfg, 1)
   trainer.train(run)
   assert run.progress["env_steps"] == 8

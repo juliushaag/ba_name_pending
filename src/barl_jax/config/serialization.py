@@ -140,6 +140,18 @@ def merge(instance, values: Mapping[str, Any], *, path: str = ""):
   return replace(instance, **updates)
 
 
+def config_problems(config: Any) -> list[str]:
+  """`problems()` of `config` and, recursively, of every nested config field,
+  each prefixed with its field path."""
+  out = list(config.problems()) if hasattr(config, "problems") else []
+  if is_dataclass(config):
+    for f in fields(config):
+      value = getattr(config, f.name)
+      if is_dataclass(value):
+        out += [f"{f.name}.{p}" for p in config_problems(value)]
+  return out
+
+
 def to_dict(value: Any) -> Any:
   """Return a detached JSON-safe tree for a dataclass or builtin container."""
   if is_dataclass(value):

@@ -103,7 +103,7 @@ if __name__ == "__main__":
   print(f"=== Run: {config.model} on {config.env}, "
         f"{num_seeds} seed{'s' if num_seeds != 1 else ''} vmapped ===")
 
-  only_validate = bool(config.validate_config)
+  only_validate = bool(config.validate)
   t0 = time.perf_counter()
   run = setup(config, num_seeds, validate_only=only_validate)
   (validate if only_validate else train)(run)

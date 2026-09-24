@@ -53,6 +53,12 @@ class NetworkConfig:
     and `head` (what `normalize_weights` projects)."""
     raise NotImplementedError
 
+  def problems(self) -> list[str]:
+    from barl_jax.networks.norm import NORMS
+    return [f"{name}={getattr(self, name)!r}: unknown {name}; available: {sorted(allowed)}"
+            for name, allowed in (("activation", ACTIVATIONS), ("dtype", DTYPES), ("norm", NORMS))
+            if getattr(self, name) not in allowed]
+
   def resolve(self):
     activation = self.activation.lower()
     assert activation in ACTIVATIONS, f"{activation} not in available activations {list(ACTIVATIONS)}"

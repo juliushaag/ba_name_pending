@@ -26,12 +26,11 @@ from barl_jax.result import write_json_atomic
 # `restore_training` actually construct or restore learning state and import
 # orbax and multiseed.unstack locally, where that state is built.
 
-# v2: the replay row field carrying the accumulated discounted return was
-# renamed rew -> chunk_return (docs/ALGORITHM_MAP.md). A v1 checkpoint's
-# replay .npz has no chunk_return field, so restore_training would silently
-# leave the buffer empty rather than actually resuming it -- rejected below
-# instead, with no shim that reinterprets the old field name.
-VERSION = 2
+# v3: run config dropped `profile`, `chunk_size` (now `model.params.chunk_size`)
+# and `env_metadata`, so older saved configs no longer round-trip. v2 renamed the
+# replay field `rew` -> `chunk_return`; an older replay .npz would silently
+# restore as an empty buffer. Both are rejected rather than reinterpreted.
+VERSION = 3
 
 _GEN_PREFIX = "gen-"
 _GEN_WIDTH = 6
@@ -163,40 +162,30 @@ def read_training(root) -> dict:
   meta = json.loads(meta_path.read_text())
   if meta.get("format_version") != VERSION:
     raise ValueError(
-      f"Unsupported training checkpoint version {meta.get('format_version')} (expected "
-      f"{VERSION}). Format version 2 renamed the replay's accumulated-return field "
-      f"rew -> chunk_return; a version-1 checkpoint's replay contents cannot be "
-      f"reinterpreted under the new name and must be rejected, not guessed at.")
+      f"Unsupported training checkpoint version {meta.get('format_version')} "
+      f"(expected {VERSION}); older resume states cannot be reinterpreted.")
   meta["_dir"] = str(gen_dir)
   return meta
 
 
+# Evaluation strategy may change across a resume; collection strategy is a training
+# config and deliberately is not here -- changing it changes the behavior policy that
+# produced the replay buffer.
+_MUTABLE = {"checkpoint", "checkpoint_mode", "run_dir", "sweep_tag", "validate",
+            "log_every", "debug_every", "eval_every", "eval_runs", "eval_video_every",
+            "compile_cache_dir", "wandb_finish_timeout", "logger", "resume_every",
+            "resume_keep", "eval_executor"}
+# The saved model itself is reused on resume (see trainer.setup), so it is not
+# part of the "did the training config change" comparison.
+_SAVED_MODEL = {"model_overrides", "snapshot"}
+
+
 def validate_resume(cfg, num_seeds, meta):
-  from barl_jax.config.run import RunConfig
   if num_seeds != meta["num_seeds"]:
     raise ValueError("Resume requires the saved num_seeds")
-  mutable = {"checkpoint", "checkpoint_mode", "run_dir", "sweep_tag", "validate",
-             "log_every", "debug_every", "eval_every", "eval_runs",
-             "eval_video_every", "compile_cache_dir", "wandb_finish_timeout",
-             "logger", "resume_every", "resume_keep",
-             # Evaluation strategy may change across a resume (recorded in
-             # each eval's own results); collection strategy is a training
-             # config and is deliberately NOT in this set -- changing it
-             # changes the behavior policy that produced the replay buffer.
-             "eval_executor"}
-  saved = meta["config"]
-  current = cfg.to_dict() if isinstance(cfg, RunConfig) else dict(cfg)
-  # `model_overrides`/`env_metadata`/`snapshot` carry the saved model itself;
-  # the run already reuses the saved model (see trainer._setup), so exclude
-  # them from the "did training config change" comparison -- otherwise every
-  # resume would report its own model as changed.
-  for key in ("model_overrides", "env_metadata", "snapshot"):
-    saved.pop(key, None) if isinstance(saved, dict) else None
-    current.pop(key, None)
-  def _cfg_get(mapping, key):
-    return mapping.get(key) if isinstance(mapping, dict) else getattr(mapping, key, None)
-  changed = [key for key, value in (saved.items() if isinstance(saved, dict) else [])
-             if key not in mutable and _cfg_get(current, key) != value]
+  current = cfg.to_dict()
+  changed = [key for key, value in meta["config"].items()
+             if key not in _MUTABLE | _SAVED_MODEL and current.get(key) != value]
   if changed:
     raise ValueError(f"Resume changes training configuration: {', '.join(sorted(changed))}")
 

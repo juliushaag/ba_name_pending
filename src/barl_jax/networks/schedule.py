@@ -38,6 +38,11 @@ class ScheduleConfig:
   power: float = 2.0
   s: float = 0.008
 
+  def problems(self) -> list[str]:
+    if self.steps < 1 or self.warmup < 0 or self.warmup >= self.steps:
+      return ["steps must be >= 1 and warmup in [0, steps)"]
+    return []
+
 
 class Schedule(Component, nnx.Module, ABC):
   """Warmup is a linear ramp 0 -> `start` over `warmup` steps; the curve proper
