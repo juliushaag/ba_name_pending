@@ -171,7 +171,7 @@ def read_training(root) -> dict:
 # Evaluation strategy may change across a resume; collection strategy is a training
 # config and deliberately is not here -- changing it changes the behavior policy that
 # produced the replay buffer.
-_MUTABLE = {"checkpoint", "checkpoint_mode", "run_dir", "sweep_tag", "validate",
+MUTABLE_ON_RESUME = {"checkpoint", "checkpoint_mode", "run_dir", "sweep_tag", "validate",
             "log_every", "debug_every", "eval_every", "eval_runs", "eval_video_every",
             "compile_cache_dir", "wandb_finish_timeout", "logger", "resume_every",
             "resume_keep", "eval_executor"}
@@ -185,7 +185,7 @@ def validate_resume(cfg, num_seeds, meta):
     raise ValueError("Resume requires the saved num_seeds")
   current = cfg.to_dict()
   changed = [key for key, value in meta["config"].items()
-             if key not in _MUTABLE | _SAVED_MODEL and current.get(key) != value]
+             if key not in MUTABLE_ON_RESUME | _SAVED_MODEL and current.get(key) != value]
   if changed:
     raise ValueError(f"Resume changes training configuration: {', '.join(sorted(changed))}")
 

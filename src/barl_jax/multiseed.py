@@ -94,12 +94,7 @@ def _stacked_infer(graphdef, num_seeds, num_envs, executor_config, state, observ
 
   def one(state, obs, key):
     policy, _ = nnx.merge(graphdef.value, state)
-    if executor_config is None:
-      return policy.inference_step(obs, key=key)
-    executor = executors.executor_from_config(executor_config)
-    infer_step = lambda o, k: policy.inference_step(o, key=k)
-    score_fn = policy.score if executor.needs_score else None
-    return executor.select(infer_step, score_fn, obs, key)
+    return executors.select_action(policy, executor_config, obs, key)
 
   action, extras = jax.vmap(one)(state, obs, keys)
   flat = lambda x: x.reshape(num_seeds * num_envs, *x.shape[2:])

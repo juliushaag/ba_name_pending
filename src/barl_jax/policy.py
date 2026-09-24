@@ -31,8 +31,7 @@ def _jitted_infer(graphdef, state, observation, key):
   cache survives across calls: repeated `nnx.split` of the same policy yields an
   equal-and-equally-hashing GraphDef, so a rollout or an eval wave rebinding its
   weights hits the cache instead of recompiling."""
-  action, extras = nnx.merge(graphdef.value, state).inference_step(observation, key=key)
-  return action, extras
+  return executors.select_action(nnx.merge(graphdef.value, state), None, observation, key)
 
 
 @partial(jax.jit, static_argnums=(0, 1))
@@ -45,11 +44,8 @@ def _jitted_infer_exec(graphdef, executor_config, state, observation, key):
   Only `executor_config` -- a frozen, all-primitive-field dataclass, hashable
   for free -- crosses the jit boundary as a static arg; the executor instance
   itself never needs to (see `executors.base.executor_from_config`)."""
-  policy = nnx.merge(graphdef.value, state)
-  executor = executors.executor_from_config(executor_config)
-  infer_step = lambda obs, key: policy.inference_step(obs, key=key)
-  score_fn = policy.score if executor.needs_score else None
-  return executor.select(infer_step, score_fn, observation, key)
+  return executors.select_action(nnx.merge(graphdef.value, state), executor_config,
+                                 observation, key)
 
 
 class Policy(OptimizerMixin, nnx.Module, ABC):

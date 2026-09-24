@@ -4,6 +4,7 @@ from barl_jax.executors.base import (
   ActionExecutor,
   ExecutorConfig,
   executor_from_config,
+  select_action,
 )
 from barl_jax.executors.blend import (
   AxisShuffleExecutor,
@@ -41,4 +42,5 @@ __all__ = [
   "TopKExecutor",
   "TopKExecutorConfig",
   "executor_from_config",
+  "select_action",
 ]

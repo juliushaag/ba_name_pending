@@ -41,6 +41,7 @@ from barl_jax.result import presentable, write_json_atomic
 from barl_jax.rollout import MultiSeedReplay
 from barl_jax.seeding import derive_seed
 from barl_jax.training_checkpoint import (
+  MUTABLE_ON_RESUME,
   read_training,
   restore_training,
   save_training,
@@ -113,98 +114,95 @@ def setup(cfg: RunConfig, num_seeds: int, *, validate_only: bool = False) -> Run
 
 
 def _setup(run, *, validate_only):
-  cfg, num_seeds = run.cfg, run.num_seeds
-
-  run_problems = validate_run(cfg, num_seeds=num_seeds)
-  if run_problems:
+  problems = validate_run(run.cfg, num_seeds=run.num_seeds)
+  if problems:
     raise ValueError(f"{run.model_name} on {run.env_name}: invalid run config, refusing to start:\n  "
-                     + "\n  ".join(run_problems))
+                     + "\n  ".join(problems))
+  enable_compilation_cache(run.cfg.compile_cache_dir)
 
-  enable_compilation_cache(cfg.compile_cache_dir)
+  resume_meta = _resolve_config(run)
+  _build_environments(run, validate_only)
+  policies = _build_policies(run, resume_meta)
 
-  mode = cfg.checkpoint_mode
-  resume_meta = None
-  if mode == "resume":
+  cfg = run.cfg
+  total_grad_steps = max(1, round(cfg.total_env_steps * cfg.utd_ratio))
+  schedule = Policy.lr_schedule(cfg.lr_warmup_steps, total_grad_steps, cfg.lr_decay)
+  optimizers = [nnx.Optimizer(p, p.build_optimizer(lr_schedule=schedule), wrt=TRAINABLE)
+                for p in policies]
+  run.reference = policies[0]
+  run.graphdef, run.state = stack(list(zip(policies, optimizers)))
+  if resume_meta is not None:
+    restore_training(run, resume_meta)
+  # A full walk of the state tree (1.7 ms) -- measured once, not per iteration.
+  run.num_params = run.reference.num_params()
+
+  run.collection_executor = executor_from_config(cfg.collection_executor)
+  run.eval_executor = executor_from_config(cfg.eval_executor)
+  problems = [f"{label}: {p}" for label, executor in
+              (("collection", run.collection_executor), ("eval", run.eval_executor))
+              for p in executor.validate(policy=run.reference)]
+  if problems:
+    raise ValueError(f"{run.model_name}: invalid execution spec, refusing to start:\n  "
+                     + "\n  ".join(problems))
+  return run
+
+
+def _resolve_config(run) -> dict | None:
+  """Apply checkpoint semantics to `run.cfg`; returns the resume metadata, if any.
+
+  The saved model always takes precedence over current defaults. On resume the
+  saved run config is reused too, apart from the mutable fields listed in
+  `training_checkpoint.MUTABLE_ON_RESUME`."""
+  cfg = run.cfg
+  if cfg.checkpoint_mode == "resume":
     if cfg.checkpoint is None:
       raise ValueError("checkpoint_mode: resume requires checkpoint")
-    resume_meta = read_training(cfg.checkpoint)
-    validate_resume(cfg, num_seeds, resume_meta)
-    # Saved model takes precedence over current defaults; mutable run fields
-    # (paths, logging, cadences, eval strategy) may change -- see
-    # training_checkpoint.validate_resume's mutable set.
-    cfg = run.cfg = RunConfig.from_dict(resume_meta["config"]).replace(
-      checkpoint=cfg.checkpoint, checkpoint_mode=cfg.checkpoint_mode,
-      run_dir=cfg.run_dir, sweep_tag=cfg.sweep_tag, logger=cfg.logger,
-      eval_every=cfg.eval_every, eval_runs=cfg.eval_runs,
-      eval_video_every=cfg.eval_video_every, log_every=cfg.log_every,
-      debug_every=cfg.debug_every, eval_executor=cfg.eval_executor,
-      resume_every=cfg.resume_every, resume_keep=cfg.resume_keep,
-      compile_cache_dir=cfg.compile_cache_dir,
-      wandb_finish_timeout=cfg.wandb_finish_timeout,
-    )
-  if cfg.checkpoint and mode == "weights":
-    # The saved model takes precedence over current defaults.
-    cfg = run.cfg = cfg.replace(model_config=saved_model(cfg.checkpoint)[0])
+    meta = read_training(cfg.checkpoint)
+    validate_resume(cfg, run.num_seeds, meta)
+    run.cfg = RunConfig.from_dict(meta["config"]).replace(
+      **{key: getattr(cfg, key) for key in MUTABLE_ON_RESUME})
+    return meta
+  if cfg.checkpoint:
+    run.cfg = cfg.replace(model_config=saved_model(cfg.checkpoint)[0])
+  return None
 
+
+def _build_environments(run, validate_only: bool) -> None:
+  cfg = run.cfg
   run.environment = Environment.make(run.env_name)
   run.env = run.own(run.environment.get_env())       # single env: spaces and EnvStats
   run.env_stats = run.environment.get_env_stats(run.env)
 
-  num_envs = 1 if validate_only else run.num_envs
-  run.num_envs = num_envs
-  run.rollout_env = run.own(run.environment.get_vector_env(num_seeds * num_envs))
-  # A seed's buffer never receives more than total_env_steps transitions --
-  # preallocating past that just reserves address space (and, as training
-  # fills it in, real RAM) no run will ever use.
+  run.num_envs = 1 if validate_only else run.num_envs
+  run.rollout_env = run.own(run.environment.get_vector_env(run.num_seeds * run.num_envs))
+  # A seed's buffer never receives more than total_env_steps transitions.
   buffer_size = min(cfg.buffer_size, cfg.total_env_steps)
   run.collector = Collector(seed=run.base_seed)
-  run.buffer = MultiSeedReplay(num_seeds, num_envs, buffer_size, seed=run.base_seed)
+  run.buffer = MultiSeedReplay(run.num_seeds, run.num_envs, buffer_size, seed=run.base_seed)
 
-  checkpoint = cfg.checkpoint
+
+def _build_policies(run, resume_meta) -> list[Policy]:
+  cfg, checkpoint = run.cfg, run.cfg.checkpoint
   if checkpoint is None:
     policies = [Policy.make(run.model_name, run.env, cfg.model_config,
                             env_stats=run.env_stats, seed=run.base_seed + i)
-                for i in range(num_seeds)]
+                for i in range(run.num_seeds)]
   elif not os.path.exists(checkpoint):
     raise FileNotFoundError(f"checkpoint={checkpoint!r}: no such directory")
   elif resume_meta is not None:
     policies = [load_policy(os.path.join(resume_meta["_dir"], f"seed{i}"), run.env, run.env_stats)
-                for i in range(num_seeds)]
+                for i in range(run.num_seeds)]
   else:
-    policies = [load_policy(checkpoint, run.env, run.env_stats) for _ in range(num_seeds)]
+    policies = [load_policy(checkpoint, run.env, run.env_stats) for _ in range(run.num_seeds)]
     for i, policy in enumerate(policies):
       policy.train_steps[...] = jnp.zeros_like(policy.train_steps[...])
       policy.rngs = nnx.Rngs(run.base_seed + i)
       for component in policy.components.values():
         if hasattr(component, "target_steps"):
           component.target_steps[...] = jnp.zeros_like(component.target_steps[...])
-
   if policies[0].model_name != run.model_name:
     raise ValueError(f"Checkpoint model {policies[0].model_name!r} differs from {run.model_name!r}")
-
-  total_grad_steps = max(1, round(cfg.total_env_steps * cfg.utd_ratio))
-  schedule = Policy.lr_schedule(cfg.lr_warmup_steps, total_grad_steps, cfg.lr_decay)
-  optimizers = [nnx.Optimizer(p, p.build_optimizer(lr_schedule=schedule), wrt=TRAINABLE)
-                for p in policies]
-
-  run.reference = policies[0]
-  run.graphdef, run.state = stack(list(zip(policies, optimizers)))
-  # Constant for the run, and a full walk of the state tree (1.7 ms) -- at
-  # `rollout_steps: 1` it was 6% of a single-seed run to recompute it per
-  # iteration. Measured once here and logged from the cache.
-  if resume_meta is not None:
-    restore_training(run, resume_meta)
-  run.num_params = run.reference.num_params()
-
-  run.collection_executor = executor_from_config(cfg.collection_executor)
-  run.eval_executor = executor_from_config(cfg.eval_executor)
-  spec_problems = [f"{label}: {p}" for label, executor in
-                   (("collection", run.collection_executor), ("eval", run.eval_executor))
-                   for p in executor.validate(policy=run.reference)]
-  if spec_problems:
-    raise ValueError(f"{run.model_name}: invalid execution spec, refusing to start:\n  "
-                     + "\n  ".join(spec_problems))
-  return run
+  return policies
 
 
 # ----------------------------------------------------------------------
@@ -217,6 +215,22 @@ def _checkpoint_dir(run: Run, root: str, seed: int) -> str:
   return os.path.join(root, f"seed{seed}")
 
 
+def summarize_eval(all_runs: list, num_seeds: int) -> list[dict]:
+  """Per-seed eval metrics from `run_episodes` results, which are round-major:
+  seed 0, seed 1, ... for each round."""
+  out = []
+  for i in range(num_seeds):
+    runs = all_runs[i::num_seeds]
+    seen = sum(r["n_act"] for r in runs)
+    out.append({
+      "eval/avg_cum_reward": float(np.mean([np.sum(r["rewards"]) for r in runs])),
+      "eval/avg_length":     float(np.mean([len(r["rewards"]) for r in runs])),
+      "eval/success_rate":   float(np.mean([float(r["success"]) for r in runs])),
+      "eval/act_nonfinite":  sum(r["act_nonfinite"] for r in runs) / seen if seen else 0.0,
+    })
+  return out
+
+
 def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
   """Every seed in one vmapped pass, plus one video episode per seed.
 
@@ -225,69 +239,49 @@ def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
   are orbax writes, the video is an EGL render plus an mp4 encode."""
   cfg = run.cfg
   eval_env, render_env = envs
-  rewards, lengths, successes, nonfinite = [], [], [], []
 
-  # Stable per-evaluation identity, independent of training RNG (this reads
-  # no policy/collector/replay RNG state, so eval never perturbs a training
-  # trajectory) -- same run seed and eval_count always reproduce the same
-  # episodes; a later eval_count never replays an earlier one's.
+  # Evaluation identity is independent of training RNG: the same run seed and
+  # eval_count always reproduce the same episodes, and eval never perturbs a
+  # training trajectory.
   eval_seed = derive_seed(run.base_seed, "eval", run.eval_count)
   run.eval_count += 1
 
-  # Entry/exit are logged because an eval is the one phase that can stall for
-  # tens of minutes with nothing on stdout, and telling "stalled" from "running
-  # normally, just slow" after the fact otherwise means reading a stack trace.
   started = time.perf_counter()
   log.message(f"Eval start @ env_step {log.get_step('env_steps')} "
               f"(every {cfg.eval_every}), {run.num_seeds} seeds x {cfg.eval_runs} episodes, "
               f"eval_seed={eval_seed}")
 
   # One slot per seed; run_episodes reuses these slots for successive rounds.
-  per_run  = cfg.eval_runs
   actor = StackedPolicy(run.graphdef, run.state, run.num_seeds, 1, run.reference,
                         executor=run.eval_executor)
 
-  # `eval/phase` is the one thing that reaches wandb *during* an eval, and it is
-  # here because a killed run uploads no term.err: without it "died before the
-  # eval" and "died inside the eval" are the same picture from the dashboard,
-  # which is exactly where sweep 2026-08-26_17-59-33's DIME/DogRun task left off.
+  # `eval/phase` is the one thing that reaches wandb *during* an eval: a killed
+  # run uploads no term.err, so without it "died before the eval" and "died
+  # inside the eval" look the same from the dashboard.
   log.log({}, quiet={"eval/phase": PHASE_EVAL_WAVE})
   t0 = time.perf_counter()
-  all_runs = run_episodes(actor, eval_env, run.num_seeds * per_run, render=False, seed=eval_seed)
+  all_runs = run_episodes(actor, eval_env, run.num_seeds * cfg.eval_runs, render=False, seed=eval_seed)
   wave_s = time.perf_counter() - t0
 
   log.log({}, quiet={"eval/phase": PHASE_EVAL_CKPT})
   t0 = time.perf_counter()
-  for i in range(run.num_seeds):
-    # Results are round-major: seed 0, seed 1, ... for each round.
-    runs = all_runs[i::run.num_seeds]
-    reward = float(np.mean([np.sum(r["rewards"]) for r in runs]))
-    rewards.append(reward)
-    lengths.append(np.mean([len(r["rewards"]) for r in runs]))
-    successes.append(np.mean([float(r["success"]) for r in runs]))
-    seen = sum(r["n_act"] for r in runs)
-    nonfinite.append(sum(r["act_nonfinite"] for r in runs) / seen if seen else 0.0)
-
+  per_seed = summarize_eval(all_runs, run.num_seeds)
+  for i, metrics in enumerate(per_seed):
+    reward = metrics["eval/avg_cum_reward"]
     policy, _ = unstack(run.graphdef, run.state, i)
     root = _checkpoint_dir(run, ckpt_dir, i)
     save_policy(policy, os.path.join(root, "latest"))
     if reward > best[i]:
       best[i] = reward
       save_policy(policy, os.path.join(root, "best"))
-
   ckpt_s = time.perf_counter() - t0
 
-  # One video episode, one seed, on `render_env` (sized 1, synchronous -- a
-  # forked worker's render() does not survive the fork). It is an *extra*
-  # episode rather than one of the counted `eval_runs`: it cannot join the
-  # main wave above (a VectorEnv renders all its sub-envs or none, at ~140x
-  # the env step). Capped at one seed rather than one-per-seed (every seed
-  # used to get its own render_env sub-env, i.e. its own offscreen EGL/GL
-  # context) -- num_seeds simultaneous contexts is what was blowing past the
-  # GPU memory `XLA_PYTHON_CLIENT_MEM_FRACTION` leaves free on the cluster
-  # (mjr_render aborting the whole process with no python traceback, sweep
-  # 2026-08-27_13-23-15). Rotates which seed gets rendered across eval
-  # rounds so every seed is sampled over the run, just not all at once.
+  # One video episode on `render_env` (sized 1, synchronous -- a forked worker's
+  # render() does not survive the fork). It is an extra episode rather than one
+  # of the counted `eval_runs`: a VectorEnv renders all its sub-envs or none.
+  # Capped at one seed because every render sub-env owns an offscreen GL
+  # context; num_seeds of them at once exhausts the GPU memory XLA leaves free.
+  # The rendered seed rotates across evals so every seed is sampled over the run.
   video_s = 0.0
   if want_video:
     log.log({}, quiet={"eval/phase": PHASE_EVAL_VIDEO})
@@ -300,23 +294,10 @@ def evaluate(run: Run, envs, log, ckpt_dir, best, *, want_video: bool):
     log.log_video("eval/video", episode["frames"], seed_index=seed_index)
     video_s = time.perf_counter() - t0
 
-  # Eval is already per-seed -- each seed owns one slot across all rounds --
-  # so it goes straight to that seed's run rather than being averaged first.
-  rewards = np.asarray(rewards)
-  per_seed = [{"eval/avg_cum_reward": float(rewards[i]),
-               "eval/avg_length":     float(lengths[i]),
-               "eval/success_rate":   float(successes[i]),
-               "eval/act_nonfinite":  float(nonfinite[i])} for i in range(run.num_seeds)]
-  panel = {"eval/avg_cum_reward": rewards.mean(),
-           "eval/avg_length":     np.mean(lengths),
-           "eval/success_rate":   np.mean(successes),
-           "eval/act_nonfinite":  np.mean(nonfinite)}
+  panel = {key: np.mean([m[key] for m in per_seed]) for key in per_seed[0]}
   log.log_per_seed(per_seed, panel=panel)
 
-  # The counterpart to `rollout/act_nonfinite`, and said out loud rather than
-  # only plotted: a non-finite action is now clamped on both paths, so the run
-  # survives it, but every number this eval just produced came from an actor
-  # that had already diverged.
+  nonfinite = [m["eval/act_nonfinite"] for m in per_seed]
   if any(f > 0 for f in nonfinite):
     worst = int(np.argmax(nonfinite))
     log.message(f"  WARNING: non-finite actions during eval -- seed {worst} "
@@ -450,39 +431,52 @@ def train(run: Run):
 
 
 def _train(run: Run):
-  from barl_jax.logger import make_logger
   cfg, num_seeds = run.cfg, run.num_seeds
   now  = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
   name = f"{run.model_name.lower()}/{run.env_name.lower()}/{now}_x{num_seeds}"
 
-  # `eval_video_every: null` means never, so the render env is not built either
-  # -- one fewer mujoco model resident, and no GL context to create at all.
-  wants_video = cfg.eval_video_every is not None
-  eval_env = run.own(run.environment.get_vector_env(num_seeds))
-
-  tags = [run.model_name, run.env_name, "online", "jax", "multiseed"]
-  if cfg.sweep_tag:
-    tags.append(cfg.sweep_tag)
-
-  # A sweep hands every run its own directory (barl_jax.launch.grid) and its
-  # weights belong next to the config and log that produced them. A standalone
-  # run has no such directory, and keeps the global checkpoints/ tree keyed by
-  # the same <model>/<env>/<timestamp> the wandb run is named after.
+  # A sweep hands every run its own directory (barl_jax.launch.grid); a standalone
+  # run keeps the global checkpoints/ tree keyed like its wandb run.
   ckpt_dir = os.path.abspath(os.path.join(cfg.run_dir, "checkpoints") if cfg.run_dir
                              else os.path.join("checkpoints", name))
   os.makedirs(ckpt_dir, exist_ok=True)
-  # The run-level directory the objective sidecar lives in: the run's own dir
-  # under a sweep, else the standalone <model>/<env>/<timestamp>/ tree. This is
-  # the only place a finished run's result is readable without wandb.
+  # Where the result sidecar lives: the only way to read a finished run without wandb.
   objective_dir = os.path.abspath(cfg.run_dir) if cfg.run_dir else os.path.join("checkpoints", name)
 
+  log = _open_logger(run, name, ckpt_dir, objective_dir)
+  eval_env = run.own(run.environment.get_vector_env(num_seeds))
+  render_env = _open_render_env(run, log)
+  eval_envs = (eval_env, render_env)
+
+  warmup_stats = warmup(run, eval_envs, log)
+
+  if cfg.random_steps > 0 and not run.progress:
+    # Prefill steps count toward neither env_steps nor grad_steps; skipped on
+    # resume, which already has a filled buffer.
+    run.collector.random_fill(run.rollout_env, n_steps=cfg.random_steps // run.num_envs,
+                              seed=run.base_seed, chunk_size=run.reference.chunk_size,
+                              discount=run.reference.discount, sink=run.buffer)
+    log.message(f"Random-filled the buffer with {cfg.random_steps} env steps before training")
+  if run.progress:
+    log.advance({key: run.progress[key] for key in ("env_steps", "grad_steps")})
+    log.message("Resumed optimizer, replay and counters; environment episodes restart")
+
+  _TrainLoop(run, log, eval_envs, render_env is not None, ckpt_dir, objective_dir,
+             warmup_stats).execute()
+
+
+def _open_logger(run: Run, name: str, ckpt_dir: str, objective_dir: str):
+  from barl_jax.logger import make_logger
+  cfg, num_seeds = run.cfg, run.num_seeds
+  tags = [run.model_name, run.env_name, "online", "jax", "multiseed"]
+  if cfg.sweep_tag:
+    tags.append(cfg.sweep_tag)
   log = make_logger(
     cfg.logger, name, step_keys={"env_steps", "grad_steps"}, tags=tags,
     config=run_config_snapshot(run), group=name,
     finish_timeout=cfg.wandb_finish_timeout, run_dir=objective_dir,
     seeds=[run.base_seed + i for i in range(num_seeds)]
   )
-
   run.resources.callback(log.finish)
 
   log.register("eval/*", "env_steps")
@@ -496,239 +490,228 @@ def _train(run: Run):
   log.message(f"{num_seeds} seed{'s' if num_seeds != 1 else ''} vmapped in one process "
               f"({num_seeds * run.num_envs} rollout envs, "
               f"{run.num_params / 1e6:.2f}M params each)")
+  return log
 
-  # One video slot, one seed (see evaluate()'s video block) -- sized 1, not
-  # num_seeds: each sub-env holds its own offscreen EGL/GL context, and
-  # num_seeds of those at once is what was exceeding the GPU memory left free
-  # on the cluster (see evaluate()'s comment). `render=True` only for this
-  # dedicated env; every other env in this run (the reference/rollout envs in
-  # _setup, scripts/evaluate.py's, and this one when videos are off) defaults
-  # to no renderer at all. Built after `log` exists (not alongside `eval_env`
-  # above) so a construction failure can be reported and the run can carry on
-  # without video -- a headless node's GL/EGL context is not required for
-  # training, only for this one optional artifact, and should never take an
-  # otherwise-healthy run down with it.
-  render_env = None
-  if wants_video:
-    try:
-      render_env = run.own(run.environment.get_vector_env(1, asynchronous=False, render=True))
-    except Exception as exc:
-      wants_video = False
-      log.message(f"WARNING: could not create the video render env ({exc!r}); "
-                  f"disabling eval videos for this run.")
-  eval_envs = (eval_env, render_env)
 
-  warmup_stats = warmup(run, eval_envs, log)
+def _open_render_env(run: Run, log):
+  """The one-slot video env, or None when videos are off or it cannot be built.
 
-  steps_per_iter = cfg.rollout_steps // run.num_envs
-
-  if cfg.random_steps > 0 and not run.progress:
-    # Prefill primitive steps are not counted into env_steps/grad_steps -- no
-    # log.advance() around this call. Only skipped on resume (`not run.progress`),
-    # never re-run against an already-filled buffer.
-    run.collector.random_fill(run.rollout_env, n_steps=cfg.random_steps // run.num_envs,
-                           seed=run.base_seed, chunk_size=run.reference.chunk_size,
-                           discount=run.reference.discount, sink=run.buffer)
-    log.message(f"Random-filled the buffer with {cfg.random_steps} env steps before training")
-
-  if run.progress:
-    log.advance({key: run.progress[key] for key in ("env_steps", "grad_steps")})
-    log.message("Resumed optimizer, replay and counters; environment episodes restart")
-  best = run.progress.get("best", [float("-inf")] * num_seeds)
-  eval_every, next_eval = cfg.eval_every, cfg.eval_every
-  # In evals, not env steps -- checked against run.eval_count (not restored on
-  # resume, so this always restarts counting from the top, same as eval_count
-  # itself) rather than a precomputed env-step threshold like next_eval's.
-  video_every = cfg.eval_video_every if wants_video else None
-  next_eval = (log.get_step("env_steps") // eval_every + 1) * eval_every
-  # Resume persistence is its own cadence -- independent of eval_every, since
-  # the replay dump it carries is what makes a save expensive, not the eval.
-  resume_dir = os.path.join(ckpt_dir, "resume")
-  resume_every = cfg.resume_every
-  next_resume = (log.get_step("env_steps") // resume_every + 1) * resume_every
-  it = run.progress.get("iteration", 0)
-  chunk_seen = False
-  run_started = time.perf_counter()
-  # `rollout_steps` may be as small as `num_envs` (one env step per slot per
-  # iteration), which is thousands of iterations per 100k env steps -- so the
-  # per-iteration narration is paced by wall clock rather than emitted every
-  # time round. wandb still gets every iteration; only stdout is thinned.
-  last_narration = 0.0
-  # Without this a mid-loop exception skipped the final save, left the eval envs
-  # to the interpreter and never flushed wandb, so the failure was invisible from
-  # the dashboard. A fatal signal still bypasses it -- that is faulthandler's job.
-  crash = None
+  Built after the logger exists so a construction failure is reported and the
+  run carries on without video: a headless node's GL/EGL context is needed only
+  for this optional artifact and must never take a healthy run down."""
+  if run.cfg.eval_video_every is None:
+    return None
   try:
-    while log.get_step("env_steps") < cfg.total_env_steps:
-      iter_start = time.perf_counter()
-      actor = StackedPolicy(run.graphdef, run.state, num_seeds, run.num_envs, run.reference,
-                            executor=run.collection_executor)
-      rollout_stats = run.collector.collect(actor, env=run.rollout_env, n_steps=steps_per_iter,
-                                         seed=run.base_seed + int(run.progress.get("env_steps", 0))
-                                         if run.collector.state is None else None,
-                                         discount=actor.discount, sink=run.buffer)
-      rollout_time = time.perf_counter() - iter_start
-      log.advance({"env_steps": cfg.rollout_steps})
+    return run.own(run.environment.get_vector_env(1, asynchronous=False, render=True))
+  except Exception as exc:
+    log.message(f"WARNING: could not create the video render env ({exc!r}); "
+                f"disabling eval videos for this run.")
+    return None
 
-      log.log_per_seed([{f"rollout/{k}": v for k, v in seed.items()}
-                        for seed in run.collector.per_seed(run.num_seeds, run.num_envs)],
-                       panel={f"rollout/{k}": v for k, v in rollout_stats.items()})
 
-      # Chunks can span collection calls: wait for replay data, then catch up
-      # to the cumulative primitive-step budget (also preserves fractional UTD).
-      grad_steps_this_iter = (
-        max(0, round(log.get_step("env_steps") * cfg.utd_ratio)
-            - log.get_step("grad_steps"))
-        if run.buffer.min_transitions() > 0 else 0)
-      narrate = (it == 0 or time.perf_counter() - last_narration > PROGRESS_INTERVAL_S)
-      if narrate:
-        log.message(f"Rollout done: {run.buffer.min_transitions()} transitions per seed, "
-                    f"~{grad_steps_this_iter} grad steps this iter")
-      log.log({"buffer/utd_ratio": grad_steps_this_iter / cfg.rollout_steps})
-      log.log_per_seed([{"buffer/transitions": n} for n in run.buffer.transitions_per_seed()],
-                       panel={"buffer/transitions": run.buffer.min_transitions()})
+class _TrainLoop:
+  """The online loop: collect, gradient steps, periodic eval and resume saves.
 
-      # Same reason `evaluate()` announces itself: this is a phase that runs for
-      # hours with nothing on stdout between it and the next rollout, and after
-      # the fact a slow step is indistinguishable from a stall. `log_every` paces
-      # wandb, which at a few seconds per step can be a long way apart.
-      epoch_start = last_report = time.perf_counter()
-      progress_every = max(1, grad_steps_this_iter // 10)
+  One `iteration()` collects `rollout_steps` env steps, then runs the gradient
+  steps the utd ratio owes -- as one `lax.scan` dispatch when no metric tier is
+  armed inside it, else step by step."""
 
-      # Whole-iteration fast path. An iteration holding no tier-armed step is
-      # one `lax.scan` over its whole gradient-step count and one host->device
-      # transfer, instead of that many jit dispatches and transfers. Split at
-      # the iteration rather than at the armed step so `k` takes exactly one
-      # value for the run: a second chunk length is a second compile of the
-      # scan, and at DIME's ~60 s per compile that costs more than it saves.
-      # An iteration holds an armed step `grad_steps_this_iter / log_every` of
-      # the time -- 13% at the 32-step iteration `rollout_steps: 16` gives.
-      base = log.get_step("grad_steps")
-      armed_here = any((base + i) % cfg.log_every == 0
-                       or (base + i) % cfg.debug_every == 0
-                       for i in range(grad_steps_this_iter))
+  def __init__(self, run: Run, log, eval_envs, wants_video: bool, ckpt_dir: str,
+               objective_dir: str, warmup_stats: dict):
+    self.run, self.cfg, self.log = run, run.cfg, log
+    self.eval_envs, self.ckpt_dir, self.objective_dir = eval_envs, ckpt_dir, objective_dir
+    self.warmup_stats = warmup_stats
+    self.video_every = self.cfg.eval_video_every if wants_video else None
+    self.steps_per_iter = self.cfg.rollout_steps // run.num_envs
+    self.best = run.progress.get("best", [float("-inf")] * run.num_seeds)
+    self.next_eval = self._next_boundary(self.cfg.eval_every)
+    # Resume persistence has its own cadence: the replay dump is what makes a save costly.
+    self.resume_dir = os.path.join(ckpt_dir, "resume")
+    self.next_resume = self._next_boundary(self.cfg.resume_every)
+    self.it = run.progress.get("iteration", 0)
+    self.chunk_seen = False
+    # Stdout is paced by wall clock, not by iteration: at `rollout_steps: 1` there
+    # are thousands of iterations per 100k env steps. wandb still gets every one.
+    self.last_narration = 0.0
+    self.started = time.perf_counter()
 
-      if grad_steps_this_iter and not armed_here:
-        batches = run.buffer.sample_chunk(grad_steps_this_iter, cfg.batch_size)
-        run.state = seeded_chunk(run.graphdef, run.state, batches,
-                                 grad_steps_this_iter, jnp.asarray(base, jnp.int32))
-        log.advance({"grad_steps": grad_steps_this_iter})
-        if not chunk_seen:
-          chunk_seen = True
-          jax.block_until_ready(run.state)
-          log.message(f"  first chunked iteration ({grad_steps_this_iter} grad steps, "
-                      f"incl. compile): {time.perf_counter() - epoch_start:.1f}s")
+  def _next_boundary(self, every: int) -> int:
+    return (self.log.get_step("env_steps") // every + 1) * every
 
-      for step in (range(grad_steps_this_iter) if armed_here else ()):
-        gstep = log.get_step("grad_steps")
-        tiers = (tuple([PRIMARY] if gstep % cfg.log_every == 0 else [])
-                 + tuple([DEBUG] if gstep % cfg.debug_every == 0 else []))
-
-        batch = run.buffer.sample(cfg.batch_size)
-        run.state, _, primary, debug = seeded_step(run.graphdef, run.state, batch, tiers,
-                                                   jnp.asarray(gstep, jnp.int32))
-
-        if tiers:
-          primary, debug = to_host(primary), to_host(debug)
-          primary_mean, primary_seeds = split_metrics(primary, num_seeds)
-          _,            debug_seeds   = split_metrics(debug, num_seeds)
-      
-          log.log_per_seed(primary_seeds, debug_seeds, panel=primary_mean)
-
-        log.advance({"grad_steps": 1})
-
-        now, done = time.perf_counter(), step + 1
-        if step == 0 and it == 0:
-          # Reported on its own because it is not a step time: every distinct
-          # `tiers` value is a separate jit trace, so the first few steps each pay
-          # a compile the rest do not.
-          log.message(f"  first grad step (incl. compile): {now - epoch_start:.1f}s")
-          last_report = now
-        # Whichever comes first: a tenth of the iteration, or PROGRESS_INTERVAL_S
-        # of silence. The second is what a slow step needs -- a tenth of a
-        # 10k-step iteration at seconds per step is an hour apart. Neither is
-        # worth saying for an iteration that lasts a fraction of a second.
-        elif narrate and done < grad_steps_this_iter and (done % progress_every == 0
-                                              or now - last_report > PROGRESS_INTERVAL_S):
-          rate = done / (now - epoch_start)
-          log.message(f"  {done}/{grad_steps_this_iter} grad steps, {rate:.2f}/s, "
-                      f"~{(grad_steps_this_iter - done) / rate / 60:.1f} min left this iter")
-          last_report = now
-
-      # Dispatch is async: without this the training time lands in the next
-      # iteration's rollout_time.
-      jax.block_until_ready(run.state)
-      epoch_time = time.perf_counter() - epoch_start
-      if narrate:
-        log.message(f"Trained {grad_steps_this_iter} grad steps in {epoch_time / 60:.1f} min "
-                    f"({1000 * epoch_time / max(1, grad_steps_this_iter):.0f} ms/step)")
-        last_narration = time.perf_counter()
-
-      eval_time, eval_phases = 0.0, {}
-      if log.get_step("env_steps") >= next_eval:
-        # A rendered episode is ~140x the cost of an env step plus a synchronous
-        # mp4 encode, so video runs on its own, coarser cadence than the eval
-        # itself -- every `video_every`th eval (run.eval_count is 0-based and
-        # not yet incremented for this call, so +1 makes it that call's number).
-        want_video = video_every is not None and (run.eval_count + 1) % video_every == 0
-        eval_start = time.perf_counter()
-        best, eval_phases = evaluate(run, eval_envs, log, ckpt_dir, best, want_video=want_video)
-        eval_time = time.perf_counter() - eval_start
-        next_eval = (log.get_step("env_steps") // eval_every + 1) * eval_every
-        _write_objective(objective_dir, model=run.model_name, env=run.env_name,
-                         seed=run.base_seed, num_seeds=run.num_seeds,
-                         env_steps=int(log.get_step("env_steps")), best=best, status="running")
-    
-      n_samples = max(1, grad_steps_this_iter * cfg.batch_size * num_seeds)
-      iter_time = time.perf_counter() - iter_start
-      elapsed   = max(1e-9, time.perf_counter() - run_started)
-      stats = {"model/num_params": run.num_params,
-               "model/epoch_time_s": epoch_time,
-               "model/eval_time_s": eval_time,
-               "model/epoch_time_per_sample_ms": 1000 * epoch_time / n_samples,
-               # The split the last sweep could not produce: which phase the wall
-               # clock actually went into, per iteration, and the rate the 8-hour
-               # budget is judged against.
-               "time/rollout_s": rollout_time,
-               "time/train_s":   epoch_time,
-               "time/iter_s":    iter_time,
-               "time/env_steps_per_hour": 3600.0 * log.get_step("env_steps") / elapsed,
-               "eval/phase": PHASE_TRAIN,
-               **eval_phases, **warmup_stats}
-      log.log(stats)
-      it += 1
-      run.progress = {"env_steps": int(log.get_step("env_steps")),
-                      "grad_steps": int(log.get_step("grad_steps")),
-                      "iteration": it, "best": list(best)}
-      if log.get_step("env_steps") >= next_resume:
-        save_training(run, resume_dir, run.progress, keep=cfg.resume_keep)
-        next_resume = (log.get_step("env_steps") // resume_every + 1) * resume_every
-  except BaseException as exc:
-    crash = exc
-    raise
-  finally:
+  def execute(self):
+    run, log = self.run, self.log
+    crash = None
     try:
-      for i in range(num_seeds):
-        policy, _ = unstack(run.graphdef, run.state, i)
-        save_policy(policy, os.path.join(_checkpoint_dir(run, ckpt_dir, i), "final"))
-    except Exception as save_error:
-      log.message(f"Could not write the final checkpoint: {save_error!r}")
+      while log.get_step("env_steps") < self.cfg.total_env_steps:
+        self.iteration()
+    except BaseException as exc:
+      crash = exc
+      raise
+    finally:
+      # A mid-loop exception must still save weights, write the result and flush
+      # the logger, or the failure is invisible from the dashboard. A fatal signal
+      # bypasses this; that is faulthandler's job.
+      try:
+        for i in range(run.num_seeds):
+          policy, _ = unstack(run.graphdef, run.state, i)
+          save_policy(policy, os.path.join(_checkpoint_dir(run, self.ckpt_dir, i), "final"))
+      except Exception as save_error:
+        log.message(f"Could not write the final checkpoint: {save_error!r}")
 
-    # Clean completion always gets a resume save, off-cadence or not: the run
-    # is done, so this is the last chance and it costs nothing to take it.
-    if crash is None:
-      save_training(run, resume_dir, run.progress, keep=cfg.resume_keep)
+      if crash is None:
+        save_training(run, self.resume_dir, run.progress, keep=self.cfg.resume_keep)
+      else:
+        log.message(f"Run failed: {type(crash).__name__}: {crash}")
+        log.summary("crash", f"{type(crash).__name__}: {crash}")
 
-    if crash is not None:
-      log.message(f"Run failed: {type(crash).__name__}: {crash}")
-      log.summary("crash", f"{type(crash).__name__}: {crash}")
+      self._write_objective("failed" if crash is not None else "finished")
 
-    _write_objective(objective_dir, model=run.model_name, env=run.env_name,
+  def _write_objective(self, status: str) -> None:
+    run = self.run
+    _write_objective(self.objective_dir, model=run.model_name, env=run.env_name,
                      seed=run.base_seed, num_seeds=run.num_seeds,
-                     env_steps=int(log.get_step("env_steps")), best=best,
-                     status="failed" if crash is not None else "finished")
+                     env_steps=int(self.log.get_step("env_steps")), best=self.best, status=status)
 
+  def iteration(self):
+    run, cfg, log = self.run, self.cfg, self.log
+    iter_start = time.perf_counter()
+    rollout_time = self._collect()
+    grad_steps = self._grad_steps_owed()
+    narrate = self.it == 0 or time.perf_counter() - self.last_narration > PROGRESS_INTERVAL_S
+    if narrate:
+      log.message(f"Rollout done: {run.buffer.min_transitions()} transitions per seed, "
+                  f"~{grad_steps} grad steps this iter")
+    log.log({"buffer/utd_ratio": grad_steps / cfg.rollout_steps})
+    log.log_per_seed([{"buffer/transitions": n} for n in run.buffer.transitions_per_seed()],
+                     panel={"buffer/transitions": run.buffer.min_transitions()})
 
+    epoch_time = self._train(grad_steps, narrate)
+
+    eval_time, eval_phases = 0.0, {}
+    if log.get_step("env_steps") >= self.next_eval:
+      eval_start = time.perf_counter()
+      eval_phases = self._evaluate()
+      eval_time = time.perf_counter() - eval_start
+
+    self._log_iteration(iter_start, rollout_time, grad_steps, epoch_time, eval_time, eval_phases)
+    self.it += 1
+    run.progress = {"env_steps": int(log.get_step("env_steps")),
+                    "grad_steps": int(log.get_step("grad_steps")),
+                    "iteration": self.it, "best": list(self.best)}
+    if log.get_step("env_steps") >= self.next_resume:
+      save_training(run, self.resume_dir, run.progress, keep=cfg.resume_keep)
+      self.next_resume = self._next_boundary(cfg.resume_every)
+
+  def _collect(self) -> float:
+    run, log = self.run, self.log
+    start = time.perf_counter()
+    actor = StackedPolicy(run.graphdef, run.state, run.num_seeds, run.num_envs, run.reference,
+                          executor=run.collection_executor)
+    first_seed = (run.base_seed + int(run.progress.get("env_steps", 0))
+                  if run.collector.state is None else None)
+    rollout_stats = run.collector.collect(actor, env=run.rollout_env, n_steps=self.steps_per_iter,
+                                          seed=first_seed, discount=actor.discount, sink=run.buffer)
+    elapsed = time.perf_counter() - start
+    log.advance({"env_steps": self.cfg.rollout_steps})
+    log.log_per_seed([{f"rollout/{k}": v for k, v in seed.items()}
+                      for seed in run.collector.per_seed(run.num_seeds, run.num_envs)],
+                     panel={f"rollout/{k}": v for k, v in rollout_stats.items()})
+    return elapsed
+
+  def _grad_steps_owed(self) -> int:
+    """Chunks span collection calls: wait for replay data, then catch up to the
+    cumulative primitive-step budget (which also preserves fractional UTD)."""
+    if self.run.buffer.min_transitions() <= 0:
+      return 0
+    log = self.log
+    return max(0, round(log.get_step("env_steps") * self.cfg.utd_ratio) - log.get_step("grad_steps"))
+
+  def _train(self, grad_steps: int, narrate: bool) -> float:
+    run, cfg, log = self.run, self.cfg, self.log
+    epoch_start = last_report = time.perf_counter()
+    progress_every = max(1, grad_steps // 10)
+
+    # Whole-iteration fast path: an iteration holding no tier-armed step is one
+    # `lax.scan` and one host->device transfer instead of that many dispatches.
+    # Split at the iteration, not at the armed step, so `k` takes one value for
+    # the run -- a second chunk length is a second compile of the scan.
+    base = log.get_step("grad_steps")
+    armed_here = any((base + i) % cfg.log_every == 0 or (base + i) % cfg.debug_every == 0
+                     for i in range(grad_steps))
+
+    if grad_steps and not armed_here:
+      batches = run.buffer.sample_chunk(grad_steps, cfg.batch_size)
+      run.state = seeded_chunk(run.graphdef, run.state, batches, grad_steps,
+                               jnp.asarray(base, jnp.int32))
+      log.advance({"grad_steps": grad_steps})
+      if not self.chunk_seen:
+        self.chunk_seen = True
+        jax.block_until_ready(run.state)
+        log.message(f"  first chunked iteration ({grad_steps} grad steps, "
+                    f"incl. compile): {time.perf_counter() - epoch_start:.1f}s")
+
+    for step in (range(grad_steps) if armed_here else ()):
+      gstep = log.get_step("grad_steps")
+      tiers = (tuple([PRIMARY] if gstep % cfg.log_every == 0 else [])
+               + tuple([DEBUG] if gstep % cfg.debug_every == 0 else []))
+
+      batch = run.buffer.sample(cfg.batch_size)
+      run.state, _, primary, debug = seeded_step(run.graphdef, run.state, batch, tiers,
+                                                 jnp.asarray(gstep, jnp.int32))
+      if tiers:
+        primary, debug = to_host(primary), to_host(debug)
+        primary_mean, primary_seeds = split_metrics(primary, run.num_seeds)
+        _, debug_seeds = split_metrics(debug, run.num_seeds)
+        log.log_per_seed(primary_seeds, debug_seeds, panel=primary_mean)
+      log.advance({"grad_steps": 1})
+
+      now, done = time.perf_counter(), step + 1
+      if step == 0 and self.it == 0:
+        # Not a step time: every distinct `tiers` value is a separate jit trace.
+        log.message(f"  first grad step (incl. compile): {now - epoch_start:.1f}s")
+        last_report = now
+      elif narrate and done < grad_steps and (done % progress_every == 0
+                                              or now - last_report > PROGRESS_INTERVAL_S):
+        rate = done / (now - epoch_start)
+        log.message(f"  {done}/{grad_steps} grad steps, {rate:.2f}/s, "
+                    f"~{(grad_steps - done) / rate / 60:.1f} min left this iter")
+        last_report = now
+
+    # Dispatch is async: without this the training time lands in the next rollout's.
+    jax.block_until_ready(run.state)
+    epoch_time = time.perf_counter() - epoch_start
+    if narrate:
+      log.message(f"Trained {grad_steps} grad steps in {epoch_time / 60:.1f} min "
+                  f"({1000 * epoch_time / max(1, grad_steps):.0f} ms/step)")
+      self.last_narration = time.perf_counter()
+    return epoch_time
+
+  def _evaluate(self) -> dict:
+    run, cfg, log = self.run, self.cfg, self.log
+    # A rendered episode costs ~140x an env step plus an mp4 encode, so video runs on
+    # a coarser cadence: every `video_every`th eval (eval_count is not yet incremented).
+    want_video = self.video_every is not None and (run.eval_count + 1) % self.video_every == 0
+    self.best, phases = evaluate(run, self.eval_envs, log, self.ckpt_dir, self.best,
+                                 want_video=want_video)
+    self.next_eval = self._next_boundary(cfg.eval_every)
+    self._write_objective("running")
+    return phases
+
+  def _log_iteration(self, iter_start, rollout_time, grad_steps, epoch_time, eval_time,
+                     eval_phases) -> None:
+    run, cfg, log = self.run, self.cfg, self.log
+    n_samples = max(1, grad_steps * cfg.batch_size * run.num_seeds)
+    elapsed = max(1e-9, time.perf_counter() - self.started)
+    log.log({"model/num_params": run.num_params,
+             "model/epoch_time_s": epoch_time,
+             "model/eval_time_s": eval_time,
+             "model/epoch_time_per_sample_ms": 1000 * epoch_time / n_samples,
+             "time/rollout_s": rollout_time,
+             "time/train_s":   epoch_time,
+             "time/iter_s":    time.perf_counter() - iter_start,
+             "time/env_steps_per_hour": 3600.0 * log.get_step("env_steps") / elapsed,
+             "eval/phase": PHASE_TRAIN,
+             **eval_phases, **self.warmup_stats})
 
 
 def validate(run: Run):

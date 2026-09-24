@@ -100,6 +100,17 @@ def executor_from_config(config) -> ActionExecutor:
   return get_executor(config.class_name)(config)
 
 
+def select_action(policy, executor_config, observation, key):
+  """`(action_chunk, extras)` for `policy` under an executor config, or the
+  policy's own action when `executor_config` is None. Traced inside jit."""
+  infer_step = lambda obs, k: policy.inference_step(obs, key=k)
+  if executor_config is None:
+    return infer_step(observation, key)
+  executor = executor_from_config(executor_config)
+  score_fn = policy.score if executor.needs_score else None
+  return executor.select(infer_step, score_fn, observation, key)
+
+
 # ---------------------------------------------------------------------------
 # Shared candidate generation/reduction helpers -- used by both
 # `executors.blend` (no scorer) and `executors.scored` (scorer-guided).
