@@ -27,13 +27,12 @@ class StochasticActorConfig(ActorOptimConfig):
   squash_cls: str = "TanhSquash"
   log_std_min: float = -20.0
   log_std_max: float = 2.0
-  log_prob_clip: float = 0.99
 
 
 @register_component
 class StochasticActor(ActorOptim, Actor):
-  """Diagonal-Normal MLP actor shared by SAC/PPO/IQL. `dist()` stays an
-  unconstrained Normal; sample()/mode() squash it (the `squash_cls` Config
+  """Diagonal-Normal MLP actor used by SAC. `dist()` stays an
+  unconstrained Normal; sample() squashes it (the `squash_cls` Config
   selects which -- any no-arg Squash works generically here).
 
   The shallow Gaussian policy has just a state-independent `log_std` plus the
@@ -68,16 +67,6 @@ class StochasticActor(ActorOptim, Actor):
     std  = jnp.exp(jnp.clip(self.log_std[...], self.config.log_std_min, self.config.log_std_max))
     return mean, std
 
-  def log_prob(self, dist, action):
-    """`action` is the squashed (canonical [-1, 1]) value; inverts the squash
-    and applies the change-of-variables correction."""
-    mean, std = dist
-    flat = action.reshape(action.shape[0], -1)
-    clip = self.config.log_prob_clip
-    x = self.squash.inverse(jnp.clip(flat, -clip, clip))
-    lp = gaussian.log_prob(x, mean, std) - self.squash.log_abs_det_jacobian(x, flat)
-    return lp.sum(axis=-1)
-
   def rsample(self, s, key=None):
     """Reparameterized (action, pre-squash x, dist) -- differentiable through s."""
     mean, std = self.dist(s)
@@ -106,11 +95,6 @@ class StochasticActor(ActorOptim, Actor):
   def sample(self, s, *, critic: Critic = None, key=None):
     action_flat, _, _ = self.rsample(s, key)
     return self.to_plan(action_flat)
-
-  def mode(self, s):
-    """Deterministic (mean) action -- IQL trains via AWR but deploys this."""
-    mean, _ = self.dist(s)
-    return self.to_plan(self.squash(mean))
 
 
 @register_policy

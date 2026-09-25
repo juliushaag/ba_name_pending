@@ -32,3 +32,4 @@ axes:
       num_bins: 101
       entropy_coef: 0.0
     - {class: FloqCritic}
+    - {class: FloqCritic, distill: false}

@@ -1,7 +1,7 @@
 # barl_jax
 
 A JAX/Flax-NNX research framework for online off-policy actor-critic learning.
-SAC, AMDP, DIME, SDAC and NCLQL share configuration, collection, replay,
+SAC, TD3, AMDP, DIME, SDAC and NCLQL share configuration, collection, replay,
 evaluation and execution infrastructure.
 
 ## Development
@@ -82,7 +82,7 @@ uv run python scripts/submit.py --config sweeps/<submission>/<run>/config.yaml
 
 ### Flow-matching critic (floq)
 
-The optional `FloqCritic` implements the scalar flow-matching critic from [arXiv:2509.06863](https://arxiv.org/abs/2509.06863). Select it for SAC, AMDP, DIME, or SDAC with a model override; the existing actor, replay, and policy interfaces remain unchanged. The default uses 8 Euler flow steps, 8 random target-noise samples, a 51-edge HL-Gauss (50 histogram features) interpolant encoding with `sigma=16.0`, and a 64-dimensional Fourier time encoding. See [docs/floq.md](docs/floq.md) for equations, adaptation details, defaults, and validation requirements.
+The optional `FloqCritic` implements the scalar flow-matching critic from [arXiv:2509.06863](https://arxiv.org/abs/2509.06863). Select it for SAC, AMDP, DIME, or SDAC with a model override; the existing actor, replay, and policy interfaces remain unchanged. The default uses 8 Euler flow steps, 8 random target-noise samples, a 51-edge HL-Gauss (50 histogram features) interpolant encoding with `sigma=16.0`, and a 64-dimensional Fourier time encoding (`Cos` is available for the reference's `cos(t)`). See [docs/floq.md](docs/floq.md) for equations, adaptation details, defaults, and validation requirements.
 
 ```bash
 uv run python scripts/submit.py --algos SAC --envs HalfCheetah --seeds 3 --set model.components.critic.class=FloqCritic
@@ -90,7 +90,7 @@ uv run python scripts/submit.py --algos AMDP --envs HalfCheetah --seeds 3 --set 
 uv run python scripts/debug.py --model SAC --json --set components.critic.class=FloqCritic
 ```
 
-The flow critic differentiates through its Euler chain during SAC and AMDP actor updates, so actor cost grows with `flow_steps`. Compare 4, 8, and 16 at matched seeds and report wall-clock cost; larger flow budgets can have diminishing returns.
+By default (`distill=true`) actors price through a distilled Q-ensemble of the same width/depth, regressed onto the flow's mean return under fresh random noise with a stop-gradient target (the field trains on flow matching alone), so actor cost does not depend on `flow_steps`. With `distill=false` the flow critic instead differentiates through its Euler chain during SAC and AMDP actor updates, so actor cost grows with `flow_steps`. Compare 4, 8, and 16 at matched seeds and report wall-clock cost; larger flow budgets can have diminishing returns.
 
 The training CLI requires an accelerator. Set `BARL_ALLOW_CPU=1` for intentional
 CPU smoke tests. Rendering uses EGL by default in the training CLI.

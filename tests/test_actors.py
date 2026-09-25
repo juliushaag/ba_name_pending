@@ -70,14 +70,26 @@ def test_sampled_actions_can_reach_the_box_edges(name, obs, key):
     assert jnp.all(jnp.abs(action) > 0.99)
 
 
-def test_stochastic_actor_log_prob_and_mode(obs, key):
-    """The squashed-Gaussian pieces SAC/IQL need on top of `sample`."""
+def test_stochastic_actor_rsample(obs, key):
     a = built("StochasticActor")
-    action, x, dist = a.rsample(obs, key)
+    action, x, _ = a.rsample(obs, key)
 
     assert x.shape == (BATCH, a.plan_dim)
     assert jnp.all(jnp.abs(action) <= 1.0)
-    assert jnp.all(jnp.abs(a.mode(obs)) <= 1.0)
 
-    lp = a.log_prob(dist, a.to_plan(action))
-    assert lp.shape == (BATCH,) and finite(lp)
+
+def test_deterministic_actor_noise_roles(obs, key):
+    """Exploration and target smoothing are noise around one mean; the actor
+    loss sees neither."""
+    a = built("DeterministicActor")
+    mean = a.to_plan(a.mean(obs))
+    cfg = a.config
+
+    assert jnp.abs(a.sample(obs, key=key) - mean).max() > 0
+    smoothed, entropy = a.generate_action(obs, key=key)
+    assert entropy is None
+    assert jnp.abs(smoothed - mean).max() <= cfg.target_noise_clip + 1e-6
+
+    critic = build("DirectCritic")
+    loss = lambda k: a.loss(obs, critic, 1.0, key=k)["actor"]
+    assert jnp.array_equal(loss(key), loss(jax.random.PRNGKey(7)))

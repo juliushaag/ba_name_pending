@@ -30,7 +30,7 @@ class DDPMActorConfig(ActorOptimConfig):
   t_max: float = 0.9946
   cosine_s: float = 0.008
   clip_sampler: bool = True
-  num_candidates: int = 500
+  num_candidates: int = 64
   temperature: float = 0.25
   grad_clip_mode: str = "none"
 

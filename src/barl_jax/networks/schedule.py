@@ -33,7 +33,7 @@ class ScheduleConfig:
   class_name: str = "ExponentialSchedule"
   start: float = 0.1
   end: float | None = 0.001
-  steps: int = 10
+  steps: int = 8
   warmup: int = 0
   power: float = 2.0
   s: float = 0.008

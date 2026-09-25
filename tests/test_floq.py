@@ -16,6 +16,7 @@ from flax import nnx
 from barl_jax.components import TRAINABLE
 from barl_jax.config.run import RunConfig
 from barl_jax.metrics import DEBUG, PRIMARY
+from barl_jax.networks.time_embedding import CosTimeConfig
 from barl_jax.optimization import train_step
 from barl_jax.policy import Policy
 
@@ -42,8 +43,9 @@ def _batch():
   }
 
 
-def test_floq_value_is_finite_and_has_a_jittable_iterative_path():
-  critic = _critic()
+@pytest.mark.parametrize("distill", [True, False])
+def test_floq_value_is_finite_and_has_a_jittable_iterative_path(distill):
+  critic = _critic(distill=distill)
   data = _batch()
   eager = critic.value(data["obs"], data["act"])
   assert eager.shape == (BATCH, 1)
@@ -202,7 +204,7 @@ class _AffineEnsemble(nnx.Module):
 
 
 def test_floq_td_loss_matches_sampled_flow_matching_equation():
-  critic = _critic(flow_steps=1, noise_samples=2)
+  critic = _critic(flow_steps=1, noise_samples=2, distill=False)
   live = _AffineEnsemble(0.2, 0.1, critic.n_models)
   target_field = _AffineEnsemble(-0.1, 0.04, critic.n_models)
   critic.net = live
@@ -215,7 +217,7 @@ def test_floq_td_loss_matches_sampled_flow_matching_equation():
     data["chunk_return"], data["term"], data["horizon"],
     entropy_bonus=entropy_bonus, key=key)["critic"]
 
-  target_key, start_key, time_key = jax.random.split(key, 3)
+  target_key, start_key, time_key, _ = jax.random.split(key, 4)
   noise_samples = critic.config.noise_samples
   target_starts = jax.random.uniform(
     target_key, (BATCH, noise_samples, 1),
@@ -233,7 +235,7 @@ def test_floq_td_loss_matches_sampled_flow_matching_equation():
   y_rep = jnp.repeat(y, noise_samples, axis=0)
   zt = (1.0 - t) * z0 + t * y_rep
   pred = 0.2 * zt + 0.1 + 0.05 * jnp.repeat(data["act"], noise_samples, axis=0)[:, :1]
-  expected = ((pred - (y_rep - z0)) ** 2).mean()
+  expected = noise_samples * ((pred - (y_rep - z0)) ** 2).mean()
   next_action_grad = nnx.grad(lambda c, next_action: c.td_loss(
     data["obs"], data["act"], data["next_obs"], next_action,
     data["chunk_return"], data["term"], data["horizon"],
@@ -248,3 +250,74 @@ def test_floq_td_loss_matches_sampled_flow_matching_equation():
   assert all(bool(jnp.all(g == 0)) for g in jax.tree.leaves(grad_state["net_target"]))
   assert any(bool(jnp.any(g != 0)) for g in jax.tree.leaves(grad_state["net"]))
   np.testing.assert_allclose(got, expected, rtol=2e-5, atol=2e-6)
+
+
+def test_floq_histogram_support_is_widened_by_reward_offset():
+  critic = _critic(reward_offset=0.05)
+  pad = 0.05 / (1.0 - critic.config.gamma)
+  assert critic.hist_min == pytest.approx(critic.v_min - pad)
+  assert critic.hist_max == pytest.approx(critic.v_max + pad)
+  assert critic.noise_min == pytest.approx(critic.v_min * critic.config.noise_coverage)
+
+
+def test_floq_loss_sums_over_noise_samples():
+  data = _batch()
+  args = (data["obs"], data["act"], data["next_obs"], data["act"],
+          data["chunk_return"], data["term"], data["horizon"])
+  key = jax.random.PRNGKey(3)
+  loss = _critic(flow_steps=1, noise_samples=4, distill=False).td_loss(*args, key=key)["critic"]
+  critic = _critic(flow_steps=1, noise_samples=4, distill=False)
+  raw = critic.regression_loss
+  critic.regression_loss = lambda pred, target: raw(pred, target) / 4
+  np.testing.assert_allclose(critic.td_loss(*args, key=key)["critic"], loss / 4, rtol=1e-5)
+
+
+def test_floq_accepts_cos_time_embedding():
+  critic = _critic(time=CosTimeConfig())
+  data = _batch()
+  assert critic.value(data["obs"], data["act"]).shape == (BATCH, 1)
+
+
+def test_floq_distill_value_is_a_single_q_net_pass_and_needs_no_integration():
+  critic = _critic()
+  data = _batch()
+
+  def boom(*args, **kwargs):
+    raise AssertionError("distilled value must not integrate the flow")
+
+  critic._integrate = boom
+  np.testing.assert_allclose(critic.value(data["obs"], data["act"]),
+                             critic.reduce_value(critic.q_net(data["obs"], data["act"])))
+
+
+def test_floq_distill_target_is_stop_gradient_and_matches_flow_returns():
+  data = _batch()
+  args = (data["obs"], data["act"], data["next_obs"], data["act"],
+          data["chunk_return"], data["term"], data["horizon"])
+  key = jax.random.PRNGKey(11)
+
+  def grads(distill):
+    critic = _critic(seed=5, flow_steps=2, noise_samples=3, distill=distill)
+    g = nnx.grad(lambda c: c.td_loss(*args, key=key)["critic"],
+                 argnums=nnx.DiffState(0, nnx.Param))(critic)
+    return critic, nnx.state(g, nnx.Param)
+
+  critic, with_distill = grads(True)
+  _, flow_only = grads(False)
+
+  assert any(bool(jnp.any(g != 0)) for g in jax.tree.leaves(with_distill["q_net"]))
+  assert all(bool(jnp.all(g == 0)) for g in jax.tree.leaves(with_distill["net_target"]))
+  # Distillation must not reach the field: its gradient equals the flow-matching-only one.
+  for got, want in zip(jax.tree.leaves(with_distill["net"]), jax.tree.leaves(flow_only["net"])):
+    np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-7)
+
+  # And the regressed target is the live flow's mean return under the distill key.
+  _, _, _, distill_key = jax.random.split(key, 4)
+  starts = jax.random.uniform(distill_key, (BATCH, 3, 1), minval=critic.noise_min,
+                              maxval=critic.noise_max)
+  flow_return = critic._integrate(critic.net, data["obs"], data["act"], starts).mean(axis=(0, 2))
+  expected = ((critic.q_net(data["obs"], data["act"]) - flow_return[None]) ** 2).mean()
+  full = critic.td_loss(*args, key=key)["critic"]
+  flow_loss = _critic(seed=5, flow_steps=2, noise_samples=3, distill=False).td_loss(
+    *args, key=key)["critic"]
+  np.testing.assert_allclose(full - flow_loss, expected, rtol=1e-4, atol=1e-6)

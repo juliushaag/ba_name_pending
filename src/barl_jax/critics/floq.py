@@ -1,9 +1,13 @@
 """Flow matching critic (floq, arXiv:2509.06863).
 
-Q is the endpoint of an Euler integration of a velocity field. `value` uses a
-fixed midpoint quadrature over the initial noise so it is deterministic (actor
-losses price through `frozen(critic).value`); TD samples the same interval and
-trains the field on the linear flow-matching target to the Bellman target.
+Q is the endpoint of an Euler integration of a velocity field, trained on the
+linear flow-matching target to the Bellman target (TD samples the initial noise).
+
+With `distill` (default) actors price through a plain Q-ensemble regressed onto
+the flow's mean return under fresh random noise; the flow only bootstraps. The
+distillation target is stop-gradient, so the field is trained by flow matching
+alone. Without it, `value` is a deterministic midpoint quadrature through the
+Euler chain (differentiated by the actor loss).
 """
 
 from dataclasses import dataclass, field
@@ -18,7 +22,7 @@ from barl_jax.networks.mlp import MLPConfig
 from barl_jax.networks.time_embedding import FourierTimeConfig, TimeEmbeddingConfig
 from barl_jax.registration import register_component
 
-from .base import EnsembleConfig, TargetConfig, value_range
+from .base import EnsembleConfig, QNetwork, TargetConfig, value_range
 from .categorical import to_histogram
 from .direct import DirectCritic, DirectCriticConfig
 
@@ -34,8 +38,8 @@ class FloqVectorField(nnx.Module):
   """One velocity field member, conditioned on (s, a, z_t, t)."""
 
   def __init__(self, obs_dim, action_dim, *, latent_dim, layers, num_bins,
-               v_min, v_max, sigma, time: TimeEmbeddingConfig, mlp: NetworkConfig, rngs):
-    self.v_min, self.v_max = float(v_min), float(v_max)
+               hist_min, hist_max, sigma, time: TimeEmbeddingConfig, mlp: NetworkConfig, rngs):
+    self.v_min, self.v_max = float(hist_min), float(hist_max)
     self.num_bins = int(num_bins)
     self.sigma = float(sigma)
     self.time = time.build(rngs=rngs)
@@ -71,8 +75,10 @@ class FloqEnsemble(nnx.Module):
 @dataclass(frozen=True)
 class FloqCriticConfig(DirectCriticConfig):
   class_name: str = "FloqCritic"
+  latent_dim: int = 512
+  layers: int = 3
   mlp: NetworkConfig = field(default_factory=lambda: MLPConfig(
-    activation="gelu", norm="none", norm_stem=False, norm_input=False,
+    activation="gelu", norm="layer", norm_stem=True, norm_input=False,
     norm_after_act=True, dtype="float32"))
   ensemble: EnsembleConfig = field(default_factory=EnsembleConfig)
   target: TargetConfig = field(default_factory=lambda: TargetConfig(kind="polyak",
@@ -82,11 +88,13 @@ class FloqCriticConfig(DirectCriticConfig):
   value_samples: int = 8
   noise_coverage: float = 0.1
   train_at_zero_only: bool = False
+  distill: bool = True
   num_bins: int = 51
   sigma: float = 16.0
   # Wider than the NC-critic's level code: the velocity must tell every Euler interval apart.
   time: TimeEmbeddingConfig = field(default_factory=lambda: FourierTimeConfig(
     time_dim=64, hidden=128, num_freqs=32))
+  reward_offset: float = 0.01
   v_min: float | None = None
   v_max: float | None = None
 
@@ -103,6 +111,8 @@ class FloqCritic(DirectCritic):
   def __init__(self, env_stats, config, *, rngs: nnx.Rngs, **kwargs):
     self.rngs = rngs
     super().__init__(env_stats, config, rngs=rngs, **kwargs)
+    if config.distill:
+      self.q_net = QNetwork(env_stats["obs_dim"], env_stats["act_dim"], 1, config, rngs=rngs)
 
   @classmethod
   def config_problems(cls, config) -> list[str]:
@@ -121,9 +131,13 @@ class FloqCritic(DirectCritic):
     self.v_min, self.v_max = value_range(env_stats, config, fallback=(-1.0, 1.0))
     self.noise_min = self.v_min * float(config.noise_coverage)
     self.noise_max = self.v_max * float(config.noise_coverage)
+    # Per-step reward slack widens only the encoding support, so clipped
+    # interpolants keep a nonzero gradient at the edges.
+    pad = config.reward_offset * config.reward_scale / (1.0 - config.gamma)
+    self.hist_min, self.hist_max = self.v_min - pad, self.v_max + pad
     return FloqEnsemble(config.ensemble.n_models, env_stats["obs_dim"], env_stats["act_dim"],
                         latent_dim=config.latent_dim, layers=config.layers,
-                        num_bins=config.num_bins, v_min=self.v_min, v_max=self.v_max,
+                        num_bins=config.num_bins, hist_min=self.hist_min, hist_max=self.hist_max,
                         sigma=config.sigma, time=config.time, mlp=config.mlp, rngs=rngs)
 
   def _integrate(self, field, obs, action, starts):
@@ -145,12 +159,14 @@ class FloqCritic(DirectCritic):
     return jnp.broadcast_to(points[None, :, None], (obs.shape[0], samples, 1))
 
   def raw(self, s, a, level=None):
+    if self.config.distill:
+      return self.q_net(s, a)
     return self._integrate(self.net, s, a, self._starts(s, self.config.value_samples)).mean(axis=2)
 
   def td_loss(self, obs, action, next_obs, next_action, chunk_return, terminated, horizon,
               entropy_bonus=0.0, *, key=None) -> dict:
     key = self.rngs.noise() if key is None else key
-    target_key, start_key, time_key = jax.random.split(key, 3)
+    target_key, start_key, time_key, distill_key = jax.random.split(key, 4)
     samples = self.config.noise_samples
     uniform = lambda k, n: jax.random.uniform(k, (n, samples, 1), minval=self.noise_min,
                                               maxval=self.noise_max)
@@ -168,15 +184,25 @@ class FloqCritic(DirectCritic):
          else jax.random.uniform(time_key, z0.shape))
     y = jnp.repeat(target, samples, axis=0)
     pred = self.net(obs_rep, action_rep, (1.0 - t) * z0 + t * y, t)
-    flow_loss = self.regression_loss(pred, (y - z0)[None, ...])
+    # Summed over the noise samples (mean over batch and members), as in the reference.
+    flow_loss = samples * self.regression_loss(pred, (y - z0)[None, ...])
 
-    current = self.raw(obs, action)
+    losses = {"critic": flow_loss}
+    if self.config.distill:
+      flow_return = self._integrate(self.net, obs, action, uniform(distill_key, obs.shape[0]))
+      flow_return = jax.lax.stop_gradient(flow_return.mean(axis=(0, 2)))
+      current = self.q_net(obs, action)
+      distill_loss = ((current - flow_return[None]) ** 2).mean()
+      self.metrics.scalar("distill_loss", distill_loss)
+      losses["critic"] = flow_loss + distill_loss
+    else:
+      current = self.raw(obs, action)
     self.record(current, target)
     self.metrics.scalar("flow_loss", flow_loss)
     self.metrics.scalar("td_error", ((current.mean(axis=0) - target) ** 2).mean())
-    return {"critic": flow_loss}
+    return losses
 
   def derived(self) -> dict:
     return {"v_min": self.v_min, "v_max": self.v_max,
             "noise_min": self.noise_min, "noise_max": self.noise_max,
-            "bin_width": (self.v_max - self.v_min) / (self.config.num_bins - 1)}
+            "bin_width": (self.hist_max - self.hist_min) / (self.config.num_bins - 1)}

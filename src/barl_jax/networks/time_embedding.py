@@ -61,6 +61,24 @@ class FourierTimeConfig(TimeEmbeddingConfig):
     return FourierEmbedding(self, rngs=rngs)
 
 
+@register_time
+@dataclass(frozen=True)
+class CosTimeConfig(TimeEmbeddingConfig):
+  """Scalar `cos(t)`, the floq reference's time feature."""
+  class_name: str = "Cos"
+  time_dim: int = 1
+
+  def build(self, *, rngs):
+    return CosEmbedding()
+
+
+class CosEmbedding(nnx.Module):
+  time_dim = 1
+
+  def __call__(self, t):
+    return jnp.cos(t)
+
+
 def sinusoidal_emb(t, time_dim: int):
   shape = t.shape[:-1]
   t = t.reshape(-1)

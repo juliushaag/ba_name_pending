@@ -18,7 +18,7 @@ from barl_jax.registration import register_component, register_policy
 class LangevinActorConfig:
   class_name: str = "LangevinActor"
   steps_per_level: int = 2
-  step_lr: float = 2.0e-3
+  step_lr: float = 1.0e-4
   temperature: float = 500.0
   normalize_score: bool = True
   clip_actions: bool = True
@@ -68,11 +68,9 @@ class LangevinActor(ActionSampler):
     score_norm = jnp.zeros(())
     keys = jax.random.split(key, num_levels * self.config.steps_per_level)
 
-    # Relative spacing normalized to 1 at the coarsest level, so `step_lr` is that
-    # level's absolute step independent of the ladder's sigma units. Unnormalized,
-    # the default ladder puts the coarsest drift at ~250 against action_limit 1.
+    # Song & Ermon spacing: `step_lr` is the finest level's step, coarser levels scale
+    # by (sigma_i / sigma_last)^2. The coarse drift saturates against the action clip.
     alpha_ratio = (sigmas / sigmas[-1]) ** 2
-    alpha_ratio = alpha_ratio / alpha_ratio[0]
     for i in range(num_levels):
       alpha = self.config.step_lr * alpha_ratio[i]
       for t in range(self.config.steps_per_level):
