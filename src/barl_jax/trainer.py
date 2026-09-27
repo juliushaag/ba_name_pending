@@ -125,8 +125,9 @@ def _setup(run, *, validate_only):
   policies = _build_policies(run, resume_meta)
 
   cfg = run.cfg
-  total_grad_steps = max(1, round(cfg.total_env_steps * cfg.utd_ratio))
-  schedule = Policy.lr_schedule(cfg.lr_warmup_steps, total_grad_steps, cfg.lr_decay)
+  params = cfg.params
+  total_grad_steps = max(1, round(cfg.total_env_steps * params.utd_ratio))
+  schedule = Policy.lr_schedule(params.lr_warmup_steps, total_grad_steps, params.lr_decay)
   optimizers = [nnx.Optimizer(p, p.build_optimizer(lr_schedule=schedule), wrt=TRAINABLE)
                 for p in policies]
   run.reference = policies[0]
@@ -446,13 +447,13 @@ def _train(run: Run):
 
   warmup_stats = warmup(run, eval_envs, log)
 
-  if cfg.random_steps > 0 and not run.progress:
+  if cfg.params.random_steps > 0 and not run.progress:
     # Prefill steps count toward neither env_steps nor grad_steps; skipped on
     # resume, which already has a filled buffer.
-    run.collector.random_fill(run.rollout_env, n_steps=cfg.random_steps // run.num_envs,
+    run.collector.random_fill(run.rollout_env, n_steps=cfg.params.random_steps // run.num_envs,
                               seed=run.base_seed, chunk_size=run.reference.chunk_size,
                               discount=run.reference.discount, sink=run.buffer)
-    log.message(f"Random-filled the buffer with {cfg.random_steps} env steps before training")
+    log.message(f"Random-filled the buffer with {cfg.params.random_steps} env steps before training")
   if run.progress:
     log.advance({key: run.progress[key] for key in ("env_steps", "grad_steps")})
     log.message("Resumed optimizer, replay and counters; environment episodes restart")
@@ -526,6 +527,7 @@ class _TrainLoop:
     self.next_resume = self._next_boundary(self.cfg.resume_every)
     self.it = run.progress.get("iteration", 0)
     self.chunk_seen = False
+    self.prefetched = None  # (k, batches) drawn during the previous iteration's scan
     # Stdout is paced by wall clock, not by iteration: at `rollout_steps: 1` there
     # are thousands of iterations per 100k env steps. wandb still gets every one.
     self.last_narration = 0.0
@@ -571,7 +573,7 @@ class _TrainLoop:
   def iteration(self):
     run, cfg, log = self.run, self.cfg, self.log
     iter_start = time.perf_counter()
-    rollout_time = self._collect()
+    self._collect()
     grad_steps = self._grad_steps_owed()
     narrate = self.it == 0 or time.perf_counter() - self.last_narration > PROGRESS_INTERVAL_S
     if narrate:
@@ -581,7 +583,8 @@ class _TrainLoop:
     log.log_per_seed([{"buffer/transitions": n} for n in run.buffer.transitions_per_seed()],
                      panel={"buffer/transitions": run.buffer.min_transitions()})
 
-    epoch_time = self._train(grad_steps, narrate)
+    self._train(grad_steps, narrate)
+    self._prefetch()
 
     eval_time, eval_phases = 0.0, {}
     if log.get_step("env_steps") >= self.next_eval:
@@ -589,7 +592,7 @@ class _TrainLoop:
       eval_phases = self._evaluate()
       eval_time = time.perf_counter() - eval_start
 
-    self._log_iteration(iter_start, rollout_time, grad_steps, epoch_time, eval_time, eval_phases)
+    self._log_iteration(iter_start, eval_time, eval_phases)
     self.it += 1
     run.progress = {"env_steps": int(log.get_step("env_steps")),
                     "grad_steps": int(log.get_step("grad_steps")),
@@ -620,9 +623,28 @@ class _TrainLoop:
     if self.run.buffer.min_transitions() <= 0:
       return 0
     log = self.log
-    return max(0, round(log.get_step("env_steps") * self.cfg.utd_ratio) - log.get_step("grad_steps"))
+    return max(0, round(log.get_step("env_steps") * self.cfg.params.utd_ratio) - log.get_step("grad_steps"))
 
-  def _train(self, grad_steps: int, narrate: bool) -> float:
+  def _prefetch(self) -> None:
+    """Draw the next iteration's batches while the scan just dispatched runs on the
+    device. Env steps advance by exactly `rollout_steps`, so the next `k` is known.
+    Skipped when this iteration ends in a resume save or the loop exits: the
+    snapshot's replay RNG must not be ahead of the batches actually consumed."""
+    run, cfg, log = self.run, self.cfg, self.log
+    env_steps = log.get_step("env_steps")
+    k = max(0, round((env_steps + cfg.rollout_steps) * cfg.params.utd_ratio) - log.get_step("grad_steps"))
+    if (k == 0 or run.buffer.min_transitions() <= 0
+        or env_steps >= self.next_resume or env_steps >= cfg.total_env_steps):
+      return
+    self.prefetched = (k, run.buffer.sample_chunk(k, cfg.params.batch_size))
+
+  def _take_chunk(self, k: int):
+    prefetched, self.prefetched = self.prefetched, None
+    if prefetched is not None and prefetched[0] == k:
+      return prefetched[1]
+    return self.run.buffer.sample_chunk(k, self.cfg.params.batch_size)
+
+  def _train(self, grad_steps: int, narrate: bool) -> None:
     run, cfg, log = self.run, self.cfg, self.log
     epoch_start = last_report = time.perf_counter()
     progress_every = max(1, grad_steps // 10)
@@ -635,8 +657,8 @@ class _TrainLoop:
     armed_here = any((base + i) % cfg.log_every == 0 or (base + i) % cfg.debug_every == 0
                      for i in range(grad_steps))
 
+    batches = self._take_chunk(grad_steps) if grad_steps else None
     if grad_steps and not armed_here:
-      batches = run.buffer.sample_chunk(grad_steps, cfg.batch_size)
       run.state = seeded_chunk(run.graphdef, run.state, batches, grad_steps,
                                jnp.asarray(base, jnp.int32))
       log.advance({"grad_steps": grad_steps})
@@ -651,7 +673,7 @@ class _TrainLoop:
       tiers = (tuple([PRIMARY] if gstep % cfg.log_every == 0 else [])
                + tuple([DEBUG] if gstep % cfg.debug_every == 0 else []))
 
-      batch = run.buffer.sample(cfg.batch_size)
+      batch = jax.tree.map(lambda value: value[step], batches)
       run.state, _, primary, debug = seeded_step(run.graphdef, run.state, batch, tiers,
                                                  jnp.asarray(gstep, jnp.int32))
       if tiers:
@@ -673,14 +695,8 @@ class _TrainLoop:
                     f"~{(grad_steps - done) / rate / 60:.1f} min left this iter")
         last_report = now
 
-    # Dispatch is async: without this the training time lands in the next rollout's.
-    jax.block_until_ready(run.state)
-    epoch_time = time.perf_counter() - epoch_start
     if narrate:
-      log.message(f"Trained {grad_steps} grad steps in {epoch_time / 60:.1f} min "
-                  f"({1000 * epoch_time / max(1, grad_steps):.0f} ms/step)")
       self.last_narration = time.perf_counter()
-    return epoch_time
 
   def _evaluate(self) -> dict:
     run, cfg, log = self.run, self.cfg, self.log
@@ -693,17 +709,11 @@ class _TrainLoop:
     self._write_objective("running")
     return phases
 
-  def _log_iteration(self, iter_start, rollout_time, grad_steps, epoch_time, eval_time,
-                     eval_phases) -> None:
-    run, cfg, log = self.run, self.cfg, self.log
-    n_samples = max(1, grad_steps * cfg.batch_size * run.num_seeds)
+  def _log_iteration(self, iter_start, eval_time, eval_phases) -> None:
+    run, log = self.run, self.log
     elapsed = max(1e-9, time.perf_counter() - self.started)
     log.log({"model/num_params": run.num_params,
-             "model/epoch_time_s": epoch_time,
              "model/eval_time_s": eval_time,
-             "model/epoch_time_per_sample_ms": 1000 * epoch_time / n_samples,
-             "time/rollout_s": rollout_time,
-             "time/train_s":   epoch_time,
              "time/iter_s":    time.perf_counter() - iter_start,
              "time/env_steps_per_hour": 3600.0 * log.get_step("env_steps") / elapsed,
              "eval/phase": PHASE_TRAIN,
@@ -721,10 +731,10 @@ def _validate(run: Run):
   cfg = run.cfg
   actor = StackedPolicy(run.graphdef, run.state, run.num_seeds, run.num_envs, run.reference,
                         executor=run.collection_executor)
-  run.collector.collect(actor, env=run.rollout_env, n_steps=cfg.batch_size,
+  run.collector.collect(actor, env=run.rollout_env, n_steps=cfg.params.batch_size,
                      seed=run.base_seed, discount=actor.discount, sink=run.buffer)
 
-  batch = run.buffer.sample(cfg.batch_size)
+  batch = run.buffer.sample(cfg.params.batch_size)
   run.state, losses, primary, debug = seeded_step(run.graphdef, run.state, batch,
                                                   (PRIMARY, DEBUG), jnp.asarray(0, jnp.int32))
   losses = jax.device_get(losses)

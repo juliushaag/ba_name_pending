@@ -74,14 +74,18 @@ def make_policy(run=None):
 def run_config(tmp_path) -> RunConfig:
   return RunConfig.from_dict({
     "model": "SAC", "env": "HalfCheetah",
-    "num_seeds": 1, "batch_size": 4, "total_env_steps": 16,
-    "random_steps": 0, "buffer_size": 16, "eval_video_every": None,
+    "num_seeds": 1, "total_env_steps": 16, "num_envs": 1, "rollout_steps": 1,
+    "buffer_size": 16, "eval_video_every": None,
     "run_dir": str(tmp_path), "compile_cache_dir": str(tmp_path / "cache"),
-    "model_overrides": {"components": {
+    "model_overrides": {"params": {"batch_size": 4, "random_steps": 0}, "components": {
       "actor": {"latent_dim": 8},
       "critic": {"latent_dim": 8},
     }},
   })
+
+
+def with_params(cfg, **params):
+  return cfg.replace(model_config=cfg.model_config.overridden({"params": params}))
 
 
 def test_imports_do_not_initialize_runtime():
@@ -419,8 +423,8 @@ def test_chunked_training_counts_primitive_steps(tmp_path, monkeypatch, utd_rati
   monkeypatch.setattr(Environment, "make", lambda name: family)
   monkeypatch.setattr(logging, "make_logger", lambda kind, *a, **kw: MemoryLogger(*a, **kw))
   monkeypatch.setattr(trainer, "warmup", lambda *args: {})
-  cfg = run_config(tmp_path).replace(total_env_steps=8, num_envs=2, rollout_steps=2, utd_ratio=utd_ratio)
-  cfg = cfg.replace(model_config=cfg.model_config.overridden({"params": {"chunk_size": 4}}))
+  cfg = run_config(tmp_path).replace(total_env_steps=8, num_envs=2, rollout_steps=2)
+  cfg = with_params(cfg, chunk_size=4, utd_ratio=utd_ratio)
   run = trainer.setup(cfg, 1)
   trainer.train(run)
   assert run.progress["env_steps"] == 8
@@ -437,3 +441,24 @@ def test_saved_spec_roundtrips_through_policy_checkpoint(tmp_path):
     if jax.dtypes.issubdtype(a.dtype, jax.dtypes.prng_key):
       a, b = jax.random.key_data(a), jax.random.key_data(b)
     np.testing.assert_array_equal(a, b)
+
+
+def test_prefetched_batches_never_run_the_replay_rng_ahead_of_a_save(tmp_path, monkeypatch):
+  import barl_jax.logger as logging
+  family = ToyFamily()
+  monkeypatch.setattr(Environment, "make", lambda name: family)
+  monkeypatch.setattr(logging, "make_logger", lambda kind, *a, **kw: MemoryLogger(*a, **kw))
+  monkeypatch.setattr(trainer, "warmup", lambda *args: {})
+  cfg = with_params(run_config(tmp_path).replace(total_env_steps=6, buffer_size=8, resume_every=3),
+                    utd_ratio=2.0)
+  run = trainer.setup(cfg, 1)
+  draws = []
+  sample_chunk = run.buffer.sample_chunk
+  run.buffer.sample_chunk = lambda k, *a, **kw: (draws.append(k), sample_chunk(k, *a, **kw))[1]
+  trainer.train(run)
+  assert sum(draws) == run.progress["grad_steps"]  # every drawn batch was trained on
+
+  with trainer.setup(cfg.replace(checkpoint=str(tmp_path / "checkpoints/resume"),
+                                 checkpoint_mode="resume"), 1) as restored:
+    assert (restored.buffer.seeds[0].rng.bit_generator.state
+            == run.buffer.seeds[0].rng.bit_generator.state)

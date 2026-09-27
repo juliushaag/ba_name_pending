@@ -60,7 +60,7 @@ def parse_args(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Axes: algo/env/seed, plus model.<dotted path> (a model override, e.g. "
                "model.components.critic.latent_dim) and run.<key> (a run-config key, e.g. "
-               "run.utd_ratio). Seeds are not an axis -- --seeds N vmaps N of them inside "
+               "model.params.utd_ratio; run.<key> is for run-level keys such as run.total_env_steps). Seeds are not an axis -- --seeds N vmaps N of them inside "
                "each run, so `--algos SAC DIME --seeds 5` is 2 runs of 5 seeds, not 10 runs.")
 
     what = parser.add_argument_group("what to run")
@@ -72,7 +72,7 @@ def parse_args(argv=None):
                            "declares one.")
     what.add_argument("--set", action="append", metavar="AXIS=VALUE", dest="sets",
                       help="Pin one axis to a single value across the sweep, e.g. "
-                           "--set model.components.critic.latent_dim=1024 --set run.batch_size=512. "
+                           "--set model.components.critic.latent_dim=1024 --set model.params.batch_size=512. "
                            "Repeatable.")
     what.add_argument("--grid", default=None,
                       help="YAML sweep spec: {axes: {name: [values]}, "

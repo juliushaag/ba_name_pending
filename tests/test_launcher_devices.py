@@ -201,13 +201,13 @@ def test_grid_materialization_freezes_overrides(tmp_path):
 
     from barl_jax.config import from_yaml
     combo = {"algo": "SAC", "env": "HalfCheetah", "seed": 7,
-             "run.batch_size": 32, "model.params.entropy_scale": -0.5}
+             "model.params.batch_size": 32, "model.params.entropy_scale": -0.5}
     runs = grid.materialize([combo], ["run"], defaults={}, sweep_dir=str(tmp_path), num_seeds=1)
     data = yaml.safe_load((tmp_path / runs[0].config).read_text())
     # Single-run mapping, loadable by the training CLI.
     assert data["model"] == "SAC" and data["env"] == "HalfCheetah"
     assert data["seed"] == 7
-    assert data["batch_size"] == 32
+    assert data["model_overrides"]["params"]["batch_size"] == 32
     assert data["num_seeds"] == 1
     assert data["model_overrides"]["params"]["entropy_scale"] == -0.5
     # The exact emitted file round-trips through the public loader.

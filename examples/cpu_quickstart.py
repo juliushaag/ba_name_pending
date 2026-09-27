@@ -63,16 +63,15 @@ def base_config():
     "model": "SAC", "env": "examples.cpu_quickstart:TinyPendulum",
     "seed": 0, "num_seeds": 1,
     "logger": "none",                # no W&B account or network needed
-    "total_env_steps": 300, "random_steps": 100,
+    "total_env_steps": 300,
     "rollout_steps": 1, "num_envs": 1, "buffer_size": 300,
-    "batch_size": 32, "utd_ratio": 1.0,
     "eval_every": 300, "eval_runs": 1, "eval_video_every": None,  # no render dependency
     "log_every": 50, "debug_every": 300,
     "resume_every": 300, "resume_keep": 1,
     "run_dir": str(RUN_DIR), "compile_cache_dir": None,
     # A real net, just a small one -- this is a plumbing demonstration, not a
     # capacity claim. tests/conftest.py's TINY fixture shrinks the same way.
-    "model_overrides": {"components": {
+    "model_overrides": {"params": {"batch_size": 32, "utd_ratio": 1.0, "random_steps": 100}, "components": {
       "actor": {"latent_dim": 8}, "critic": {"latent_dim": 8}}},
   })
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from copy import deepcopy
 from dataclasses import dataclass, field, fields, replace
 from typing import TYPE_CHECKING, Any, Mapping, get_type_hints
@@ -13,7 +12,6 @@ if TYPE_CHECKING:
 from barl_jax.config.schemas import (
   CHECKPOINT_MODES,
   LOGGER_KINDS,
-  LR_DECAYS,
   ComponentsConfig,
   ModelConfig,
   component_to_dict,
@@ -24,9 +22,9 @@ from barl_jax.executors import DirectExecutorConfig, ExecutorConfig
 from barl_jax.registration import available_executors, get_component, get_executor
 
 _NESTED = ("model_config", "collection_executor", "eval_executor")
-_INT_POSITIVE = ("total_env_steps", "rollout_steps", "num_envs", "buffer_size", "batch_size",
+_INT_POSITIVE = ("total_env_steps", "rollout_steps", "num_envs", "buffer_size",
                  "eval_every", "eval_runs", "log_every", "debug_every", "resume_keep")
-_INT_NONNEGATIVE = ("random_steps", "lr_warmup_steps", "wandb_finish_timeout")
+_INT_NONNEGATIVE = ("wandb_finish_timeout",)
 _INT_POSITIVE_OR_NULL = ("eval_video_every", "resume_every")
 
 
@@ -49,14 +47,9 @@ class RunConfig:
   sweep_tag: str | None = None
   logger: str = "wandb"
   total_env_steps: int = 1_000_000
-  random_steps: int = 5000
-  rollout_steps: int = 1
-  num_envs: int = 1
+  rollout_steps: int = 8
+  num_envs: int = 8
   buffer_size: int = 1_000_000
-  batch_size: int = 256
-  utd_ratio: float = 2.0
-  lr_warmup_steps: int = 0
-  lr_decay: str = "constant"
   eval_every: int = 25_000
   eval_runs: int = 10
   eval_video_every: int | None = 4
@@ -142,6 +135,10 @@ class RunConfig:
       if self.env not in Environment.available():
         problems.append(f"env={self.env!r}: unknown environment; "
                         f"available: {Environment.available()}")
+    random_steps = self.params.random_steps
+    if _is_int(random_steps, 0) and _is_int(self.num_envs, 1) and random_steps % self.num_envs:
+      problems.append(f"params.random_steps={random_steps!r}: must be divisible by "
+                      f"num_envs ({self.num_envs})")
     return problems + _model_problems(self.model_config)
 
   def replace(self, **changes) -> "RunConfig":
@@ -201,12 +198,8 @@ def _run_problems(cfg: Mapping[str, Any]) -> list[str]:
   ranged(_INT_POSITIVE, 1, "must be >= 1")
   ranged(_INT_NONNEGATIVE, 0, "must be >= 0")
   ranged(_INT_POSITIVE_OR_NULL, 1, "must be >= 1 or null")
-  utd = cfg.get("utd_ratio")
-  if isinstance(utd, (int, float)) and not isinstance(utd, bool) and (not math.isfinite(utd) or utd <= 0):
-    fail("utd_ratio", "must be a finite number > 0")
   for key, allowed, default in (("checkpoint_mode", CHECKPOINT_MODES, "weights"),
-                                ("logger", LOGGER_KINDS, "wandb"),
-                                ("lr_decay", LR_DECAYS, "constant")):
+                                ("logger", LOGGER_KINDS, "wandb")):
     if cfg.get(key, default) not in allowed:
       fail(key, f"must be one of {allowed}")
   if cfg.get("checkpoint_mode") == "resume" and not cfg.get("checkpoint"):
@@ -215,9 +208,8 @@ def _run_problems(cfg: Mapping[str, Any]) -> list[str]:
     fail("num_seeds", "must be an int >= 1")
   num_envs = cfg.get("num_envs")
   if _is_int(num_envs, 1):
-    for key in ("rollout_steps", "random_steps"):
-      if _is_int(cfg.get(key), 0) and cfg[key] % num_envs:
-        fail(key, f"must be divisible by num_envs ({num_envs})")
+    if _is_int(cfg.get("rollout_steps"), 0) and cfg["rollout_steps"] % num_envs:
+      fail("rollout_steps", f"must be divisible by num_envs ({num_envs})")
   for key in ("collection_executor", "eval_executor"):
     if cfg.get(key) is not None:
       try:

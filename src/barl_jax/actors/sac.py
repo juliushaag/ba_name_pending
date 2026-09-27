@@ -20,8 +20,8 @@ from barl_jax.registration import get_component, register_component, register_po
 @dataclass(frozen=True)
 class StochasticActorConfig(ActorOptimConfig):
   class_name: str = "StochasticActor"
-  latent_dim: int = 256
-  layers: int = 2
+  latent_dim: int = 512
+  layers: int = 3
   mlp: NetworkConfig = field(default_factory=lambda: MLPConfig(
     activation="silu", norm="layer", norm_kwargs={"epsilon": 1e-5}, dtype="bfloat16"))
   squash_cls: str = "TanhSquash"

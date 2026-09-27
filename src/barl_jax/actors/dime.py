@@ -22,8 +22,8 @@ from barl_jax.registration import get_component, register_component, register_po
 @dataclass(frozen=True)
 class DISActorConfig(ActorOptimConfig):
   class_name: str = "DISActor"
-  latent_dim: int = 256
-  layers: int = 2
+  latent_dim: int = 512
+  layers: int = 3
   mlp: NetworkConfig = field(default_factory=lambda: MLPConfig(activation="gelu", norm="none", dtype="float32"))
   time: TimeEmbeddingConfig = field(default_factory=FourierTimeConfig)
   

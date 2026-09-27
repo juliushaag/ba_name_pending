@@ -330,3 +330,17 @@ def test_eval_slot_blocks_map_to_seeds(per_run):
 
   # vacuous unless the seeds really are different policies
   assert not np.allclose(actions[:per_run], actions[per_run:2 * per_run], atol=1e-5)
+
+
+def test_sample_chunk_is_k_consecutive_samples():
+  """The trainer's prefetched chunk and its step-by-step path draw the same batches."""
+  def filled():
+    ms = MultiSeedReplay(num_seeds=2, num_envs=1, max_transitions=50, seed=3)
+    ms.add(obs=np.arange(20, dtype=np.float32).reshape(2, 10))
+    for _ in range(4):
+      ms.add(obs=np.random.default_rng(_).standard_normal((2, 10)).astype(np.float32))
+    return ms
+  chunk = filled().sample_chunk(3, 4)
+  single = filled()
+  for step in range(3):
+    assert np.array_equal(np.asarray(chunk["obs"][step]), np.asarray(single.sample(4)["obs"]))

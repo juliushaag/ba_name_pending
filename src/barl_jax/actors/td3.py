@@ -18,8 +18,8 @@ from barl_jax.registration import register_component, register_policy
 @dataclass(frozen=True)
 class DeterministicActorConfig(ActorOptimConfig):
   class_name: str = "DeterministicActor"
-  latent_dim: int = 256
-  layers: int = 1
+  latent_dim: int = 512
+  layers: int = 3
   mlp: NetworkConfig = field(default_factory=lambda: MLPConfig(
     activation="relu", norm="none", dtype="float32"))
   explore_noise: float = 0.1

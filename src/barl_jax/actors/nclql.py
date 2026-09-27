@@ -97,6 +97,15 @@ class LangevinActor(ActionSampler):
     return a.reshape(a.shape[0], self.chunk_size, self.action_dim), None
 
 
+@dataclass(frozen=True)
+class NCLQLPolicyConfig(PolicyConfig):
+  # generate_action's Langevin chain runs through the critic on every grad step
+  # (target next-action) and every rollout step, ~3x a plain critic step's cost
+  # -- measured on DogRun -- so the default utd is cut from the RLPolicy
+  # baseline to keep wall time per env step comparable.
+  utd_ratio: float = 0.5
+
+
 @register_policy
 class NCLQL(RLPolicy):
   """Binds LangevinActor into the shared actor-critic template -- the
@@ -111,7 +120,7 @@ class NCLQL(RLPolicy):
 @dataclass(frozen=True)
 class NCLQLModelConfig(ModelConfig):
   policy_class: str = "NCLQL"
-  params: PolicyConfig = field(default_factory=PolicyConfig)
+  params: NCLQLPolicyConfig = field(default_factory=NCLQLPolicyConfig)
   components: ComponentsConfig = field(default_factory=lambda: ComponentsConfig(
     actor=LangevinActorConfig(),
     critic=nclql(C51CriticConfig()), entropy=None))

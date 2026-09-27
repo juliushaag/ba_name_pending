@@ -16,6 +16,7 @@ difference is entirely in which actor/critic/params a model variant's
 `ModelConfig` selects and, for SDAC, the `actor_objective` seam, never in a
 second copy of this training step."""
 
+import math
 from dataclasses import dataclass
 
 import gymnasium as gym
@@ -23,6 +24,7 @@ import jax
 import jax.numpy as jnp
 
 from barl_jax.components import ActionSampler
+from barl_jax.config.schemas import LR_DECAYS
 from barl_jax.critics import QCritic
 from barl_jax.networks.regulator import AutotuneRegulator
 from barl_jax.optimization import gated_losses
@@ -37,8 +39,13 @@ class PolicyConfig:
   """Params every off-policy actor-critic policy owns."""
 
   chunk_size: int = 1
-  normalize_obs: bool = True
+  normalize_obs: bool = False
   policy_delay: int = 1
+  random_steps: int = 5000
+  batch_size: int = 256
+  utd_ratio: float = 2.0
+  lr_warmup_steps: int = 0
+  lr_decay: str = "constant"
 
 
 @dataclass(frozen=True)
@@ -90,7 +97,20 @@ class RLPolicy(Policy):
 
   @classmethod
   def config_problems(cls, params) -> list[str]:
-    return [] if params.policy_delay >= 1 else [f"policy_delay={params.policy_delay!r}: must be >= 1"]
+    problems = []
+    if params.policy_delay < 1:
+      problems.append(f"policy_delay={params.policy_delay!r}: must be >= 1")
+    if params.random_steps < 0:
+      problems.append(f"random_steps={params.random_steps!r}: must be >= 0")
+    if params.batch_size < 1:
+      problems.append(f"batch_size={params.batch_size!r}: must be >= 1")
+    if not (math.isfinite(params.utd_ratio) and params.utd_ratio > 0):
+      problems.append(f"utd_ratio={params.utd_ratio!r}: must be a finite number > 0")
+    if params.lr_warmup_steps < 0:
+      problems.append(f"lr_warmup_steps={params.lr_warmup_steps!r}: must be >= 0")
+    if params.lr_decay not in LR_DECAYS:
+      problems.append(f"lr_decay={params.lr_decay!r}: must be one of {LR_DECAYS}")
+    return problems
 
   def optimizer_cadence(self) -> dict:
     return {key: self.policy_delay for key in self.actor.create_optimizer()}

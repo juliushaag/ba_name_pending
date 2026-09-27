@@ -147,7 +147,7 @@ class OptimizerMixin:
     """Multiplicative LR factor: linear 0 -> 1 ramp over `warmup_steps`, then
     `decay` from 1 -> 0 by `total_steps` (flat past that, in case `total_steps` --
     an estimate -- undershoots the run's actual grad-step count). `decay` is the
-    run config's `lr_decay`; it used to be hardcoded to "sine" here, which meant
+    policy params' `lr_decay`; it used to be hardcoded to "sine" here, which meant
     the schedule's shape was the one part of the optimizer no run recorded."""
     if decay not in OptimizerMixin.DECAYS:
       raise KeyError(f"lr_decay {decay!r} is not one of {', '.join(OptimizerMixin.DECAYS)}")
