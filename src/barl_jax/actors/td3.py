@@ -10,6 +10,7 @@ from barl_jax.critics.base import TargetConfig
 from barl_jax.critics.direct import EnsembleCriticConfig
 from barl_jax.networks.base import NetworkConfig
 from barl_jax.networks.mlp import MLPConfig
+from barl_jax.networks.simba import SimbaConfig
 from barl_jax.optimization import ActorOptim, ActorOptimConfig
 from barl_jax.policies.rl import PolicyConfig, RLPolicy
 from barl_jax.registration import register_component, register_policy
@@ -18,9 +19,9 @@ from barl_jax.registration import register_component, register_policy
 @dataclass(frozen=True)
 class DeterministicActorConfig(ActorOptimConfig):
   class_name: str = "DeterministicActor"
-  latent_dim: int = 512
+  latent_dim: int = 128
   layers: int = 3
-  mlp: NetworkConfig = field(default_factory=lambda: MLPConfig(
+  mlp: NetworkConfig = field(default_factory=lambda: SimbaConfig(
     activation="relu", norm="none", dtype="float32"))
   explore_noise: float = 0.1
   target_noise: float = 0.2

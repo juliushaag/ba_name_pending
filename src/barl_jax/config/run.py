@@ -47,8 +47,8 @@ class RunConfig:
   sweep_tag: str | None = None
   logger: str = "wandb"
   total_env_steps: int = 1_000_000
-  rollout_steps: int = 8
-  num_envs: int = 8
+  rollout_steps: int = 4
+  num_envs: int = 4
   buffer_size: int = 1_000_000
   eval_every: int = 25_000
   eval_runs: int = 10

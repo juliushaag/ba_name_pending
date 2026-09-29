@@ -5,13 +5,13 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-from barl_jax.components import Actor, Buffer, Critic
+from barl_jax.components import Actor, Buffer, Critic, frozen
 from barl_jax.config.schemas import ComponentsConfig, ModelConfig, register_model
 from barl_jax.critics.categorical import C51CriticConfig
 from barl_jax.networks import gaussian
 from barl_jax.networks.base import NetworkConfig
-from barl_jax.networks.mlp import MLPConfig
 from barl_jax.networks.regulator import AutotuneRegulatorConfig
+from barl_jax.networks.simba import SimbaConfig
 from barl_jax.optimization import ActorOptim, ActorOptimConfig
 from barl_jax.policies.rl import MaxEntPolicyConfig, MaxEntRLPolicy
 from barl_jax.registration import get_component, register_component, register_policy
@@ -20,9 +20,9 @@ from barl_jax.registration import get_component, register_component, register_po
 @dataclass(frozen=True)
 class StochasticActorConfig(ActorOptimConfig):
   class_name: str = "StochasticActor"
-  latent_dim: int = 512
+  latent_dim: int = 128
   layers: int = 3
-  mlp: NetworkConfig = field(default_factory=lambda: MLPConfig(
+  mlp: NetworkConfig = field(default_factory=lambda: SimbaConfig(
     activation="silu", norm="layer", norm_kwargs={"epsilon": 1e-5}, dtype="bfloat16"))
   squash_cls: str = "TanhSquash"
   log_std_min: float = -20.0
@@ -97,6 +97,20 @@ class StochasticActor(ActorOptim, Actor):
     return self.to_plan(action_flat)
 
 
+  
+  def loss(self, obs, critic: "Critic", alpha, *, key=None):
+    """This actor's own training objective at `obs`, priced against a frozen
+    `critic` -- a dict with one scalar per optimizer key it trains. Every key
+    must be one `create_optimizer()` also declares.
+
+    The default is maximum-entropy Q ascent through the reparameterized sample:
+    `alpha` is a scalar or `(chunk_size,)` and broadcasts against the per-position
+    `(B, chunk_size)` entropy, whose chunk sum is the `(B, 1)` bonus."""
+    action, entropy = self.generate_action(obs, key=key)
+    q = frozen(critic).value(obs, action.reshape(action.shape[0], -1))
+    bonus = (jax.lax.stop_gradient(alpha) * entropy).sum(axis=-1, keepdims=True)
+    return {"actor": -(q + bonus).mean()}
+  
 @register_policy
 class SAC(MaxEntRLPolicy):
   """Binds StochasticActor into the shared max-entropy actor-critic template --

@@ -10,8 +10,8 @@ from barl_jax.config.schemas import ComponentsConfig, ModelConfig, register_mode
 from barl_jax.critics.categorical import C51CriticConfig
 from barl_jax.networks.base import NetworkConfig
 from barl_jax.networks.diffusion import TimeConditionedField, controlled_sde
-from barl_jax.networks.mlp import MLPConfig
 from barl_jax.networks.regulator import AutotuneRegulatorConfig
+from barl_jax.networks.simba import SimbaConfig
 from barl_jax.networks.time_embedding import FourierTimeConfig, TimeEmbeddingConfig
 from barl_jax.optimization import ActorOptim, ActorOptimConfig
 from barl_jax.policies.rl import MaxEntPolicyConfig, MaxEntRLPolicy
@@ -21,9 +21,9 @@ from barl_jax.registration import get_component, register_component, register_po
 @dataclass(frozen=True)
 class ScoreContinuousActorConfig(ActorOptimConfig):
   class_name: str = "ScoreContinuousActor"
-  latent_dim: int = 512
+  latent_dim: int = 128
   layers: int = 3
-  mlp: NetworkConfig = field(default_factory=lambda: MLPConfig(activation="gelu", norm="none", dtype="float32"))
+  mlp: NetworkConfig = field(default_factory=lambda: SimbaConfig(activation="gelu", norm="none", dtype="float32"))
   time: TimeEmbeddingConfig = field(default_factory=FourierTimeConfig)
   squash_cls: str = "ErfSquash"
   sigma_min: float = 0.01

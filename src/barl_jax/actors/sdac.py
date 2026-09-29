@@ -10,20 +10,19 @@ from barl_jax.config.schemas import ComponentsConfig, ModelConfig, register_mode
 from barl_jax.critics.categorical import C51CriticConfig
 from barl_jax.networks.base import NetworkConfig
 from barl_jax.networks.diffusion import TimeConditionedField, reverse_chain
-from barl_jax.networks.mlp import MLPConfig
-from barl_jax.networks.regulator import AutotuneRegulatorConfig
+from barl_jax.networks.simba import SimbaConfig
 from barl_jax.networks.time_embedding import FourierTimeConfig, TimeEmbeddingConfig
 from barl_jax.optimization import ActorOptim, ActorOptimConfig
-from barl_jax.policies.rl import MaxEntPolicyConfig, MaxEntRLPolicy
+from barl_jax.policies.rl import PolicyConfig, RLPolicy
 from barl_jax.registration import register_component, register_policy
 
 
 @dataclass(frozen=True)
 class DDPMActorConfig(ActorOptimConfig):
   class_name: str = "DDPMActor"
-  latent_dim: int = 512
+  latent_dim: int = 128
   layers: int = 3
-  mlp: NetworkConfig = field(default_factory=lambda: MLPConfig(activation="mish", norm="none", dtype="float32"))
+  mlp: NetworkConfig = field(default_factory=lambda: SimbaConfig(activation="mish", norm="none", dtype="float32"))
   time: TimeEmbeddingConfig = field(default_factory=lambda: FourierTimeConfig(
     time_dim=64, num_freqs=32, hidden=64, concat_input=False, learn_freqs=True))
   num_steps: int = 20
@@ -32,7 +31,7 @@ class DDPMActorConfig(ActorOptimConfig):
   cosine_s: float = 0.008
   clip_sampler: bool = True
   num_candidates: int = 500
-  alpha_ref: float = 5.0
+  temp: float = 0.25
   grad_clip_mode: str = "none"
 
 
@@ -96,7 +95,19 @@ class DDPMActor(ActorOptim, Actor):
   def loss(self, obs, critic, alpha, *, key=None, action=None):
     """Diffuse `action` (the replay action; a fresh sample when None) to a random
     t, draw K eps whose x0 reconstructions stay in [-1, 1], and regress the eps
-    prediction onto them weighted by softmax(Q(x0_k) * alpha_ref / alpha) over K."""
+    prediction onto them weighted by softmax(Q(x0_k) / (temp * q_scale)) over K,
+    where `q_scale` is this batch's own cross-candidate Q spread -- not a
+    running, cross-*state* statistic (e.g. a critic-wide value scale): on
+    DogRun the Q range across different candidate actions at one state is
+    ~15-30x smaller than the Q range across different states (measured on a
+    trained checkpoint: cross-candidate std ~0.01-0.06 vs. cross-state std
+    ~0.9), so dividing by anything but the local, per-example spread leaves
+    the softmax within numerical noise of uniform regardless of `temp` --
+    the actor degenerates into plain behavior cloning of `action` and the
+    critic's ranking of candidates never reaches the gradient. `alpha` is
+    unused -- SDAC has no entropy dual (`RLPolicy`) -- and stays a parameter
+    only because every actor's `loss()` shares this call signature (see
+    `RLPolicy.actor_objective`)."""
     keys = jax.random.split(self.next_key(key), 5)
     if action is None:
       action = jax.lax.stop_gradient(self.generate_action(obs, key=keys[4])[0])
@@ -117,12 +128,13 @@ class DDPMActor(ActorOptim, Actor):
     qv = frozen(critic).value(
       jnp.broadcast_to(obs[None], (K, B, obs.shape[-1])).reshape(K * B, -1),
       candidates.reshape(K * B, -1)).reshape(K, B)
-    weight = jax.lax.stop_gradient(
-      jax.nn.softmax(qv * self.config.alpha_ref / jax.lax.stop_gradient(alpha), axis=0))
+    q_scale = jax.lax.stop_gradient(qv.std(axis=0).mean()) + 1.0e-6
+    weight = jax.lax.stop_gradient(jax.nn.softmax(qv / (self.config.temp * q_scale), axis=0))
 
     eps_pred = self.predict_eps(obs, x_t, t)
     loss = (weight[..., None] * (eps_pred[None] - eps) ** 2).mean()
 
+    self.metrics.scalar("q_scale", q_scale)
     self.metrics.dist("weight_ess", 1.0 / (weight ** 2).sum(axis=0))
     self.metrics.dist("weight_max", weight.max(axis=0))
     self.metrics.vec("eps_pred", eps_pred)
@@ -130,44 +142,21 @@ class DDPMActor(ActorOptim, Actor):
 
 
 @dataclass(frozen=True)
-class SDACPolicyConfig(MaxEntPolicyConfig):
-  entropy_scale: float = -0.9
-  entropy_in_target: bool = False
-  alpha_delay: int = 250
-  policy_std_ratio: float = 0.1
+class SDACPolicyConfig(PolicyConfig):
   utd_ratio: float = 0.2
 
 
 @register_policy
-class SDAC(MaxEntRLPolicy):
-  """DDPMActor on the shared actor-critic template. alpha is not an entropy
-  temperature here: it only scales the candidate weights, and is driven by the
-  closed-form entropy of an isotropic Gaussian of std `policy_std_ratio * alpha`
-  (the reference's `approx_entropy`) rather than a measured one. The actor loss
-  is priced at the replay action rather than a fresh sample."""
+class SDAC(RLPolicy):
+  """DDPMActor on the shared actor-critic template. No entropy dual: the
+  candidate-weighting temperature (`DDPMActor.loss`) is set from the critic's
+  own running value scale instead. The actor loss is priced at the replay
+  action rather than a fresh sample."""
 
   actor_cls = DDPMActor
 
-  @classmethod
-  def config_problems(cls, params) -> list[str]:
-    problems = super().config_problems(params)
-    if params.alpha_granularity != "per_chunk":
-      problems.append(f"alpha_granularity={params.alpha_granularity!r}: SDAC's alpha is one scalar")
-    if params.alpha_delay < 1:
-      problems.append(f"alpha_delay={params.alpha_delay!r}: must be >= 1")
-    return problems
-
-  def optimizer_cadence(self) -> dict:
-    return {**super().optimizer_cadence(),
-            **{key: self.params.alpha_delay for key in self.entropy.create_optimizer()}}
-
   def actor_objective(self, actor, critic, obs, action, alpha, key):
     return actor.loss(obs, critic, alpha, key=key, action=action)
-
-  def dual_loss(self, entropy) -> dict:
-    std = self.params.policy_std_ratio * self.entropy.value()
-    dim = self.chunk_size * self.action_dim
-    return self.entropy.loss(0.5 * dim * jnp.log(2 * jnp.pi * jnp.e * std ** 2))
 
 
 @register_model
@@ -176,5 +165,4 @@ class SDACModelConfig(ModelConfig):
   policy_class: str = "SDAC"
   params: SDACPolicyConfig = field(default_factory=SDACPolicyConfig)
   components: ComponentsConfig = field(default_factory=lambda: ComponentsConfig(
-    actor=DDPMActorConfig(), critic=C51CriticConfig(),
-    entropy=AutotuneRegulatorConfig(alpha_init=5.0, lr=7.0e-3)))
+    actor=DDPMActorConfig(), critic=C51CriticConfig(), entropy=None))

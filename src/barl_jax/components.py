@@ -231,20 +231,9 @@ class ActionSampler(Component, nnx.Module, ABC):
 class Actor(ActionSampler):
   """A sampler with an off-policy actor objective."""
 
+  @abstractmethod
   def loss(self, obs, critic: "Critic", alpha, *, key=None):
-    """This actor's own training objective at `obs`, priced against a frozen
-    `critic` -- a dict with one scalar per optimizer key it trains. Every key
-    must be one `create_optimizer()` also declares.
-
-    The default is maximum-entropy Q ascent through the reparameterized sample:
-    `alpha` is a scalar or `(chunk_size,)` and broadcasts against the per-position
-    `(B, chunk_size)` entropy, whose chunk sum is the `(B, 1)` bonus."""
-    action, entropy = self.generate_action(obs, key=key)
-    q = frozen(critic).value(obs, action.reshape(action.shape[0], -1))
-    bonus = (jax.lax.stop_gradient(alpha) * entropy).sum(axis=-1, keepdims=True)
-    return {"actor": -(q + bonus).mean()}
-
-
+    ...
 
 class Critic(Component, nnx.Module, ABC):
   """A network that can price (s,a) -- pure architecture; Bellman targets
