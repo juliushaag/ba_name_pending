@@ -1,0 +1,16 @@
+# SAC with the distributional critics on DogRun and HumanoidRun:
+# value head x learned/fixed support x entropy regularizer. Both heads share the
+# DySEL support settings, so the head is the only thing the class axis changes.
+# `entropy_coef` is the critic's own regularizer on the predicted categorical
+# (loss += coef * sum p log p); it is not SAC's entropy bonus. Everything not
+# listed below (steps, logger, bootstrap, norm, reduction) is the SAC default.
+#
+#   uv run python scripts/submit.py --grid experiments/sac_distributional_critics.yaml --seeds 2 \
+#     --executor tmux --max-parallel 3 --sweep-dir sweeps/sac_distributional_critics
+
+axes:
+  algo: [SAC]
+  env: [DogRun, HumanoidRun]
+  model.components.critic.class: [C51Critic, HLGaussCritic]
+  model.components.critic.learn_support: [true, false]
+  model.components.critic.entropy_coef: [0.0, 0.005]

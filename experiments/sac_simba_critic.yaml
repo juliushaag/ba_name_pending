@@ -1,0 +1,48 @@
+# SAC critic network x XQC recipe on DogRun and HumanoidRun: the current default
+# critic vs a SimBa critic, each with XQC off and on. C51 head throughout (the SAC
+# default), learned support at its defaults.
+#
+#   default    the SAC default critic: CrossQ-style BatchRenorm MLP, 2048 x 1, no target net
+#   xqc        full XQC (arXiv:2509.25174): pre-activation BatchNorm MLP, 512 x 3, polyak
+#              target, weight norm, min-bootstrap, Adam b1 0.9, 101 bins, entropy_coef 0
+#   simba      SimBa (LayerNorm residual blocks, 512 x 2) with the default CrossQ-style recipe
+#   simba_xqc  the same SimBa net trained with XQC's recipe (everything above except the net)
+#
+# Each axis value is a whole critic override bundle; `label` only names the run tag.
+#
+#   uv run python scripts/submit.py --grid experiments/sac_simba_critic.yaml --seeds 2 \
+#     --executor tmux --max-parallel 2 --sweep-dir sweeps/sac_simba_critic
+
+axes:
+  algo: [SAC]
+  env: [DogRun, HumanoidRun]
+
+  model.components.critic:
+    - label: default
+    - label: xqc
+      latent_dim: 512
+      layers: 3
+      mlp: {class_name: MLP, activation: relu, norm: batch, norm_input: true, norm_stem: true,
+            norm_after_act: false, norm_kwargs: {momentum: 0.99, epsilon: 0.001}, dtype: float32}
+      target: {kind: polyak, joint_forward: true}
+      ensemble: {n_models: 2, value_reduce: mean, target_reduce: min}
+      weight_norm: true
+      adam_b1: 0.9
+      num_bins: 101
+      entropy_coef: 0.0
+    - label: simba
+      latent_dim: 512
+      layers: 2
+      mlp: {class_name: SimBa, activation: relu, norm: layer, norm_kwargs: {epsilon: 1.0e-5},
+            dtype: float32, dropout: 0.0, expansion: 4}
+    - label: simba_xqc
+      latent_dim: 512
+      layers: 2
+      mlp: {class_name: SimBa, activation: relu, norm: layer, norm_kwargs: {epsilon: 1.0e-5},
+            dtype: float32, dropout: 0.0, expansion: 4}
+      target: {kind: polyak, joint_forward: true}
+      ensemble: {n_models: 2, value_reduce: mean, target_reduce: min}
+      weight_norm: true
+      adam_b1: 0.9
+      num_bins: 101
+      entropy_coef: 0.0

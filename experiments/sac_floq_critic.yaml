@@ -1,0 +1,16 @@
+# SAC with the flow-matching critic (floq), on the same envs / budget / logger as
+# experiments/sac_distributional_critics.yaml so the two sweeps line up in wandb.
+#
+# floq is a scalar flow-matching critic, not a categorical head: it has no
+# learn_support / entropy_coef, rejects weight_norm, and always uses its own
+# LayerNorm MLP with separate target forwards. So only the axes it honours are
+# crossed here: target net (polyak, as in the paper, or none) x ensemble reduction.
+#
+#   uv run python scripts/submit.py --grid experiments/sac_floq_critic.yaml --seeds 2 \
+#     --executor tmux --max-parallel 2 --sweep-dir sweeps/sac_floq_critic
+
+axes:
+  algo: [SAC]
+  env: [DogRun, HumanoidRun]
+
+  model.components.critic.class: [FloqCritic]
