@@ -26,8 +26,11 @@ class DISActorConfig(ActorOptimConfig):
   layers: int = 3
   mlp: NetworkConfig = field(default_factory=lambda: AdaLNSimbaConfig(
     activation="gelu", dtype="float32"))
-  time: TimeEmbeddingConfig = field(default_factory=FourierTimeConfig)
-  
+  # dime_am's PISGRADNet time coder (diffusion/common/models/pisgrad_net.py, with
+  # cond_pisgradnet.yaml's num_hid = time_coder_out = 256): 256 linearly spaced
+  # frequencies on the raw step index, no raw-input channel.
+  time: TimeEmbeddingConfig = field(default_factory=lambda: FourierTimeConfig(
+    time_dim=256, num_freqs=256, hidden=256, concat_input=False, spacing="linear"))
   squash_cls: str = "TanhSquash"
   adam_b1: float = 0.5
   num_steps: int = 16
