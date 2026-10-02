@@ -268,10 +268,35 @@ def test_unknown_clip_mode_is_rejected():
 def test_network_builds_and_weight_projection_normalizes_every_hidden_layer(name):
   from barl_jax.networks.base import NETWORK_CONFIGS, normalize_weights
   net = NETWORK_CONFIGS[name]().build(5, 3, 8, 2, rngs=nnx.Rngs(0))
-  assert net(jnp.ones((4, 5))).shape == (4, 3)
+  assert net((jnp.ones((4, 5)),)).shape == (4, 3)
   normalize_weights(net)
   for lin in net.hidden_linears:
     assert jnp.allclose(jnp.linalg.norm(lin.kernel[...], axis=-2), 1.0, atol=1e-2)
+
+
+def test_adaln_simba_is_conditioned_and_starts_as_identity_blocks():
+  from barl_jax.networks.base import NETWORK_CONFIGS, normalize_weights
+  net = NETWORK_CONFIGS["AdaLNSimBa"]().build(5, 3, 8, 2, cond_dim=4, rngs=nnx.Rngs(0))
+  x, c = jnp.ones((4, 5)), jax.random.normal(jax.random.key(1), (4, 4))
+  assert net((x,), (c,)).shape == (4, 3)
+  h = net.stem(x)
+  cc = jax.nn.silu(net.cond_embed(c))
+  assert jnp.array_equal(net.blocks[0](h, cc), h)  # gate is 0 at init
+  for block in net.blocks:
+    kernel = block.norm.modulation.kernel
+    kernel[...] = jax.random.normal(jax.random.key(2), kernel.shape)
+  assert not jnp.allclose(net((x,), (c,)), net((x,), (-c,)))
+  normalize_weights(net)
+  for lin in net.hidden_linears:
+    assert jnp.allclose(jnp.linalg.norm(lin.kernel[...], axis=-2), 1.0, atol=1e-2)
+
+
+def test_plain_networks_treat_conditioning_as_extra_inputs():
+  from barl_jax.networks.base import NETWORK_CONFIGS
+  for name in ("MLP", "SimBa"):
+    net = NETWORK_CONFIGS[name]().build(5, 3, 8, 2, cond_dim=2, rngs=nnx.Rngs(0))
+    x, c = jnp.ones((4, 5)), jnp.full((4, 2), 0.5)
+    assert jnp.array_equal(net((x,), (c,)), net((jnp.concatenate([x, c], -1),)))
 
 
 def test_simba_block_is_a_pre_norm_residual_with_wide_hidden_layer():
@@ -287,8 +312,9 @@ def test_simba_block_is_a_pre_norm_residual_with_wide_hidden_layer():
 def test_network_class_name_selects_the_variant_in_config_overrides():
   from barl_jax.actors.sac import StochasticActorConfig
   from barl_jax.config.serialization import construct, merge, to_dict
+  from barl_jax.networks.mlp import MLPConfig
   from barl_jax.networks.simba import SimbaConfig
-  base = StochasticActorConfig()
+  base = StochasticActorConfig(mlp=MLPConfig())
   swapped = merge(base, {"mlp": {"class_name": "SimBa", "expansion": 2}})
   assert swapped.mlp == SimbaConfig(expansion=2)
   assert merge(swapped, {"mlp": {"norm": "none"}}).mlp.norm == "none"

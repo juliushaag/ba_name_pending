@@ -117,6 +117,27 @@ def LayerNorm(num_features: int, *, epsilon: float, dtype=jnp.float32,
                        dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
 
 
+class AdaLN(nnx.Module):
+  """Adaptive LayerNorm (DiT): an affine-free LayerNorm, then `x * (1 + scale(c)) +
+  shift(c)`. With `gated` it also returns a per-channel gate for the residual branch.
+  The modulation is zero-initialised, so it starts as a plain LayerNorm (gate 0)."""
+
+  def __init__(self, num_features: int, cond_dim: int, *, gated: bool, epsilon: float,
+               rngs: nnx.Rngs, dtype=jnp.float32):
+    self.norm = nnx.LayerNorm(num_features, epsilon=epsilon, use_bias=False, use_scale=False,
+                              dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
+    self.gated = gated
+    self.modulation = nnx.Linear(cond_dim, (3 if gated else 2) * num_features,
+                                 kernel_init=nnx.initializers.zeros_init(),
+                                 bias_init=nnx.initializers.zeros_init(),
+                                 dtype=dtype, param_dtype=jnp.float32, rngs=rngs)
+
+  def __call__(self, x, c):
+    shift, scale, *gate = jnp.split(self.modulation(c), 3 if self.gated else 2, axis=-1)
+    h = self.norm(x) * (1.0 + scale) + shift
+    return (h, gate[0]) if self.gated else h
+
+
 NORMS = {
   "none":        None,
   "layer":       LayerNorm,

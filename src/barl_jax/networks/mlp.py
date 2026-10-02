@@ -7,6 +7,7 @@ from barl_jax.networks.base import (
   Linear,
   NetworkConfig,
   act_norm,
+  concat,
   make_dropout,
   normalize_weights,  # noqa: F401  (re-exported: the projection is defined for any trunk)
   register_network,
@@ -23,16 +24,16 @@ class MLPConfig(NetworkConfig):
   final_activation: bool = False
   residual: bool = False
 
-  def build(self, input_dim, output_dim, latent_dim, layers, *, rngs):
-    return MLP(input_dim, output_dim, latent_dim, layers, config=self, rngs=rngs)
+  def build(self, input_dim, output_dim, latent_dim, layers, *, cond_dim=0, rngs):
+    return MLP(input_dim + cond_dim, output_dim, latent_dim, layers, config=self, rngs=rngs)
 
 
 class Block(nnx.Module):
   """Linear -> dropout -> activation/norm, optionally wrapped in a skip."""
 
   def __init__(self, latent_dim: int, act, norm, *, dropout: float, norm_after_act: bool,
-               residual: bool, rngs: nnx.Rngs, dtype=jnp.float32):
-    self.lin = Linear(latent_dim, latent_dim, rngs=rngs, dtype=dtype)
+               residual: bool, activation: str, rngs: nnx.Rngs, dtype=jnp.float32):
+    self.lin = Linear(latent_dim, latent_dim, rngs=rngs, dtype=dtype, activation=activation)
     self.act, self.norm = act, norm
     self.dropout = make_dropout(dropout, rngs)
     self.norm_after_act, self.residual = norm_after_act, residual
@@ -64,24 +65,26 @@ class MLP(nnx.Module):
 
     mk = lambda dim: config.make_norm(dim, rngs=rngs)
     self.input_norm = mk(input_dim) if config.norm_input else None
-    self.stem = Linear(input_dim, latent_dim, rngs=rngs, dtype=dtype)
+    self.stem = Linear(input_dim, latent_dim, rngs=rngs, dtype=dtype,
+                       activation=None if config.residual else config.activation)
     self.stem_norm = mk(latent_dim) if config.norm_stem else None
     self.blocks = nnx.List([
       Block(latent_dim, act, mk(latent_dim), dropout=config.dropout,
             norm_after_act=config.norm_after_act, residual=config.residual,
-            rngs=rngs, dtype=dtype) for _ in range(layers)])
+            activation=config.activation, rngs=rngs, dtype=dtype) for _ in range(layers)])
     # A skip stream's scale grows with depth; the head needs it normalized.
     self.stream_norm = mk(latent_dim) if config.residual else None
-    self.head = Linear(latent_dim, output_dim, rngs=rngs, dtype=dtype)
+    self.head = Linear(latent_dim, output_dim, rngs=rngs, dtype=dtype,
+                       activation=config.activation if config.final_activation else None,
+                       gain=config.head_gain)
     self.head_norm = mk(output_dim) if config.final_activation else None
 
   @property
   def hidden_linears(self):
     return [self.stem, *(block.lin for block in self.blocks)]
 
-  def __call__(self, *x):
-    h = x[0] if len(x) == 1 else jnp.concatenate(x, axis=-1)
-    h = h.astype(self.dtype)
+  def __call__(self, inputs, conditioning=()):
+    h = concat(inputs, conditioning).astype(self.dtype)
     if self.input_norm is not None:
       h = self.input_norm(h)
 

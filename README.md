@@ -120,6 +120,18 @@ selector; set width/depth directly. For example, change an activation with
 `--set model.components.actor.mlp.activation=silu`, or widen a critic with
 `--set model.components.critic.latent_dim=1024`.
 
+Hidden linear layers initialize for the activation that follows them: He-style
+fan-in scaling for ReLU/ReLU6/leaky ReLU, Xavier with gain 5/3 for tanh, and
+fan-in scaling with approximate unit-Gaussian second-moment gains for
+SiLU/GELU/Mish. Bare linear projections retain LeCun normal initialization.
+All linear biases start at zero. MLP, SimBa, and AdaLNSimBa output heads use
+`mlp.head_gain=0.01` by default; for example,
+`--set model.components.actor.mlp.head_gain=0.1` changes that kernel gain.
+Fourier time embeddings use GELU initialization for their hidden projection
+and an unscaled linear output projection. AMDP/DIME still override their
+field heads to exactly zero. XQC's unit-norm weight projection overrides
+kernel gains, including the small head gain.
+
 ### Action selection at inference time
 
 `RunConfig.collection_executor`/`eval_executor` each select, independently,
