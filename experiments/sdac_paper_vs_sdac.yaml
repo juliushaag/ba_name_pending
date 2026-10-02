@@ -1,0 +1,25 @@
+# The paper's SDAC (SDACPaper, actors/sdac_paper.py) vs this repo's SDAC, with SAC as
+# the reference, on DogRun and HumanoidRun -- the two dmc_hard tasks where SDAC
+# stayed near its untrained return in sweep 2026-09-29_14-20-52 (HumanoidRun ~1.5
+# against ~130 for SAC at 500k steps).
+#
+# All three use the default C51 critic, so the actor/sampler is the only thing the
+# algo axis changes. Each algo runs its own defaults:
+#
+#   SAC        utd 2.0, entropy-regularised Gaussian actor
+#   SDAC       this repo's continuous-time actor: one chain sample, no exploration
+#              noise, per-batch-normalised softmax weights, replay-action anchor.
+#              utd_ratio 0.2 here (the code default); the 2026-09-29 sweep ran it at 0.5
+#   SDACPaper  the official release: best-of-32 acting with alpha-scaled noise,
+#              absolute-Q softmax weights (Q * 5 / alpha), policy-action anchor,
+#              30k random steps, policy update every 2nd step, utd_ratio 0.2
+#
+# Both SDAC variants therefore differ from SAC in update rate too. To separate that,
+# add `model.params.utd_ratio: [0.2, 2.0]` as an axis.
+#
+#   uv run python scripts/submit.py --grid experiments/sdac_paper_vs_sdac.yaml --seeds 3 \
+#     --executor tmux --max-parallel 3 --sweep-dir sweeps/sdac_paper_vs_sdac
+
+axes:
+  algo: [SDACPaper, SDAC, SAC]
+  env: [DogRun, HumanoidRun]
