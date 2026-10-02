@@ -200,7 +200,7 @@ def target_expectation(critic, target):
     a scalar already, or a distribution over the critic's support."""
     if target.shape[-1] == 1:
         return target.squeeze(-1)
-    return (target * critic.support[...]).sum(axis=-1)
+    return (target * critic.support_values()).sum(axis=-1)
 
 
 def params_of(module):

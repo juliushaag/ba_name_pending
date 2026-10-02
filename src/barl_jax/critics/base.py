@@ -145,15 +145,15 @@ class QNetwork(nnx.Module):
                *, rngs: nnx.Rngs):
     time = config.noise.time if config.noise.enabled else None
     self.encoder = time.build(rngs=rngs) if time else None
-    in_dim = obs_dim + act_dim + (time.time_dim if time else 0)
-    self.ensemble = Ensemble(config.ensemble.n_models, config.mlp.build, in_dim, out_dim,
-                             config.latent_dim, config.layers, rngs=rngs)
+    self.ensemble = Ensemble(config.ensemble.n_models, config.mlp.build, obs_dim + act_dim,
+                             out_dim, config.latent_dim, config.layers,
+                             cond_dim=time.time_dim if time else 0, rngs=rngs)
 
   def __call__(self, s, a, level=None):
-    x = [s, a]
+    cond = ()
     if self.encoder is not None:
-      x.append(self.encoder(level.astype(jnp.float32)[:, None]))
-    return self.ensemble(jnp.concatenate(x, axis=-1))
+      cond = (self.encoder(level.astype(jnp.float32)[:, None]),)
+    return self.ensemble((s, a), cond)
 
 
 class QCritic(Critic):
@@ -270,10 +270,19 @@ class QCritic(Critic):
     return reduce_members(self.bootstrap_members(next_raw), self.expectation_members(next_raw),
                           self.config.ensemble.target_reduce)
 
-  def bellman_target(self, chunk_return, terminated, horizon, bootstrap, entropy_bonus=0.0):
+  def n_step_inputs(self, chunk_return, terminated, horizon):
+    """`(reward-scaled chunk return, discount)`, both (B, 1)."""
     chunk_return = chunk_return.reshape(-1, 1) * self.config.reward_scale
-    discount = n_step_discount(self.config.gamma, horizon, terminated, chunk_return.dtype)
+    return chunk_return, n_step_discount(self.config.gamma, horizon, terminated, chunk_return.dtype)
+
+  def bellman_target(self, chunk_return, terminated, horizon, bootstrap, entropy_bonus=0.0):
+    chunk_return, discount = self.n_step_inputs(chunk_return, terminated, horizon)
     return jax.lax.stop_gradient(self.td_target(chunk_return, discount, bootstrap, entropy_bonus))
+
+  def support_losses(self, chunk_return, terminated, horizon, bootstrap, entropy_bonus=0.0) -> dict:
+    """Losses for parameters a head trains besides the network (a learned value
+    support), keyed by their own optimizer key. Empty unless the head has some."""
+    return {}
 
   def td_loss(self, obs, action, next_obs, next_action, chunk_return, terminated, horizon,
               entropy_bonus=0.0, *, key=None) -> dict:
@@ -289,8 +298,8 @@ class QCritic(Critic):
       items.append((obs, noisy, levels))
 
     preds, next_raw = self._forward(items, (next_obs, next_action, self._level(next_obs, None)))
-    target = self.bellman_target(chunk_return, terminated, horizon, self.bootstrap(next_raw),
-                                 entropy_bonus)
+    bootstrap = self.bootstrap(next_raw)
+    target = self.bellman_target(chunk_return, terminated, horizon, bootstrap, entropy_bonus)
     loss = self.regression_loss(preds[0], target)
     self.record(preds[0], target)
 
@@ -299,7 +308,8 @@ class QCritic(Critic):
       self.metrics.scalar("clean_td_loss", loss)
       self.metrics.scalar("smoothing_loss", smoothing)
       loss = loss + self.config.noise.smoothing_coef * smoothing
-    return {"critic": loss}
+    return {"critic": loss,
+            **self.support_losses(chunk_return, terminated, horizon, bootstrap, entropy_bonus)}
 
   def record(self, raw, target) -> None:
     exp = self.expectation_members(raw)

@@ -33,11 +33,16 @@ def moments(support, d):
 def two_point(c, half_width: int):
     """A bootstrap distribution with an exactly known mean and std: half the mass
     on each of two atoms symmetric about the centre of the support."""
-    support = c.support[...]
+    support = c.support_values()
     n = support.shape[0]
     lo, hi = n // 2 - half_width, n // 2 + half_width
     probs = jnp.zeros((1, n)).at[0, lo].set(0.5).at[0, hi].set(0.5)
     return probs, float(0.5 * (support[lo] + support[hi])), float(0.5 * (support[hi] - support[lo]))
+
+
+def fixed(name, **extra):
+    """A head on its configured, non-moving support."""
+    return build(name, learn_support=False, **extra)
 
 
 def bin_width(c):
@@ -55,11 +60,11 @@ def test_categorical_target_transports_the_spread(name, half_width):
     next-state distribution, so the target's spread is the bootstrap's scaled by
     gamma. The residual above that is the projection's own inflation, which is
     why this is a relative tolerance and not an equality."""
-    c = built(name)
+    c = fixed(name)
     boot, boot_mean, boot_std = two_point(c, half_width)
 
     target = c.bellman_target(jnp.zeros((1,)), jnp.zeros((1,)), ONE, boot)
-    mean, std = moments(c.support[...], target)
+    mean, std = moments(c.support_values(), target)
 
     assert float(mean[0]) == pytest.approx(c.config.gamma * boot_mean, abs=1e-3)
     assert float(std[0]) == pytest.approx(c.config.gamma * boot_std, rel=5e-3)
@@ -72,10 +77,10 @@ def test_histogram_target_discards_the_spread(name, boot_value):
     discretizes at the end, so the width of its target is label smoothing and
     nothing else. Pinned to the same constant whatever the bootstrap was, which
     is the whole difference from the test above."""
-    c = built(name)
+    c = fixed(name)
     target = c.bellman_target(jnp.zeros((1,)), jnp.zeros((1,)), ONE,
                               jnp.full((1, 1), boot_value))
-    mean, std = moments(c.support[...], target)
+    mean, std = moments(c.support_values(), target)
 
     smoothing = jnp.sqrt(c.sigma ** 2 + bin_width(c) ** 2 / 12)
     assert float(mean[0]) == pytest.approx(c.config.gamma * boot_value, abs=1e-3)
@@ -88,9 +93,9 @@ def test_histogram_of_a_scalar_is_a_discretized_gaussian(name, value):
     """`sigma` is a label-smoothing width, so the histogram a scalar lands in
     has that scalar as its mean and a variance of exactly sigma^2 plus the
     discretization's own bin^2/12 -- independent of where on the support it is."""
-    c = built(name)
+    c = fixed(name)
     hist = c.bellman_target(jnp.array([value]), jnp.ones((1,)), ONE, jnp.zeros((1, 1)))
-    mean, std = moments(c.support[...], hist)
+    mean, std = moments(c.support_values(), hist)
 
     assert float(hist.sum()) == pytest.approx(1.0, abs=1e-5)
     assert float(mean[0]) == pytest.approx(value, abs=1e-3)
@@ -214,15 +219,15 @@ def test_min_target_transports_the_lower_heads_distribution():
     """Not a pointwise min over probabilities -- that is not a distribution.
     It picks the member with the lower E[Z] and moves that member's whole
     categorical."""
-    c = build("C51Critic", ensemble={"target_reduce": "min"}, num_bins=11, v_min=-1.0, v_max=1.0)
+    c = fixed("C51Critic", ensemble={"target_reduce": "min"}, num_bins=11, v_min=-1.0, v_max=1.0)
     target = c.bellman_target(jnp.zeros((1,)), NO_TERM, ONE, c.bootstrap(_logits(11, 8, 2)))
-    assert float(moments(c.support[...], target)[0][0]) == pytest.approx(c.config.gamma * -0.6, abs=1e-4)
+    assert float(moments(c.support_values(), target)[0][0]) == pytest.approx(c.config.gamma * -0.6, abs=1e-4)
 
 
 def test_mean_target_takes_both_heads():
-    c = build("C51Critic", ensemble={"target_reduce": "mean"}, num_bins=11, v_min=-1.0, v_max=1.0)
+    c = fixed("C51Critic", ensemble={"target_reduce": "mean"}, num_bins=11, v_min=-1.0, v_max=1.0)
     target = c.bellman_target(jnp.zeros((1,)), NO_TERM, ONE, c.bootstrap(_logits(11, 8, 2)))
-    assert float(moments(c.support[...], target)[0][0]) == pytest.approx(0.0, abs=1e-4)
+    assert float(moments(c.support_values(), target)[0][0]) == pytest.approx(0.0, abs=1e-4)
 
 
 def test_projection_saturates_once_the_reward_leaves_the_contraction_interior():
@@ -266,7 +271,7 @@ def test_smoothing_coefficient_is_actually_wired_in(name, obs, act, key):
         c.config = replace(c.config, noise=replace(c.config.noise, smoothing_coef=coef))
         losses = c.td_loss(obs, act, obs[::-1], act, jnp.zeros((BATCH,)),
                            jnp.zeros((BATCH,)), jnp.ones((BATCH,)), key=key)
-        assert set(losses) == {"critic"}
+        assert set(losses) == set(c.create_optimizer())
         return losses["critic"]
 
     off, on = loss_at(0.0), loss_at(1.0)

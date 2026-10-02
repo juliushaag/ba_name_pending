@@ -69,7 +69,7 @@ def test_loss_trains_the_live_net_only(variant, obs, act):
 
     def loss_fn(critic):
         losses = td_losses(critic, obs, act)
-        assert set(losses) == {"critic"}
+        assert set(losses) == set(critic.create_optimizer())
         return losses["critic"]
 
     grads = nnx.grad(loss_fn, argnums=nnx.DiffState(0, nnx.Param))(build_variant(variant))
