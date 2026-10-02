@@ -119,6 +119,79 @@ def test_floq_config_rejects_nonpositive_flow_steps():
     _critic(flow_steps=0)
 
 
+@pytest.mark.parametrize("bounds, expected", [
+  ((-3200., 3200.), (-1., 1.)),
+  ((-1600., 3200.), (-0.5, 1.)),
+  ((0., 3200.), (0., 1.)),
+  ((-5., 5.), (-0.5, 0.5)),
+])
+def test_floq_source_noise_is_bounded_without_changing_histogram_support(bounds, expected):
+  stats = make_env_stats(return_min=bounds[0], return_max=bounds[1])
+  critic = build("FloqCritic", env_stats=stats)
+  assert (critic.noise_min, critic.noise_max) == pytest.approx(expected)
+  pad = critic.config.reward_offset / (1.0 - critic.config.gamma)
+  assert critic.hist_min == pytest.approx(bounds[0] - pad)
+  assert critic.hist_max == pytest.approx(bounds[1] + pad)
+
+
+def test_floq_can_restore_unrestricted_reference_noise():
+  critic = build("FloqCritic", env_stats=make_env_stats(return_min=-3200., return_max=3200.),
+                 noise_limit=None)
+  assert (critic.noise_min, critic.noise_max) == pytest.approx((-320., 320.))
+
+
+@pytest.mark.parametrize("values, problem", [
+  ({"noise_samples": 0}, "noise_samples"),
+  ({"value_samples": 0}, "value_samples"),
+  ({"noise_coverage": 0.}, "noise_coverage"),
+  ({"noise_coverage": float("inf")}, "noise_coverage"),
+  ({"noise_limit": 0.}, "noise_limit"),
+  ({"noise_limit": float("nan")}, "noise_limit"),
+  ({"sigma": -1.}, "sigma"),
+  ({"gamma": 1.}, "gamma"),
+  ({"gamma": float("nan")}, "gamma"),
+  ({"reward_offset": -0.1}, "reward_offset"),
+  ({"v_min": 1., "v_max": 1.}, "value bounds"),
+])
+def test_floq_rejects_invalid_sampling_and_encoding_config(values, problem):
+  with pytest.raises(ValueError, match=problem):
+    _critic(**values)
+
+
+@pytest.mark.parametrize("distill", [True, False])
+def test_floq_learns_action_dependent_terminal_rewards_with_wide_return_bounds(distill):
+  # A single-step MDP has Q(s,a)=r(s,a)=2*a[0]. This must actually learn;
+  # merely checking finite losses/nonzero gradients misses a noisy, flat Q.
+  critic = build("FloqCritic", latent_dim=64, layers=2, flow_steps=2,
+                 noise_samples=4, value_samples=4, distill=distill,
+                 env_stats=make_env_stats(return_min=-3200., return_max=3200.))
+  obs = jnp.zeros((64, OBS_DIM))
+  action = jax.random.uniform(jax.random.key(52), (64, 3), minval=-1., maxval=1.)
+  reward = 2 * action[:, 0]
+  test_action = jax.random.uniform(jax.random.key(53), (64, 3), minval=-1., maxval=1.)
+  target = 2 * test_action[:, 0]
+  optimizer = nnx.Optimizer(critic, critic.config.build(), wrt=TRAINABLE)
+
+  @nnx.jit
+  def update(c, opt, key):
+    def loss(c):
+      return c.td_loss(obs, action, obs, action, reward, jnp.ones(64),
+                       jnp.ones(64, jnp.int32), key=key)["critic"]
+    grads = nnx.grad(loss, argnums=nnx.DiffState(0, TRAINABLE))(c)
+    opt.update(c, grads)
+    c.after_step()
+
+  initial_mse = jnp.mean((critic.value(obs, test_action).reshape(-1) - target) ** 2)
+  for step in range(400):
+    update(critic, optimizer, jax.random.fold_in(jax.random.key(1), step))
+  mse = jnp.mean((critic.value(obs, test_action).reshape(-1) - target) ** 2)
+  assert float(mse) < 0.25
+  assert float(mse) < 0.2 * float(initial_mse)
+  gradient = nnx.grad(lambda c, a: c.value(obs, a).sum(), argnums=1)(critic, test_action)
+  assert np.isfinite(gradient).all()
+  assert float(gradient[:, 0].mean()) > 0.75
+
+
 def test_floq_rng_state_roundtrips_for_checkpoint_continuation():
   critic = _critic(flow_steps=1, noise_samples=2)
   data = _batch()

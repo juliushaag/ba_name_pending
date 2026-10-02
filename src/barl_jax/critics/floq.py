@@ -10,6 +10,7 @@ alone. Without it, `value` is a deterministic midpoint quadrature through the
 Euler chain (differentiated by the actor loss).
 """
 
+import math
 from dataclasses import dataclass, field
 
 import jax
@@ -43,12 +44,12 @@ class FloqVectorField(nnx.Module):
     self.num_bins = int(num_bins)
     self.sigma = float(sigma)
     self.time = time.build(rngs=rngs)
-    self.net = mlp.build(obs_dim + action_dim + num_bins - 1 + time.time_dim, 1,
-                         latent_dim, layers, rngs=rngs)
+    self.net = mlp.build(obs_dim + action_dim + num_bins - 1, 1, latent_dim, layers,
+                         cond_dim=time.time_dim, rngs=rngs)
 
   def __call__(self, obs, action, z, time):
     z = _histogram(z, self.v_min, self.v_max, self.num_bins, self.sigma)
-    return self.net(jnp.concatenate([obs, action, z, self.time(time)], axis=-1))
+    return self.net((obs, action, z), (self.time(time),))
 
 
 class FloqEnsemble(nnx.Module):
@@ -87,6 +88,11 @@ class FloqCriticConfig(DirectCriticConfig):
   noise_samples: int = 8
   value_samples: int = 8
   noise_coverage: float = 0.1
+  # Episode-return bounds can be orders of magnitude wider than a TD reward.
+  # Cap the source distribution in scaled return units so its finite-sample
+  # mean does not overwhelm bootstrap/distillation targets at initialization.
+  # None restores the reference's unrestricted coverage of the value range.
+  noise_limit: float | None = 1.0
   train_at_zero_only: bool = False
   distill: bool = True
   num_bins: int = 51
@@ -125,12 +131,33 @@ class FloqCritic(DirectCritic):
       problems.append(f"flow_steps must be >= 1, got {config.flow_steps}")
     if config.num_bins < 2:
       problems.append(f"num_bins must be >= 2, got {config.num_bins}")
+    for name in ("noise_samples", "value_samples"):
+      if getattr(config, name) < 1:
+        problems.append(f"{name} must be >= 1")
+    for name in ("noise_coverage", "sigma"):
+      value = getattr(config, name)
+      if not (math.isfinite(value) and value > 0):
+        problems.append(f"{name} must be finite and > 0")
+    if config.noise_limit is not None and not (
+        math.isfinite(config.noise_limit) and config.noise_limit > 0):
+      problems.append("noise_limit must be None or finite and > 0")
+    if not (math.isfinite(config.gamma) and 0 <= config.gamma < 1):
+      problems.append("gamma must be finite and satisfy 0 <= gamma < 1")
+    if not (math.isfinite(config.reward_offset) and config.reward_offset >= 0):
+      problems.append("reward_offset must be finite and >= 0")
     return problems
 
   def build_network(self, env_stats, config, *, rngs):
     self.v_min, self.v_max = value_range(env_stats, config, fallback=(-1.0, 1.0))
+    if not (math.isfinite(self.v_min) and math.isfinite(self.v_max) and self.v_min < self.v_max):
+      raise ValueError("FloqCritic: value bounds must be finite with v_min < v_max")
     self.noise_min = self.v_min * float(config.noise_coverage)
     self.noise_max = self.v_max * float(config.noise_coverage)
+    if config.noise_limit is not None:
+      magnitude = max(abs(self.noise_min), abs(self.noise_max))
+      scale = min(1.0, config.noise_limit / magnitude)
+      self.noise_min *= scale
+      self.noise_max *= scale
     # Per-step reward slack widens only the encoding support, so clipped
     # interpolants keep a nonzero gradient at the edges.
     pad = config.reward_offset * config.reward_scale / (1.0 - config.gamma)
