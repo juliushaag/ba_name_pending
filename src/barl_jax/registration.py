@@ -142,7 +142,8 @@ EXECUTORS = Registry("executors", "executor", "barl_jax.executors.base:ActionExe
 POLICIES = Registry("policies", "policy", "barl_jax.policy:Policy", ("policies", "actors"))
 ENVIRONMENTS = Registry("environments", "environment", "barl_jax.env:Environment",
                         tuple(f"environments.{name}" for name in
-                              ("mujoco_gym", "dm_control", "mani_skill", "humanoid_bench")))
+                              ("mujoco_gym", "dm_control", "mani_skill", "humanoid_bench",
+                               "myosuite")))
 
 register_component = COMPONENTS.register
 register_executor = EXECUTORS.register

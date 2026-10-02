@@ -13,8 +13,9 @@ def episode_success(info, i: int, is_vec: bool, terminated: bool) -> bool:
 
   Where the env says so itself, that answer wins: ManiSkill reports
   `info["success"]` and sets `terminated` *from* it, so the survival convention
-  below would read its success rate exactly backwards. Every other family here
-  reports no such key, and for them an episode that never terminated is one the
+  below would read its success rate exactly backwards. MyoSuite's adapter
+  reports episode success after more than five solved steps. For families that
+  report no such key, an episode that never terminated is one the
   agent did not fail out of -- a MuJoCo humanoid terminates by falling over.
 
   Gymnasium's vector envs batch each sub-env info key into an array plus an
@@ -125,5 +126,4 @@ def run_episodes(actor, env: gym.Env, n: int, render: bool, *, seed: int = 0,
     out += data[:wave]
 
   return out
-
 

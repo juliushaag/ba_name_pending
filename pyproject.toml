@@ -23,6 +23,7 @@ dependencies = [
     "rich>=15.0.0",
     "mani-skill>=3.0.1",
     "humanoid_bench",
+    "myosuite==2.12.2; python_version < '3.14'",
 ]
 
 
@@ -52,6 +53,10 @@ humanoid_bench = { path = "third_party/humanoid-bench", editable = true }
 # constraints win; HumanoidBenchEnvironment.__init__ monkeypatches the one
 # place (dm_control-style named MuJoCo struct indexing) where a mujoco this
 # much newer than 3.1.6 actually breaks humanoid_bench at runtime.
+# MyoSuite 2.12.2 also caps gymnasium<1.3 and mujoco<3.7. Its CPU
+# environments are exercised against our newer versions in test_myosuite.py;
+# keep those versions shared with the other simulator families. MyoSuite's
+# Python <3.14 requirement is respected by the dependency marker above.
 override-dependencies = [
     "rich>=13.7.1",
     "gymnasium>=1.3.0",

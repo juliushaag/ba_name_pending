@@ -80,6 +80,22 @@ uv run python scripts/debug.py --model SAC --json
 uv run python scripts/submit.py --config sweeps/<submission>/<run>/config.yaml
 ```
 
+### MyoSuite
+
+`uv sync` installs MyoSuite 2.12.2 on Python 3.11–3.13. Twelve standard MyoBase
+tasks are registered, including `MyoElbowPose1D6MRandom`, `MyoFingerReachRandom`,
+`MyoHandPoseRandom`, `MyoHandReachRandom`, `MyoLegStandRandom`, and `MyoLegWalk`.
+They use the existing training, replay, evaluation, and checkpoint interfaces.
+
+```bash
+uv run python scripts/submit.py --algos SAC --envs MyoHandReachRandom --seeds 3 --dry-run
+BARL_ALLOW_CPU=1 JAX_PLATFORMS=cpu uv run python scripts/train.py --config experiments/sac_myosuite_smoke.yaml
+```
+
+The adapter seeds randomized targets before reset, reports MyoSuite's episode
+success metric, and renders evaluation videos lazily. See [docs/myosuite.md](docs/myosuite.md)
+for task names, dependency compatibility, and critic reward supports.
+
 ### NCLQL action sampling
 
 NCLQL caps coarse Langevin step sizes at `model.components.actor.max_step_size=0.001`
