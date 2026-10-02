@@ -39,6 +39,19 @@ def _nested_set(mapping: dict, dotted: str, value) -> None:
   node[parts[-1]] = value
 
 
+def _label(value) -> str:
+  """How an axis value reads in a run tag. A mapping with a `label` key names itself
+  by it, so a whole override bundle (a critic recipe, say) gets a short tag."""
+  return str(value["label"]) if isinstance(value, dict) and "label" in value else str(value)
+
+
+def _unlabelled(value):
+  """The value to apply: a labelled mapping minus its `label`, anything else as-is."""
+  if isinstance(value, dict) and "label" in value:
+    return {key: item for key, item in value.items() if key != "label"}
+  return value
+
+
 def _materialize_candidate(combo: dict, *, defaults: dict | None = None):
   """Build and validate one expanded point from Python values."""
   model, env = combo["algo"], combo["env"]
@@ -51,7 +64,7 @@ def _materialize_candidate(combo: dict, *, defaults: dict | None = None):
   model_overrides = {}
   for key, value in combo.items():
     if key.startswith("model."):
-      _nested_set(model_overrides, key.removeprefix("model."), value)
+      _nested_set(model_overrides, key.removeprefix("model."), _unlabelled(value))
   if model_overrides:
     payload["model_overrides"] = model_overrides
   config = RunConfig.from_dict(payload)
@@ -156,7 +169,7 @@ def name_combos(combos: list[dict], axes: dict, num_seeds: int) -> list[str]:
     if len(axes["seed"]) > 1:
       parts.append(f"base{combo['seed']}")
     parts.append(f"{combo.get('run.num_seeds', num_seeds)}seeds")
-    parts += [f"{short[k]}={combo[k]}" for k in varying]
+    parts += [f"{short[k]}={_label(combo[k])}" for k in varying]
     tags.append(re.sub(r"[^A-Za-z0-9.=_-]", "-", "_".join(parts)))
   return tags
 
@@ -230,6 +243,8 @@ def materialize(combos: list[dict], tags: list[str], *, defaults: dict = None, s
     metadata = dict(defaults or {})
     if num_seeds is not None:
       metadata["num_seeds"] = num_seeds
+    if "run.name" not in combo:
+      metadata.setdefault("name", tag)      # the logger's display name
     config = _materialize_candidate(combo, defaults=metadata)
 
     run_dir = os.path.join(sweep_dir, tag)

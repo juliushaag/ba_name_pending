@@ -45,6 +45,9 @@ class RunConfig:
   validate: bool = False
   run_dir: str | None = None
   sweep_tag: str | None = None
+  # Display name for the logger (wandb run name and group). A sweep sets it to the run's
+  # grid tag; None keeps the automatic `<model>/<env>/<timestamp>_x<seeds>`.
+  name: str | None = None
   logger: str = "wandb"
   total_env_steps: int = 1_000_000
   rollout_steps: int = 4

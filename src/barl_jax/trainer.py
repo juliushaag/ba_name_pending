@@ -352,7 +352,7 @@ def run_config_snapshot(run: Run) -> dict:
   return config
 
 
-_EXPERIMENT_IDENTITY_KEYS = frozenset({"seed", "num_seeds", "run_dir", "sweep_tag",
+_EXPERIMENT_IDENTITY_KEYS = frozenset({"seed", "num_seeds", "run_dir", "sweep_tag", "name",
                                        "snapshot", "checkpoint"})
 
 
@@ -468,9 +468,12 @@ def _open_logger(run: Run, name: str, ckpt_dir: str, objective_dir: str):
   tags = [run.model_name, run.env_name, "online", "jax", "multiseed"]
   if cfg.sweep_tag:
     tags.append(cfg.sweep_tag)
+  # The logger's display name; `name` stays the automatic one that keys the
+  # checkpoint path.
+  label = cfg.name or name
   log = make_logger(
-    cfg.logger, name, step_keys={"env_steps", "grad_steps"}, tags=tags,
-    config=run_config_snapshot(run), group=name,
+    cfg.logger, label, step_keys={"env_steps", "grad_steps"}, tags=tags,
+    config=run_config_snapshot(run), group=label,
     finish_timeout=cfg.wandb_finish_timeout, run_dir=objective_dir,
     seeds=[run.base_seed + i for i in range(num_seeds)]
   )

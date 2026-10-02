@@ -171,7 +171,7 @@ def read_training(root) -> dict:
 # Evaluation strategy may change across a resume; collection strategy is a training
 # config and deliberately is not here -- changing it changes the behavior policy that
 # produced the replay buffer.
-MUTABLE_ON_RESUME = {"checkpoint", "checkpoint_mode", "run_dir", "sweep_tag", "validate",
+MUTABLE_ON_RESUME = {"checkpoint", "checkpoint_mode", "run_dir", "sweep_tag", "name", "validate",
             "log_every", "debug_every", "eval_every", "eval_runs", "eval_video_every",
             "compile_cache_dir", "wandb_finish_timeout", "logger", "resume_every",
             "resume_keep", "eval_executor"}
