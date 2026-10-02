@@ -1,4 +1,5 @@
 """Annealed Langevin action sampling from a noise-conditioned critic."""
+import math
 from dataclasses import dataclass, field
 
 import jax
@@ -19,11 +20,21 @@ class LangevinActorConfig:
   class_name: str = "LangevinActor"
   steps_per_level: int = 2
   step_lr: float = 1.0e-4
+  # Bound coarse-level drift and noise together. With the default ladder,
+  # unrestricted alpha reaches 1 and normalized drift has norm 250.
+  # None restores the reference sampler's unrestricted annealing schedule.
+  max_step_size: float | None = 1.0e-3
   temperature: float = 500.0
   normalize_score: bool = True
   clip_actions: bool = True
   action_limit: float = 1.0
   init_scale: float = 1.0
+
+  def problems(self):
+    if self.max_step_size is not None and not (
+        math.isfinite(self.max_step_size) and self.max_step_size > 0):
+      return ["max_step_size must be None or finite and > 0"]
+    return []
 
 
 @register_component
@@ -40,6 +51,9 @@ class LangevinActor(ActionSampler):
 
   def __init__(self, env_stats, config: LangevinActorConfig, *, rngs, **kwargs):
     super().__init__(env_stats, config, rngs=rngs, **kwargs)
+    problems = self.config_problems(config)
+    if problems:
+      raise ValueError(f"{type(self).__name__}: " + "; ".join(problems))
 
   def critic_score(self, critic, obs, act, level):
     """grad_a E[Z(s, a, level)], averaged over heads -- `expectation()` and not
@@ -69,10 +83,14 @@ class LangevinActor(ActionSampler):
     keys = jax.random.split(key, num_levels * self.config.steps_per_level)
 
     # Song & Ermon spacing: `step_lr` is the finest level's step, coarser levels scale
-    # by (sigma_i / sigma_last)^2. The coarse drift saturates against the action clip.
+    # by (sigma_i / sigma_last)^2. Cap alpha before computing both drift and noise
+    # so coarse updates stay small relative to the action box.
     alpha_ratio = (sigmas / sigmas[-1]) ** 2
     for i in range(num_levels):
       alpha = self.config.step_lr * alpha_ratio[i]
+      if self.config.max_step_size is not None:
+        alpha = jnp.minimum(alpha, self.config.max_step_size)
+      self.metrics.scalar(f"chain/step_size_l{i}", alpha, tier=DEBUG)
       for t in range(self.config.steps_per_level):
         g = self.critic_score(critic, obs, a, i)
         score_norm = jnp.linalg.norm(g, axis=-1).mean()
@@ -124,4 +142,3 @@ class NCLQLModelConfig(ModelConfig):
   components: ComponentsConfig = field(default_factory=lambda: ComponentsConfig(
     actor=LangevinActorConfig(),
     critic=nclql(C51CriticConfig()), entropy=None))
-

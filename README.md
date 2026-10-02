@@ -80,6 +80,13 @@ uv run python scripts/debug.py --model SAC --json
 uv run python scripts/submit.py --config sweeps/<submission>/<run>/config.yaml
 ```
 
+### NCLQL action sampling
+
+NCLQL caps coarse Langevin step sizes at `model.components.actor.max_step_size=0.001`
+to reduce action saturation while preserving the finest step size. Both the drift
+and Gaussian noise use the capped step. Set this field to `null` to restore the
+unrestricted schedule. See [docs/nclql.md](docs/nclql.md) for tuning and clipping metrics.
+
 ### Flow-matching critic (floq)
 
 The optional `FloqCritic` implements the scalar flow-matching critic from [arXiv:2509.06863](https://arxiv.org/abs/2509.06863). Select it for SAC, AMDP, DIME, or SDAC with a model override; the existing actor, replay, and policy interfaces remain unchanged. The default uses 8 Euler flow steps, 8 random target-noise samples, a 51-edge HL-Gauss (50 histogram features) interpolant encoding with `sigma=16.0`, and a 64-dimensional Fourier time encoding (`Cos` is available for the reference's `cos(t)`). See [docs/floq.md](docs/floq.md) for equations, adaptation details, defaults, and validation requirements.
