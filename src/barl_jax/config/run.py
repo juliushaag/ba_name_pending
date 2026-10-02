@@ -50,8 +50,8 @@ class RunConfig:
   name: str | None = None
   logger: str = "wandb"
   total_env_steps: int = 1_000_000
-  rollout_steps: int = 4
-  num_envs: int = 4
+  rollout_steps: int = 1
+  num_envs: int = 1
   buffer_size: int = 1_000_000
   eval_every: int = 25_000
   eval_runs: int = 10
