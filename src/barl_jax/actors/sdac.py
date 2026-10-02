@@ -10,7 +10,7 @@ from barl_jax.config.schemas import ComponentsConfig, ModelConfig, register_mode
 from barl_jax.critics.categorical import C51CriticConfig
 from barl_jax.networks.base import NetworkConfig
 from barl_jax.networks.diffusion import TimeConditionedField, reverse_chain
-from barl_jax.networks.simba import SimbaConfig
+from barl_jax.networks.simba import AdaLNSimbaConfig
 from barl_jax.networks.time_embedding import FourierTimeConfig, TimeEmbeddingConfig
 from barl_jax.optimization import ActorOptim, ActorOptimConfig
 from barl_jax.policies.rl import PolicyConfig, RLPolicy
@@ -22,7 +22,8 @@ class DDPMActorConfig(ActorOptimConfig):
   class_name: str = "DDPMActor"
   latent_dim: int = 128
   layers: int = 3
-  mlp: NetworkConfig = field(default_factory=lambda: SimbaConfig(activation="mish", norm="none", dtype="float32"))
+  mlp: NetworkConfig = field(default_factory=lambda: AdaLNSimbaConfig(
+    activation="mish", dtype="float32"))
   time: TimeEmbeddingConfig = field(default_factory=lambda: FourierTimeConfig(
     time_dim=64, num_freqs=32, hidden=64, concat_input=False, learn_freqs=True))
   num_steps: int = 20
@@ -33,6 +34,16 @@ class DDPMActorConfig(ActorOptimConfig):
   num_candidates: int = 500
   temp: float = 0.25
   grad_clip_mode: str = "none"
+
+  def problems(self):
+    problems = super().problems()
+    if self.num_steps < 1:
+      problems.append("num_steps must be >= 1")
+    if not (0 < self.t_min < self.t_max < 1):
+      problems.append("time bounds require 0 < t_min < t_max < 1")
+    if not (0 <= self.cosine_s < math.inf):
+      problems.append("cosine_s must be finite and >= 0")
+    return problems
 
 
 @register_component
@@ -48,6 +59,9 @@ class DDPMActor(ActorOptim, Actor):
 
   def __init__(self, env_stats, config: DDPMActorConfig, *, rngs: nnx.Rngs, **kwargs):
     super().__init__(env_stats, config, rngs=rngs, **kwargs)
+    problems = self.config_problems(config)
+    if problems:
+      raise ValueError(f"{type(self).__name__}: " + "; ".join(problems))
     self.field = TimeConditionedField(
       self.obs_dim, self.plan_dim, latent_dim=config.latent_dim, layers=config.layers,
       time=config.time, mlp=config.mlp, rngs=rngs)
@@ -57,32 +71,35 @@ class DDPMActor(ActorOptim, Actor):
   def alpha_sigma(self, t):
     """Cosine VP schedule: x_t = alpha(t) x0 + sigma(t) eps, alpha^2 + sigma^2 = 1."""
     s = self.config.cosine_s
-    alpha = (jnp.cos(jnp.pi / 2 * (jnp.clip(t, 0.0, self.config.t_max) + s) / (1 + s))
-             / math.cos(math.pi / 2 * s / (1 + s)))
-    return alpha, jnp.sqrt(1.0 - alpha ** 2)
+    offset = math.pi / 2 * s / (1 + s)
+    angle = jnp.pi / 2 * jnp.clip(t, 0.0, self.config.t_max) / (1 + s)
+    alpha = jnp.cos(offset + angle) / math.cos(offset)
+    # cos²(offset) - cos²(offset + angle) = sin(angle) sin(2 offset + angle).
+    # This avoids rounding sigma to zero when a positive t is close to zero.
+    sigma_sq = jnp.sin(angle) * jnp.sin(2 * offset + angle) / math.cos(offset) ** 2
+    return alpha, jnp.sqrt(jnp.maximum(sigma_sq, 0.0))
 
   def x0_from_eps(self, x_t, eps, t):
     alpha, sigma = self.alpha_sigma(t)
     return (x_t - sigma * eps) / alpha
 
   def predict_eps(self, obs, x, t):
-    t = jnp.broadcast_to(t, (x.shape[0], 1))
     return self.field(obs, x, t).astype(jnp.float32)
 
   # ---- the reverse chain ---------------------------------------------------
   def reverse_step(self, obs, x, n, key):
     t_n, t_prev = self.t_grid[...][n], self.t_grid[...][n - 1]
-    ab_n, ab_prev = self.alpha_sigma(t_n)[0] ** 2, self.alpha_sigma(t_prev)[0] ** 2
-    a_n = ab_n / ab_prev
-    beta_n = 1.0 - a_n
+    alpha_n, sigma_n = self.alpha_sigma(t_n)
+    alpha_prev, sigma_prev = self.alpha_sigma(t_prev)
+    a_n = (alpha_n / alpha_prev) ** 2
+    beta_n = (sigma_n ** 2 - sigma_prev ** 2) / alpha_prev ** 2
 
     x0 = self.x0_from_eps(x, self.predict_eps(obs, x, t_n), t_n)
     if self.config.clip_sampler:
       x0 = jnp.clip(x0, -1.0, 1.0)
-    mean = (jnp.sqrt(ab_prev) * beta_n * x0 + jnp.sqrt(a_n) * (1.0 - ab_prev) * x) / (1.0 - ab_n)
-    if n > 1:
-      mean = mean + jnp.sqrt(beta_n) * jax.random.normal(key, x.shape, x.dtype)
-    return mean
+    mean = (alpha_prev * beta_n * x0 + jnp.sqrt(a_n) * sigma_prev ** 2 * x) / sigma_n ** 2
+    noise = jnp.sqrt(beta_n) * jax.random.normal(key, x.shape, x.dtype)
+    return mean + jnp.where(n > 1, noise, jnp.zeros_like(noise))
 
   def generate_action(self, obs, *, critic=None, key=None):
     key = self.next_key(key)
@@ -96,7 +113,8 @@ class DDPMActor(ActorOptim, Actor):
     """Diffuse `action` (the replay action; a fresh sample when None) to a random
     t, draw K eps whose x0 reconstructions stay in [-1, 1], and regress the eps
     prediction onto them weighted by softmax(Q(x0_k) / (temp * q_scale)) over K,
-    where `q_scale` is this batch's own cross-candidate Q spread -- not a
+    where `q_scale` is the cross-candidate Q std averaged over this batch's
+    states (one scalar per batch, not per state) -- not a
     running, cross-*state* statistic (e.g. a critic-wide value scale): on
     DogRun the Q range across different candidate actions at one state is
     ~15-30x smaller than the Q range across different states (measured on a

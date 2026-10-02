@@ -11,7 +11,7 @@ from barl_jax.critics.categorical import C51CriticConfig
 from barl_jax.networks.base import NetworkConfig
 from barl_jax.networks.diffusion import TimeConditionedField, controlled_sde
 from barl_jax.networks.regulator import AutotuneRegulatorConfig
-from barl_jax.networks.simba import SimbaConfig
+from barl_jax.networks.simba import AdaLNSimbaConfig
 from barl_jax.networks.time_embedding import FourierTimeConfig, TimeEmbeddingConfig
 from barl_jax.optimization import ActorOptim, ActorOptimConfig
 from barl_jax.policies.rl import MaxEntPolicyConfig, MaxEntRLPolicy
@@ -23,7 +23,8 @@ class ScoreContinuousActorConfig(ActorOptimConfig):
   class_name: str = "ScoreContinuousActor"
   latent_dim: int = 128
   layers: int = 3
-  mlp: NetworkConfig = field(default_factory=lambda: SimbaConfig(activation="gelu", norm="none", dtype="float32"))
+  mlp: NetworkConfig = field(default_factory=lambda: AdaLNSimbaConfig(
+    activation="gelu", dtype="float32"))
   time: TimeEmbeddingConfig = field(default_factory=FourierTimeConfig)
   squash_cls: str = "ErfSquash"
   sigma_min: float = 0.01
@@ -34,7 +35,17 @@ class ScoreContinuousActorConfig(ActorOptimConfig):
   out_clip: float = 10000.0
   q_score_max_norm: float = 5.0
   q_score_max_percentile: float = 95.0
-  batch_rep: int = 1
+  batch_rep: int = 3
+
+  def problems(self):
+    problems = super().problems()
+    if not (0 < self.sigma_min < self.sigma_max < math.inf):
+      problems.append("sigma bounds require 0 < sigma_min < sigma_max < infinity")
+    if not (0 <= self.tau_min < self.tau_max <= 1):
+      problems.append("time bounds require 0 <= tau_min < tau_max <= 1")
+    if self.max_steps < 1 or self.batch_rep < 1:
+      problems.append("max_steps and batch_rep must be >= 1")
+    return problems
 
 
 def clip_score(score, max_norm: float, percentile: float):
@@ -56,9 +67,11 @@ class ScoreContinuousActor(ActorOptim, Actor):
 
   def __init__(self, env_stats, config: ScoreContinuousActorConfig, *, rngs: nnx.Rngs, **kwargs):
     super().__init__(env_stats, config, rngs=rngs, **kwargs)
+    problems = self.config_problems(config)
+    if problems:
+      raise ValueError(f"{type(self).__name__}: " + "; ".join(problems))
 
     self._log_r    = math.log(self.config.sigma_max / self.config.sigma_min)
-    self._int_base = float(self._raw_int(jnp.asarray(self.config.tau_min, jnp.float32)))
 
     latent_dim, layers = config.latent_dim, config.layers
 
@@ -69,26 +82,30 @@ class ScoreContinuousActor(ActorOptim, Actor):
     self.field.zero_init_head()   # u ~ 0 at the beginning
 
     taus   = jnp.linspace(self.config.tau_min, self.config.tau_max, self.config.max_steps + 1, dtype=jnp.float32)
-    sig_sq = self.sigma_sq_int_fn(taus)                        # exact, rebased to tau_min
     self.taus     = Buffer(taus)
-    self.step_var = Buffer(jnp.maximum(sig_sq[1:] - sig_sq[:-1], 0.0))
+    self.step_var = Buffer(self._variance_between(taus[:-1], taus[1:]))
 
-    self._terminal_var = float(self.step_var[...].sum())
+    self._terminal_var = float(self.sigma_sq_int_fn(jnp.asarray(config.tau_max, jnp.float32)))
 
     self.squash = get_component(self.config.squash_cls)(
       env_stats, None, erf_k=(2 * self._terminal_var) ** -0.5)
 
   def sigma_fn(self, tau):
-    r = self.config.sigma_max / self.config.sigma_min
-    return self.config.sigma_min * r ** (1.0 - tau) * math.sqrt(2.0 * self._log_r)
+    return self.config.sigma_max * jnp.exp(-self._log_r * tau) * math.sqrt(2.0 * self._log_r)
 
-  def _raw_int(self, tau):
-    r = self.config.sigma_max / self.config.sigma_min
-    return self.config.sigma_max ** 2 * (1.0 - r ** (-2.0 * tau))
+  def _variance_between(self, start, end):
+    # Integrate directly over the interval: subtracting cumulative variances
+    # loses the late steps when the cumulative value has rounded to sigma_max².
+    span = -2.0 * self._log_r * (end - start)
+    # expm1 keeps short intervals accurate; exp keeps long-interval time
+    # derivatives accurate (JAX differentiates expm1 using expm1(x) + 1).
+    mass = jnp.where(span > -math.log(2), -jnp.expm1(span), 1.0 - jnp.exp(span))
+    return (self.config.sigma_max ** 2 * jnp.exp(-2.0 * self._log_r * start)
+            * mass)
 
   def sigma_sq_int_fn(self, tau):
     """int_{tau_min}^{tau} sigma^2(t) dt -- matches what the sampler injects."""
-    return self._raw_int(tau) - self._int_base
+    return self._variance_between(self.config.tau_min, tau)
 
   def bridge_sample(self, endpoint, tau, noise):
     sigma_sq = self.sigma_sq_int_fn(tau)
@@ -98,7 +115,7 @@ class ScoreContinuousActor(ActorOptim, Actor):
 
   @property
   def terminal_var(self) -> float:
-    """Var(X_1) at zero control. erf_k MUST be derived from this."""
+    """Var(X_tau_max) at zero control. erf_k MUST be derived from this."""
     return self._terminal_var
 
   def squash_correction(self, X):
@@ -117,13 +134,13 @@ class ScoreContinuousActor(ActorOptim, Actor):
 
   def scaled_time(self, tau):
     """The level the control net conditions on. The reference scales it into
-    [-1, 1] before its fourier coder (ctrl_net.py), so the fixed frequency ladder
-    reads the same span whatever tau_min/tau_max say."""
+    [-1, 1] over the full [0, 1] diffusion horizon before its Fourier coder
+    (ctrl_net.py). A truncated tau interval keeps its absolute time coordinates."""
     return 2.0 * tau - 1.0
 
   def euler_step(self, obs, X, i, key):
     """The same controlled transition for sampling and adjoint training."""
-    tau = jnp.broadcast_to(self.taus[...][i], (obs.shape[0], 1))
+    tau = self.taus[...][i]
     u_tilde = self.control(obs, X, tau)
     v = self.step_var[...][i]
     sqrt_v = jnp.sqrt(v)

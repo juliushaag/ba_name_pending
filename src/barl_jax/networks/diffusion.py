@@ -20,6 +20,8 @@ from barl_jax.networks.time_embedding import TimeEmbeddingConfig
 class TimeConditionedField(nnx.Module):
   """`(obs, x, t) -> a vector over the action dims`, conditioned on a scalar time.
 
+  Diffusion actors default to AdaLNSimBa: the noisy action `x` enters the stem,
+  while observation and encoded time modulate every block and the final norm.
   What `t` means is the caller's: a normalized tau, a step index, a noise level.
   The output is left in the net's compute dtype -- a caller that accumulates in
   float32 casts at its own boundary."""
@@ -27,7 +29,8 @@ class TimeConditionedField(nnx.Module):
   def __init__(self, obs_dim: int, action_dim: int, *, latent_dim: int, layers: int,
                time: TimeEmbeddingConfig, mlp: NetworkConfig, rngs: nnx.Rngs):
     self.time_emb = time.build(rngs=rngs)
-    self.net = mlp.build(obs_dim + action_dim + time.time_dim, action_dim, latent_dim, layers, rngs=rngs)
+    self.net = mlp.build(action_dim, action_dim, latent_dim, layers,
+                         cond_dim=obs_dim + time.time_dim, rngs=rngs)
 
   def zero_init_head(self):
     """Start the chain uncontrolled -- the field is identically 0 at step 0, so
@@ -36,21 +39,24 @@ class TimeConditionedField(nnx.Module):
     self.net.head.bias[...]   = jnp.zeros_like(self.net.head.bias[...])
 
   def __call__(self, obs, x, t):
-    return self.net(obs, x, self.time_emb(t))
+    """`t` is a scalar or `(n,)` shared level, or `(..., 1)` per row. It is embedded
+    at its own shape and the embedding broadcast over the batch, so a level shared
+    by every row (a step index) costs one embedding rather than one per row."""
+    t = jnp.asarray(t, jnp.float32)
+    if t.ndim <= 1:
+      t = t[..., None]
+    emb = self.time_emb(t)
+    emb = jnp.broadcast_to(emb, (*x.shape[:-1], emb.shape[-1]))
+    return self.net((x,), (obs, emb))
 
 
-# Both loops are unrolled Python rather than a lax.scan, and both split every key
-# up front. Scan was measured: it cuts the traced graph by ~15% and compiles ~15%
-# faster, and changes SDAC's step time by 0.3% -- so the unrolled form stays,
-# since it keeps `n` a Python int and the step algebra readable. The keys are
-# split up front because DIME differentiates through its whole chain, so the
-# draws have to be ordinary values in the graph rather than module side effects.
 
 def reverse_chain(step, x, num_steps: int, key):
-  """Ancestral / denoising direction: n = num_steps .. 1, `step(x, n, key) -> x`."""
+  """Ancestral / denoising direction: n = num_steps .. 1, `step(x, n, key) -> x`.
+  `n` is a traced int32 scalar, so `step` indexes with it rather than branching."""
   keys = jax.random.split(key, num_steps)
-  for i, n in enumerate(range(num_steps, 0, -1)):
-    x = step(x, n, keys[i])
+  ns = jnp.arange(num_steps, 0, -1, dtype=jnp.int32)
+  x, _ = jax.lax.scan(lambda x, nk: (step(x, *nk), None), x, (ns, keys))
   return x
 
 
@@ -60,9 +66,18 @@ def controlled_sde(step, x, num_steps: int, key, aux=0.0):
 
   The scalar is whatever the sampler's own change of measure is -- a Girsanov
   path weight, a log-ratio of transition kernels -- so `aux` is seeded by the
-  caller with the term its process starts from, and read back as (B, 1)."""
+  caller with the term its process starts from, and read back as (B, 1).
+  `i` is a traced int32 scalar."""
   keys = jax.random.split(key, num_steps)
-  for i in range(num_steps):
-    x, increment = step(x, i, keys[i])
-    aux = aux + increment
+  idx = jnp.arange(num_steps, dtype=jnp.int32)
+
+  def body(carry, ik):
+    x, aux = carry
+    x, increment = step(x, *ik)
+    return (x, aux + increment), None
+
+  # A scalar seed is broadcast to the increment's shape so the carry is fixed.
+  increment = jax.eval_shape(lambda: step(x, idx[0], keys[0])[1])
+  aux = jnp.broadcast_to(jnp.asarray(aux, increment.dtype), increment.shape)
+  (x, aux), _ = jax.lax.scan(body, (x, aux), (idx, keys))
   return x, aux

@@ -63,7 +63,7 @@ class StochasticActor(ActorOptim, Actor):
 
   def dist(self, s):
     """(mean, std) of the pre-squash Normal, over the flat plan."""
-    mean = self.net(s).astype(jnp.float32)
+    mean = self.net((s,)).astype(jnp.float32)
     std  = jnp.exp(jnp.clip(self.log_std[...], self.config.log_std_min, self.config.log_std_max))
     return mean, std
 

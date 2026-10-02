@@ -7,6 +7,7 @@ from flax import nnx
 from barl_jax.components import Actor, Critic, frozen
 from barl_jax.config.schemas import ComponentsConfig, ModelConfig, register_model
 from barl_jax.critics.base import TargetConfig
+from barl_jax.critics.categorical import C51CriticConfig
 from barl_jax.critics.direct import EnsembleCriticConfig
 from barl_jax.networks.base import NetworkConfig
 from barl_jax.networks.mlp import MLPConfig
@@ -45,7 +46,7 @@ class DeterministicActor(ActorOptim, Actor):
                                 rngs=rngs)
 
   def mean(self, s):
-    return jnp.tanh(self.net(s).astype(jnp.float32))
+    return jnp.tanh(self.net((s,)).astype(jnp.float32))
 
   def noisy(self, s, key, std, clip=None):
     mean = self.mean(s)
@@ -82,7 +83,5 @@ class TD3ModelConfig(ModelConfig):
   params: PolicyConfig = field(default_factory=lambda: PolicyConfig(policy_delay=2))
   components: ComponentsConfig = field(default_factory=lambda: ComponentsConfig(
     actor=DeterministicActorConfig(),
-    critic=EnsembleCriticConfig(
-      latent_dim=256, layers=1, target=TargetConfig(kind="polyak", joint_forward=False),
-      mlp=MLPConfig(activation="relu", norm="none", dtype="float32")),
+    critic=C51CriticConfig(),
     entropy=None))

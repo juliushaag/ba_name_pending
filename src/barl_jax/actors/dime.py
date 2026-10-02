@@ -12,7 +12,7 @@ from barl_jax.networks import gaussian
 from barl_jax.networks.base import NetworkConfig
 from barl_jax.networks.diffusion import TimeConditionedField, controlled_sde
 from barl_jax.networks.regulator import AutotuneRegulatorConfig
-from barl_jax.networks.simba import SimbaConfig
+from barl_jax.networks.simba import AdaLNSimbaConfig
 from barl_jax.networks.time_embedding import FourierTimeConfig, TimeEmbeddingConfig
 from barl_jax.optimization import ActorOptim, ActorOptimConfig
 from barl_jax.policies.rl import MaxEntPolicyConfig, MaxEntRLPolicy
@@ -24,7 +24,8 @@ class DISActorConfig(ActorOptimConfig):
   class_name: str = "DISActor"
   latent_dim: int = 128
   layers: int = 3
-  mlp: NetworkConfig = field(default_factory=lambda: SimbaConfig(activation="gelu", norm="none", dtype="float32"))
+  mlp: NetworkConfig = field(default_factory=lambda: AdaLNSimbaConfig(
+    activation="gelu", dtype="float32"))
   time: TimeEmbeddingConfig = field(default_factory=FourierTimeConfig)
   
   squash_cls: str = "TanhSquash"
@@ -40,6 +41,20 @@ class DISActorConfig(ActorOptimConfig):
   per_dim_friction: bool = True
   learn_dt: bool = True
   learn_friction: bool = True
+
+  def problems(self):
+    problems = super().problems()
+    if self.num_steps < 1:
+      problems.append("num_steps must be >= 1")
+    for name in ("dt_init", "friction_init", "prior_std"):
+      if not (0 < getattr(self, name) < math.inf):
+        problems.append(f"{name} must be finite and > 0")
+    if not (0 <= self.dt_min <= 1):
+      problems.append("dt_min must be in [0, 1]")
+    for name in ("dt_s", "dt_pow"):
+      if not (0 <= getattr(self, name) < math.inf):
+        problems.append(f"{name} must be finite and >= 0")
+    return problems
 
 def _inv_softplus(x: float) -> float:
   """dime_am's `inverse_softplus`, so a raw parameter initialized with this
@@ -80,6 +95,9 @@ class DISActor(ActorOptim, Actor):
 
   def __init__(self, env_stats, config: DISActorConfig, *, rngs: nnx.Rngs, **kwargs):
     super().__init__(env_stats, config, rngs=rngs, **kwargs)
+    problems = self.config_problems(config)
+    if problems:
+      raise ValueError(f"{type(self).__name__}: " + "; ".join(problems))
 
     # Both are stored through softplus, the reference's parameterization, so the
     # positivity a step size and a friction need is structural rather than a
@@ -121,8 +139,7 @@ class DISActor(ActorOptim, Actor):
     return -x / self.config.prior_std**2
 
   def control_at(self, obs, x, i: int):
-    t = jnp.full((x.shape[0], 1), float(i), jnp.float32)
-    u = self.field(obs, x, t).astype(jnp.float32)
+    u = self.field(obs, x, jnp.asarray(i, jnp.float32)).astype(jnp.float32)
     return jnp.clip(u, -self.config.out_clip, self.config.out_clip)
 
   def generate_action(self, obs, *, critic: Critic = None, key=None, squash=True):
