@@ -28,6 +28,10 @@ REPO_ROOT = Path.cwd()
 
 POLL_SECONDS = 0.5
 
+#: Forwarded into each run window when set, so runs sharing a GPU can cap their
+#: preallocation (e.g. XLA_PYTHON_CLIENT_MEM_FRACTION=0.45 for two per GPU).
+GPU_MEMORY_VARS = ("XLA_PYTHON_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_PREALLOCATE")
+
 STATE_STYLE = {"queued": "dim", "running": "cyan", "done": "green",
                "failed": "bold red", "cancelled": "yellow"}
 
@@ -118,6 +122,7 @@ class Pool:
       "new-window", "-d", "-t", f"{self.session}:", "-n", task.tag,
       "-c", str(REPO_ROOT), "-e", f"CUDA_VISIBLE_DEVICES={gpu}",
       "-e", f"PATH={os.environ['PATH']}",
+      *[a for v in GPU_MEMORY_VARS if v in os.environ for a in ("-e", f"{v}={os.environ[v]}")],
       "-P", "-F", "#{window_id}", "--", "bash", "-c", script, capture=True)
 
     # Kept alive after the command exits so a failure stays on screen; a task

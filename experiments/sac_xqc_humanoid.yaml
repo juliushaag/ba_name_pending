@@ -1,0 +1,7 @@
+axes:
+  algo: [SAC]
+  env: [HumanoidRun]
+
+  model.components.critic:
+    - label: xqc
+      weight_norm: true
