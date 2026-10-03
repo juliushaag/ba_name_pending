@@ -2,8 +2,9 @@
 
 from dataclasses import replace
 
-from .base import EnsembleConfig, NoiseConditioningConfig, TargetConfig, target_mlp, xqc_mlp
+from .base import EnsembleConfig, NoiseConditioningConfig, TargetConfig
 from .categorical import CategoricalCriticConfig
+from .mlps import target_mlp, xqc_mlp
 
 
 def target_ensemble(config):

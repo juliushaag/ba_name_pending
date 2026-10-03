@@ -20,12 +20,9 @@ class EnsembleCriticConfig(DirectCriticConfig):
     n_models=2, value_reduce="min", target_reduce="min"))
 
 
-@register_component
-class DirectCritic(QCritic):
-  """Scalar Q regressed with MSE."""
-
-  kind = "critic"
-  config_type = DirectCriticConfig
+class ScalarValue:
+  """The scalar value head: Q is one output per member, regressed with MSE.
+  Mixed into every critic whose network predicts the value itself."""
 
   @classmethod
   def out_dim(cls, config) -> int:
@@ -48,6 +45,14 @@ class DirectCritic(QCritic):
 
   def target_expectation(self, target):
     return target.astype(jnp.float32)
+
+
+@register_component
+class DirectCritic(ScalarValue, QCritic):
+  """Scalar Q regressed with MSE."""
+
+  kind = "critic"
+  config_type = DirectCriticConfig
 
 
 @register_component

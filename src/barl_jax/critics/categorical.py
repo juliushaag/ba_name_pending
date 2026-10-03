@@ -132,33 +132,66 @@ class CategoricalCritic(QCritic):
       self.dual = nnx.Param(jnp.asarray(config.dual_init, jnp.float32))
     else:
       self.v_min, self.v_max = value_range(env_stats, config)
+      edges, centers, sigma = self._geometry(self.v_min, self.v_max)
+      self.support = Buffer(centers)
+      self.edges = None if edges is None else Buffer(edges)
+      self.sigma = float(sigma) if self.reports_sigma else None
 
   @classmethod
   def out_dim(cls, config) -> int:
     return config.num_bins
 
   # ---- the (possibly moving) support ------------------------------------------
-  # A head supplies `_geometry(lo, hi)` -> (edges or None, centers, sigma) for a
-  # moving support and `_static_geometry()` for the fixed one.
+  # A head supplies `_intervals()` (spans between neighbouring bin values) and
+  # `_geometry(lo, hi)` -> (edges or None, centers, sigma). A fixed support
+  # evaluates `_geometry` once at init and keeps the result as buffers.
+
+  reports_sigma = True
+
+  def _intervals(self) -> int:
+    raise NotImplementedError
+
+  def _grid(self, lo, hi, n):
+    """`n` evenly spaced values from `lo` to `hi`. The learned support spells the
+    spacing out so the grid stays differentiable in the endpoints; the fixed one
+    is a plain `linspace`. The two differ in the last bit, which cancellation in
+    the cross-entropy gradient can amplify, so each keeps its own."""
+    if self.config.learn_support:
+      return lo + (hi - lo) * jnp.arange(n, dtype=jnp.float32) / (n - 1)
+    return jnp.linspace(lo, hi, n, dtype=jnp.float32)
+
+  def _sigma(self, lo, hi):
+    """The Gaussian width `sigma_to_bin_ratio` bin widths wide; a learned support
+    floors it so shrinking the range cannot fake coverage."""
+    sigma = self.config.sigma_to_bin_ratio * (hi - lo) / self._intervals()
+    return jnp.maximum(sigma, self.config.support_sigma_min) if self.config.learn_support else sigma
 
   def _current(self):
     """The geometry the heads and the target use: a constant to every loss."""
     if not self.config.learn_support:
-      return self._static_geometry()
-    lo, hi = jax.lax.stop_gradient(self.support_net.bounds())
-    return self._geometry(lo, hi)
+      return None if self.edges is None else self.edges[...], self.support[...], self.sigma
+    return self._geometry(*self._bounds())
+
+  def _bounds(self):
+    """The support endpoints, a constant to every loss."""
+    if not self.config.learn_support:
+      return self.v_min, self.v_max
+    return jax.lax.stop_gradient(self.support_net.bounds())
 
   def support_values(self):
     """The value each bin / atom stands for, (num_bins,)."""
     return self._current()[1]
 
   def derived(self) -> dict:
-    if not self.config.learn_support:
-      return self._static_derived()
-    lo, hi = self.support_net.bounds()
-    _, centers, sigma = self._geometry(lo, hi)
-    return {"v_min": float(lo), "v_max": float(hi), "sigma": float(sigma),
-            "bin_width": float(centers[1] - centers[0]), "support": "learned"}
+    learned = self.config.learn_support
+    lo, hi = self.support_net.bounds() if learned else (self.v_min, self.v_max)
+    out = {"v_min": float(lo), "v_max": float(hi), "bin_width": float(hi - lo) / self._intervals()}
+    sigma = self._geometry(lo, hi)[2] if learned else self.sigma
+    if sigma is not None:
+      out["sigma"] = float(sigma)
+    if learned:
+      out["support"] = "learned"
+    return out
 
   # ---- the learned support ------------------------------------------------------
 
@@ -245,36 +278,23 @@ class C51Critic(CategoricalCritic):
   kind = "critic"
   config_type = C51CriticConfig
 
-  def __init__(self, env_stats, config, **kwargs):
-    super().__init__(env_stats, config, **kwargs)
-    if not config.learn_support:
-      self.support = Buffer(jnp.linspace(self.v_min, self.v_max, config.num_bins, dtype=jnp.float32))
+  # The fixed support has no use for sigma: the projection never smooths.
+  reports_sigma = False
+
+  def _intervals(self) -> int:
+    return self.config.num_bins - 1
 
   def _geometry(self, lo, hi):
     """`(None, atoms, sigma)`: `num_bins` atoms spanning `[lo, hi]` inclusive."""
-    k = self.config.num_bins
-    atoms = lo + (hi - lo) * jnp.arange(k, dtype=jnp.float32) / (k - 1)
-    sigma = jnp.maximum(self.config.sigma_to_bin_ratio * (hi - lo) / (k - 1),
-                        self.config.support_sigma_min)
-    return None, atoms, sigma
-
-  def _static_geometry(self):
-    return None, self.support[...], None
-
-  def _static_derived(self) -> dict:
-    return {"v_min": self.v_min, "v_max": self.v_max,
-            "bin_width": (self.v_max - self.v_min) / (self.config.num_bins - 1)}
+    return None, self._grid(lo, hi, self.config.num_bins), self._sigma(lo, hi)
 
   def bootstrap_members(self, next_raw):
     return self.probs(next_raw)
 
   def td_target(self, chunk_return, discount, bootstrap, entropy_bonus):
-    if not self.config.learn_support:
-      return categorical_projection(bootstrap, self.support[...], chunk_return, discount,
-                                    self.v_min, self.v_max, entropy_bonus)
-    lo, hi = jax.lax.stop_gradient(self.support_net.bounds())
-    _, atoms, _ = self._geometry(lo, hi)
-    return categorical_projection(bootstrap, atoms, chunk_return, discount, lo, hi, entropy_bonus)
+    lo, hi = self._bounds()
+    return categorical_projection(bootstrap, self.support_values(), chunk_return, discount,
+                                  lo, hi, entropy_bonus)
 
   def _leak(self, lo, hi, sigma, centers, chunk_return, discount, bootstrap, entropy_bonus):
     """The bootstrap distribution shifted onto `chunk_return + discount * (atom +
@@ -295,29 +315,13 @@ class HLGaussCritic(CategoricalCritic):
   kind = "critic"
   config_type = HLGaussCriticConfig
 
-  def __init__(self, env_stats, config, **kwargs):
-    super().__init__(env_stats, config, **kwargs)
-    if config.learn_support:
-      return
-    edges = jnp.linspace(self.v_min, self.v_max, config.num_bins + 1, dtype=jnp.float32)
-    self.edges = Buffer(edges)
-    self.support = Buffer((edges[:-1] + edges[1:]) / 2)
-    self.sigma = config.sigma_to_bin_ratio * (self.v_max - self.v_min) / config.num_bins
+  def _intervals(self) -> int:
+    return self.config.num_bins
 
   def _geometry(self, lo, hi):
     """`(edges, centers, sigma)` of `num_bins` equal bins over `[lo, hi]`."""
-    k = self.config.num_bins
-    edges = lo + (hi - lo) * jnp.arange(k + 1, dtype=jnp.float32) / k
-    sigma = jnp.maximum(self.config.sigma_to_bin_ratio * (hi - lo) / k,
-                        self.config.support_sigma_min)
-    return edges, (edges[:-1] + edges[1:]) / 2, sigma
-
-  def _static_geometry(self):
-    return self.edges[...], self.support[...], self.sigma
-
-  def _static_derived(self) -> dict:
-    return {"v_min": self.v_min, "v_max": self.v_max, "sigma": float(self.sigma),
-            "bin_width": (self.v_max - self.v_min) / self.config.num_bins}
+    edges = self._grid(lo, hi, self.config.num_bins + 1)
+    return edges, (edges[:-1] + edges[1:]) / 2, self._sigma(lo, hi)
 
   def bootstrap_members(self, next_raw):
     return self.expectation_members(next_raw)

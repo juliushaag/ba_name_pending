@@ -23,9 +23,9 @@ from barl_jax.networks.mlp import MLPConfig
 from barl_jax.networks.time_embedding import FourierTimeConfig, TimeEmbeddingConfig
 from barl_jax.registration import register_component
 
-from .base import EnsembleConfig, QNetwork, TargetConfig, value_range
+from .base import EnsembleConfig, QCritic, QNetwork, TargetConfig, value_range
 from .categorical import to_histogram
-from .direct import DirectCritic, DirectCriticConfig
+from .direct import DirectCriticConfig, ScalarValue
 
 
 def _histogram(value, v_min, v_max, num_bins, sigma):
@@ -105,10 +105,41 @@ class FloqCriticConfig(DirectCriticConfig):
   v_max: float | None = None
 
 
+@dataclass(frozen=True)
+class FlowGeometry:
+  """Where the flow lives, in reward-scaled return units: the value range, the
+  source distribution `z0` is drawn from, and the (slightly wider) range the
+  interpolant is histogram-encoded over."""
+
+  v_min: float
+  v_max: float
+  noise_min: float
+  noise_max: float
+  hist_min: float
+  hist_max: float
+
+  @classmethod
+  def build(cls, env_stats, config) -> "FlowGeometry":
+    v_min, v_max = value_range(env_stats, config, fallback=(-1.0, 1.0))
+    if not (math.isfinite(v_min) and math.isfinite(v_max) and v_min < v_max):
+      raise ValueError("FloqCritic: value bounds must be finite with v_min < v_max")
+    noise_min = v_min * float(config.noise_coverage)
+    noise_max = v_max * float(config.noise_coverage)
+    if config.noise_limit is not None:
+      magnitude = max(abs(noise_min), abs(noise_max))
+      scale = min(1.0, config.noise_limit / magnitude)
+      noise_min *= scale
+      noise_max *= scale
+    # Per-step reward slack widens only the encoding support, so clipped
+    # interpolants keep a nonzero gradient at the edges.
+    pad = config.reward_offset * config.reward_scale / (1.0 - config.gamma)
+    return cls(v_min, v_max, noise_min, noise_max, v_min - pad, v_max + pad)
+
+
 @register_component
-class FloqCritic(DirectCritic):
+class FloqCritic(ScalarValue, QCritic):
   """Scalar flow-matching critic. Shares the target net, reductions and
-  Bellman target with `DirectCritic`; only the network, `raw` and the
+  Bellman target with the other scalar critics; only the network, `raw` and the
   regression objective differ."""
 
   kind = "critic"
@@ -148,24 +179,20 @@ class FloqCritic(DirectCritic):
     return problems
 
   def build_network(self, env_stats, config, *, rngs):
-    self.v_min, self.v_max = value_range(env_stats, config, fallback=(-1.0, 1.0))
-    if not (math.isfinite(self.v_min) and math.isfinite(self.v_max) and self.v_min < self.v_max):
-      raise ValueError("FloqCritic: value bounds must be finite with v_min < v_max")
-    self.noise_min = self.v_min * float(config.noise_coverage)
-    self.noise_max = self.v_max * float(config.noise_coverage)
-    if config.noise_limit is not None:
-      magnitude = max(abs(self.noise_min), abs(self.noise_max))
-      scale = min(1.0, config.noise_limit / magnitude)
-      self.noise_min *= scale
-      self.noise_max *= scale
-    # Per-step reward slack widens only the encoding support, so clipped
-    # interpolants keep a nonzero gradient at the edges.
-    pad = config.reward_offset * config.reward_scale / (1.0 - config.gamma)
-    self.hist_min, self.hist_max = self.v_min - pad, self.v_max + pad
+    # Called from `QCritic.__init__`, after `config_problems` has vetted the config.
+    self.geometry = FlowGeometry.build(env_stats, config)
     return FloqEnsemble(config.ensemble.n_models, env_stats["obs_dim"], env_stats["act_dim"],
                         latent_dim=config.latent_dim, layers=config.layers,
-                        num_bins=config.num_bins, hist_min=self.hist_min, hist_max=self.hist_max,
+                        num_bins=config.num_bins, hist_min=self.geometry.hist_min,
+                        hist_max=self.geometry.hist_max,
                         sigma=config.sigma, time=config.time, mlp=config.mlp, rngs=rngs)
+
+  v_min = property(lambda self: self.geometry.v_min)
+  v_max = property(lambda self: self.geometry.v_max)
+  noise_min = property(lambda self: self.geometry.noise_min)
+  noise_max = property(lambda self: self.geometry.noise_max)
+  hist_min = property(lambda self: self.geometry.hist_min)
+  hist_max = property(lambda self: self.geometry.hist_max)
 
   def _integrate(self, field, obs, action, starts):
     """Euler-integrate starts (B, M, 1) to (N, B, M, 1)."""

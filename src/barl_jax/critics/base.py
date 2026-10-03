@@ -19,10 +19,11 @@ import jax.numpy as jnp
 from flax import nnx
 
 from barl_jax.components import TARGET_SUFFIX, Buffer, Critic, frozen
+from barl_jax.critics.mlps import crossq_mlp
 from barl_jax.critics.noise import NoiseConditioning
+from barl_jax.critics.target import polyak_step
 from barl_jax.networks.base import NetworkConfig, normalize_weights
 from barl_jax.networks.ensemble import Ensemble
-from barl_jax.networks.mlp import MLPConfig
 from barl_jax.networks.schedule import ScheduleConfig
 from barl_jax.networks.time_embedding import FourierTimeConfig, TimeEmbeddingConfig
 from barl_jax.optimization import CriticOptimConfig
@@ -30,27 +31,6 @@ from barl_jax.optimization import CriticOptimConfig
 REDUCTIONS = ("mean", "min")
 TARGET_KINDS = ("none", "polyak")
 BATCH_STAT_NORMS = ("batch", "batchrenorm")
-
-
-def crossq_mlp() -> MLPConfig:
-  """CrossQ (Bhatt et al., ICLR 2024): post-activation BatchRenorm with input
-  and stem normalized, so the joint [(s,a), (s',a')] forward shares statistics."""
-  return MLPConfig(activation="gelu", norm="batchrenorm", norm_stem=True, norm_input=True,
-                   norm_after_act=True, norm_kwargs={"momentum": 0.99, "warmup_steps": 100000,
-                   "epsilon": 0.001, "r_max": 3.0, "d_max": 5.0}, dtype="bfloat16")
-
-
-def target_mlp() -> MLPConfig:
-  """`crossq_mlp` with LayerNorm, for separate target-net forwards."""
-  return MLPConfig(activation="gelu", norm="layer", norm_stem=True, norm_input=True,
-                   norm_after_act=True, norm_kwargs={"epsilon": 1e-5}, dtype="bfloat16")
-
-
-def xqc_mlp() -> MLPConfig:
-  """XQC (arXiv:2509.25174): pre-activation BatchNorm, input included."""
-  return MLPConfig(activation="relu", norm="batch", norm_input=True, norm_stem=True,
-                   norm_after_act=False, norm_kwargs={"momentum": 0.99, "epsilon": 0.001},
-                   dtype="float32")
 
 
 @dataclass(frozen=True)
@@ -324,17 +304,7 @@ class QCritic(Critic):
     if not self.has_target:
       return
 
-    tau, delay = self.config.target.tau, self.config.target.delay
-    self.target_steps[...] += 1
-    live = nnx.state(self.net, nnx.Param)
-    tgt = nnx.state(self.net_target, nnx.Param)
-    blend = lambda t, l: t + tau * (l - t)
-    if delay > 1:
-      due = (self.target_steps[...] % delay) == 0
-      step = jax.tree.map(lambda t, l: jnp.where(due, blend(t, l), t), tgt, live)
-    else:
-      step = jax.tree.map(blend, tgt, live)
-    nnx.update(self.net_target, step)
+    live, tgt = polyak_step(self.net, self.net_target, self.target_steps, self.config.target)
     self.metrics.gap(f"critic{TARGET_SUFFIX}", live, tgt)
 
   # ---- head interface ----------------------------------------------------

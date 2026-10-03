@@ -6,11 +6,8 @@ from barl_jax.critics.base import (
   QCriticConfig,
   QNetwork,
   TargetConfig,
-  crossq_mlp,
   n_step_discount,
   reduce_members,
-  target_mlp,
-  xqc_mlp,
 )
 from barl_jax.critics.categorical import (
   C51Critic,
@@ -29,6 +26,7 @@ from barl_jax.critics.direct import (
   EnsembleCriticConfig,
 )
 from barl_jax.critics.floq import FloqCritic, FloqCriticConfig
+from barl_jax.critics.mlps import crossq_mlp, target_mlp, xqc_mlp
 from barl_jax.critics.noise import NoiseConditioning
 
 __all__ = [
