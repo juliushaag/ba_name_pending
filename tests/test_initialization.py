@@ -106,5 +106,3 @@ def test_controlled_diffusion_keeps_exactly_zero_heads(actor_name):
   actor = build(actor_name)
   assert jnp.all(actor.field.net.head.kernel[...] == 0)
   assert jnp.all(actor.field.net.head.bias[...] == 0)
-  assert all(jnp.all(block.norm.modulation.kernel[...] == 0) for block in actor.field.net.blocks)
-  assert all(jnp.all(block.norm.modulation.bias[...] == 0) for block in actor.field.net.blocks)

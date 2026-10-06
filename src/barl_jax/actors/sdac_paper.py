@@ -11,7 +11,6 @@ from barl_jax.config.schemas import ComponentsConfig, ModelConfig, register_mode
 from barl_jax.critics.categorical import C51CriticConfig
 from barl_jax.networks.base import NetworkConfig
 from barl_jax.networks.diffusion import TimeConditionedField
-from barl_jax.networks.mlp import MLPConfig
 from barl_jax.networks.simba import SimbaConfig
 from barl_jax.networks.time_embedding import SinusoidalTimeConfig, TimeEmbeddingConfig
 from barl_jax.optimization import ActorOptimConfig, adam
@@ -29,7 +28,8 @@ TIME_PRE_SCALE = 1.0e-3
 @dataclass(frozen=True)
 class PaperDDPMActorConfig(ActorOptimConfig):
   """The official SDAC release (mahaitongdae/diffusion_policy_online_rl,
-  `relax/algorithm/sdac.py` with `scripts/train_mujoco.py` defaults)."""
+  `relax/algorithm/sdac.py` with `scripts/train_mujoco.py` defaults), except the
+  network: it uses the repo's standard SimBa so it compares with SDAC on equal footing."""
   class_name: str = "PaperDDPMActor"
   grad_clip_mode: str = "none"
   latent_dim: int = 128

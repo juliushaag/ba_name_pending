@@ -3,7 +3,7 @@
 # stayed near its untrained return in sweep 2026-09-29_14-20-52 (HumanoidRun ~1.5
 # against ~130 for SAC at 500k steps).
 #
-# All three use the default C51 critic, so the actor/sampler is the only thing the
+# All three use the default C51 critic and the standard SimBa actor net, so the sampler is the only thing the
 # algo axis changes. Each algo runs its own defaults:
 #
 #   SAC        utd 2.0, entropy-regularised Gaussian actor

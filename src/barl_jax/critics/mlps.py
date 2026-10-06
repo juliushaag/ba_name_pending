@@ -13,7 +13,7 @@ def crossq_mlp() -> MLPConfig:
 
 def target_mlp() -> MLPConfig:
   return MLPConfig(activation="relu", norm="batch", norm_stem=True, norm_input=True,
-                   norm_after_act=True, norm_kwargs={"epsilon": 1e-5}, dtype="bfloat16")
+                   norm_after_act=True, norm_kwargs={"momentum": 0.99, "epsilon": 1e-5}, dtype="bfloat16")
 
 
 def xqc_mlp() -> MLPConfig:

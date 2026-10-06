@@ -8,8 +8,8 @@ from .mlps import target_mlp, xqc_mlp
 
 
 def target_ensemble(config):
-  """Polyak target net with separate forwards and LayerNorm."""
-  return replace(config, target=TargetConfig(kind="polyak", joint_forward=False),
+  """Polyak target net; batch-statistic norms need the joint forward."""
+  return replace(config, target=TargetConfig(kind="polyak", joint_forward=True),
                  mlp=target_mlp())
 
 

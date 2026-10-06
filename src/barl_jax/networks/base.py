@@ -57,9 +57,9 @@ class NetworkConfig:
 
   class_name: str = ""
   activation: str = "gelu"
-  norm: str = "batch"
+  norm: str = "layer"
   dropout: float = 0.0
-  norm_kwargs: dict = field(default_factory=lambda: { "epsilon": 1e-5, "momentum": 0.99 })
+  norm_kwargs: dict = field(default_factory=lambda: {"epsilon": 1e-5})
   dtype: str = "float32"
   head_gain: float = 0.01
 

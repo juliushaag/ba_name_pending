@@ -20,8 +20,8 @@ from barl_jax.networks.time_embedding import TimeEmbeddingConfig
 class TimeConditionedField(nnx.Module):
   """`(obs, x, t) -> a vector over the action dims`, conditioned on a scalar time.
 
-  Diffusion actors default to AdaLNSimBa: the noisy action `x` enters the stem,
-  while observation and encoded time modulate every block and the final norm.
+  Diffusion actors default to SimBa: the noisy action `x`, observation and encoded time
+  are concatenated into the stem.
   What `t` means is the caller's: a normalized tau, a step index, a noise level.
   The output is left in the net's compute dtype -- a caller that accumulates in
   float32 casts at its own boundary."""
