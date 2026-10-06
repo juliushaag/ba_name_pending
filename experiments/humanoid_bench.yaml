@@ -1,0 +1,61 @@
+# HumanoidBench (Sferrazza et al. 2024) with the Unitree H1 hand: every h1hand
+# task that builds and renders under the pinned MuJoCo / gymnasium, across the
+# four algorithms of experiments/dmc_hb_16env_sweep.yaml.
+#
+# 29 of the 32 registered tasks. Dropped, because they fail in gym.make() before
+# any training starts, for every algo (render=False fails identically, so this
+# is not a rendering issue):
+#   - H1HandHighbarSimple, H1HandHighbarHard: this humanoid_bench checkout ships no
+#     h1hand_pos_highbar_*.xml (assets/envs/ has highbar only for h1/h1strong).
+#   - H1HandKitchen: its MJCF hits "top-level default class 'main' cannot be
+#     renamed" under the pinned MuJoCo.
+#
+# Every kept task was checked through get_vector_env(1, asynchronous=False,
+# render=True): reset, 60 steps, env.call("render") each step -- 60 distinct,
+# non-blank frames per task. Eval videos use one synchronous render env per run;
+# building several render envs in one process (not something a run does) leaves
+# the later ones rendering all-black once an earlier one is closed.
+#
+# Dry run:
+#   uv run python scripts/submit.py --grid experiments/humanoid_bench.yaml --dry-run
+#
+# Real submission:
+#   uv run python scripts/submit.py --grid experiments/humanoid_bench.yaml
+
+axes:
+  algo: [SAC, AMDP, DIME, SDAC]
+  env:
+    # Locomotion
+    - H1HandWalk
+    - H1HandStand
+    - H1HandRun
+    - H1HandCrawl
+    - H1HandHurdle
+    - H1HandMaze
+    - H1HandSitSimple
+    - H1HandSitHard
+    - H1HandBalanceSimple
+    - H1HandBalanceHard
+    - H1HandStair
+    - H1HandSlide
+    - H1HandPole
+    # Manipulation
+    - H1HandReach
+    - H1HandPush
+    - H1HandCabinet
+    - H1HandDoor
+    - H1HandTruck
+    - H1HandCube
+    - H1HandBookshelfSimple
+    - H1HandBookshelfHard
+    - H1HandBasketball
+    - H1HandWindow
+    - H1HandSpoon
+    - H1HandPackage
+    - H1HandPowerlift
+    - H1HandRoom
+    - H1HandInsertNormal
+    - H1HandInsertSmall
+  seed: [0]
+
+exclude: []

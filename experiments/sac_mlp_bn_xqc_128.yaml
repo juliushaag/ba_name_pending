@@ -1,0 +1,14 @@
+# SAC on HumanoidRun, standard MLP critic (batch norm) + XQC weight norm, 128 latent, 3 layers.
+#   uv run python scripts/submit.py --grid experiments/sac_mlp_bn_xqc_128.yaml --seeds 3 --executor tmux
+
+axes:
+  algo: [SAC]
+  env: [HumanoidRun]
+
+  model.components.critic:
+    - label: mlp_bn_xqc_128
+      latent_dim: 128
+      layers: 3
+      mlp: {class_name: MLP, activation: relu, norm: batch, norm_input: true, norm_stem: true,
+            norm_after_act: false, norm_kwargs: {momentum: 0.99, epsilon: 1.0e-3}, dtype: float32}
+      weight_norm: true

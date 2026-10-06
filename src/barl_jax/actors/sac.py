@@ -23,7 +23,7 @@ class StochasticActorConfig(ActorOptimConfig):
   latent_dim: int = 128
   layers: int = 3
   mlp: NetworkConfig = field(default_factory=lambda: SimbaConfig(
-    activation="silu", norm="layer", norm_kwargs={"epsilon": 1e-5}, dtype="bfloat16"))
+    activation="silu", norm="batch", norm_kwargs={"momentum": 0.99, "epsilon": 1e-5}, dtype="bfloat16"))
   squash_cls: str = "TanhSquash"
   log_std_min: float = -20.0
   log_std_max: float = 2.0

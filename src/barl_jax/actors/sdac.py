@@ -10,7 +10,7 @@ from barl_jax.config.schemas import ComponentsConfig, ModelConfig, register_mode
 from barl_jax.critics.categorical import C51CriticConfig
 from barl_jax.networks.base import NetworkConfig
 from barl_jax.networks.diffusion import TimeConditionedField, reverse_chain
-from barl_jax.networks.simba import AdaLNSimbaConfig
+from barl_jax.networks.simba import AdaLNSimbaConfig, SimbaConfig
 from barl_jax.networks.time_embedding import FourierTimeConfig, TimeEmbeddingConfig
 from barl_jax.optimization import ActorOptim, ActorOptimConfig
 from barl_jax.policies.rl import PolicyConfig, RLPolicy
@@ -22,8 +22,8 @@ class DDPMActorConfig(ActorOptimConfig):
   class_name: str = "DDPMActor"
   latent_dim: int = 128
   layers: int = 3
-  mlp: NetworkConfig = field(default_factory=lambda: AdaLNSimbaConfig(
-    activation="mish", dtype="float32"))
+  mlp: NetworkConfig = field(default_factory=lambda: SimbaConfig(
+    activation="silu", norm="batch", norm_kwargs={"epsilon": 1e-5, "momentum" : 0.99}, dtype="bfloat16"))
   time: TimeEmbeddingConfig = field(default_factory=lambda: FourierTimeConfig(
     time_dim=64, num_freqs=32, hidden=64, concat_input=False, learn_freqs=True))
   num_steps: int = 20

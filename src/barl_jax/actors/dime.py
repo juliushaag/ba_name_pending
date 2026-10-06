@@ -12,7 +12,7 @@ from barl_jax.networks import gaussian
 from barl_jax.networks.base import NetworkConfig
 from barl_jax.networks.diffusion import TimeConditionedField, controlled_sde
 from barl_jax.networks.regulator import AutotuneRegulatorConfig
-from barl_jax.networks.simba import AdaLNSimbaConfig
+from barl_jax.networks.simba import AdaLNSimbaConfig, SimbaConfig
 from barl_jax.networks.time_embedding import FourierTimeConfig, TimeEmbeddingConfig
 from barl_jax.optimization import ActorOptim, ActorOptimConfig
 from barl_jax.policies.rl import MaxEntPolicyConfig, MaxEntRLPolicy
@@ -24,11 +24,9 @@ class DISActorConfig(ActorOptimConfig):
   class_name: str = "DISActor"
   latent_dim: int = 128
   layers: int = 3
-  mlp: NetworkConfig = field(default_factory=lambda: AdaLNSimbaConfig(
-    activation="gelu", dtype="float32"))
-  # dime_am's PISGRADNet time coder (diffusion/common/models/pisgrad_net.py, with
-  # cond_pisgradnet.yaml's num_hid = time_coder_out = 256): 256 linearly spaced
-  # frequencies on the raw step index, no raw-input channel.
+  mlp: NetworkConfig = field(default_factory=lambda: SimbaConfig(
+    activation="silu", norm="batch", norm_kwargs={"epsilon": 1e-5, "momentum" : 0.99}, dtype="bfloat16"))
+  
   time: TimeEmbeddingConfig = field(default_factory=lambda: FourierTimeConfig(
     time_dim=256, num_freqs=256, hidden=256, concat_input=False, spacing="linear"))
   squash_cls: str = "TanhSquash"

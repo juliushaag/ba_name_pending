@@ -12,6 +12,7 @@ from barl_jax.critics.categorical import C51CriticConfig
 from barl_jax.networks.base import NetworkConfig
 from barl_jax.networks.diffusion import TimeConditionedField
 from barl_jax.networks.mlp import MLPConfig
+from barl_jax.networks.simba import SimbaConfig
 from barl_jax.networks.time_embedding import SinusoidalTimeConfig, TimeEmbeddingConfig
 from barl_jax.optimization import ActorOptimConfig, adam
 from barl_jax.policies.rl import PolicyConfig, RLPolicy
@@ -31,10 +32,10 @@ class PaperDDPMActorConfig(ActorOptimConfig):
   `relax/algorithm/sdac.py` with `scripts/train_mujoco.py` defaults)."""
   class_name: str = "PaperDDPMActor"
   grad_clip_mode: str = "none"
-  latent_dim: int = 256
+  latent_dim: int = 128
   layers: int = 3
-  mlp: NetworkConfig = field(default_factory=lambda: MLPConfig(
-    activation="mish", norm="none", dtype="float32"))
+  mlp: NetworkConfig = field(default_factory=lambda: SimbaConfig(
+    activation="silu", norm="batch", norm_kwargs={"epsilon": 1e-5, "momentum" : 0.99}, dtype="bfloat16"))
   time: TimeEmbeddingConfig = field(default_factory=lambda: SinusoidalTimeConfig(time_dim=16))
   num_steps: int = 20
   beta_scale: float = 0.8

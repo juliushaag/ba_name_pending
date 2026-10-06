@@ -20,6 +20,7 @@
 #   uv run python scripts/submit.py --grid experiments/sdac_paper_vs_sdac.yaml --seeds 3 \
 #     --executor tmux --max-parallel 3 --sweep-dir sweeps/sdac_paper_vs_sdac
 
+
 axes:
   algo: [SDACPaper, SDAC, SAC]
-  env: [DogRun, HumanoidRun]
+  env: [DogRun, HumanoidRun, H1HandStair, H1HandCube]
