@@ -35,7 +35,7 @@ class PaperDDPMActorConfig(ActorOptimConfig):
   latent_dim: int = 128
   layers: int = 3
   mlp: NetworkConfig = field(default_factory=lambda: SimbaConfig(
-    activation="silu", norm="batch", norm_kwargs={"epsilon": 1e-5, "momentum" : 0.99}, dtype="bfloat16"))
+    activation="silu", norm="layer", norm_kwargs={"epsilon": 1e-5}, dtype="bfloat16"))
   time: TimeEmbeddingConfig = field(default_factory=lambda: SinusoidalTimeConfig(time_dim=16))
   num_steps: int = 20
   beta_scale: float = 0.8

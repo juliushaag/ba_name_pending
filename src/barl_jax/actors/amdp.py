@@ -24,7 +24,7 @@ class ScoreContinuousActorConfig(ActorOptimConfig):
   latent_dim: int = 128
   layers: int = 3
   mlp: NetworkConfig = field(default_factory=lambda: SimbaConfig(
-    activation="silu", norm="batch", norm_kwargs={"epsilon": 1e-5, "momentum" : 0.99}, dtype="bfloat16"))
+    activation="silu", norm="layer", norm_kwargs={"epsilon": 1e-5}, dtype="bfloat16"))
   time: TimeEmbeddingConfig = field(default_factory=FourierTimeConfig)
   squash_cls: str = "ErfSquash"
   sigma_min: float = 0.01
