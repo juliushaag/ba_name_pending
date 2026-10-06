@@ -56,10 +56,10 @@ class NetworkConfig:
   variants: ClassVar[dict[str, type]] = NETWORK_CONFIGS
 
   class_name: str = ""
-  activation: str = "silu"
-  norm: str = "layer"
+  activation: str = "gelu"
+  norm: str = "batch"
   dropout: float = 0.0
-  norm_kwargs: dict = field(default_factory=lambda: {"epsilon": 1e-5})
+  norm_kwargs: dict = field(default_factory=lambda: { "epsilon": 1e-5, "momentum": 0.99 })
   dtype: str = "float32"
   head_gain: float = 0.01
 

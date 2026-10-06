@@ -21,7 +21,7 @@ class SimbaConfig(NetworkConfig):
   blocks whose hidden layer is `expansion` times wider, and a final norm. The
   observation running-statistics normalizer is the policy's, not this net's."""
   class_name: str = "SimBa"
-  activation: str = "relu"
+  activation: str = "gelu"
   expansion: int = 4
 
   def build(self, input_dim, output_dim, latent_dim, layers, *, cond_dim=0, rngs):
