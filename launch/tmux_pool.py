@@ -21,16 +21,12 @@ from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 
-from .backends import detect_gpus, read_manifest
+from .backends import GPU_MEMORY_VARS, detect_gpus, read_manifest
 from .grid import command_for
 
 REPO_ROOT = Path.cwd()
 
 POLL_SECONDS = 0.5
-
-#: Forwarded into each run window when set, so runs sharing a GPU can cap their
-#: preallocation (e.g. XLA_PYTHON_CLIENT_MEM_FRACTION=0.45 for two per GPU).
-GPU_MEMORY_VARS = ("XLA_PYTHON_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_PREALLOCATE")
 
 STATE_STYLE = {"queued": "dim", "running": "cyan", "done": "green",
                "failed": "bold red", "cancelled": "yellow"}

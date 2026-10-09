@@ -57,6 +57,10 @@ DEBUG_SECONDS = 30 * 60
 #: filter.
 DEVICE_VARS = ("JAX_PLATFORMS", "JAX_PLATFORM_NAME")
 
+#: Preallocation caps, forwarded launcher -> tmux manager -> run window so runs
+#: sharing a GPU can each take a fraction of it (e.g. 0.3 for three per GPU).
+GPU_MEMORY_VARS = ("XLA_PYTHON_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_PREALLOCATE")
+
 
 def child_env(**extra: str) -> dict:
     """This process's environment as a run should see it: device choice left to
@@ -321,6 +325,8 @@ class TmuxExecutor(Executor):
         # passes it on again to each run window.
         subprocess.run(["tmux", "new-session", "-d", "-s", session, "-n", "manager",
                         "-c", str(Path.cwd()), "-e", f"PATH={os.environ['PATH']}",
+                        *[a for v in GPU_MEMORY_VARS if v in os.environ
+                          for a in ("-e", f"{v}={os.environ[v]}")],
                         *manager], check=True)
 
         # `tmux new-session` succeeds as long as tmux started, even if the manager
