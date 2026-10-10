@@ -22,8 +22,7 @@ class StochasticActorConfig(ActorOptimConfig):
   class_name: str = "StochasticActor"
   latent_dim: int = 128
   layers: int = 3
-  mlp: NetworkConfig = field(default_factory=lambda: SimbaConfig(
-    activation="silu", norm="layer", norm_kwargs={"epsilon": 1e-5}, dtype="bfloat16"))
+  mlp: NetworkConfig = field(default_factory=lambda: SimbaConfig())
   squash_cls: str = "TanhSquash"
   log_std_min: float = -20.0
   log_std_max: float = 2.0
@@ -35,12 +34,10 @@ class StochasticActor(ActorOptim, Actor):
   unconstrained Normal; sample() squashes it (the `squash_cls` Config
   selects which -- any no-arg Squash works generically here).
 
-  The shallow Gaussian policy has just a state-independent `log_std` plus the
-  std bounds. The MLP uses SiLU and LayerNorm on hidden blocks, with no input
-  or stem normalization; its settings are grouped under `mlp` below.
-
-  `log_std` is a state-independent parameter rather than a network head --
-  barl's deliberate deviation from canonical SAC, kept as-is."""
+  As in canonical SAC the network has a state-dependent head emitting
+  `(mean, log_std)`; `log_std` is clipped to `[log_std_min, log_std_max]`.
+  The MLP uses SiLU and LayerNorm on hidden blocks, with no input or stem
+  normalization; its settings are grouped under `mlp` below."""
 
   kind = "actor"
   config_type = StochasticActorConfig
@@ -48,7 +45,6 @@ class StochasticActor(ActorOptim, Actor):
   def __init__(self, env_stats, config: StochasticActorConfig, *, rngs: nnx.Rngs, **kwargs):
     super().__init__(env_stats, config, rngs=rngs, **kwargs)
 
-    self.log_std = nnx.Param(jnp.zeros((self.plan_dim,), jnp.float32))
     self.squash  = get_component(config.squash_cls)(env_stats, None)
 
     low, high = env_stats.get("act_low"), env_stats.get("act_high")
@@ -59,12 +55,13 @@ class StochasticActor(ActorOptim, Actor):
 
     latent_dim, layers = config.latent_dim, config.layers
 
-    self.net = config.mlp.build(self.obs_dim, self.plan_dim, latent_dim, layers, rngs=rngs)
+    self.net = config.mlp.build(self.obs_dim, 2 * self.plan_dim, latent_dim, layers, rngs=rngs)
 
   def dist(self, s):
-    """(mean, std) of the pre-squash Normal, over the flat plan."""
-    mean = self.net((s,)).astype(jnp.float32)
-    std  = jnp.exp(jnp.clip(self.log_std[...], self.config.log_std_min, self.config.log_std_max))
+    """State-dependent (mean, std) of the pre-squash Normal, over the flat plan."""
+    out = self.net((s,)).astype(jnp.float32)
+    mean, log_std = jnp.split(out, 2, axis=-1)
+    std = jnp.exp(jnp.clip(log_std, self.config.log_std_min, self.config.log_std_max))
     return mean, std
 
   def rsample(self, s, key=None):
@@ -85,10 +82,7 @@ class StochasticActor(ActorOptim, Actor):
     log_prob = (gaussian.log_prob(x, mean, std)
                 - self.squash.log_abs_det_jacobian(x, action_flat)
                 - self.log_act_scale[...])
-    # Per-chunk-position entropy, (B, chunk_size): summing within each
-    # position's action_dim block rather than over the whole flattened plan --
-    # the same shape (and at chunk_size 1 the same value) as the old (B, 1)
-    # joint entropy, so a scalar alpha reads the chunk-summed total unchanged.
+
     entropy = -self.chunk_sum(log_prob)
     return self.to_plan(action_flat), entropy
 

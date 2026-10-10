@@ -409,16 +409,8 @@ def warmup(run: Run, envs, log) -> dict:
   # so one measurement at startup says everything the per-iteration one did.
   out["model/inference_latency_ms"] = run.reference.measure_latency()
 
-  if render_env is not None:
-    t0 = time.perf_counter()
-    render_env.reset(seed=run.base_seed)
-    render_env.call("render")
-    out["time/warmup_render_s"] = time.perf_counter() - t0
-
-  log.message("Warm-up: eval-shape compile {:.1f}s, first render {:.1f}s, "
-              "inference {:.2f}ms".format(out["time/warmup_compile_s"],
-                                          out.get("time/warmup_render_s", 0.0),
-                                          out["model/inference_latency_ms"]))
+  log.message("Warm-up: eval-shape compile {:.1f}s, inference {:.2f}ms".format(
+    out["time/warmup_compile_s"], out["model/inference_latency_ms"]))
   return out
 
 
@@ -502,7 +494,15 @@ def _open_render_env(run: Run, log):
   if run.cfg.eval_video_every is None:
     return None
   try:
-    return run.own(run.environment.get_vector_env(1, asynchronous=False, render=True))
+    env = run.own(run.environment.get_vector_env(1, asynchronous=False, render=True))
+    # Some families (MyoSuite, dm_control) allocate their GL context lazily on the
+    # first render(), so constructing the env proves nothing: render once here,
+    # inside the guard, which also moves the failure to minute one.
+    t0 = time.perf_counter()
+    env.reset(seed=run.base_seed)
+    env.call("render")
+    log.message(f"First render {time.perf_counter() - t0:.1f}s")
+    return env
   except Exception as exc:
     log.message(f"WARNING: could not create the video render env ({exc!r}); "
                 f"disabling eval videos for this run.")
@@ -536,7 +536,9 @@ class _TrainLoop:
     self.last_narration = 0.0
     self.started = time.perf_counter()
 
-  def _next_boundary(self, every: int) -> int:
+  def _next_boundary(self, every: int | None) -> float:
+    if every is None:
+      return float("inf")
     return (self.log.get_step("env_steps") // every + 1) * every
 
   def execute(self):
@@ -560,7 +562,8 @@ class _TrainLoop:
         log.message(f"Could not write the final checkpoint: {save_error!r}")
 
       if crash is None:
-        save_training(run, self.resume_dir, run.progress, keep=self.cfg.resume_keep)
+        if self.cfg.resume_every is not None:
+          save_training(run, self.resume_dir, run.progress, keep=self.cfg.resume_keep)
       else:
         log.message(f"Run failed: {type(crash).__name__}: {crash}")
         log.summary("crash", f"{type(crash).__name__}: {crash}")

@@ -20,9 +20,6 @@ class LangevinActorConfig:
   class_name: str = "LangevinActor"
   steps_per_level: int = 2
   step_lr: float = 1.0e-4
-  # Bound coarse-level drift and noise together. With the default ladder,
-  # unrestricted alpha reaches 1 and normalized drift has norm 250.
-  # None restores the reference sampler's unrestricted annealing schedule.
   max_step_size: float | None = 1.0e-3
   temperature: float = 500.0
   normalize_score: bool = True

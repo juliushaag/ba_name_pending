@@ -391,26 +391,7 @@ seeded_step = jax.jit(jax.vmap(train_step, in_axes=(None, 0, 0, None, None)),
 
 @partial(jax.jit, static_argnums=(0, 3), donate_argnums=(1,))
 def seeded_chunk(graphdef, state, batches, k, grad_step):
-  """`k` gradient steps in one dispatch, over a `(k, num_seeds, batch, ...)` chunk.
 
-  The same update as `k` calls of `seeded_step` with no metric tier armed: the
-  same states in the same order, the same per-step `grad_step` feeding the
-  `policy_delay` gate, and the same batches (see `sample_chunk`). What it drops
-  is the Python between them -- ~1.6 ms of jit dispatch plus a `device_put` per
-  step, which for AMDP is 1.38x of the step and for DIME 1.22x.
-
-  The same update, but **not bit-identical**: XLA schedules the fused scan
-  differently from a standalone jit, and float addition does not associate. In
-  float32 that is 1e-11 on two leaves after one step; in the bfloat16 the nets
-  actually use, 2.5e-5, because bfloat16 carries 8 mantissa bits. It is
-  reassociation and not a second algorithm -- but a run does not replay a
-  pre-chunking run step for step.
-
-  Tier-armed steps do not come through here. They return metrics, and `tiers`
-  is static, so an armed step inside the scan would be a second compiled shape
-  per position it could occupy; the caller runs those iterations step-by-step
-  instead. `k` likewise stays the iteration's whole gradient-step count -- one
-  value for the life of a run, hence one compile."""
   def body(carry, batch):
     state, step = carry
     state, _, _, _ = jax.vmap(train_step, in_axes=(None, 0, 0, None, None))(

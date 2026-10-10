@@ -22,8 +22,7 @@ class DeterministicActorConfig(ActorOptimConfig):
   class_name: str = "DeterministicActor"
   latent_dim: int = 128
   layers: int = 3
-  mlp: NetworkConfig = field(default_factory=lambda: SimbaConfig(
-    activation="silu", norm="layer", norm_kwargs={"epsilon": 1e-5}, dtype="bfloat16"))
+  mlp: NetworkConfig = field(default_factory=lambda: SimbaConfig())
   explore_noise: float = 0.1
   target_noise: float = 0.2
   target_noise_clip: float = 0.5

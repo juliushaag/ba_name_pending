@@ -22,8 +22,8 @@ class DDPMActorConfig(ActorOptimConfig):
   class_name: str = "DDPMActor"
   latent_dim: int = 128
   layers: int = 3
-  mlp: NetworkConfig = field(default_factory=lambda: SimbaConfig(
-    activation="silu", norm="layer", norm_kwargs={"epsilon": 1e-5}, dtype="bfloat16"))
+  mlp: NetworkConfig = field(default_factory=lambda: SimbaConfig())
+  
   time: TimeEmbeddingConfig = field(default_factory=lambda: FourierTimeConfig(
     time_dim=64, num_freqs=32, hidden=64, concat_input=False, learn_freqs=True))
   num_steps: int = 20
