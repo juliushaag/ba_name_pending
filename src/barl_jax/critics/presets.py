@@ -27,4 +27,4 @@ def xqc(config):
 def nclql(config):
   """NCLQL: noise-conditioned TD on a polyak/LayerNorm critic, min-reduced."""
   return replace(target_ensemble(config), noise=NoiseConditioningConfig(enabled=True),
-                 ensemble=replace(config.ensemble, value_reduce="min", target_reduce="min"))
+                 ensemble=replace(config.ensemble))

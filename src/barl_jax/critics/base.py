@@ -45,7 +45,7 @@ class TargetConfig:
 class EnsembleConfig:
   n_models: int = 2
   value_reduce: str = "mean"
-  target_reduce: str = "min"
+  target_reduce: str = "mean"
 
 
 @dataclass(frozen=True)
