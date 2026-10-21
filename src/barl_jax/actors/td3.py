@@ -55,8 +55,7 @@ class DeterministicActor(ActorOptim, Actor):
     return self.to_plan(jnp.clip(mean + noise, -1.0, 1.0))
 
   def generate_action(self, s, *, critic: Critic = None, key=None):
-    cfg = self.config
-    return self.noisy(s, key, cfg.target_noise, cfg.target_noise_clip), None
+    return self.noisy(s, key, self.config.target_noise, self.config.target_noise_clip), None
 
   def sample(self, s, *, critic: Critic = None, key=None):
     return self.noisy(s, key, self.config.explore_noise)
@@ -79,7 +78,7 @@ class TD3(RLPolicy):
 @dataclass(frozen=True)
 class TD3ModelConfig(ModelConfig):
   policy_class: str = "TD3"
-  params: PolicyConfig = field(default_factory=lambda: PolicyConfig(policy_delay=2))
+  params: PolicyConfig = field(default_factory=lambda: PolicyConfig(policy_delay=3))
   components: ComponentsConfig = field(default_factory=lambda: ComponentsConfig(
     actor=DeterministicActorConfig(),
     critic=C51CriticConfig(),

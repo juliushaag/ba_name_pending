@@ -72,7 +72,7 @@ class QCriticConfig(CriticOptimConfig):
   gamma: float = 0.99
   reward_scale: float = 1.0
   latent_dim: int = 2048
-  layers: int = 1
+  layers: int = 2
   mlp: NetworkConfig = field(default_factory=crossq_mlp)
   target: TargetConfig = field(default_factory=TargetConfig)
   ensemble: EnsembleConfig = field(default_factory=EnsembleConfig)

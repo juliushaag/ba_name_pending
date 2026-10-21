@@ -99,18 +99,13 @@ class DISActor(ActorOptim, Actor):
     if problems:
       raise ValueError(f"{type(self).__name__}: " + "; ".join(problems))
 
-    # Both are stored through softplus, the reference's parameterization, so the
-    # positivity a step size and a friction need is structural rather than a
-    # clamp. `learn_*` picks Param vs Buffer -- the reference spells the same
-    # choice as a stop_gradient on the read.
     hold = (lambda v: nnx.Param(v)) if self.config.learn_dt else (lambda v: Buffer(v))
     self.dt_raw = hold(jnp.full((1,), _inv_softplus(self.config.dt_init), jnp.float32))
+    
     hold = (lambda v: nnx.Param(v)) if self.config.learn_friction else (lambda v: Buffer(v))
     friction_shape = (self.plan_dim,) if self.config.per_dim_friction else (1,)
     self.friction_raw = hold(jnp.full(friction_shape, _inv_softplus(self.config.friction_init), jnp.float32))
 
-    # dime_am's `get_cosine_schedule`, tabulated once: `per_step_dt` is False
-    # there, so the learned dt is a single scalar the schedule shapes.
     i = jnp.arange(self.config.num_steps, dtype=jnp.float32)
     t = (self.config.num_steps - i) / self.config.num_steps
     offset = 1.0 + self.config.dt_s
@@ -129,13 +124,11 @@ class DISActor(ActorOptim, Actor):
   # ---- the process ---------------------------------------------------------
 
   def step_coef(self, i: int):
-    """(eta, scale) at step `i`; both broadcast over the action dimension."""
     dt    = jax.nn.softplus(self.dt_raw[...]) * self.dt_scale[...][i]
     eta   = dt / jax.nn.softplus(self.friction_raw[...])
     return eta, jnp.sqrt(2.0 * eta)
 
   def prior_score(self, x):
-    """grad_x log N(x; 0, prior_std^2 I), the reference's uncontrolled drift."""
     return -x / self.config.prior_std**2
 
   def control_at(self, obs, x, i: int):
@@ -143,8 +136,7 @@ class DISActor(ActorOptim, Actor):
     return jnp.clip(u, -self.config.out_clip, self.config.out_clip)
 
   def generate_action(self, obs, *, critic: Critic = None, key=None, squash=True):
-    """`critic` is unused -- DIME's actor needs none to sample -- and accepted
-    only to satisfy the shared `Actor.generate_action` contract."""
+   
     key = self.next_key(key)
     key, prior_key = jax.random.split(key)
 
@@ -156,11 +148,7 @@ class DISActor(ActorOptim, Actor):
       x_new    = fwd_mean + scale * jax.random.normal(step_key, x.shape, jnp.float32)
 
       bwd_mean = x_new + eta * self.prior_score(x_new)
-      # Per-chunk-position log-ratio, (B, chunk_size): the diagonal kernel's
-      # log-density is a sum of independent per-dimension terms, so summing
-      # only within each position's action_dim block (chunk_sum) rather than
-      # over the whole plan_dim is the same total at chunk_size 1 and a
-      # genuine decomposition at chunk_size > 1.
+     
       return x_new, self.chunk_sum(gaussian.log_prob(x, bwd_mean, scale)) \
                     - self.chunk_sum(gaussian.log_prob(x_new, fwd_mean, scale))
 
@@ -179,13 +167,6 @@ class DISActor(ActorOptim, Actor):
             "prior_var": self.config.prior_std**2}
 
   def loss(self, obs, critic: "Critic", alpha, *, key=None):
-    """This actor's own training objective at `obs`, priced against a frozen
-    `critic` -- a dict with one scalar per optimizer key it trains. Every key
-    must be one `create_optimizer()` also declares.
-
-    The default is maximum-entropy Q ascent through the reparameterized sample:
-    `alpha` is a scalar or `(chunk_size,)` and broadcasts against the per-position
-    `(B, chunk_size)` entropy, whose chunk sum is the `(B, 1)` bonus."""
     action, entropy = self.generate_action(obs, key=key)
     q = frozen(critic).value(obs, action.reshape(action.shape[0], -1))
     bonus = (jax.lax.stop_gradient(alpha) * entropy).sum(axis=-1, keepdims=True)

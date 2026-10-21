@@ -30,14 +30,6 @@ class StochasticActorConfig(ActorOptimConfig):
 
 @register_component
 class StochasticActor(ActorOptim, Actor):
-  """Diagonal-Normal MLP actor used by SAC. `dist()` stays an
-  unconstrained Normal; sample() squashes it (the `squash_cls` Config
-  selects which -- any no-arg Squash works generically here).
-
-  As in canonical SAC the network has a state-dependent head emitting
-  `(mean, log_std)`; `log_std` is clipped to `[log_std_min, log_std_max]`.
-  The MLP uses SiLU and LayerNorm on hidden blocks, with no input or stem
-  normalization; its settings are grouped under `mlp` below."""
 
   kind = "actor"
   config_type = StochasticActorConfig
@@ -58,25 +50,18 @@ class StochasticActor(ActorOptim, Actor):
     self.net = config.mlp.build(self.obs_dim, 2 * self.plan_dim, latent_dim, layers, rngs=rngs)
 
   def dist(self, s):
-    """State-dependent (mean, std) of the pre-squash Normal, over the flat plan."""
     out = self.net((s,)).astype(jnp.float32)
     mean, log_std = jnp.split(out, 2, axis=-1)
     std = jnp.exp(jnp.clip(log_std, self.config.log_std_min, self.config.log_std_max))
     return mean, std
 
   def rsample(self, s, key=None):
-    """Reparameterized (action, pre-squash x, dist) -- differentiable through s."""
     mean, std = self.dist(s)
     key = self.next_key(key)
     x = mean + std * jax.random.normal(key, mean.shape, mean.dtype)
     return self.squash(x), x, (mean, std)
 
   def generate_action(self, s, *, critic: Critic = None, key=None):
-    """Reparameterized (action, entropy), differentiable through `s`. The squash
-    Jacobian correction needs the extra `act_scale` term since log_prob is the
-    density of an affine-transformed variable, not of `action` itself.
-    `critic` is unused -- SAC's actor needs none to sample -- and accepted only
-    to satisfy the shared `Actor.generate_action` contract."""
     action_flat, x, (mean, std) = self.rsample(s, key)
 
     log_prob = (gaussian.log_prob(x, mean, std)
@@ -90,20 +75,14 @@ class StochasticActor(ActorOptim, Actor):
     action_flat, _, _ = self.rsample(s, key)
     return self.to_plan(action_flat)
 
-
   
   def loss(self, obs, critic: "Critic", alpha, *, key=None):
-    """This actor's own training objective at `obs`, priced against a frozen
-    `critic` -- a dict with one scalar per optimizer key it trains. Every key
-    must be one `create_optimizer()` also declares.
-
-    The default is maximum-entropy Q ascent through the reparameterized sample:
-    `alpha` is a scalar or `(chunk_size,)` and broadcasts against the per-position
-    `(B, chunk_size)` entropy, whose chunk sum is the `(B, 1)` bonus."""
+  
     action, entropy = self.generate_action(obs, key=key)
     q = frozen(critic).value(obs, action.reshape(action.shape[0], -1))
     bonus = (jax.lax.stop_gradient(alpha) * entropy).sum(axis=-1, keepdims=True)
     return {"actor": -(q + bonus).mean()}
+
   
 @register_policy
 class SAC(MaxEntRLPolicy):
@@ -120,7 +99,7 @@ class SAC(MaxEntRLPolicy):
 @dataclass(frozen=True)
 class SACModelConfig(ModelConfig):
   policy_class: str = "SAC"
-  params: MaxEntPolicyConfig = field(default_factory=MaxEntPolicyConfig)
+  params: MaxEntPolicyConfig = field(default_factory=lambda: MaxEntPolicyConfig(policy_delay=3))
   components: ComponentsConfig = field(default_factory=lambda: ComponentsConfig(
     actor=StochasticActorConfig(), critic=C51CriticConfig(),
     entropy=AutotuneRegulatorConfig()))

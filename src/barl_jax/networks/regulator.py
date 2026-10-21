@@ -14,7 +14,7 @@ from barl_jax.registration import register_component
 @dataclass(frozen=True)
 class AutotuneRegulatorConfig(DualOptimConfig):
   class_name: str = "AutotuneRegulator"
-  alpha_init: float = 1.0
+  alpha_init: float = 1e-4
   tune: bool = True
 
 

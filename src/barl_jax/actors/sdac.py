@@ -110,22 +110,7 @@ class DDPMActor(ActorOptim, Actor):
 
   # ---- reverse-sampling score matching ---------------------------------------
   def loss(self, obs, critic, alpha, *, key=None, action=None):
-    """Diffuse `action` (the replay action; a fresh sample when None) to a random
-    t, draw K eps whose x0 reconstructions stay in [-1, 1], and regress the eps
-    prediction onto them weighted by softmax(Q(x0_k) / (temp * q_scale)) over K,
-    where `q_scale` is the cross-candidate Q std averaged over this batch's
-    states (one scalar per batch, not per state) -- not a
-    running, cross-*state* statistic (e.g. a critic-wide value scale): on
-    DogRun the Q range across different candidate actions at one state is
-    ~15-30x smaller than the Q range across different states (measured on a
-    trained checkpoint: cross-candidate std ~0.01-0.06 vs. cross-state std
-    ~0.9), so dividing by anything but the local, per-example spread leaves
-    the softmax within numerical noise of uniform regardless of `temp` --
-    the actor degenerates into plain behavior cloning of `action` and the
-    critic's ranking of candidates never reaches the gradient. `alpha` is
-    unused -- SDAC has no entropy dual (`RLPolicy`) -- and stays a parameter
-    only because every actor's `loss()` shares this call signature (see
-    `RLPolicy.actor_objective`)."""
+    
     keys = jax.random.split(self.next_key(key), 5)
     if action is None:
       action = jax.lax.stop_gradient(self.generate_action(obs, key=keys[4])[0])
@@ -161,7 +146,7 @@ class DDPMActor(ActorOptim, Actor):
 
 @dataclass(frozen=True)
 class SDACPolicyConfig(PolicyConfig):
-  utd_ratio: float = 0.2
+  utd_ratio: float = 0.5
 
 
 @register_policy
@@ -181,6 +166,6 @@ class SDAC(RLPolicy):
 @dataclass(frozen=True)
 class SDACModelConfig(ModelConfig):
   policy_class: str = "SDAC"
-  params: SDACPolicyConfig = field(default_factory=SDACPolicyConfig)
+  params: SDACPolicyConfig = field(default_factory=lambda: SDACPolicyConfig(policy_delay=3))
   components: ComponentsConfig = field(default_factory=lambda: ComponentsConfig(
     actor=DDPMActorConfig(), critic=C51CriticConfig(), entropy=None))
